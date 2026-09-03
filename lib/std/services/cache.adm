@@ -1,0 +1,676 @@
+partial module std.services {
+	use (
+		std.reflection::MethodMetaContext
+		std.glob::Glob
+		std.time
+		std.reflection
+		std.ide::(ide, IdeKind, IdeTable)
+	)
+
+	struct CacheConfig {
+		// Maximum number of entries the cache may retain.
+		//
+		// Entries are evicted when this limit is exceeded.
+		maxEntries ?int
+
+		// Maximum amount of runtime memory the cache may retain.
+		//
+		// Entries are evicted when this limit is exceeded.
+		maxMemory ?int
+	}
+
+	// Internal cache record. Expiration timestamps use the monotonic clock so
+	// wall-clock adjustments cannot unexpectedly expire or extend entries.
+	internal struct CacheEntry {
+		value       any
+		createdAt   int64
+		accessedAt  int64
+		accessOrder uint64
+		ttl         ?duration
+		idle        ?duration
+		memory      int
+	}
+
+	// Fast in-memory cache for retaining runtime values.
+	//
+	// Keys are arbitrary strings. A colon-separated format is recommended for
+	// grouping related entries:
+	//
+	//     users:123
+	//     users:123:permissions
+	//     sessions:abc
+	//
+	// The cache does not enforce namespaces or interpret ':' specially.
+	// Namespacing is purely a key-naming convention.
+	//
+	// Cache keys are always treated as literal strings. To match multiple keys,
+	// explicitly construct a Glob selector.
+	//
+	// For example:
+	//
+	//     get("users:*")        // Looks for the literal key "users:*".
+	//     get(glob("users:*"))  // Returns all keys matching "users:" prefix.
+	//
+	// Glob selectors may be used with operations that support matching multiple keys.
+	service Cache {
+		description           = "Fast in-memory cache with TTL, idle expiration, and LRU eviction"
+		dependencies          = Dependencies{
+			hard: [Runtime],
+			soft: []
+		}
+		lifecycle             = Lifecycle{
+			start: StartMode.Manual,
+			restart: RestartMode.Always,
+		}
+		permissions  string[]
+
+		internal configuredMaxEntries ?int                    = none
+		internal configuredMaxMemory  ?int                    = none
+		internal entries              map<string, CacheEntry> = map<string, CacheEntry>{}
+		internal memoryUsed           int
+		internal accessOrder          uint64
+
+		// Cache accounting includes the key bytes and the value's complete retained
+		// runtime footprint.
+		def entryMemory(key string, value any) int {
+			return key.len() + Runtime.sizeOf(value)
+		}
+
+		def isExpired(entry CacheEntry, now int64) bool {
+			let configuredTTL = entry.ttl
+			if !(configuredTTL is none) {
+				if duration(now - entry.createdAt) >= configuredTTL {
+					return true
+				}
+			}
+			let configuredIdle = entry.idle
+			if !(configuredIdle is none) {
+				if duration(now - entry.accessedAt) >= configuredIdle {
+					return true
+				}
+			}
+			return false
+		}
+
+		def remainingTTL(entry CacheEntry, now int64) duration {
+			let configured = entry.ttl
+			return 0s when configured is none
+			let remaining = configured - duration(now - entry.createdAt)
+			return 0s when remaining < 0s
+			return remaining
+		}
+
+		def remainingIdle(entry CacheEntry, now int64) duration {
+			let configured = entry.idle
+			return 0s when configured is none
+			let remaining = configured - duration(now - entry.accessedAt)
+			return 0s when remaining < 0s
+			return remaining
+		}
+
+		// Removes an expired entry and emits the expiration event. Returns true
+		// when the key was present but expired.
+		def expireKey(key string, now int64) bool {
+			let entry = entries.get(key)
+			return false when entry is none
+			return false unless isExpired(entry, now)
+
+			entries = entries.delete(key)
+			memoryUsed -= entry.memory
+			expired(key)
+			return true
+		}
+
+		def purgeExpired(now int64) {
+			// Iterate over a snapshot because expiration mutates the map.
+			for let (_, key) in entries.keys() {
+				expireKey(key, now)
+			}
+		}
+
+		// Loads a live entry. When markAccess is true, the idle timer and LRU
+		// position are updated.
+		def load(key string, markAccess bool) ?CacheEntry {
+			let now = time.monoNs()
+			return none when expireKey(key, now)
+
+			let entry = entries.get(key)
+			return none when entry is none
+			if markAccess {
+				accessOrder++
+				entry.accessedAt = now
+				entry.accessOrder = accessOrder
+			}
+			return entry
+		}
+
+		def removeKey(key string, notify bool) bool {
+			let entry = entries.get(key)
+			return false when entry is none
+
+			entries = entries.delete(key)
+			memoryUsed -= entry.memory
+			deleted(key) when notify
+			return true
+		}
+
+		def overEntryLimit() bool {
+			let limit = configuredMaxEntries
+			return false when limit is none
+			return entries.len() > limit
+		}
+
+		def overMemoryLimit() bool {
+			let limit = configuredMaxMemory
+			return false when limit is none
+			return memoryUsed > limit
+		}
+
+		def evictIfNeeded() {
+			purgeExpired(time.monoNs())
+			for overEntryLimit() || overMemoryLimit() {
+				let oldestKey = ""
+				let oldestOrder uint64
+				let found = false
+				for let (key, entry) in entries {
+					if !found || entry.accessOrder < oldestOrder {
+						oldestKey = key
+						oldestOrder = entry.accessOrder
+						found = true
+					}
+				}
+				break unless found
+				// Capacity eviction is distinct from explicit deletion, so it does
+				// not emit the `deleted` event.
+				removeKey(oldestKey, false)
+			}
+		}
+
+		atomic def config(val CacheConfig) !none {
+			let maxEntries = val.maxEntries
+			if !(maxEntries is none) {
+				fail "cache maxEntries cannot be negative" when maxEntries < 0
+			}
+			let maxMemory = val.maxMemory
+			if !(maxMemory is none) {
+				fail "cache maxMemory cannot be negative" when maxMemory < 0
+			}
+			configuredMaxEntries = maxEntries
+			configuredMaxMemory = maxMemory
+			evictIfNeeded()
+			return none
+		}
+
+		async def start() !none {
+			entries = map<string, CacheEntry>{}
+			memoryUsed = 0
+			accessOrder = 0
+			return none
+		}
+
+		async def stop() !none {
+			entries = map<string, CacheEntry>{}
+			memoryUsed = 0
+			return none
+		}
+
+		async def restart() !none {
+			try await stop()
+			try await start()
+			return none
+		}
+
+		// Stores a key-value pair with optional TTL and idle expiration.
+		//
+		// TTL defines the maximum lifetime of the key.
+		// Idle defines how long the key may remain unused before expiring.
+		@commit()
+		atomic def set(key string, value any, ttl ?duration = none, idle ?duration = none) {
+			let now = time.monoNs()
+			expireKey(key, now)
+			let exists = entries.hasKey(key)
+			if exists {
+				let previous = entries.get(key)
+				memoryUsed -= previous.memory unless previous is none
+			}
+
+			accessOrder++
+			let memory = entryMemory(key, value)
+			entries = entries.set(key, CacheEntry{
+				value: value,
+				createdAt: now,
+				accessedAt: now,
+				accessOrder: accessOrder,
+				ttl: ttl,
+				idle: idle,
+				memory: memory,
+			})
+			memoryUsed += memory
+			created(key) unless exists
+			evictIfNeeded()
+		}
+
+		// Returns the value associated with the key.
+		//
+		// Accessing the key resets its idle timer if idle expiration is configured.
+		// Returns none if the key does not exist or has expired.
+		@query()
+		atomic def get(key string) ?any {
+			let entry = load(key, true)
+			return none when entry is none
+			return entry.value
+		}
+
+		// Returns the values associated with the specified keys.
+		//
+		// Accessing a key resets its idle timer if idle expiration is configured.
+		@query()
+		atomic def get(keys string[]) map<string, any> {
+			let result = map<string, any>{}
+			for let (_, key) in keys {
+				let entry = load(key, true)
+				continue when entry is none
+				result[key] = entry.value
+			}
+			return result
+		}
+
+		// Returns the values associated with keys matching the selector.
+		//
+		// Accessing a matched key resets its idle timer if idle expiration is configured.
+		// Unlike string keys, Glob values are interpreted as key patterns.
+		@query()
+		atomic def get(selector Glob) map<string, any> {
+			let result = map<string, any>{}
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				let entry = load(key, true)
+				continue when entry is none
+				result[key] = entry.value
+			}
+			return result
+		}
+
+		// Removes the specified key from the cache.
+		@commit()
+		atomic def delete(key string) {
+			if !expireKey(key, time.monoNs()) {
+				removeKey(key, true)
+			}
+		}
+
+		// Removes the specified keys from the cache.
+		@commit()
+		atomic def delete(keys string[]) {
+			let now = time.monoNs()
+			for let (_, key) in keys {
+				if !expireKey(key, now) {
+					removeKey(key, true)
+				}
+			}
+		}
+
+		// Removes all keys matching the selector returning the number of items deleted.
+		//
+		// Unlike string keys, Glob values are interpreted as key patterns.
+		@commit()
+		atomic def delete(selector Glob) int {
+			let count = 0
+			let now = time.monoNs()
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				if !expireKey(key, now) && removeKey(key, true) {
+					count++
+				}
+			}
+			return count
+		}
+
+		// Updates the key's expiration settings.
+		//
+		// If TTL is provided, the key's TTL is reset from the current time.
+		// If idle is provided, the key's idle duration is updated and its idle timer is reset.
+		@commit()
+		atomic def renew(key string, ttl ?duration = none, idle ?duration = none) {
+			let entry = load(key, false)
+			return when entry is none
+			let now = time.monoNs()
+			if !(ttl is none) {
+				entry.ttl = ttl
+				entry.createdAt = now
+			}
+			if !(idle is none) {
+				entry.idle = idle
+				entry.accessedAt = now
+			}
+		}
+
+		// Updates the expiration settings of all keys matching the selector returning the number if items renewed.
+		//
+		// If TTL is provided, each matched key's TTL is reset from the current time.
+		// If idle is provided, each matched key's idle duration is updated and its idle timer is reset.
+		@commit()
+		atomic def renew(selector Glob, ttl ?duration = none, idle ?duration = none) int {
+			let count = 0
+			let now = time.monoNs()
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				if expireKey(key, now) {
+					continue
+				}
+				let entry = entries.get(key)
+				continue when entry is none
+				if !(ttl is none) {
+					entry.ttl = ttl
+					entry.createdAt = now
+				}
+				if !(idle is none) {
+					entry.idle = idle
+					entry.accessedAt = now
+				}
+				count++
+			}
+			return count
+		}
+
+		// Returns the value associated with the key and removes the key from the cache.
+		//
+		// Returns none if the key does not exist or has expired.
+		@commit()
+		atomic def take(key string) ?any {
+			let entry = load(key, false)
+			return none when entry is none
+			entries = entries.delete(key)
+			memoryUsed -= entry.memory
+			deleted(key)
+			return entry.value
+		}
+
+		// Marks the key as accessed.
+		//
+		// Resets the key's idle timer without changing its TTL.
+		@commit()
+		atomic def touch(key string) {
+			let _ = load(key, true)
+		}
+
+		// Marks the specified keys as accessed.
+		//
+		// Resets each key's idle timer without changing its TTL.
+		@commit()
+		atomic def touch(keys string[]) {
+			for let (_, key) in keys {
+				let _ = load(key, true)
+			}
+		}
+
+		// Marks all keys matching the selector as accessed returning the number of items modified
+		//
+		// Resets each matched key's idle timer without changing its TTL.
+		@commit()
+		atomic def touch(selector Glob) int {
+			let count = 0
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				let entry = load(key, true)
+				count++ unless entry is none
+			}
+			return count
+		}
+
+		// Returns whether the key exists and has not expired.
+		@query()
+		atomic def has(key string) bool {
+			return !(load(key, false) is none)
+		}
+
+		// Returns whether each specified key exists and has not expired.
+		@query()
+		atomic def has(keys string[]) map<string, bool> {
+			let result = map<string, bool>{}
+			for let (_, key) in keys {
+				result[key] = !(load(key, false) is none)
+			}
+			return result
+		}
+
+		// Returns whether at least one existing key matches the selector.
+		@query()
+		atomic def has(selector Glob) bool {
+			for let (_, key) in entries.keys() {
+				if selector.matches(key) && !(load(key, false) is none) {
+					return true
+				}
+			}
+			return false
+		}
+
+		// Returns the remaining TTL of the key.
+		//
+		// Returns none if the key does not exist or has no TTL configured.
+		@query()
+		atomic def ttl(key string) ?duration {
+			let entry = load(key, false)
+			return none when entry is none
+			return none when entry.ttl is none
+			return remainingTTL(entry, time.monoNs())
+		}
+
+		// Returns the remaining TTL of each specified key.
+		//
+		// A value is none if the key does not exist or has no TTL configured.
+		@query()
+		atomic def ttl(keys string[]) map<string, ?duration> {
+			let result = map<string, ?duration>{}
+			for let (_, key) in keys {
+				let remaining ?duration = none
+				let entry = load(key, false)
+				result[key] = remaining when entry is none
+				continue when entry is none
+				remaining = remainingTTL(entry, time.monoNs()) unless entry.ttl is none
+				result[key] = remaining
+			}
+			return result
+		}
+
+		// Returns the remaining TTL of each key matching the selector.
+		//
+		// A value is none if the matched key has no TTL configured.
+		@query()
+		atomic def ttl(selector Glob) map<string, ?duration> {
+			let result = map<string, ?duration>{}
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				let entry = load(key, false)
+				continue when entry is none
+				let remaining ?duration = none
+				remaining = remainingTTL(entry, time.monoNs()) unless entry.ttl is none
+				result[key] = remaining
+			}
+			return result
+		}
+
+		// Returns the remaining idle time of the key.
+		//
+		// Returns none if the key does not exist or has no idle expiration configured.
+		@query()
+		atomic def idle(key string) ?duration {
+			let entry = load(key, false)
+			return none when entry is none
+			return none when entry.idle is none
+			return remainingIdle(entry, time.monoNs())
+		}
+
+		// Returns the remaining idle time of each specified key.
+		//
+		// A value is none if the key does not exist or has no idle expiration configured.
+		@query()
+		atomic def idle(keys string[]) map<string, ?duration> {
+			let result = map<string, ?duration>{}
+			for let (_, key) in keys {
+				let remaining ?duration = none
+				let entry = load(key, false)
+				result[key] = remaining when entry is none
+				continue when entry is none
+				remaining = remainingIdle(entry, time.monoNs()) unless entry.idle is none
+				result[key] = remaining
+			}
+			return result
+		}
+
+		// Returns the remaining idle time of each key matching the selector.
+		//
+		// A value is none if the matched key has no idle expiration configured.
+		@query()
+		atomic def idle(selector Glob) map<string, ?duration> {
+			let result = map<string, ?duration>{}
+			for let (_, key) in entries.keys() {
+				continue unless selector.matches(key)
+				let entry = load(key, false)
+				continue when entry is none
+				let remaining ?duration = none
+				remaining = remainingIdle(entry, time.monoNs()) unless entry.idle is none
+				result[key] = remaining
+			}
+			return result
+		}
+
+		// Returns all keys currently present in the cache.
+		@query()
+		atomic def keys() string[] {
+			purgeExpired(time.monoNs())
+			return entries.keys()
+		}
+
+		// Returns all keys matching the selector.
+		@query()
+		atomic def keys(selector Glob) string[] {
+			purgeExpired(time.monoNs())
+			let result = string[]
+			for let (_, key) in entries.keys() {
+				result.push(key) when selector.matches(key)
+			}
+			return result
+		}
+
+		// Returns the number of keys currently present in the cache.
+		@query()
+		atomic def size() int {
+			purgeExpired(time.monoNs())
+			return entries.len()
+		}
+
+		// Returns the number of keys matching the selector.
+		@query()
+		atomic def size(selector Glob) int {
+			purgeExpired(time.monoNs())
+			let count = 0
+			for let (key, _) in entries {
+				count++ when selector.matches(key)
+			}
+			return count
+		}
+
+		// Removes all keys from the cache.
+		@commit()
+		atomic def clear() {
+			for let (_, key) in entries.keys() {
+				removeKey(key, true)
+			}
+		}
+
+		// IDE service panel: the live entries with their remaining budgets.
+		@ide(kind = IdeKind.Table, label = "Entries", refresh = 1s)
+		atomic def ideEntries() IdeTable {
+			purgeExpired(time.monoNs())
+			let now = time.monoNs()
+			let rows = string[][]
+			for let (key, entry) in entries {
+				let ttlMs = "-"
+				ttlMs = "{int64(remainingTTL(entry, now)) / 1000000}" unless entry.ttl is none
+				let idleMs = "-"
+				idleMs = "{int64(remainingIdle(entry, now)) / 1000000}" unless entry.idle is none
+				rows.push([key, reflection.typeName(entry.value), "{entry.memory}", ttlMs, idleMs])
+			}
+			return IdeTable{
+				columns: ["Key", "Type", "Size (B)", "TTL (ms)", "Idle (ms)"],
+				rows: rows,
+			}
+		}
+
+		// IDE service panel: how many keys are live.
+		@ide(kind = IdeKind.Value, label = "Keys", refresh = 1s)
+		atomic def ideCount() int {
+			purgeExpired(time.monoNs())
+			return entries.len()
+		}
+
+		// IDE service panel: retained memory, graphed over time.
+		@ide(kind = IdeKind.Series, label = "Memory", refresh = 500ms, unit = "B")
+		def ideMemory() int {
+			return memoryUsed
+		}
+
+		// Emitted when a key expires.
+		@emit()
+		def expired(key string) string {
+			return key
+		}
+
+		// Emitted when a key is explicitly deleted.
+		@emit()
+		def deleted(key string) string {
+			return key
+		}
+
+		// Emitted when a new key is created.
+		@emit()
+		def created(key string) string {
+			return key
+		}
+	}
+
+	// Caches the result of the annotated method under the specified key.
+	//
+	// If a cached value exists, it is returned without executing the method.
+	// When refresh is true, the method is always executed and the cached value
+	// is replaced with its result.
+	//
+	// TTL defines the maximum lifetime of the cached result.
+	// Idle defines how long the cached result may remain unused before expiring.
+	meta def cache(target MethodMetaContext, key string, ttl ?duration = none, idle ?duration = none, refresh = false) {
+		if !refresh {
+			let cached = Cache.get(key)
+			if !(cached is none) {
+				target.resolve(cached)
+				return
+			}
+		}
+
+		target.invoke()
+
+		let produced = target.result()
+		return when produced is none
+		Cache.set(key, produced, ttl, idle)
+	}
+
+	// Invalidates the specified cache keys after the annotated method executes.
+	//
+	// Keys may contain template expressions evaluated using the method's arguments.
+	meta def cacheInvalidate(target MethodMetaContext, key ...string) {
+		target.invoke()
+		Cache.delete(key)
+	}
+
+	// Invalidates all cache keys matching the specified glob selectors after
+	// the annotated method executes.
+	//
+	// Glob patterns may contain template expressions evaluated using the
+	// method's arguments.
+	meta def cacheInvalidate(target MethodMetaContext, key ...Glob) {
+		target.invoke()
+		for let (_, selector) in key {
+			Cache.delete(selector)
+		}
+	}
+}
