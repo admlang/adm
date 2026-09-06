@@ -1,0 +1,574 @@
+@os("linux")
+partial module std.proto {
+	use (
+		std.time
+	)
+
+	// D-Bus, the freedesktop message bus: the wire format (little-endian
+	// marshalling, header fields, signatures), the SASL EXTERNAL handshake and
+	// a connection to a bus over its Unix socket. `dbusConnect` opens one;
+	// `DBusConnection.call` needs a task pumping `readMessage` into `deliver`,
+	// `callSync` reads the reply itself.
+
+	// Message type: a method call.
+	
+	const DBUS_CALL byte = 1
+	// Message type: the reply to a call.
+	
+	const DBUS_REPLY byte = 2
+	// Message type: an error reply.
+	
+	const DBUS_ERROR byte = 3
+	// Message type: a broadcast signal.
+	
+	const DBUS_SIGNAL byte = 4
+
+	// A connection to a D-Bus bus: the socket, the SASL handshake, message
+	// framing, and the calls waiting for replies. One task reads (`readMessage`),
+	// any task may send; the state is guarded by the type's own lock, not the
+	// service's.
+	
+	type DBusConnection {
+		internal fd       int                     = -1
+		internal serial   uint32                  = 0
+		internal inbound  byte[]
+		internal pending  map<uint32, DBusWaiter>
+		internal timeout  duration                = 5s
+		internal interval duration                = 5ms
+		// Set by close; the listener stops instead of reporting a lost connection.
+		stopping          bool                    = false
+
+		def new(fd int) {
+			self.fd = fd
+			inbound = []
+			pending = map<uint32, DBusWaiter>{}
+		}
+
+		// Asks the bus to route the interface's signal to this connection.
+		//
+		// Fails when the bus refuses the match rule.
+		def subscribe(iface string, member string) !none {
+			let w = new DBusWriter()
+			w.putString("type='signal',interface='{iface}',member='{member}'")
+			let reply = try callSync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes())
+			fail "dbus: {dbusErrorMessage(reply)}" when reply.kind == DBUS_ERROR
+			return none
+		}
+
+		// Closes the socket and answers every waiting call with the closed sentinel.
+		atomic def close() {
+			stopping = true
+			if fd >= 0 {
+				__net_close(fd) onerror recover none
+			}
+			fd = -1
+			releaseWaiters()
+		}
+
+		// The listener's report that the socket failed: answers waiting calls and closes.
+		atomic def lost() {
+			return when stopping
+			if fd >= 0 {
+				__net_close(fd) onerror recover none
+			}
+			fd = -1
+			releaseWaiters()
+		}
+
+		internal def releaseWaiters() {
+			let closedMessage = DBusMessage{kind: 0}
+			for let (_, waiter) in pending {
+				waiter.resolve(closedMessage)
+			}
+			pending = map<uint32, DBusWaiter>{}
+		}
+
+		// The SASL EXTERNAL handshake: the bus trusts the socket's peer
+		// credentials, the client only names its uid.
+		//
+		// Fails when the bus rejects the connection.
+		def authenticate() !none {
+			try writeAll([0])
+			let uid = dbusProcessUid()
+			if uid.len() > 0 {
+				try writeAll("AUTH EXTERNAL {uid.bytes().hex()}\r\n".bytes())
+			} else {
+				try writeAll("AUTH EXTERNAL\r\n".bytes())
+			}
+			for {
+				let line = try readLine()
+				if line.startsWith("OK ") {
+					try writeAll("BEGIN\r\n".bytes())
+					return none
+				}
+				if line.startsWith("DATA") {
+					try writeAll("DATA\r\n".bytes())
+					continue
+				}
+				fail "dbus: the session bus rejected the connection: {line}"
+			}
+			fail "dbus: unreachable"
+		}
+
+		// Sends a method call and waits for its reply while the listener task reads.
+		//
+		// The wait polls the waiter every few milliseconds: a sleep hands the
+		// processor to the listener on every backend, a channel receive does not on the C backend.
+		//
+		// Fails when the connection drops or the peer does not answer in time.
+		def call(destination string, path string, iface string, member string, signature string, body byte[]) !DBusMessage {
+			let waiter = try send(destination, path, iface, member, signature, body)
+			let waited = 0ms
+			for {
+				let reply = replyOf(waiter)
+				if !(reply is none) {
+					let message DBusMessage = reply
+					fail "dbus: the session bus connection closed" when message.kind == 0
+					return message
+				}
+				if waited >= timeout {
+					drop(waiter.serial)
+					fail "dbus: the notification server did not answer {member} in time"
+				}
+				time.sleep(interval)
+				waited += interval
+			}
+			fail "dbus: unreachable"
+		}
+
+		// Sends a method call and reads the reply straight off the socket, for
+		// the handshake before the listener runs; signals seen on the way are dropped.
+		//
+		// Fails when the connection drops or the reply does not come in time.
+		def callSync(destination string, path string, iface string, member string, signature string, body byte[]) !DBusMessage {
+			let waiter = try send(destination, path, iface, member, signature, body)
+			for {
+				let message = try readMessage(timeout)
+				if (message.kind == DBUS_REPLY || message.kind == DBUS_ERROR) && message.replySerial == waiter.serial {
+					drop(waiter.serial)
+					return message
+				}
+			}
+			fail "dbus: unreachable"
+		}
+
+		// Writes a method call and registers the waiter its reply lands on.
+		//
+		// Fails when the socket write does.
+		internal atomic def send(destination string, path string, iface string, member string, signature string, body byte[]) !DBusWaiter {
+			serial++
+			let id = serial
+			let waiter = new DBusWaiter(id)
+			pending[id] = waiter
+			writeAll(dbusEncodeCall(id, destination, path, iface, member, signature, body)) onerror (err error) {
+				pending.delete(id)
+				fail err
+			}
+			return waiter
+		}
+
+		// Answers the call waiting on the serial, if one still is.
+		atomic def deliver(serial uint32, message DBusMessage) {
+			return unless pending.hasKey(serial)
+			let target = pending[serial]
+			pending.delete(serial)
+			target.resolve(message)
+		}
+
+		internal atomic def replyOf(waiter DBusWaiter) ?DBusMessage {
+			return waiter.reply
+		}
+
+		internal atomic def drop(serial uint32) {
+			pending.delete(serial)
+		}
+
+		// --- the wire ------------------------------------------------------------
+
+		internal def writeAll(data byte[]) !none {
+			let sent = 0
+			for sent < data.len() {
+				let n = try __net_write(fd, data[sent:], timeout)
+				fail "dbus: the session bus connection closed" when n <= 0
+				sent += n
+			}
+			return none
+		}
+
+		// Reads one `\r\n`-terminated handshake line.
+		//
+		// Fails when the socket does or the bus closes it.
+		internal def readLine() !string {
+			for {
+				for let (i, b) in inbound {
+					if b == byte(10) && i > 0 && inbound[i - 1] == byte(13) {
+						let line = string(inbound[0:i - 1])
+						inbound = inbound[i + 1:]
+						return line
+					}
+				}
+				try fill(timeout)
+			}
+			fail "dbus: unreachable"
+		}
+
+		// Reads from the socket into the inbound buffer.
+		//
+		// Fails when the read does or the bus closed the connection.
+		internal def fill(wait duration) !none {
+			let chunk byte[]
+			chunk.len(4096)
+			let n = try __net_read(fd, chunk, wait)
+			fail "dbus: the session bus closed the connection" when n <= 0
+			for let (i, b) in chunk {
+				break when i >= n
+				inbound.push(b)
+			}
+			return none
+		}
+
+		// Reads one whole message off the socket. Only the listener (or the
+		// handshake before it) calls this.
+		//
+		// Fails when the socket does, the bus closes it, or nothing arrives within the wait.
+		def readMessage(wait duration) !DBusMessage {
+			for inbound.len() < 16 {
+				try fill(wait)
+			}
+			fail "dbus: the session bus sent a big-endian message" unless inbound[0] == byte(108)
+			let bodyLen = int(dbusReadUint32(inbound, 4))
+			let fieldsLen = int(dbusReadUint32(inbound, 12))
+			let headerLen = dbusAlign(16 + fieldsLen, 8)
+			let total = headerLen + bodyLen
+			for inbound.len() < total {
+				try fill(wait)
+			}
+			let raw = inbound[0:total]
+			inbound = inbound[total:]
+			return dbusDecodeMessage(raw, headerLen, fieldsLen)
+		}
+	}
+
+	// Connects to the bus socket, authenticates and says Hello.
+	//
+	// Fails when the socket cannot connect or the bus rejects the connection.
+	
+	def dbusConnect(address string) !DBusConnection {
+		let sock = try __net_socket(1, 1)
+		__net_connect(sock, address, 5s) onerror (err error) {
+			__net_close(sock) onerror recover none
+			fail "dbus: no session bus at {address}: {err.message}"
+		}
+		let connection = new DBusConnection(sock)
+		connection.authenticate() onerror (err error) {
+			connection.close()
+			fail err
+		}
+		// Hello registers the connection; the reply carries the unique name, which nothing needs.
+		connection.callSync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "", []) onerror (err error) {
+			connection.close()
+			fail err
+		}
+		return connection
+	}
+
+	// The sentinel a failed read turns into: kind 0 with the error code.
+	
+	def dbusReadFailure(code string) DBusMessage {
+		return DBusMessage{kind: 0, errorName: code}
+	}
+
+	// The user id from /proc, as the EXTERNAL handshake wants it; empty
+	// where /proc is not available.
+	
+	internal def dbusProcessUid() string {
+		let status = __fs_read_all("/proc/self/status") onerror recover []
+		for let line in string(status).split("\n") {
+			continue unless line.startsWith("Uid:")
+			for let field in line[4:].split("\t") {
+				let trimmed = field.trim()
+				return trimmed when trimmed.len() > 0
+			}
+		}
+		return ""
+	}
+
+	// Where the session bus listens: `DBUS_SESSION_BUS_ADDRESS`, else the
+	// runtime folder's `bus` socket.
+	//
+	// Fails when neither names a socket path.
+	
+	def dbusSessionBusAddress() !string {
+		let env = __env_get("DBUS_SESSION_BUS_ADDRESS")
+		if !(env is none) {
+			let address string = env
+			for let part in address.split(";") {
+				for let item in part.split(",") {
+					return item[5:] when item.startsWith("path=")
+					return item[10:] when item.startsWith("unix:path=")
+				}
+			}
+		}
+		let runtimeDir = __env_get("XDG_RUNTIME_DIR")
+		if !(runtimeDir is none) {
+			let dir string = runtimeDir
+			return "{dir}/bus"
+		}
+		fail "dbus: no session bus (DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are unset)"
+	}
+
+	// Pulls the header fields a reply or signal needs out of a raw message.
+	
+	def dbusDecodeMessage(raw byte[], headerLen int, fieldsLen int) DBusMessage {
+		let message = DBusMessage{kind: raw[1], serial: dbusReadUint32(raw, 8)}
+		let offset = 16
+		let end = 16 + fieldsLen
+		for offset < end {
+			offset = dbusAlign(offset, 8)
+			break when offset >= end
+			let code = raw[offset]
+			offset++
+			let sigLen = int(raw[offset])
+			let sig = string(raw[offset + 1:offset + 1 + sigLen])
+			offset += sigLen + 2
+			if sig := "s" || "o" {
+				offset = dbusAlign(offset, 4)
+				let value = dbusReadString(raw, offset)
+				offset += 4 + value.bytes().len() + 1
+				message.member = value when code == 3
+				message.errorName = value when code == 4
+			} else if sig == "g" {
+				let n = int(raw[offset])
+				message.signature = string(raw[offset + 1:offset + 1 + n])
+				offset += n + 2
+			} else if sig == "u" {
+				offset = dbusAlign(offset, 4)
+				message.replySerial = dbusReadUint32(raw, offset) when code == 5
+				offset += 4
+			} else {
+				// An unknown field type ends the walk; the fields this service reads come first.
+				break
+			}
+		}
+		message.body = raw[headerLen:]
+		return message
+	}
+
+	// Serialises a method call: the fixed header, the header fields and the body.
+	
+	def dbusEncodeCall(id uint32, destination string, path string, iface string, member string, signature string, body byte[]) byte[] {
+		let fields = new DBusWriter()
+		fields.putField(1, "o", path)
+		fields.putField(6, "s", destination)
+		fields.putField(2, "s", iface)
+		fields.putField(3, "s", member)
+		if signature.len() > 0 {
+			fields.pad(8)
+			fields.putByte(8)
+			fields.putSignature("g")
+			fields.putSignature(signature)
+		}
+		let w = new DBusWriter()
+		w.putByte(108)
+		w.putByte(DBUS_CALL)
+		w.putByte(0)
+		w.putByte(1)
+		w.putUint32(uint32(body.len()))
+		w.putUint32(id)
+		w.putUint32(uint32(fields.len()))
+		w.putRaw(fields.bytes())
+		w.pad(8)
+		w.putRaw(body)
+		return w.bytes()
+	}
+
+	// The offset rounded up to the next multiple of `to`, as D-Bus aligns each type.
+	
+	def dbusAlign(offset int, to int) int {
+		let rest = offset % to
+		return offset when rest == 0
+		return offset + to - rest
+	}
+
+	// A D-Bus string at the offset: its length, the bytes, a trailing nul.
+	
+	def dbusReadString(raw byte[], offset int) string {
+		let n = int(dbusReadUint32(raw, offset))
+		let start = offset + 4
+		return "" when start + n > raw.len()
+		return string(raw[start:start + n])
+	}
+
+	// One decoded bus message: the parts the service reads.
+	
+	struct DBusMessage {
+		kind        byte
+		serial      uint32
+		replySerial uint32
+		member      string
+		errorName   string
+		signature   string
+		body        byte[]
+	}
+
+	// A sent call; the reply lands in `reply` when it arrives.
+	
+	internal type DBusWaiter {
+		serial uint32
+		reply  ?DBusMessage
+
+		def new(serial uint32) {
+			self.serial = serial
+		}
+
+		def resolve(message DBusMessage) {
+			reply = message
+		}
+	}
+
+	// The message text of an error reply, or the error name when it carries none.
+	
+	def dbusErrorMessage(message DBusMessage) string {
+		return message.errorName when message.signature != "s" || message.body.len() < 4
+		let n = int(dbusReadUint32(message.body, 0))
+		return message.errorName when 4 + n > message.body.len()
+		return string(message.body[4:4 + n])
+	}
+
+	// Little-endian D-Bus marshalling with the alignment each type needs.
+	
+	type DBusWriter {
+		internal buf       byte[]
+		internal dictStart int    = -1
+		internal dictLen   int    = -1
+
+		def new() {}
+
+		// How many bytes are written so far.
+		def len() int {
+			return buf.len()
+		}
+
+		// The bytes written so far.
+		def bytes() byte[] {
+			return buf
+		}
+
+		// Writes zero bytes until the position is a multiple of `to`.
+		def pad(to int) {
+			for buf.len() % to != 0 {
+				buf.push(0)
+			}
+		}
+
+		// Writes one byte (D-Bus `y`).
+		def putByte(value byte) {
+			buf.push(value)
+		}
+
+		// Writes the bytes as they are, no alignment.
+		def putRaw(data byte[]) {
+			for let b in data {
+				buf.push(b)
+			}
+		}
+
+		// Writes a `u`, aligned to 4.
+		def putUint32(value uint32) {
+			pad(4)
+			buf.push(byte(value & 0xFF))
+			buf.push(byte((value >> 8) & 0xFF))
+			buf.push(byte((value >> 16) & 0xFF))
+			buf.push(byte((value >> 24) & 0xFF))
+		}
+
+		// Writes an `i`, aligned to 4.
+		def putInt32(value int32) {
+			putUint32(uint32(value))
+		}
+
+		// Writes an `s` or `o`: the length, the bytes, a nul.
+		def putString(value string) {
+			let data = value.bytes()
+			putUint32(uint32(data.len()))
+			putRaw(data)
+			buf.push(0)
+		}
+
+		// A signature: one length byte, the text, a nul.
+		// Writes a `g`: one length byte, the text, a nul.
+		def putSignature(value string) {
+			let data = value.bytes()
+			buf.push(byte(data.len()))
+			putRaw(data)
+			buf.push(0)
+		}
+
+		// One header field: the code and a variant of the given signature.
+		// Writes one header field: the code and a string variant of the signature.
+		def putField(code byte, sig string, value string) {
+			pad(8)
+			buf.push(code)
+			putSignature(sig)
+			putString(value)
+		}
+
+		// Writes an `as`: the byte length, then each string.
+		def putStringArray(values string[]) {
+			pad(4)
+			let lenAt = buf.len()
+			putUint32(0)
+			let start = buf.len()
+			for let value in values {
+				putString(value)
+			}
+			patch(lenAt, buf.len() - start)
+		}
+
+		// Opens an `a{sv}` dictionary; entries follow, then endDict.
+		def beginDict() {
+			pad(4)
+			dictLen = buf.len()
+			putUint32(0)
+			pad(8)
+			dictStart = buf.len()
+		}
+
+		// Writes one `{sv}` entry whose value is a byte.
+		def dictByte(key string, value byte) {
+			pad(8)
+			putString(key)
+			putSignature("y")
+			buf.push(value)
+		}
+
+		// Writes one `{sv}` entry whose value is a string.
+		def dictString(key string, value string) {
+			pad(8)
+			putString(key)
+			putSignature("s")
+			putString(value)
+		}
+
+		// Closes the dictionary beginDict opened, patching its byte length.
+		def endDict() {
+			patch(dictLen, buf.len() - dictStart)
+			dictStart = -1
+			dictLen = -1
+		}
+
+		internal def patch(at int, value int) {
+			let v = uint32(value)
+			buf[at] = byte(v & 0xFF)
+			buf[at + 1] = byte((v >> 8) & 0xFF)
+			buf[at + 2] = byte((v >> 16) & 0xFF)
+			buf[at + 3] = byte((v >> 24) & 0xFF)
+		}
+	}
+
+	// The little-endian `u` at the offset.
+	
+	def dbusReadUint32(raw byte[], offset int) uint32 {
+		return uint32(raw[offset]) | (uint32(raw[offset + 1]) << 8) | (uint32(raw[offset + 2]) << 16) | (uint32(raw[offset + 3]) << 24)
+	}
+}
