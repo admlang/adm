@@ -1,0 +1,407 @@
+partial module std.net.http {
+	use (
+		std.bytes
+		std.data.encoding
+		std.formats
+		std.io
+		std.os
+		std.time
+	)
+
+	// FileSystem is what `FileServer` reads: a root it opens and stats
+	// paths under. `Dir` maps it to a directory through `Storage`; a
+	// packaged application maps it to embedded assets.
+	interface FileSystem {
+		// Opens the file at the slash-separated, rooted `name`.
+		// Fails with NetError-shaped os errors: not found, permission.
+		def open(name string) !os.File
+		def stat(name string) !os.FileInfo
+		def readDir(name string) !os.DirEntry[]
+	}
+
+	// Dir serves a directory on disk. A `name` that escapes the root
+	// (`..`, absolute) fails as not found; symlinks are followed, so a
+	// link out of the root is the operator's choice.
+	type Dir {
+		root string
+
+		def new(root string) {
+			self.root = root
+		}
+
+		// Implements FileSystem.
+		def open(name string) !os.File {
+			return try os.open(resolve(name))
+		}
+
+		def stat(name string) !os.FileInfo {
+			return try os.stat(resolve(name))
+		}
+
+		def readDir(name string) !os.DirEntry[] {
+			return try os.readDir(resolve(name), 0)
+		}
+
+		// The path on disk for a rooted name: cleaned first, so `..`
+		// cannot climb out of the root.
+		internal def resolve(name string) string {
+			let cleaned = cleanPath(name.replace("\\", "/"))
+			let base = root == "" ?? (".", root.trimSuffix("/"))
+			return base when cleaned == "/"
+			return base + cleaned
+		}
+	}
+
+	// FileServer serves files from a `FileSystem` with the behaviour a
+	// static host needs: content type by extension (sniffed when
+	// unknown), `Last-Modified` and a weak `ETag` from size and mtime,
+	// `If-*` conditionals (304, 412), byte ranges (206, multipart for
+	// several), `HEAD`, `index.html` for a directory (or a listing when
+	// `listDirectories`), `/dir` redirected to `/dir/` and
+	// `/dir/index.html` to `/dir/`, and precompressed siblings
+	// (`app.js.gz`, `app.js.br`) sent when the client accepts them.
+	// Dot files are hidden unless `dotFiles` allows them. Implements
+	// `Handler`; mount it with `mux.static` or `stripPrefix`.
+	type FileServer {
+		fs              FileSystem
+		indexFile       string     = "index.html"
+		listDirectories bool       = false
+		dotFiles        bool       = false
+		precompressed   bool       = true
+		// `Cache-Control: max-age=…` on every file; 0 sends none.
+		maxAge          duration   = 0s
+		// Immutable assets (`Cache-Control: … immutable`) under these
+		// path prefixes, for fingerprinted bundles.
+		immutable       string[]   = []
+		// Served instead of 404 when set: a single-page app's shell.
+		fallback        string     = ""
+
+		def new(fs FileSystem) {
+			self.fs = fs
+		}
+
+		def new(root string) {
+			self.fs = new Dir(root)
+		}
+
+		// Implements Handler.
+		def serve(ctx Context) !none {
+			let req = ctx.request
+			return ctx.error(405) unless req.method == Method.GET || req.method == Method.HEAD
+			let raw = req.url.path
+			raw = "/" when raw == ""
+			let name = cleanPath(raw)
+			name = name + "/" when raw.endsWith("/") && !name.endsWith("/")
+			return ctx.notFound() when !dotFiles && containsDotFile(name)
+			let info = statIn(fs, name) onerror recover none
+			return try serveFallback(ctx) when info is none
+			return try serveDirectory(ctx, name) when info.isDir
+			return try serveFallback(ctx) when name.endsWith("/")
+			// `/dir/index.html` is `/dir/`: one address per page.
+			return try ctx.redirect(name[:name.len() - indexFile.len()], 301) when name.endsWith("/" + indexFile) && indexFile != ""
+			return try serveEntry(ctx, name, info)
+		}
+
+		// Serves the single-page fallback, or 404.
+		internal def serveFallback(ctx Context) !none {
+			return try ctx.notFound() when fallback == ""
+			let info = statIn(fs, fallback) onerror recover none
+			return try ctx.notFound() when info is none || info.isDir
+			return try serveEntry(ctx, fallback, info)
+		}
+
+		internal def serveDirectory(ctx Context, name string) !none {
+			// A directory lives at `/dir/`, so relative links resolve
+			// inside it.
+			return try ctx.redirect(name + "/", 301) unless name.endsWith("/")
+			if indexFile != "" {
+				let index = name + indexFile
+				let info = statIn(fs, index) onerror recover none
+				return try serveEntry(ctx, index, info) unless info is none || info.isDir
+			}
+			return try serveListing(ctx, name) when listDirectories
+			return try serveFallback(ctx)
+		}
+
+		internal def serveListing(ctx Context, name string) !none {
+			let entries = fs.readDir(name) onerror recover []
+			let visible os.DirEntry[] = []
+			for let entry in entries {
+				let base = os.base(entry.path)
+				continue when !dotFiles && base.startsWith(".")
+				visible.push(entry)
+			}
+			return try ctx.html(listingHTML(name, visible))
+		}
+
+		// Sends one file with caching headers, conditionals, ranges and a
+		// precompressed sibling when the client accepts one.
+		internal def serveEntry(ctx Context, name string, info os.FileInfo) !none {
+			let w = ctx.response
+			let modified = info.modTime
+			let size = int(info.size)
+			let sizeText = size.hex()
+			let stampText = modified.unixNs().hex()
+			w.etag("{sizeText}-{stampText}", true)
+			applyCacheControl(w, name)
+			let contentType = formats.typeByName(name)
+			let encoded = precompressedFor(ctx, name)
+			if !(encoded is none) {
+				let (path, encoding, compressedInfo) = encoded
+				w.headers.set("Content-Encoding", encoding)
+				w.vary("Accept-Encoding")
+				w.headers.set("Content-Type", contentType) unless contentType is none
+				w.headers.set("Content-Type", "application/octet-stream") when contentType is none
+				let file = try fs.open(path)
+				return try serveContent(ctx, path, modified, int(compressedInfo.size), file)
+			}
+			let file = try fs.open(name)
+			return try serveContent(ctx, name, modified, size, file)
+		}
+
+		// A `.br` or `.gz` sibling the client accepts, with its encoding
+		// and stat; none when there is none.
+		internal def precompressedFor(ctx Context, name string) ?(string, string, os.FileInfo) {
+			return none unless precompressed
+			let accepted = ctx.request.acceptsEncoding("br", "gzip")
+			return none when accepted is none
+			let order = accepted == "br" ?? (["br", "gzip"], ["gzip", "br"])
+			for let encoding in order {
+				continue when ctx.request.acceptsEncoding(encoding) is none
+				let suffix = encoding == "br" ?? (".br", ".gz")
+				let sibling = name + suffix
+				let info = statIn(fs, sibling) onerror recover none
+				continue when info is none || info.isDir
+				return (sibling, encoding, info)
+			}
+			return none
+		}
+
+		// Sets `Cache-Control` from `maxAge` and `immutable`.
+		internal def applyCacheControl(w ResponseWriter, name string) {
+			return when w.headers.has("Cache-Control")
+			let seconds = wholeSeconds(maxAge)
+			for let prefix in immutable {
+				if name.startsWith(prefix) {
+					let age = seconds > 0 ?? (seconds, 31536000)
+					w.headers.set("Cache-Control", "public, max-age={age}, immutable")
+					return
+				}
+			}
+			w.headers.set("Cache-Control", "public, max-age={seconds}") when seconds > 0
+		}
+	}
+
+	// serveFile sends the file at `path` on disk with the `FileServer`
+	// rules for one file: content type, conditionals, ranges, HEAD.
+	// `Context.file` is the same for the common case; this one applies
+	// conditionals and ranges from the request too. A directory
+	// is not served: 404.
+	// Fails when the response write does; a missing file is a 404, not
+	// an error.
+	def serveFile(ctx Context, path string) !none {
+		let info = statOrNone(path)
+		return try ctx.notFound() when info is none || info.isDir
+		let file = try os.open(path)
+		let w = ctx.response
+		let size = int(info.size)
+		let sizeText = size.hex()
+		let stampText = info.modTime.unixNs().hex()
+		w.etag("{sizeText}-{stampText}", true)
+		return try serveContent(ctx, path, info.modTime, size, file)
+	}
+
+	// serveContent sends `content` as the body of a file named `name`
+	// (for the content type) modified at `modified` (for `Last-Modified`
+	// and `If-Modified-Since`; none sends neither), with conditionals
+	// and byte ranges applied. The reader must seek; `size` is its
+	// length.
+	// Fails when the response write does.
+	def serveContent(ctx Context, name string, modified ?time.Time, size int, content io.Reader) !none {
+		let req = ctx.request
+		let w = ctx.response
+		w.lastModified(modified) unless modified is none
+		if !w.headers.has("Content-Type") {
+			let byName = formats.typeByName(name)
+			if byName is none {
+				let head = try readPrefix(content, 512)
+				w.headers.set("Content-Type", formats.detectContentType(head))
+				// The sniffed bytes are part of the body: put them back.
+				content = new PrefixReader(head, content)
+			} else {
+				w.headers.set("Content-Type", byName)
+			}
+		}
+		w.headers.set("Accept-Ranges", "bytes")
+		let etag = w.headers.get("ETag")
+		match evaluateConditions(req, etag, modified) {
+			case ConditionResult.NotModified:
+				return try w.noContent(304)
+			case ConditionResult.PreconditionFailed:
+				return try w.noContent(412)
+			default:
+		}
+		let ranges ByteRange[] = []
+		let unsatisfiable = false
+		ranges = req.ranges(size) onerror (err error) {
+			unsatisfiable = true
+			recover []
+		}
+		if unsatisfiable {
+			w.headers.set("Content-Range", "bytes */{size}")
+			return try w.error(416)
+		}
+		// `If-Range` with a stale validator means the whole file.
+		ranges = [] unless ifRangeHolds(req, etag, modified)
+		if ranges.len() == 1 {
+			let r = ranges[0]
+			w.headers.set("Content-Range", r.contentRange(size))
+			w.headers.set("Content-Length", r.length.str())
+			try skipBytes(content, r.start)
+			let contentType = w.headers.get("Content-Type")
+			return try w.stream(206, contentType, new LengthReader(content, r.length))
+		}
+		return try serveMultipartRanges(ctx, ranges, size, content) when ranges.len() > 1 && size <= 8 * 1024 * 1024
+		w.headers.set("Content-Length", size.str())
+		return try w.stream(200, w.headers.get("Content-Type"), content)
+	}
+
+	def serveContent(ctx Context, name string, modified ?time.Time, content byte[]) !none {
+		return try serveContent(ctx, name, modified, content.len(), new bytes.Reader(content))
+	}
+
+	// serveMultipartRanges answers several ranges as `multipart/byteranges`.
+	internal def serveMultipartRanges(ctx Context, ranges ByteRange[], size int, content io.Reader) !none {
+		let w = ctx.response
+		let whole = try readAll(content)
+		let contentType = w.headers.get("Content-Type")
+		let boundary = "adm-" + time.now().unixNs().hex()
+		let out = new bytes.Buffer()
+		for let r in ranges {
+			try out.writeString("--" + boundary + "\r\n")
+			try out.writeString("Content-Type: " + contentType + "\r\n")
+			try out.writeString("Content-Range: " + r.contentRange(size) + "\r\n\r\n")
+			try out.write(whole.slice(r.start, r.start + r.length))
+			try out.writeString("\r\n")
+		}
+		try out.writeString("--" + boundary + "--\r\n")
+		let body = out.bytes()
+		w.headers.set("Content-Length", body.len().str())
+		return try w.blob(206, "multipart/byteranges; boundary=" + boundary, body)
+	}
+
+	// ifRangeHolds reports whether an `If-Range` header, when present,
+	// still names the current entity: an ETag match or a date not
+	// earlier than the modification time.
+	internal def ifRangeHolds(req Request, etag string, modified ?time.Time) bool {
+		let value = req.headers.get("If-Range").trim()
+		return true when value == ""
+		return etag != "" && etagMatches(value, etag, false) when value.startsWith("\"") || value.startsWith("W/")
+		return false when modified is none
+		let stamp = parseDateHeader(value)
+		return false when stamp is none
+		return !modified.after(stamp)
+	}
+
+	// statIn is `FileSystem.stat` as an optional, so a miss can recover
+	// to none.
+	internal def statIn(fs FileSystem, name string) !?os.FileInfo {
+		return try fs.stat(name)
+	}
+
+	// PrefixReader hands out bytes already read ahead, then the rest of
+	// the stream.
+	internal type PrefixReader {
+		head byte[]
+		rest io.Reader
+		pos  int       = 0
+
+		def new(head byte[], rest io.Reader) {
+			self.head = head
+			self.rest = rest
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			if pos < head.len() {
+				let n = head.len() - pos
+				n = buf.len() when buf.len() < n
+				for let i = 0; i < n; i++ {
+					buf[i] = head[pos + i]
+				}
+				pos += n
+				return n
+			}
+			return rest.read(buf)
+		}
+	}
+
+	// readPrefix reads up to n bytes from the reader.
+	internal def readPrefix(r io.Reader, n int) !byte[] {
+		let out byte[] = []
+		let chunk byte[] = []
+		chunk.len(n)
+		for {
+			break when out.len() >= n
+			let got = try r.read(chunk)
+			break when got <= 0
+			out = out.concat(chunk.slice(0, got))
+		}
+		return out.len() > n ?? (out.slice(0, n), out)
+	}
+
+	// skipBytes reads and discards n bytes.
+	internal def skipBytes(r io.Reader, n int) !none {
+		let left = n
+		let chunk byte[] = []
+		chunk.len(32 * 1024)
+		for {
+			return none when left <= 0
+			let want = left < chunk.len() ?? (left, chunk.len())
+			let got = try r.read(chunk.slice(0, want))
+			fail HttpError{message: "content ended before the range start", op: "fs"} when got <= 0
+			left -= got
+		}
+	}
+
+	// containsDotFile reports whether any element of the path starts
+	// with a dot.
+	internal def containsDotFile(name string) bool {
+		for let part in name.split("/") {
+			return true when part.startsWith(".") && part != "." && part != ".."
+		}
+		return false
+	}
+
+	// listingHTML renders a directory listing page: names sorted,
+	// directories first, sizes and modification times, escaped.
+	internal def listingHTML(name string, entries os.DirEntry[]) string {
+		let dirs os.DirEntry[] = []
+		let files os.DirEntry[] = []
+		for let entry in entries {
+			if entry.info.isDir {
+				dirs.push(entry)
+			} else {
+				files.push(entry)
+			}
+		}
+		dirs.sort((a os.DirEntry, b os.DirEntry) => os.base(a.path) < os.base(b.path))
+		files.sort((a os.DirEntry, b os.DirEntry) => os.base(a.path) < os.base(b.path))
+		let title = encoding.htmlEncode(name)
+		let out = "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Index of " + title + "</title></head>\n<body>\n<h1>Index of " + title + "</h1>\n<table>\n"
+		out += "<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>\n" when name != "/"
+		for let entry in dirs {
+			let base = encoding.htmlEncode(os.base(entry.path))
+			let stamp = time.formatHTTPDate(entry.info.modTime)
+			out += "<tr><td><a href=\"" + base + "/\">" + base + "/</a></td><td>-</td><td>" + stamp + "</td></tr>\n"
+		}
+		for let entry in files {
+			let base = encoding.htmlEncode(os.base(entry.path))
+			let stamp = time.formatHTTPDate(entry.info.modTime)
+			let size = entry.info.size
+			out += "<tr><td><a href=\"" + base + "\">" + base + "</a></td><td>{size}</td><td>" + stamp + "</td></tr>\n"
+		}
+		out += "</table>\n</body></html>\n"
+		return out
+	}
+}

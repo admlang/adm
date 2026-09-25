@@ -1,0 +1,858 @@
+partial module std.net.http {
+	use (
+		std.bytes
+		std.data.encoding
+		std.io
+		std.metrics
+		std.net
+		std.net.http.http2
+		std.net.tls
+		std.net.url::(URL)
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// RoundTripper sends one request and returns its response, no
+	// redirects, no cookies, no retries. `Transport` is the real one; a
+	// test hands `Client.transport` a fake.
+	interface RoundTripper {
+		// Fails with the transport's error; a 4xx or 5xx is a response,
+		// not a failure. The response body must be read or closed.
+		def roundTrip(req Request) !Response
+	}
+
+	// Dialer opens the stream a connection runs on. `Transport` dials
+	// through `net.dialStream` by default; a proxy or a test replaces it.
+	interface Dialer {
+		// Fails with NetError as `net.dialStream` does.
+		def dial(network string, addr string, timeout duration) !net.Connection
+	}
+
+	// Transport is the HTTP/1.1 connection pool: it keys idle connections
+	// by scheme, host, port and proxy, reuses them across requests, and
+	// applies the dial and read timeouts. One shared instance serves the
+	// whole process (`defaultTransport()`); make another for a different
+	// proxy, TLS setup or pool size. Safe from many tasks.
+	//
+	// Timeouts are per phase, like Go's: `dialTimeout` for the connect,
+	// `tlsHandshakeTimeout`, `responseHeaderTimeout` from the end of the
+	// request to the status line, `expectContinueTimeout` for the `100
+	// Continue` wait. The whole-exchange deadline is the `Request`'s.
+	type Transport {
+		proxy                  ?Proxy      = none
+		dialer                 ?Dialer     = none
+		// Idle connections kept across all hosts; 0 keeps none.
+		maxIdle                int         = 100
+		maxIdlePerHost         int         = 2
+		// Connections open per host at once, dialing included; 0 is no
+		// limit. A request past the cap waits. HTTP/2 connections count:
+		// when every one of a host is at the stream limit its server set,
+		// another is dialed while the cap allows, else the request waits
+		// for a stream on the least busy one.
+		maxConnsPerHost        int         = 0
+		// How long a connection stays pooled unused; an HTTP/2 connection
+		// with no stream open is closed after it.
+		idleTimeout            duration    = 90s
+		// HTTP/2 only: a PING goes out once the connection has been silent
+		// this long, and no answer within `pingTimeout` closes it, so a
+		// dead peer is noticed between requests. 0s sends none.
+		pingInterval           duration    = 0s
+		pingTimeout            duration    = 15s
+		dialTimeout            duration    = 30s
+		tlsHandshakeTimeout    duration    = 10s
+		responseHeaderTimeout  duration    = 0s
+		expectContinueTimeout  duration    = 1s
+		// Send `Connection: close` and pool nothing.
+		disableKeepAlives      bool        = false
+		// Offer `h2` through ALPN on https and send every request to a
+		// host that takes it over one HTTP/2 connection. Off with
+		// `disableKeepAlives`, or when `tls.alpn` names the protocols.
+		http2                  bool        = true
+		// Speak HTTP/2 on plain http as well, without asking: for servers
+		// known to take the HTTP/2 preface in cleartext (h2c). Needs
+		// `http2`; a request through an HTTP proxy stays on HTTP/1.1.
+		http2PriorKnowledge    bool        = false
+		// Largest response header block accepted; 1 MiB.
+		maxResponseHeaderBytes int         = 1024 * 1024
+		// Bytes of a request body held so an idempotent request can be
+		// resent on a stale pooled connection; a longer body is not
+		// retried.
+		maxResendBytes         int         = 64 * 1024
+		// Sizes of the per-connection read and write buffers.
+		readBufferSize         int         = 4096
+		writeBufferSize        int         = 4096
+		// TLS settings for https: root CAs, insecureSkipVerify, ALPN,
+		// suites. None verifies against the system roots; the server
+		// name is the request's host unless the config names one.
+		tls                    ?tls.Config = none
+
+		internal idle     map<string, PooledConnection[]>
+		internal active   map<string, int>
+		internal sessions map<string, http2.Conn[]>
+		internal closed   bool                            = false
+
+		// Shared by every transport of the process.
+		@metric("net.http.client.requests.total")
+		internal requestsMetric metrics.Counter
+		@metric("net.http.client.errors.total")
+		internal errorsMetric metrics.Counter
+		@metric("net.http.client.dials.total")
+		internal dialsMetric metrics.Counter
+		@metric("net.http.client.connections.idle")
+		internal idleMetric metrics.Gauge
+		@metric("net.http.client.connections.active")
+		internal activeMetric metrics.Gauge
+
+		def new() {
+			self.idle = {}
+			self.active = {}
+			self.sessions = {}
+		}
+
+		// Implements RoundTripper. Takes an idle connection for the key
+		// or dials one, writes the request, reads the response head, and
+		// hands back a body that returns the connection to the pool when
+		// read to the end or closed. A request that fails on a reused
+		// connection before any byte of the response arrived is sent once
+		// more on a fresh one when its body can be resent.
+		// Fails with PolicyDenied when the policy denies the URL's scheme
+		// or host, NetError from the dial or the wire, HttpError (op
+		// "transport") for an unsupported scheme, a bad response head or
+		// a header block past the limit, and HttpError (op "timeout")
+		// when a phase timeout passes.
+		def roundTrip(req Request) !Response {
+			requestsMetric.inc()
+			return deliver(req) onerror (err error) {
+				errorsMetric.inc()
+				fail err
+			}
+		}
+
+		// `roundTrip` without the metrics.
+		internal def deliver(req Request) !Response {
+			fail HttpError{message: "transport is closed", op: "transport"} when closed
+			let scheme = req.url.scheme.lower()
+			fail HttpError{message: "request URL needs a scheme and a host: {req.url.str()}", op: "transport", text: req.url.str()} when scheme == "" || req.url.host == ""
+			fail HttpError{message: "unsupported scheme: {scheme}", op: "transport", text: scheme} unless scheme := "http" || "https"
+			let key = try keyFor(req)
+			// A short body is read now, so a stale pooled connection can be
+			// retried with the same bytes.
+			let resendable = req.body is none
+			if !resendable && req.contentLength >= 0 && req.contentLength <= maxResendBytes {
+				try req.bytes()
+				resendable = true
+			}
+			for let attempt = 0; attempt < 2; attempt++ {
+				let session = sessionFor(key)
+				let pooled ?PooledConnection = none
+				pooled = takeIdle(key) when session is none
+				let reused = !(pooled is none)
+				if session is none && pooled is none {
+					let dialed = try dialFor(req, key)
+					if dialed.protocol() == "h2" {
+						session = try adoptSession(key, dialed)
+					} else {
+						pooled = dialed
+					}
+				}
+				if !(session is none) {
+					let refused ?error = none
+					let answer = tryExchangeHTTP2(session, req) onerror (err error) {
+						refused = err
+						recover none
+					}
+					return answer unless answer is none
+					dropSession(key, session) unless session.isUsable()
+					let err = refused
+					fail HttpError{message: "exchange failed without an error", op: "transport"} when err is none
+					// The connection took no new stream, or its GOAWAY left
+					// this one unhandled: once more on a new connection.
+					continue when resendable && attempt == 0 && refusedStream(err)
+					fail timeoutOrError(err)
+				}
+				let pc = pooled
+				fail HttpError{message: "no connection for the request", op: "transport", text: key} when pc is none
+				countActive(key, 1)
+				req.headers.set("Connection", "close") when disableKeepAlives
+				let failure ?error = none
+				let head = tryExchange(pc, req) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if head is none {
+					pc.discard()
+					countActive(key, -1)
+					let err = failure
+					fail HttpError{message: "exchange failed without an error", op: "transport"} when err is none
+					// A pooled connection the server closed meanwhile: once
+					// more on a fresh one, when the body can go again.
+					continue when reused && resendable && attempt == 0 && staleConnection(err)
+					fail err
+				}
+				return attachBody(head, pc, key)
+			}
+			fail HttpError{message: "request could not be sent", op: "transport", text: key}
+		}
+
+		// `PooledConnection.exchange` as an optional, so a failure can
+		// recover to none.
+		// Sends a request that switches protocols (`Upgrade: websocket`) on
+		// a fresh connection, outside the pool, and hands the connection
+		// over with the response head: the stream, then bytes already read
+		// past the head. The caller owns the stream whatever the status:
+		// on a `101` it speaks the new protocol on it, otherwise it reads
+		// the response body from `res.body` and closes it. Fails with
+		// NetError when the dial does, TLSError on https, HttpError when
+		// the head does not parse or the transport is closed.
+		def upgrade(req Request) !(Response, net.Stream, io.Reader) {
+			fail HttpError{message: "transport is closed", op: "transport"} when closed
+			let key = try keyFor(req)
+			let pc = try dialFor(req, key, true)
+			pc.owner = none
+			let failure ?error = none
+			let res = pc.exchange(req, responseHeaderTimeout, expectContinueTimeout, maxResponseHeaderBytes) onerror (err error) {
+				failure = err
+				recover new Response()
+			}
+			if !(failure is none) {
+				pc.drop()
+				fail failure
+			}
+			return (res, pc.conn, new bytes.Reader(pc.wire.buffered()))
+		}
+
+		// `exchangeHTTP2` as an optional, so a failure can recover to none.
+		internal def tryExchangeHTTP2(conn http2.Conn, req Request) !?Response {
+			return try exchangeHTTP2(conn, req, responseHeaderTimeout)
+		}
+
+		internal def tryExchange(pc PooledConnection, req Request) !?Response {
+			return try pc.exchange(req, responseHeaderTimeout, expectContinueTimeout, maxResponseHeaderBytes)
+		}
+
+		// Wires the response body to the pool: read to the end or closed
+		// cleanly, the connection goes back; closed early or broken, it
+		// is dropped.
+		internal def attachBody(res Response, pc PooledConnection, key string) Response {
+			let keep = !res.connectionClose && !disableKeepAlives && !closed
+			let body = res.body
+			if body is none {
+				countActive(key, -1)
+				if keep {
+					pc.release()
+				} else {
+					pc.discard()
+				}
+				return res
+			}
+			let pooled = new PooledBody(body, pc, self, key, keep)
+			res.body = pooled
+			res.onClose(def () {pooled.settle(false)})
+			return res
+		}
+
+		// Closes every idle connection; in-flight ones finish and are
+		// then closed instead of pooled.
+		def closeIdle() {
+			let all = takeAllIdle()
+			for let pc in all {
+				pc.drop()
+			}
+			for let conn in takeSessions(true) {
+				conn.close() onerror recover none
+			}
+		}
+
+		// Closes the pool: idle connections now, active ones as they
+		// finish. A later `roundTrip` fails with HttpError (op
+		// "transport").
+		def close() !none {
+			closed = true
+			closeIdle()
+			for let conn in takeSessions(false) {
+				conn.goAway() onerror recover none
+			}
+			return none
+		}
+
+		// Counts of idle and active connections, for tests and metrics.
+		def idleCount() int {
+			let total = 0
+			for let (_, list) in idle {
+				total += list.len()
+			}
+			return total
+		}
+
+		// Connections with a request in flight.
+		def activeCount() int {
+			let total = 0
+			for let (_, n) in active {
+				total += n
+			}
+			return total
+		}
+
+		// The HTTP/2 connection of the key to send on: one with room for a
+		// stream, else none while another may be dialed, else the least
+		// busy. Connections closed or closing are forgotten.
+		atomic def sessionFor(key string) ?http2.Conn {
+			let usable = usableSessions(key)
+			let least ?http2.Conn = none
+			for let conn in usable {
+				return conn when conn.hasRoom()
+				least = conn when least is none || conn.activeStreams() < least.activeStreams()
+			}
+			return none when maxConnsPerHost <= 0 || usable.len() < maxConnsPerHost
+			return least
+		}
+
+		// usableSessions prunes the key's list to the connections still
+		// usable and returns it.
+		internal def usableSessions(key string) http2.Conn[] {
+			let all = sessions.get(key)
+			let usable http2.Conn[] = []
+			return usable when all is none
+			for let conn in all {
+				usable.push(conn) when conn.isUsable()
+			}
+			if usable.len() == 0 {
+				sessions.delete(key)
+			} else {
+				sessions[key] = usable
+			}
+			return usable
+		}
+
+		// Runs a dialed connection that negotiated `h2` as the key's
+		// HTTP/2 connection. When another task got there first, its
+		// connection is used and this one closed. Fails with Http2Error
+		// when the preface exchange does.
+		internal def adoptSession(key string, pc PooledConnection) !http2.Conn {
+			pc.stream.readTimeout = 0s
+			let conn = new http2.Conn(pc.stream, pc.stream, true, pc.conn)
+			conn.idleTimeout = idleTimeout
+			conn.pingInterval = pingInterval
+			conn.pingTimeout = pingTimeout
+			let failure ?error = none
+			conn.handshake() onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				pc.drop()
+				fail failure
+			}
+			let kept = keepSession(key, conn)
+			if kept != conn {
+				conn.close() onerror recover none
+			}
+			return kept
+		}
+
+		// Records conn for the key and returns the one to use: another
+		// task's connection when it has room for a stream or the cap is
+		// reached, in which case the caller closes conn.
+		atomic def keepSession(key string, conn http2.Conn) http2.Conn {
+			let usable = usableSessions(key)
+			let least ?http2.Conn = none
+			for let other in usable {
+				return other when other.hasRoom()
+				least = other when least is none || other.activeStreams() < least.activeStreams()
+			}
+			return least when !(least is none) && maxConnsPerHost > 0 && usable.len() >= maxConnsPerHost
+			usable.push(conn)
+			sessions[key] = usable
+			return conn
+		}
+
+		// Forgets conn as one of the key's connections; its streams finish.
+		atomic def dropSession(key string, conn http2.Conn) {
+			let all = sessions.get(key)
+			return when all is none
+			let kept http2.Conn[] = []
+			for let other in all {
+				kept.push(other) unless other == conn
+			}
+			if kept.len() == 0 {
+				sessions.delete(key)
+			} else {
+				sessions[key] = kept
+			}
+		}
+
+		// Takes the HTTP/2 connections out of the pool: all of them, or
+		// with `quiet` only those with no stream open.
+		atomic def takeSessions(quiet bool) http2.Conn[] {
+			let out http2.Conn[] = []
+			let kept map<string, http2.Conn[]> = {}
+			for let (key, all) in sessions {
+				let busy http2.Conn[] = []
+				for let conn in all {
+					if quiet && conn.activeStreams() > 0 {
+						busy.push(conn)
+					} else {
+						out.push(conn)
+					}
+				}
+				kept[key] = busy when busy.len() > 0
+			}
+			sessions = kept
+			return out
+		}
+
+		// HTTP/2 connections open, for tests and metrics.
+		def sessionCount() int {
+			let usable = 0
+			for let (_, all) in sessions {
+				for let conn in all {
+					usable++ when conn.isUsable()
+				}
+			}
+			return usable
+		}
+
+		// The pool key of a request: "https|host:443|proxyURL".
+		internal def keyFor(req Request) !string {
+			let proxyText = ""
+			let via = proxy
+			if !(via is none) {
+				let target = try via.proxyFor(req)
+				proxyText = target.str() unless target is none
+			}
+			let port = req.url.effectivePort()
+			return req.url.scheme.lower() + "|" + req.url.hostname().lower() + ":" + port.str() + "|" + proxyText
+		}
+
+		// Dials a connection for the key: through the proxy when the
+		// request has one (SOCKS5 handshake done, or absolute-form
+		// requests for an HTTP proxy), else to the host itself. An https
+		// request gets a TLS handshake on top: after a SOCKS5 or CONNECT
+		// tunnel through the proxy, on the socket itself otherwise.
+		internal def dialFor(req Request, key string, upgrade bool = false) !PooledConnection {
+			try checkEndpoint(req.url)
+			try waitForSlot(key)
+			dialsMetric.inc()
+			// An upgraded connection speaks HTTP/1.1 whatever the config
+			// offers; otherwise `h2` is offered ahead of it.
+			let protocols = [alpnHTTP11]
+			if !upgrade {
+				let given = tls
+				let named = !(given is none) && given.alpn.len() > 0
+				protocols = [] when named
+				protocols = [alpnH2, alpnHTTP11] when !named && http2 && !disableKeepAlives
+			}
+			let host = req.url.hostname()
+			let port = req.url.effectivePort()
+			let target = joinHostPort(host, port)
+			let secure = req.url.scheme.lower() == "https"
+			let cleartext = !secure && !upgrade && http2 && http2PriorKnowledge && !disableKeepAlives
+			let proxyURL ?URL = none
+			let via = proxy
+			proxyURL = try via.proxyFor(req) unless via is none
+			let d = dialer
+			let opener Dialer = d is none ?? (new NetDialer(), d)
+			if proxyURL is none {
+				let conn = try opener.dial("tcp", target, dialTimeout)
+				let direct = new PooledConnection(key, try secureStream(conn, host, secure, tls, tlsHandshakeTimeout, protocols))
+				direct.owner = self
+				direct.cleartextHTTP2 = cleartext
+				return direct
+			}
+			let proxyScheme = proxyURL.scheme.lower()
+			let proxyAddr = joinHostPort(proxyURL.hostname(), proxyURL.effectivePort())
+			let conn = try opener.dial("tcp", proxyAddr, dialTimeout)
+			let user = ""
+			let password = ""
+			let info = proxyURL.user
+			if !(info is none) {
+				user = info.username
+				let secret = info.password
+				password = secret unless secret is none
+			}
+			if proxyScheme := "socks5" || "socks5h" || "socks" {
+				try socks5Connect(conn, target, user, password, dialTimeout)
+				let tunnelled = new PooledConnection(key, try secureStream(conn, host, secure, tls, tlsHandshakeTimeout, protocols))
+				tunnelled.owner = self
+				tunnelled.cleartextHTTP2 = cleartext
+				return tunnelled
+			}
+			let auth = ""
+			auth = basicCredentials(user, password) when user != ""
+			if secure {
+				try connectTunnel(conn, target, auth, dialTimeout)
+				let inside = new PooledConnection(key, try secureStream(conn, host, true, tls, tlsHandshakeTimeout, protocols))
+				inside.owner = self
+				return inside
+			}
+			let pc = new PooledConnection(key, conn)
+			pc.owner = self
+			pc.proxyURL = proxyURL.str()
+			pc.proxyAuth = auth
+			return pc
+		}
+
+		// Blocks while the host is at `maxConnsPerHost`.
+		internal def waitForSlot(key string) !none {
+			return none when maxConnsPerHost <= 0
+			for {
+				let n = active.get(key)
+				let count = n is none ?? (0, n)
+				return none when count < maxConnsPerHost
+				fail HttpError{message: "transport is closed", op: "transport"} when closed
+				time.sleep(1ms)
+			}
+			return none
+		}
+
+		// Adjusts the in-flight count for a pool key.
+		atomic def countActive(key string, delta int) {
+			let n = active.get(key)
+			let count = n is none ?? (0, n)
+			count += delta
+			activeMetric.set(float64(delta))
+			if count <= 0 {
+				active.delete(key)
+			} else {
+				active[key] = count
+			}
+		}
+
+		// Pops a usable idle connection for the key, dropping stale ones.
+		atomic def takeIdle(key string) ?PooledConnection {
+			let list = idle.get(key)
+			return none when list is none
+			for {
+				return none when list.len() == 0
+				let pc = list.pop()
+				idleMetric.dec()
+				if list.len() == 0 {
+					idle.delete(key)
+				} else {
+					idle[key] = list
+				}
+				if time.since(pc.idleSince) > idleTimeout || pc.broken || !pc.conn.isOpen() {
+					pc.drop()
+					continue
+				}
+				return pc
+			}
+			return none
+		}
+
+		// Returns a connection to the pool, or closes it when the pool is
+		// full, closed, or keep-alive is off.
+		atomic def putIdle(pc PooledConnection) {
+			if closed || disableKeepAlives || pc.broken || maxIdle <= 0 {
+				pc.drop()
+				return
+			}
+			let list = idle.get(pc.key)
+			let current PooledConnection[] = list is none ?? ([], list)
+			if current.len() >= maxIdlePerHost || idleCount() >= maxIdle {
+				pc.drop()
+				return
+			}
+			pc.idleSince = time.now()
+			current.push(pc)
+			idle[pc.key] = current
+			idleMetric.inc()
+		}
+
+		// Empties the idle pool and returns what it held.
+		atomic def takeAllIdle() PooledConnection[] {
+			let all PooledConnection[] = []
+			for let (_, list) in idle {
+				for let pc in list {
+					all.push(pc)
+				}
+			}
+			idle = {}
+			idleMetric.set(-float64(all.len()))
+			return all
+		}
+	}
+
+	// staleConnection reports whether a failure looks like a pooled
+	// connection the server closed: a reset, a pipe, or a stream that
+	// ended before a status line.
+	internal def staleConnection(err error) bool {
+		return err.kind == net.ErrorCode.ConnReset || err.kind == net.ErrorCode.Pipe || err.kind == net.ErrorCode.Closed when err is net.NetError
+		return err.code == "eof" when err is HttpError
+		return false
+	}
+
+	// Checks the request's `scheme://host:port` against the `connect`
+	// permission. The socket-level check sees only the address dialed: no
+	// scheme, and the proxy in place of the host behind it.
+	//
+	// Fails with PolicyDenied when the policy denies the scheme or the host.
+	internal def checkEndpoint(target URL) !none {
+		let endpoint = target.scheme.lower() + "://" + joinHostPort(target.hostname(), target.effectivePort())
+		return try Policy.validate("adm.network.connect", "std.services.EndpointSpec", endpoint)
+	}
+
+	// joinHostPort is "host:port", with an IPv6 host in brackets.
+	internal def joinHostPort(host string, port int) string {
+		return "[" + host + "]:" + port.str() when host.contains(":") && !host.startsWith("[")
+		return host + ":" + port.str()
+	}
+
+	// basicCredentials is the `Basic` authorization value for the pair.
+	internal def basicCredentials(user string, password string) string {
+		return "Basic " + encoding.base64encode((user + ":" + password).bytes())
+	}
+
+	// PooledBody is a response body that returns its connection to the
+	// pool once read to the end, or drops it when closed early.
+	internal type PooledBody {
+		inner      io.Reader
+		pc         PooledConnection
+		weak owner ?Transport
+		key        string
+		keepAlive  bool
+		done       bool             = false
+
+		def new(inner io.Reader, pc PooledConnection, owner Transport, key string, keepAlive bool) {
+			self.inner = inner
+			self.pc = pc
+			self.owner = owner
+			self.key = key
+			self.keepAlive = keepAlive
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			return 0 when done
+			let failed = false
+			let n = inner.read(buf) onerror (err error) {
+				failed = true
+				recover 0
+			}
+			if failed {
+				settle(false)
+				fail HttpError{message: "response body read failed", op: "transport", code: "body"}
+			}
+			settle(true) when n == 0
+			return n
+		}
+
+		// Settles the connection once: back to the pool after a clean end,
+		// closed otherwise.
+		def settle(clean bool) {
+			return when done
+			done = true
+			let t = owner
+			t.countActive(key, -1) unless t is none
+			if clean && keepAlive {
+				pc.release()
+			} else {
+				pc.discard()
+			}
+		}
+	}
+
+	// PooledConnection is one HTTP/1.1 connection in the pool: the stream,
+	// its wire reader, when it went idle, and how many requests it served.
+	// A response body that reaches its end calls `release`; a body closed
+	// early, or a connection the server closed, calls `discard`.
+	internal type PooledConnection {
+		key            string
+		conn           net.Stream
+		stream         ConnStream
+		wire           WireReader
+		idleSince      time.Time
+		requests       int        = 0
+		broken         bool       = false
+		// The proxy this connection tunnels through, "" for a direct one.
+		proxyURL       string     = ""
+		// `Proxy-Authorization` value for an HTTP proxy, "" for none.
+		proxyAuth      string     = ""
+		// A plain connection that speaks HTTP/2 by prior knowledge.
+		cleartextHTTP2 bool       = false
+		weak owner     ?Transport
+
+		def new(key string, conn net.Stream) {
+			self.key = key
+			self.conn = conn
+			self.stream = new ConnStream(conn)
+			self.wire = new WireReader(self.stream)
+			self.idleSince = time.now()
+		}
+
+		// The protocol ALPN chose on a TLS connection, `h2` on a plain one
+		// that takes it by prior knowledge, "" otherwise.
+		def protocol() string {
+			return "h2" when cleartextHTTP2
+			let c = conn
+			return c.connectionState().alpn when c is tls.Conn
+			return ""
+		}
+
+		// Sends the request and reads the response head. A request with
+		// `Expect: 100-continue` and a body sends its head alone, waits
+		// `continueTimeout` for the interim response, then sends the body;
+		// a final status before it (`417`, `413`) comes back without the
+		// body sent, on a connection marked to close, and the wait
+		// running out sends the body anyway, as RFC 9110 allows.
+		def exchange(req Request, headerTimeout duration, continueTimeout duration, maxHeaderBytes int) !Response {
+			let limit = req.deadline
+			let left = 0s
+			if !(limit is none) {
+				left = limit - time.now()
+				fail HttpError{message: "request deadline passed", op: "timeout"} when left <= 0s
+				stream.writeTimeout = left
+				stream.readTimeout = (headerTimeout > 0s && headerTimeout < left) ?? (headerTimeout, left)
+			} else {
+				stream.writeTimeout = 30s
+				stream.readTimeout = headerTimeout
+			}
+			let viaProxy = proxyURL != ""
+			if viaProxy {
+				req.headers.set("Proxy-Authorization", proxyAuth) when proxyAuth != "" && !req.headers.has("Proxy-Authorization")
+			}
+			let holdBody = req.hasBody() && req.expectsContinue()
+			try req.writeHead(stream, viaProxy)
+			let res = new Response()
+			if holdBody {
+				let early = try awaitContinue(req, continueTimeout, left, maxHeaderBytes)
+				if !(early is none) {
+					res = early
+					res.connectionClose = true
+					requests++
+					return res
+				}
+			}
+			try req.writeBody(stream)
+			res = readResponse(wire, req, maxHeaderBytes) onerror (err error) {
+				fail timeoutOrError(err)
+			}
+			requests++
+			// The body reads under the request deadline alone.
+			stream.readTimeout = limit is none ?? (0s, limit - time.now())
+			return res
+		}
+
+		// Waits for the server's answer to `Expect: 100-continue`: none
+		// when it was `100 Continue` or the wait ran out, so the body goes
+		// next; the final response, framed, when the server answered
+		// without the body. Fails when the read does other than by
+		// timing out.
+		internal def awaitContinue(req Request, continueTimeout duration, left duration, maxHeaderBytes int) !?Response {
+			let wait = continueTimeout > 0s ?? (continueTimeout, 1s)
+			wait = left when left > 0s && left < wait
+			let saved = stream.readTimeout
+			stream.readTimeout = wait
+			let timedOut = false
+			let failure ?error = none
+			let head ?Response = none
+			for {
+				let next = readResponseHead(wire, req, maxHeaderBytes) onerror (err error) {
+					if err is net.NetError && err.kind == net.ErrorCode.TimedOut {
+						timedOut = true
+					} else {
+						failure = err
+					}
+					recover new Response()
+				}
+				break when timedOut || !(failure is none)
+				head = next
+				break unless next.isInterim() && next.status != 100
+			}
+			stream.readTimeout = saved
+			fail failure unless failure is none
+			return none when timedOut || head is none
+			return none when head.status == 100
+			return try frameResponse(head, wire)
+		}
+
+		// Returns the connection to the pool.
+		def release() {
+			let t = owner
+			if t is none {
+				drop()
+				return
+			}
+			t.putIdle(self)
+		}
+
+		// Drops the connection: the server closed it, or a body was left
+		// unread.
+		def discard() {
+			broken = true
+			drop()
+		}
+
+		// Closes the socket.
+		def drop() {
+			conn.close() onerror recover none
+		}
+	}
+
+	// secureStream wraps a connected socket in TLS for an https request,
+	// verifying the host (or the config's server name), offering
+	// `http/1.1` through ALPN unless the config names protocols, and
+	// running the handshake within the timeout; a plain request gets the
+	// socket back. Fails with TLSError or CertificateError from the
+	// handshake, the socket closed.
+	internal def secureStream(conn net.Connection, host string, secure bool, config ?tls.Config, handshakeTimeout duration, protocols string[] = []) !net.Stream {
+		return conn unless secure
+		let given = tls.Config{}
+		given = config unless config is none
+		// A copy, so the caller's config keeps its name and protocols.
+		let cfg = tls.withServerName(given, given.serverName == "" ?? (host, given.serverName))
+		cfg.alpn = protocols when protocols.len() > 0
+		cfg.alpn = [alpnHTTP11] when cfg.alpn.len() == 0
+		let secured = tls.client(conn, cfg)
+		let failure ?error = none
+		secured.handshake(handshakeTimeout) onerror (err error) {
+			failure = err
+			recover none
+		}
+		return secured when failure is none
+		conn.close() onerror recover none
+		fail failure
+	}
+
+	// refusedStream reports whether an HTTP/2 exchange failed before the
+	// server handled the request.
+	internal def refusedStream(err error) bool {
+		return false unless err is http2.Http2Error
+		return err.errorCode == http2.ErrorCode.RefusedStream
+	}
+
+	// timeoutOrError turns a socket timeout into HttpError (op "timeout")
+	// and leaves other errors as they are.
+	internal def timeoutOrError(err error) error {
+		if err is net.NetError {
+			return HttpError{message: "timed out waiting for the response head", op: "timeout", cause: err} when err.kind == net.ErrorCode.TimedOut
+		}
+		return err
+	}
+
+	// The shared pool behind `defaultClient()` and every `Client` that
+	// sets no transport.
+	internal let sharedTransport ?Transport = none
+
+	// defaultTransport is the shared pool, made on first use with the
+	// environment proxy.
+	def defaultTransport() Transport {
+		let current = sharedTransport
+		return current unless current is none
+		let made = new Transport()
+		made.proxy = proxyFromEnvironment()
+		sharedTransport = made
+		return made
+	}
+
+	// The default `Dialer`: `net.dialStream` on "host:port", with the
+	// resolver's addresses tried in order (happy eyeballs later).
+	type NetDialer {
+		def new() {}
+
+		// Implements Dialer.
+		def dial(network string, addr string, timeout duration) !net.Connection {
+			return net.dialStream(addr, timeout)
+		}
+	}
+}

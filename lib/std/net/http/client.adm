@@ -1,4 +1,534 @@
 partial module std.net.http {
-	// Client is the HTTP client; it has no members yet.
-	type Client {}
+	use (
+		std.data.compress.gzip
+		std.data.compress.zlib
+		std.data.encoding
+		std.io
+		std.net
+		std.net.url
+		std.net.url::(URL, Values)
+		std.time
+	)
+
+	// RedirectPolicy decides whether the client follows a redirect. `next`
+	// is the request about to be sent, `via` the requests already made,
+	// oldest first. Return false to stop: `do` then returns the redirect
+	// response itself, body unread. Fail to abort with that error.
+	interface RedirectPolicy {
+		def follow(next Request, via Request[]) !bool
+	}
+
+	// DefaultRedirects is the policy `Client` starts with: follow up to
+	// `maxHops` redirects.
+	type DefaultRedirects {
+		maxHops int = 10
+
+		def new(maxHops int = 10) {
+			self.maxHops = maxHops
+		}
+
+		// Implements RedirectPolicy. Fails with HttpError (op "client")
+		// past `maxHops` redirects.
+		def follow(next Request, via Request[]) !bool {
+			fail HttpError{message: "stopped after {maxHops} redirects", op: "client", text: next.url.str()} when via.len() > maxHops
+			return true
+		}
+	}
+
+	// RetryPolicy says which failed attempts a `Client` repeats. Only
+	// requests whose body can be resent are retried. Modelled on the
+	// retry handlers of undici and OkHttp: transport errors on idempotent
+	// methods, plus the listed statuses, with exponential backoff capped
+	// at `maxBackoff` and `Retry-After` honoured when present.
+	struct RetryPolicy {
+		// How many extra attempts after the first; 0 turns retries off.
+		attempts   int      = 0
+		// Statuses that trigger a retry (`502`, `503`, `504` by default).
+		statuses   int[]    = [502, 503, 504]
+		// Retry on a transport failure (refused, reset, timeout) too. Only
+		// idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE, TRACE)
+		// unless `allMethods` is set.
+		onError    bool     = true
+		allMethods bool     = false
+		backoff    duration = 200ms
+		maxBackoff duration = 5s
+	}
+
+	// The `User-Agent` sent when neither the client nor the request
+	// names one.
+	internal const defaultUserAgent = "adm-http/1.0"
+
+	// Client sends requests and returns responses. Zero configuration
+	// works: `new Client()` follows redirects, keeps cookies out of it, and
+	// shares the process-wide `Transport`. A configured client is a
+	// session (Python `requests.Session`): base URL, default headers, a
+	// cookie jar, a timeout. It is safe to use from many tasks.
+	//
+	//     let client = new Client(baseURL: "https://api.example.com")
+	//     let res = try client.get("/users/42")
+	//     let user = try res.json<User>()
+	//
+	// `do` and the verbs fail on transport errors, timeouts and redirect
+	// loops, never on a 4xx or 5xx status: check `res.ok()`, or set
+	// `failOnStatus` to turn every 4xx/5xx into an HttpError (op
+	// "status") that carries the response.
+	type Client {
+		// The round tripper every request goes through; the shared
+		// `defaultTransport()` when none is set. Replace it to mock the
+		// network in tests.
+		transport    ?RoundTripper   = none
+		// Prefix for relative targets: `get("/users")` with base
+		// "https://api.example.com/v1" fetches ".../v1/users". Absolute
+		// targets ignore it.
+		baseURL      string          = ""
+		// Headers added to every request unless the request sets them.
+		headers      Header
+		// Sent as `User-Agent` unless the request sets one; "" sends
+		// the library default.
+		userAgent    string          = ""
+		// Cookies to send and store; none keeps the client cookie-less.
+		jar          ?CookieJar      = none
+		// Deadline for the whole exchange, redirects included: dial,
+		// send, headers, and reading the body to the end. 0 is no limit.
+		timeout      duration        = 0s
+		redirects    ?RedirectPolicy = none
+		retry        RetryPolicy
+		// Fail `do` with HttpError (op "status") on any 4xx or 5xx.
+		failOnStatus bool            = false
+		// Decode `gzip` and `deflate` bodies transparently and ask for
+		// them with `Accept-Encoding`, unless the request set its own
+		// `Accept-Encoding`.
+		decompress   bool            = true
+		// Bytes of a response body `bytes`/`text`/`json` will read; 0 is
+		// unlimited.
+		maxBodyBytes int             = 0
+
+		internal requestHooks  RequestHook[]  = []
+		internal responseHooks ResponseHook[] = []
+
+		def new(baseURL string = "", timeout duration = 0s) {
+			self.baseURL = baseURL
+			self.timeout = timeout
+			self.headers = new Header()
+		}
+
+		// Sends the request and returns the response with its body still
+		// on the wire: read it (`bytes`, `text`, `json`, `copyTo`) or
+		// `close` it, else the connection is not reused. Applies the
+		// default headers, the jar, the timeout, redirects (with method
+		// rewrite for 301/302/303 on POST, `Authorization` and cookies
+		// dropped across origins, `Referer` set) and retries.
+		// Fails with HttpError (op "client") on a redirect loop or a body
+		// that cannot be resent, with the transport's error otherwise.
+		def do(req Request) !Response {
+			applyDefaults(req)
+			req.deadline = time.now() + timeout when timeout > 0s && req.deadline is none
+			for let hook in requestHooks {
+				try hook.fn(req)
+			}
+			let rt = roundTripper()
+			let policy = redirects
+			let follow RedirectPolicy = policy is none ?? (new DefaultRedirects(), policy)
+			let via Request[] = []
+			let current = req
+			for {
+				addJarCookies(current)
+				let res = try send(rt, current)
+				res.request = current
+				storeJarCookies(current, res)
+				decode(res)
+				let raw = res.body
+				res.body = new MaxBytesReader(raw, maxBodyBytes) when maxBodyBytes > 0 && !(raw is none)
+				for let hook in responseHooks {
+					try hook.fn(res)
+				}
+				if statusIsRedirect(res.status) && res.headers.has("Location") && res.status != 304 && res.status != 300 {
+					let target = try res.location()
+					return try statusCheck(res) when target is none
+					let next = try redirectRequest(current, res.status, target)
+					via.push(current)
+					let go = try follow.follow(next, via)
+					return try statusCheck(res) unless go
+					try res.close()
+					current = next
+					continue
+				}
+				return try statusCheck(res)
+			}
+			fail HttpError{message: "request was not sent", op: "client", text: req.url.str()}
+		}
+
+		// Fails as `do` does, and when `target` does not parse.
+		def get(target string) !Response {
+			return try do(try request(Method.GET, target))
+		}
+
+		// Sends HEAD. Fails as `get` does.
+		def head(target string) !Response {
+			return try do(try request(Method.HEAD, target))
+		}
+
+		// Sends DELETE. Fails as `get` does.
+		def delete(target string) !Response {
+			return try do(try request(Method.DELETE, target))
+		}
+
+		// Sends OPTIONS. Fails as `get` does.
+		def options(target string) !Response {
+			return try do(try request(Method.OPTIONS, target))
+		}
+
+		// Sends `body` with the content type; the overloads mirror
+		// `ResponseWriter.blob`, `text` and `json`. Fail as `get` does.
+		def post(target string, contentType string, body byte[]) !Response {
+			return try do(try withBody(Method.POST, target, contentType, body))
+		}
+
+		// Streams `body` with the content type, chunked. Fails as `get` does.
+		def post(target string, contentType string, body io.Reader) !Response {
+			let req = try request(Method.POST, target, body)
+			req.headers.set("Content-Type", expandContentType(contentType))
+			return try do(req)
+		}
+
+		// Sends `text/plain`. Fails as `get` does.
+		def post(target string, text string) !Response {
+			return try do(try withBody(Method.POST, target, "text/plain; charset=utf-8", text.bytes()))
+		}
+
+		// Sends `application/x-www-form-urlencoded`. Fails as `get` does.
+		def postForm(target string, form Values) !Response {
+			return try do(try withBody(Method.POST, target, "application/x-www-form-urlencoded", form.encode().bytes()))
+		}
+
+		// Encodes `value` as JSON and sends `application/json`. Fails as
+		// `get` does.
+		def postJSON(target string, value any) !Response {
+			return try do(try withJSON(Method.POST, target, value))
+		}
+
+		// Sends PUT with the body. Fails as `get` does.
+		def put(target string, contentType string, body byte[]) !Response {
+			return try do(try withBody(Method.PUT, target, contentType, body))
+		}
+
+		// Sends PUT with `value` as JSON. Fails as `get` does.
+		def putJSON(target string, value any) !Response {
+			return try do(try withJSON(Method.PUT, target, value))
+		}
+
+		// Sends PATCH with the body. Fails as `get` does.
+		def patch(target string, contentType string, body byte[]) !Response {
+			return try do(try withBody(Method.PATCH, target, contentType, body))
+		}
+
+		// Sends PATCH with `value` as JSON. Fails as `get` does.
+		def patchJSON(target string, value any) !Response {
+			return try do(try withJSON(Method.PATCH, target, value))
+		}
+
+		// Builds a request against `baseURL` with the default headers
+		// applied, for callers that adjust it before `do`.
+		// Fails when `target` does not parse.
+		def request(method Method, target string, body ?io.Reader = none) !Request {
+			let text = resolveTarget(target)
+			let parsed = url.parse(text) onerror (err error) {
+				fail HttpError{message: "invalid request target: {target}", op: "client", text: target, cause: err}
+			}
+			let req = newRequest(method, parsed, body) onerror (err error) {
+				fail HttpError{message: "invalid request target: {target}", op: "client", text: target, cause: err}
+			}
+			applyDefaults(req)
+			return req
+		}
+
+		// A request with a byte body and content type.
+		internal def withBody(method Method, target string, contentType string, body byte[]) !Request {
+			let req = try request(method, target)
+			req.replaceBody(body)
+			req.headers.set("Content-Type", expandContentType(contentType))
+			return req
+		}
+
+		// A request whose body is `value` as JSON.
+		internal def withJSON(method Method, target string, value any) !Request {
+			let codec = new encoding.JSON()
+			return try withBody(method, target, "application/json", codec.encode(value))
+		}
+
+		// Registers fn to run on every request before it is sent, after
+		// the defaults are applied: signing, tracing headers, logging.
+		// Failing aborts the request with that error.
+		def onRequest(fn def(Request) !none) {
+			requestHooks.push(new RequestHook(fn))
+		}
+
+		// Registers fn to run on every response before `do` returns it,
+		// redirects included: logging, metrics, token refresh. Failing
+		// aborts with that error.
+		def onResponse(fn def(Response) !none) {
+			responseHooks.push(new ResponseHook(fn))
+		}
+
+		// Drops the idle connections of the client's transport.
+		def closeIdle() {
+			let rt = roundTripper()
+			rt.closeIdle() when rt is Transport
+		}
+
+		// The client named by its base URL.
+		def str() string {
+			return "Client(" + baseURL + ")"
+		}
+
+		// The transport requests go through.
+		internal def roundTripper() RoundTripper {
+			let rt = transport
+			return defaultTransport() when rt is none
+			return rt
+		}
+
+		// The absolute target: `target` itself when absolute, else joined
+		// to `baseURL`.
+		internal def resolveTarget(target string) string {
+			return target when baseURL == "" || target.contains("://")
+			let base = baseURL.trimSuffix("/")
+			return base + target when target.startsWith("/")
+			return base + "/" + target
+		}
+
+		// Adds the default headers and the user agent to a request that
+		// does not set them.
+		internal def applyDefaults(req Request) {
+			for let key in headers.keys() {
+				continue when req.headers.has(key)
+				for let value in headers.values(key) {
+					req.headers.add(key, value)
+				}
+			}
+			req.headers.set("User-Agent", userAgent == "" ?? (defaultUserAgent, userAgent)) unless req.headers.has("User-Agent")
+			req.headers.set("Accept-Encoding", "gzip, deflate") when decompress && !req.headers.has("Accept-Encoding")
+		}
+
+		internal def addJarCookies(req Request) {
+			let store = jar
+			return when store is none
+			for let c in store.cookies(req.url) {
+				req.addCookie(c)
+			}
+		}
+
+		internal def storeJarCookies(req Request, res Response) {
+			let store = jar
+			return when store is none
+			let set = res.cookies()
+			store.setCookies(req.url, set) when set.len() > 0
+		}
+
+		// Unwraps a `gzip` or `deflate` body when `decompress` is set.
+		internal def decode(res Response) {
+			return unless decompress
+			let coding = res.headers.get("Content-Encoding").trim().lower()
+			return when coding == ""
+			let body = res.body
+			return when body is none
+			if coding := "gzip" || "x-gzip" {
+				res.body = new DecodedBody(new gzip.Reader(body))
+			} else if coding == "deflate" {
+				res.body = new DecodedBody(new zlib.Reader(body))
+			} else {
+				return
+			}
+			res.uncompressed = true
+			res.headers.del("Content-Encoding")
+			res.headers.del("Content-Length")
+			res.contentLength = -1
+		}
+
+		// Sends one request with the retry policy applied.
+		internal def send(rt RoundTripper, req Request) !Response {
+			let attempts = retry.attempts
+			let delay = retry.backoff
+			let resendable = req.body is none
+			if !resendable && attempts > 0 && req.contentLength >= 0 && req.contentLength <= 64 * 1024 {
+				try req.bytes()
+				resendable = true
+			}
+			let idempotent = retry.allMethods || methodIsIdempotent(req.method)
+			for let i = 0;; i++ {
+				let failure ?error = none
+				let res = tryRoundTrip(rt, req) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if res is none {
+					let err = failure
+					fail HttpError{message: "round trip failed without an error", op: "client"} when err is none
+					fail err unless i < attempts && retry.onError && idempotent && resendable && transportFailure(err)
+				} else {
+					return res unless i < attempts && retry.statuses.includes(res.status) && resendable
+					let after = retryAfter(res)
+					delay = after unless after is none
+					res.close() onerror recover none
+				}
+				fail HttpError{message: "request deadline passed", op: "timeout", text: req.url.str()} when req.cancelled()
+				time.sleep(delay)
+				delay = delay + delay
+				delay = retry.maxBackoff when delay > retry.maxBackoff
+			}
+			fail HttpError{message: "request was not sent", op: "client", text: req.url.str()}
+		}
+
+		// `roundTrip` as an optional, so a failure can recover to none.
+		internal def tryRoundTrip(rt RoundTripper, req Request) !?Response {
+			return try rt.roundTrip(req)
+		}
+
+		// Applies `failOnStatus`.
+		internal def statusCheck(res Response) !Response {
+			return res unless failOnStatus && res.status >= 400
+			let reason = res.reason == "" ?? (statusText(res.status), res.reason)
+			let statusLine = res.status.str() + " " + reason
+			res.close() onerror recover none
+			fail HttpError{message: "request failed with {statusLine}", op: "status", text: statusLine, status: res.status}
+		}
+	}
+
+	// DecodedBody wraps a decompressing reader so the response body is
+	// the decoded bytes.
+	internal type DecodedBody {
+		inner io.Reader
+
+		def new(inner io.Reader) {
+			self.inner = inner
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			return inner.read(buf)
+		}
+	}
+
+	// transportFailure reports whether an error is one a retry policy
+	// covers: a network failure or a timeout, not a bad request.
+	internal def transportFailure(err error) bool {
+		return true when err is net.NetError
+		return err.op == "timeout" || err.code == "eof" when err is HttpError
+		return false
+	}
+
+	// retryAfter reads a `Retry-After` header as seconds or an HTTP
+	// date; none when absent or unreadable.
+	internal def retryAfter(res Response) ?duration {
+		let value = res.headers.get("Retry-After").trim()
+		return none when value == ""
+		if value.isNumeric() {
+			let seconds = value.toInt<int>()
+			return duration(seconds * 1000000000)
+		}
+		let stamp = parseDateHeader(value)
+		return none when stamp is none
+		let wait = stamp - time.now()
+		return wait > 0s ?? (wait, 0s)
+	}
+
+	// redirectRequest builds the request a redirect leads to: the method
+	// rewritten for 301, 302 and 303, the body kept for 307 and 308,
+	// `Authorization` and `Cookie` dropped across hosts, `Referer` set.
+	// Fails with HttpError (op "client") when the body cannot be sent
+	// again.
+	internal def redirectRequest(from Request, status int, target URL) !Request {
+		let method = from.method
+		let keepBody = status == 307 || status == 308
+		if status == 303 {
+			method = Method.GET unless method == Method.HEAD
+		} else if (status == 301 || status == 302) && method == Method.POST {
+			method = Method.GET
+		}
+		keepBody = false when method != from.method
+		let next = new Request()
+		next.method = method
+		next.rawMethod = from.rawMethod
+		next.url = target
+		next.proto = from.proto
+		next.deadline = from.deadline
+		next.headers = from.headers.clone()
+		let sameHost = target.hostname().lower() == from.url.hostname().lower()
+		if !sameHost {
+			next.headers.del("Authorization")
+			next.headers.del("Cookie")
+		}
+		if keepBody && !(from.body is none) {
+			let kept = from.bytes() onerror (err error) {
+				fail HttpError{message: "request body cannot be sent again after a {status} redirect", op: "client", text: target.str(), cause: err}
+			}
+			next.replaceBody(kept)
+		} else {
+			next.headers.del("Content-Type")
+			next.headers.del("Content-Length")
+			next.headers.del("Transfer-Encoding")
+		}
+		// A secure page is not named to a plain one.
+		let downgrade = from.url.scheme.lower() == "https" && target.scheme.lower() != "https"
+		next.headers.set("Referer", from.url.redacted()) unless downgrade
+		return next
+	}
+
+	internal type RequestHook {
+		fn def(Request) !none
+
+		def new(fn def(Request) !none) {
+			self.fn = fn
+		}
+	}
+
+	internal type ResponseHook {
+		fn def(Response) !none
+
+		def new(fn def(Response) !none) {
+			self.fn = fn
+		}
+	}
+
+	// The process-wide client behind the module-level verbs: default
+	// transport, redirects followed, no jar, no timeout.
+	internal let sharedClient ?Client = none
+
+	// defaultClient is the shared client, made on first use.
+	def defaultClient() Client {
+		let current = sharedClient
+		return current unless current is none
+		let made = new Client()
+		sharedClient = made
+		return made
+	}
+
+	// Module-level verbs over `defaultClient()`, for scripts and one-off
+	// calls: `let res = try http.get("https://example.com")`.
+	// Fail as `Client.do` does.
+	def get(target string) !Response {
+		return try defaultClient().get(target)
+	}
+
+	// head sends HEAD through the default client. Fails as `get` does.
+	def head(target string) !Response {
+		return try defaultClient().head(target)
+	}
+
+	// post sends the body through the default client. Fails as `get` does.
+	def post(target string, contentType string, body byte[]) !Response {
+		return try defaultClient().post(target, contentType, body)
+	}
+
+	// postForm sends the form through the default client. Fails as `get`
+	// does.
+	def postForm(target string, form Values) !Response {
+		return try defaultClient().postForm(target, form)
+	}
+
+	// postJSON sends the value as JSON through the default client. Fails
+	// as `get` does.
+	def postJSON(target string, value any) !Response {
+		return try defaultClient().postJSON(target, value)
+	}
 }

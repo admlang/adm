@@ -1,0 +1,710 @@
+// The validating resolver (RFC 4035 §5): it asks with the DO and CD bits,
+// so that the signatures come along and the server does not judge them,
+// and checks every record set against a chain of keys that starts at a
+// trust anchor.
+//
+// ```
+// let validator = new dnssec.Validator(new dns.Client(["1.1.1.1"]))
+// let response = try validator.query("example.com", dns.RecordType.A)
+// println(response.authenticData)
+// ```
+
+partial module std.net.dns.dnssec {
+	use (
+		std.data.encoding::(Base32, hexdecode)
+		std.net.dns
+		std.time
+	)
+
+	// Security is what validation found out about a response (RFC 4035
+	// §4.3). A response that does not validate is no member: it is an error
+	// of the kind Bogus.
+	enum Security {
+		// Every record set is signed by a chain of keys from a trust anchor.
+		Secure,
+		// A signed parent proves that the zone is not signed, or the zone is
+		// signed with algorithms `supports` refuses only.
+		Insecure,
+		// No trust anchor lies above the name.
+		Indeterminate,
+	}
+
+	// rootAnchors is the DS records of the root's key signing keys 20326 and
+	// 38696, as IANA publishes them.
+	def rootAnchors() dns.Record[] {
+		return [
+			anchorOf(20326, "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
+			anchorOf(38696, "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"),
+		]
+	}
+
+	internal def anchorOf(keyTag int, sum string) dns.Record {
+		let nothing byte[]
+		let raw = hexdecode(sum) onerror recover nothing
+		return dns.dsRecord(".", dns.DS{keyTag: keyTag, algorithm: dns.Algorithm.RSASHA256.value, digestType: DigestType.SHA256.value, digest: raw})
+	}
+
+	// RecordSet is the records of one name, class and type of a section,
+	// with the signatures over them.
+	internal type RecordSet {
+		// The owner in canonical form.
+		name       string
+		// The wire value of the type.
+		code       int
+		records    dns.Record[] = []
+		signatures dns.Record[] = []
+	}
+
+	// recordSets groups a section into its record sets. A signature over a
+	// set the section does not hold is dropped.
+	internal def recordSets(section dns.Record[]) RecordSet[] {
+		let out RecordSet[]
+		for let (_, r) in section {
+			continue when r.kind == dns.RecordType.RRSIG
+			let owner = dns.canonicalName(r.name)
+			let held = setIn(out, owner, r.wireType())
+			if held is none {
+				let made = new RecordSet()
+				made.name = owner
+				made.code = r.wireType()
+				made.records.push(r)
+				out.push(made)
+			} else {
+				held.records.push(r)
+			}
+		}
+		for let (_, r) in section {
+			let data = r.rrsig
+			continue when data is none
+			let covered = data.covered == dns.RecordType.Unknown ?? (data.coveredCode, data.covered.value)
+			let held = setIn(out, dns.canonicalName(r.name), covered)
+			held.signatures.push(r) unless held is none
+		}
+		return out
+	}
+
+	internal def setIn(sets RecordSet[], name string, code int) ?RecordSet {
+		for let (_, set) in sets {
+			return set when set.name == name && set.code == code
+		}
+		return none
+	}
+
+	// KeySet is what the validator knows about a zone: its DNSKEY records
+	// when the zone is secure, else why it is not.
+	internal type KeySet {
+		security Security     = Security.Secure
+		records  dns.Record[] = []
+		// When the knowledge is asked for again, in Unix nanoseconds.
+		expires  int64        = 0
+	}
+
+	// Denial is what a negative answer proved.
+	internal struct Denial {
+		security   Security = Security.Secure
+		// The name exists, without the type.
+		exists     bool     = false
+		// The name is a delegation: NS records and no SOA.
+		delegation bool     = false
+		// An NSEC3 span with opt-out covers the name, so an unsigned
+		// delegation may lie there.
+		optOut     bool     = false
+	}
+
+	// Proofs is the NSEC and NSEC3 sets of an authority section that
+	// validated, and the weakest result among them.
+	internal struct Proofs {
+		sets     RecordSet[] = []
+		security Security    = Security.Secure
+	}
+
+	// Validator is a validating stub resolver. It trusts the root's keys
+	// unless given other anchors, and keeps the keys of the zones it has
+	// validated for their TTL.
+	//
+	// The client decides where the questions go: a recursive server, which
+	// needs not validate itself, or a `Mux` of authorities in a test. Give
+	// the client a `Cache`, since one validation asks for the DS and DNSKEY
+	// records of every zone above the name.
+	type Validator {
+		client  dns.Client
+		// DS and DNSKEY records of the zones trust starts at.
+		anchors dns.Record[] = []
+		// The time signatures are checked at; the present when none.
+		now     ?time.Time   = none
+
+		internal kept map<string, KeySet> = map<string, KeySet>{}
+
+		// new takes the root's anchors when `anchors` is empty.
+		def new(client dns.Client, anchors dns.Record[] = []) {
+			self.client = client
+			self.anchors = anchors.len() == 0 ?? (rootAnchors(), anchors)
+		}
+
+		// query asks for the records of the name and validates the response.
+		// `authenticData` of the response says whether it is Secure; a
+		// response from an unsigned zone comes back with it false.
+		// Fails with Bogus when the response does not validate, with
+		// ServerFailed when a server answers with a failure code, else as
+		// `Client.exchange` does.
+		def query(name string, kind dns.RecordType = dns.RecordType.A) !dns.Message {
+			let response = try ask(name, kind)
+			let security = try validate(response)
+			response.authenticData = security == Security.Secure
+			return response
+		}
+
+		// lookup returns the validated records of the type for the name,
+		// following the aliases the response carries. Records of an unsigned
+		// zone are returned too; `query` tells the two apart.
+		// Fails with NotFound when the name is proven not to exist, with
+		// NoData when it has no record of the type, else as `query` does.
+		def lookup(name string, kind dns.RecordType = dns.RecordType.A) !dns.Record[] {
+			let response = try query(name, kind)
+			if response.rcode == dns.RCode.NameError {
+				let missing = dns.errorOf(dns.ErrorKind.NotFound, "{name} does not exist", name)
+				missing.rcode = dns.RCode.NameError
+				fail missing
+			}
+			let found dns.Record[]
+			for let (_, r) in response.answers {
+				found.push(r) when r.kind == kind
+			}
+			fail dns.errorOf(dns.ErrorKind.NoData, "{name} has no {kind.name} record", name) when found.len() == 0
+			return found
+		}
+
+		// validate checks a response that was asked for with the DO and CD
+		// bits: every record set of the answer, and for a name or a type
+		// that is missing, the proof in the authority section.
+		// Fails with Bogus; the message says which check failed. Fails as
+		// `Client.exchange` does when a DS or DNSKEY question gets no answer.
+		def validate(response dns.Message) !Security {
+			let question = response.question()
+			fail bogus("the response has no question", "") when question is none
+			let code = question.kind == dns.RecordType.Unknown ?? (question.code, question.kind.value)
+			let sets = recordSets(response.answers)
+			let target = dns.canonicalName(question.name)
+			let found = false
+			for let hop = 0; hop <= sets.len() && !found; hop++ {
+				let alias = ""
+				for let (_, set) in sets {
+					continue when set.name != target
+					found = true when set.code == code || code == dns.RecordType.ANY.value
+					alias = dns.canonicalName(set.records[0].target) when set.code == dns.RecordType.CNAME.value
+				}
+				break when found || alias == ""
+				target = alias
+			}
+			let result = Security.Secure
+			for let (_, set) in sets {
+				result = weaker(result, try secure(set, response.authorities, sets))
+			}
+			return result when found
+			let proof = try denied(response, target, code)
+			return weaker(result, proof.security)
+		}
+
+		internal def ask(name string, kind dns.RecordType) !dns.Message {
+			let message = try dns.newQuery(name, kind)
+			message.recursionDesired = client.recursionDesired
+			message.checkingDisabled = true
+			message.edns = dns.EDNS{udpSize: client.udpSize > 0 ?? (client.udpSize, 1232), dnssecOK: true}
+			let response = try client.exchange(message)
+			if !(response.rcode := dns.RCode.Success || dns.RCode.NameError) {
+				let failure = dns.errorOf(dns.ErrorKind.ServerFailed, "{name}: server answered {response.rcode.name}", name)
+				failure.rcode = response.rcode
+				fail failure
+			}
+			return response
+		}
+
+		// secure validates one record set. `authorities` holds the proof a
+		// set made from a wildcard needs, `answers` the other sets of the
+		// answer, among them the DNAME an unsigned CNAME was made from (RFC
+		// 6672 §5.3).
+		internal def secure(set RecordSet, authorities dns.Record[], answers RecordSet[] = []) !Security {
+			if set.signatures.len() == 0 {
+				if set.code == dns.RecordType.CNAME.value {
+					let covering = try coveredByDNAME(set, answers)
+					return covering unless covering is none
+				}
+				// The DS of a zone is data of its parent.
+				return try unsigned(set.code == dns.RecordType.DS.value ?? (parentOf(set.name), set.name))
+			}
+			let failure ?error = none
+			for let (_, sig) in set.signatures {
+				let data = sig.rrsig
+				continue when data is none
+				let signer = dns.canonicalName(data.signer)
+				continue unless dns.isSubdomain(set.name, signer)
+				continue when set.code == dns.RecordType.DS.value && signer == set.name
+				let keys = try keysOf(signer)
+				return keys.security when keys.security != Security.Secure
+				for let (_, key) in keys.records {
+					let zoneKey = key.dnskey
+					continue when zoneKey is none
+					continue when zoneKey.keyTag() != data.keyTag || zoneKey.algorithm != data.algorithm
+					let ok = true
+					verify(set.records, sig, key, now) onerror (err error) {
+						failure = err
+						ok = false
+						recover none
+					}
+					continue unless ok
+					if data.labels < labelCount(set.name) {
+						fail bogus("the proof of {set.name} is made from a wildcard", set.name) when set.code := dns.RecordType.NSEC.value || dns.RecordType.NSEC3.value
+						return try expanded(set, data.labels, authorities)
+					}
+					return Security.Secure
+				}
+			}
+			fail failure unless failure is none
+			fail bogus("no key of its zone signs {set.name}", set.name)
+		}
+
+		// coveredByDNAME is the security of a DNAME set among `answers`
+		// whose owner is an ancestor of the CNAME's and whose substitution
+		// produces the CNAME exactly, none when nothing covers it (RFC 6672
+		// §3.4). A DNAME does not affect its own owner name.
+		internal def coveredByDNAME(set RecordSet, answers RecordSet[]) !?Security {
+			return none when set.records.len() == 0
+			let alias = set.records[0].target
+			for let (_, other) in answers {
+				continue when other.code != dns.RecordType.DNAME.value || other.records.len() == 0
+				continue unless dns.isSubdomain(set.name, other.name) && set.name != other.name
+				let target = dnameSubstitute(set.name, other.name, other.records[0].target)
+				continue when dns.canonicalName(target) != dns.canonicalName(alias)
+				let security = try secure(other, [], answers)
+				return security when security == Security.Secure
+			}
+			return none
+		}
+
+		// expanded checks that a set made from a wildcard comes with the
+		// proof that its own name does not exist (RFC 4035 §5.3.4). An
+		// NSEC3 span with opt-out proves less: the answer is Insecure.
+		internal def expanded(set RecordSet, labels int, authorities dns.Record[]) !Security {
+			let proofs = try proofsIn(authorities)
+			fail bogus("the proof beside the wildcard answer {set.name} is not signed", set.name) when proofs.security != Security.Secure
+			let own = dns.nameLabels(set.name)
+			let nextCloser = own[own.len() - labels - 1:].join(".")
+			for let (_, proof) in proofs.sets {
+				let link = proof.records[0].nsec
+				return Security.Secure when !(link is none) && spans(proof.name, link.next, set.name)
+			}
+			let cover = try coverOf(try hashedSpans(proofs.sets), nextCloser)
+			fail bogus("nothing proves that the wildcard answer {set.name} has no name of its own", set.name) when cover is none
+			return cover.data.optOut() ?? (Security.Insecure, Security.Secure)
+		}
+
+		// proofsIn validates the NSEC and NSEC3 sets of an authority section.
+		internal def proofsIn(authorities dns.Record[]) !Proofs {
+			let out = Proofs{}
+			for let (_, set) in recordSets(authorities) {
+				continue unless set.code := dns.RecordType.NSEC.value || dns.RecordType.NSEC3.value
+				let security = try secure(set, [])
+				out.security = weaker(out.security, security)
+				out.sets.push(set) when security == Security.Secure
+			}
+			return out
+		}
+
+		// denied checks the proof that `name` has no record of the type, or
+		// does not exist when the response says so.
+		internal def denied(response dns.Message, name string, code int) !Denial {
+			let signed = false
+			for let (_, r) in response.authorities {
+				signed = true when r.kind == dns.RecordType.RRSIG
+			}
+			if !signed {
+				let subject = code == dns.RecordType.DS.value ?? (parentOf(name), name)
+				return Denial{security: try unsigned(subject)}
+			}
+			let proofs = try proofsIn(response.authorities)
+			return Denial{security: proofs.security} when proofs.security != Security.Secure
+			let missing = response.rcode == dns.RCode.NameError
+			for let (_, set) in proofs.sets {
+				return try nsecDenial(proofs.sets, name, code, missing) when set.code == dns.RecordType.NSEC.value
+			}
+			return try nsec3Denial(proofs.sets, name, code, missing)
+		}
+
+		// unsigned finds out why records of `name` may come without
+		// signatures: it walks down from the trust anchor until a signed
+		// parent proves a delegation without DS records.
+		// Fails with Bogus when every zone down to the name is signed.
+		internal def unsigned(name string) !Security {
+			let top = anchorAbove(name)
+			return Security.Indeterminate when top == ""
+			let apex = try keysOf(top)
+			return apex.security when apex.security != Security.Secure
+			let labels = dns.nameLabels(name)
+			for let count = labelCount(top) + 1; count <= labels.len(); count++ {
+				let zone = labels[labels.len() - count:].join(".")
+				let known = keptFor(zone)
+				if !(known is none) {
+					return known.security when known.security != Security.Secure
+					continue
+				}
+				let response = try ask(zone, dns.RecordType.DS)
+				if !(setIn(recordSets(response.answers), zone, dns.RecordType.DS.value) is none) {
+					let keys = try keysOf(zone)
+					return keys.security when keys.security != Security.Secure
+					continue
+				}
+				// An alias is no delegation.
+				continue when response.answers.len() > 0
+				let proof = try denied(response, zone, dns.RecordType.DS.value)
+				return proof.security when proof.security != Security.Secure
+				if proof.delegation || proof.optOut {
+					keep(zone, insecureFor(response))
+					return Security.Insecure
+				}
+				fail bogus("{zone} does not exist, and {name} came without signatures", name) unless proof.exists
+			}
+			fail bogus("{name} lies in a signed zone and came without signatures", name)
+		}
+
+		// keysOf is the validated DNSKEY set of the zone, or why the zone is
+		// not secure: no anchor above it, no DS in its parent, or DS records
+		// of algorithms that are not supported only (RFC 4035 §5.2).
+		internal def keysOf(zone string) !KeySet {
+			let known = keptFor(zone)
+			return known unless known is none
+			let trusted dns.Record[]
+			for let (_, anchor) in anchors {
+				trusted.push(anchor) when dns.canonicalName(anchor.name) == zone
+			}
+			if trusted.len() == 0 {
+				let out = new KeySet()
+				out.security = Security.Indeterminate
+				return out when anchorAbove(zone) == ""
+				let response = try ask(zone, dns.RecordType.DS)
+				let held = setIn(recordSets(response.answers), zone, dns.RecordType.DS.value)
+				if held is none {
+					let proof = try denied(response, zone, dns.RecordType.DS.value)
+					if proof.security == Security.Secure {
+						fail bogus("{zone} signs records and is no zone of its own", zone) unless proof.delegation || proof.optOut
+						proof.security = Security.Insecure
+					}
+					let unsignedZone = insecureFor(response)
+					unsignedZone.security = proof.security
+					keep(zone, unsignedZone)
+					return unsignedZone
+				}
+				out.security = try secure(held, response.authorities)
+				return out when out.security != Security.Secure
+				trusted = held.records
+			}
+
+			let usable dns.Record[]
+			for let (_, t) in trusted {
+				let ds = t.ds
+				let key = t.dnskey
+				usable.push(t) when !(ds is none) && signs(ds.algorithm) && !(digestHash(ds.digestType) is none)
+				usable.push(t) when !(key is none) && signs(key.algorithm)
+			}
+			let response = try ask(zone, dns.RecordType.DNSKEY)
+			if usable.len() == 0 {
+				let unsupported = insecureFor(response)
+				keep(zone, unsupported)
+				return unsupported
+			}
+			let keys = setIn(recordSets(response.answers), zone, dns.RecordType.DNSKEY.value)
+			fail bogus("{zone} has no DNSKEY records", zone) when keys is none
+			let failure ?error = none
+			for let (_, sig) in keys.signatures {
+				for let (_, key) in keys.records {
+					continue unless named(usable, key)
+					let ok = true
+					verify(keys.records, sig, key, now) onerror (err error) {
+						failure = err
+						ok = false
+						recover none
+					}
+					continue unless ok
+					let out = new KeySet()
+					out.records = keys.records
+					out.expires = expiry(keys.records)
+					keep(zone, out)
+					return out
+				}
+			}
+			fail failure unless failure is none
+			fail bogus("no trusted key signs the DNSKEY records of {zone}", zone)
+		}
+
+		// anchorAbove is the longest anchored name at or above `name`, ""
+		// when there is none.
+		internal def anchorAbove(name string) string {
+			let best = ""
+			for let (_, anchor) in anchors {
+				let owner = dns.canonicalName(anchor.name)
+				continue unless dns.isSubdomain(name, owner)
+				best = owner when best == "" || labelCount(owner) > labelCount(best)
+			}
+			return best
+		}
+
+		internal atomic def keptFor(zone string) ?KeySet {
+			let held = kept.get(zone)
+			return none when held is none
+			return none when held.expires <= time.now().unixNs()
+			return held
+		}
+
+		internal atomic def keep(zone string, keys KeySet) {
+			kept[zone] = keys
+		}
+
+		// forget drops the validated keys kept so far, so that the next
+		// query builds its chain from `anchors` again.
+		atomic def forget() {
+			kept = map<string, KeySet>{}
+		}
+	}
+
+	// weaker is the lesser of two results.
+	internal def weaker(a Security, b Security) Security {
+		return Security.Indeterminate when a == Security.Indeterminate || b == Security.Indeterminate
+		return Security.Insecure when a == Security.Insecure || b == Security.Insecure
+		return Security.Secure
+	}
+
+	internal def labelCount(name string) int {
+		let labels = dns.nameLabels(name)
+		return labels.len() > 0 && labels[0] == "*" ?? (labels.len() - 1, labels.len())
+	}
+
+	// parentOf is the name one label up; the root is its own parent.
+	internal def parentOf(name string) string {
+		let labels = dns.nameLabels(name)
+		return "." when labels.len() <= 1
+		return labels[1:].join(".")
+	}
+
+	// dnameSubstitute is the name below a DNAME's owner rewritten to its
+	// target: the owner suffix replaced (RFC 6672 §2.2).
+	internal def dnameSubstitute(name string, owner string, target string) string {
+		return "{name}.{target}" when owner == "."
+		return name[:name.len() - owner.len()] + target
+	}
+
+	// insecureFor is the note that a zone is not signed, kept for the
+	// shortest TTL of the response that said so.
+	internal def insecureFor(response dns.Message) KeySet {
+		let out = new KeySet()
+		out.security = Security.Insecure
+		out.expires = expiry(response.authorities.len() > 0 ?? (response.authorities, response.answers))
+		return out
+	}
+
+	// expiry is when records stop being kept: their shortest TTL from now,
+	// a day at most.
+	internal def expiry(records dns.Record[]) int64 {
+		let ttl = 86400
+		for let (_, r) in records {
+			ttl = r.ttl when r.ttl < ttl
+		}
+		return time.now().unixNs() + int64(ttl) * 1000000000
+	}
+
+	// named reports whether a trust anchor or DS record names the key.
+	internal def named(trusted dns.Record[], key dns.Record) bool {
+		let nothing byte[]
+		let own = key.wireData() onerror recover nothing
+		for let (_, t) in trusted {
+			return true when !(t.ds is none) && matches(t, key)
+			continue when t.dnskey is none || dns.canonicalName(t.name) != dns.canonicalName(key.name)
+			let theirs = t.wireData() onerror recover nothing
+			return true when own.len() > 0 && compareBytes(own, theirs) == 0
+		}
+		return false
+	}
+
+	// spans reports whether the name lies within an NSEC record's span:
+	// after the owner and before `next`, which for the last record of the
+	// chain is the apex.
+	internal def spans(owner string, next string, name string) bool {
+		let after = dns.compareNames(owner, name) < 0
+		let before = dns.compareNames(name, next) < 0
+		return dns.compareNames(owner, next) < 0 ?? (after && before, after || before)
+	}
+
+	// closestEncloser is the longest name above `name` that two names
+	// around it show to exist.
+	internal def closestEncloser(name string, owner string, next string) string {
+		let a = sharedSuffix(name, owner)
+		let b = sharedSuffix(name, next)
+		return labelCount(a) >= labelCount(b) ?? (a, b)
+	}
+
+	internal def sharedSuffix(a string, b string) string {
+		let left = dns.nameLabels(a)
+		let right = dns.nameLabels(b)
+		let shared = 0
+		for shared < left.len() && shared < right.len() && left[left.len() - 1 - shared].lower() == right[right.len() - 1 - shared].lower() {
+			shared++
+		}
+		return "." when shared == 0
+		return left[left.len() - shared:].join(".").lower()
+	}
+
+	internal def wildcardAt(encloser string) string {
+		return encloser == "." ?? ("*", "*." + encloser)
+	}
+
+	// typesDeny checks the type list of the name's own NSEC or NSEC3
+	// record against the question. Fails with Bogus when the list has the
+	// type or an alias, and when the record speaks for the wrong side of
+	// a delegation.
+	internal def typesDeny(types int[], name string, code int) !Denial {
+		let delegation = types.includes(dns.RecordType.NS.value) && !types.includes(dns.RecordType.SOA.value)
+		if code == dns.RecordType.DS.value {
+			fail bogus("the proof about the DS of {name} comes from the zone itself", name) when types.includes(dns.RecordType.SOA.value) && name != "."
+		} else {
+			fail bogus("the proof about {name} comes from above its delegation", name) when delegation
+		}
+		fail bogus("{name} is proven to have the record type asked for", name) when types.includes(code)
+		fail bogus("{name} is proven to be an alias", name) when types.includes(dns.RecordType.CNAME.value)
+		return Denial{exists: true, delegation: delegation}
+	}
+
+	// nsecDenial reads the proof of NSEC records (RFC 4035 §5.4): that the
+	// name has no record of the type, or when `missing`, that neither the
+	// name nor a wildcard for it exists.
+	internal def nsecDenial(proofs RecordSet[], name string, code int, missing bool) !Denial {
+		let own = setIn(proofs, name, dns.RecordType.NSEC.value)
+		if !(own is none) {
+			fail bogus("{name} is proven to exist", name) when missing
+			let link = own.records[0].nsec
+			fail bogus("the NSEC record has no data", name) when link is none
+			return try typesDeny(link.types, name, code)
+		}
+		for let (_, set) in proofs {
+			let link = set.records[0].nsec
+			continue when link is none
+			continue unless spans(set.name, link.next, name)
+			if name != set.name && dns.isSubdomain(name, set.name) {
+				let cut = link.types.includes(dns.RecordType.NS.value) && !link.types.includes(dns.RecordType.SOA.value)
+				fail bogus("the proof about {name} comes from above its delegation", name) when cut || link.types.includes(dns.RecordType.DNAME.value)
+			}
+			// A name above the next one exists without records of its own.
+			if dns.isSubdomain(link.next, name) {
+				fail bogus("{name} is proven to exist", name) when missing
+				return Denial{exists: true}
+			}
+			let wild = wildcardAt(closestEncloser(name, set.name, link.next))
+			if missing {
+				for let (_, other) in proofs {
+					let span = other.records[0].nsec
+					return Denial{} when !(span is none) && spans(other.name, span.next, wild)
+				}
+				fail bogus("nothing proves that {wild} does not exist", name)
+			}
+			let answer = setIn(proofs, wild, dns.RecordType.NSEC.value)
+			fail bogus("nothing proves what {wild} holds", name) when answer is none
+			let listed = answer.records[0].nsec
+			fail bogus("the NSEC record has no data", name) when listed is none
+			return try typesDeny(listed.types, name, code)
+		}
+		fail bogus("no NSEC record proves the answer about {name}", name)
+	}
+
+	// HashedSpan is one NSEC3 record: the hash of its owner, and its zone.
+	internal struct HashedSpan {
+		hash byte[]
+		zone string
+		data dns.NSEC3
+	}
+
+	// The most extra iterations an NSEC3 chain may ask for before its zone
+	// counts as unsigned (RFC 9276 §3.2).
+	const maxIterations = 150
+
+	// hashedSpans reads the NSEC3 records of the proofs. Records with a
+	// hash or flags this module does not know are left out (RFC 5155 §8.2).
+	internal def hashedSpans(proofs RecordSet[]) !HashedSpan[] {
+		let out HashedSpan[]
+		let codec = new Base32()
+		codec.hex = true
+		codec.padded = false
+		for let (_, set) in proofs {
+			let data = set.records[0].nsec3
+			continue when data is none
+			continue when data.hashAlgorithm != 1 || data.flags & 0xfe != 0
+			let labels = dns.nameLabels(set.name)
+			continue when labels.len() == 0
+			let nothing byte[]
+			let hash = codec.decode(labels[0].upper()) onerror recover nothing
+			continue when hash.len() == 0
+			out.push(HashedSpan{hash: hash, zone: parentOf(set.name), data: data})
+		}
+		return out
+	}
+
+	// matchOf is the NSEC3 record of the name, none when the proofs have none.
+	internal def matchOf(found HashedSpan[], name string) !?HashedSpan {
+		for let (_, span) in found {
+			continue unless dns.isSubdomain(name, span.zone)
+			let hash = try span.data.hash(name)
+			return span when compareBytes(hash, span.hash) == 0
+		}
+		return none
+	}
+
+	// coverOf is the NSEC3 record whose span holds the hash of the name,
+	// none when the proofs have none.
+	internal def coverOf(found HashedSpan[], name string) !?HashedSpan {
+		for let (_, span) in found {
+			continue unless dns.isSubdomain(name, span.zone)
+			let hash = try span.data.hash(name)
+			let after = compareBytes(span.hash, hash) < 0
+			let before = compareBytes(hash, span.data.next) < 0
+			let inside = compareBytes(span.hash, span.data.next) < 0 ?? (after && before, after || before)
+			return span when inside
+		}
+		return none
+	}
+
+	// nsec3Denial reads the proof of NSEC3 records (RFC 5155 §8): the
+	// closest name above that exists, the next name below it that does
+	// not, and what the wildcard between them holds.
+	internal def nsec3Denial(proofs RecordSet[], name string, code int, missing bool) !Denial {
+		let found = try hashedSpans(proofs)
+		fail bogus("no NSEC or NSEC3 record proves the answer about {name}", name) when found.len() == 0
+		for let (_, span) in found {
+			return Denial{security: Security.Insecure} when span.data.iterations > maxIterations
+		}
+		let own = try matchOf(found, name)
+		if !(own is none) {
+			fail bogus("{name} is proven to exist", name) when missing
+			return try typesDeny(own.data.types, name, code)
+		}
+		let encloser = name
+		let nextCloser = name
+		let above ?HashedSpan = none
+		for above is none && encloser != "." {
+			nextCloser = encloser
+			encloser = parentOf(encloser)
+			above = try matchOf(found, encloser)
+		}
+		fail bogus("no NSEC3 record names a name above {name}", name) when above is none
+		let cut = above.data.types.includes(dns.RecordType.NS.value) && !above.data.types.includes(dns.RecordType.SOA.value)
+		fail bogus("the proof about {name} comes from above its delegation", name) when cut || above.data.types.includes(dns.RecordType.DNAME.value)
+		let cover = try coverOf(found, nextCloser)
+		fail bogus("nothing proves that {nextCloser} does not exist", name) when cover is none
+		let optOut = cover.data.optOut()
+		return Denial{optOut: true} when optOut && !missing && code == dns.RecordType.DS.value
+		let wild = wildcardAt(encloser)
+		if missing {
+			let wildCover = try coverOf(found, wild)
+			fail bogus("nothing proves that {wild} does not exist", name) when wildCover is none
+			return Denial{security: optOut ?? (Security.Insecure, Security.Secure), optOut: optOut}
+		}
+		let answer = try matchOf(found, wild)
+		fail bogus("nothing proves what {wild} holds", name) when answer is none
+		return try typesDeny(answer.data.types, name, code)
+	}
+}

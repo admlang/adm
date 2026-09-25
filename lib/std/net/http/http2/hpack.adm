@@ -1,0 +1,349 @@
+partial module std.net.http.http2 {
+	// HPACK (RFC 7541): the static table, a dynamic table each side
+	// keeps, `Encoder` for header blocks going out and `Decoder` for
+	// blocks coming in. Names are lower-case on the wire; the codec
+	// carries them as given.
+
+	// HeaderField is one name/value pair of a header block. A sensitive
+	// field (`authorization`, a short `cookie`) is sent as a literal
+	// that is never indexed, so a proxy does not put it in a table.
+	struct HeaderField {
+		name      string
+		value     string
+		sensitive bool   = false
+	}
+
+	// The 61 entries of Appendix A, index 1 first.
+	internal const staticNames = string[
+		":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme", ":status", ":status", ":status",
+		":status", ":status", ":status", ":status", "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept", "access-control-allow-origin",
+		"age", "allow", "authorization", "cache-control", "content-disposition", "content-encoding", "content-language", "content-length", "content-location", "content-range",
+		"content-type", "cookie", "date", "etag", "expect", "expires", "from", "host", "if-match", "if-modified-since",
+		"if-none-match", "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards", "proxy-authenticate", "proxy-authorization", "range",
+		"referer", "refresh", "retry-after", "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent", "vary", "via",
+		"www-authenticate"
+	]
+
+	internal const staticValues = string[
+		"", "GET", "POST", "/", "/index.html", "http", "https", "200", "204", "206",
+		"304", "400", "404", "500", "", "gzip, deflate", "", "", "", "",
+		"", "", "", "", "", "", "", "", "", "",
+		"", "", "", "", "", "", "", "", "", "",
+		"", "", "", "", "", "", "", "", "", "",
+		"", "", "", "", "", "", "", "", "", "",
+		""
+	]
+
+	internal const staticTableLen = 61
+
+	// fieldSize is an entry's size in the dynamic table: the octets of
+	// the name and value plus 32 (§4.1).
+	internal def fieldSize(f HeaderField) int {
+		return f.name.bytes().len() + f.value.bytes().len() + 32
+	}
+
+	// DynamicTable is the FIFO of recent fields one side of a
+	// connection keeps (§2.3.2): newest at index 1 after the static
+	// table, evicted from the oldest end when `maxSize` is exceeded.
+	type DynamicTable {
+		// Oldest first.
+		internal entries HeaderField[] = []
+		// Octets used, as §4.1 counts them.
+		size             int           = 0
+		maxSize          int           = defaultHeaderTableSize
+
+		// Entries held.
+		def len() int {
+			return entries.len()
+		}
+
+		// Adds a field, evicting the oldest entries to make room; a
+		// field larger than the table empties it (§4.4).
+		def add(f HeaderField) {
+			let need = fieldSize(f)
+			evictTo(maxSize - need)
+			if need > maxSize {
+				entries = []
+				size = 0
+				return
+			}
+			entries.push(f)
+			size += need
+		}
+
+		// Sets the size limit, evicting down to it.
+		def resize(n int) {
+			maxSize = n
+			evictTo(n)
+		}
+
+		// Evicts the oldest entries until the table fits `limit`.
+		internal def evictTo(limit int) {
+			let dropped = 0
+			for size > limit && dropped < entries.len() {
+				size -= fieldSize(entries[dropped])
+				dropped++
+			}
+			entries = entries.slice(dropped, entries.len() - dropped) when dropped > 0
+		}
+
+		// The entry at a dynamic index, 1 for the newest; none past the
+		// end.
+		def get(index int) ?HeaderField {
+			return none when index < 1 || index > entries.len()
+			return entries[entries.len() - index]
+		}
+
+		// The dynamic index of an entry with the name and value, else
+		// the newest with the name alone, else 0. The second result says
+		// whether the value matched too.
+		def find(name string, value string) (int, bool) {
+			let nameOnly = 0
+			for let i = entries.len() - 1; i >= 0; i-- {
+				let e = entries[i]
+				continue unless e.name == name
+				return (entries.len() - i, true) when e.value == value
+				nameOnly = entries.len() - i when nameOnly == 0
+			}
+			return (nameOnly, false)
+		}
+	}
+
+	// lookupStatic finds a static index for a field: an exact match,
+	// else the first with the name, else 0, and whether the value matched.
+	internal def lookupStatic(name string, value string) (int, bool) {
+		let nameOnly = 0
+		for let i = 0; i < staticTableLen; i++ {
+			continue unless staticNames[i] == name
+			return (i + 1, true) when staticValues[i] == value
+			nameOnly = i + 1 when nameOnly == 0
+		}
+		return (nameOnly, false)
+	}
+
+	// Encoder writes header blocks (§6). Each field goes as an index
+	// when the tables hold it, else as a literal with incremental
+	// indexing (an indexed name when one matches) so the peer learns
+	// it, or never indexed when the field is sensitive. Strings are
+	// Huffman-coded when that is shorter. One encoder serves one
+	// connection's sending side.
+	type Encoder {
+		table               DynamicTable = new DynamicTable()
+		// The limit the peer announced through SETTINGS_HEADER_TABLE_SIZE.
+		internal peerMax    int          = defaultHeaderTableSize
+		// The lowest size set since the last block, sent as a size update
+		// at the start of the next (§4.2); -1 when none is pending.
+		internal pendingMin int          = -1
+		internal pendingNew int          = -1
+		// Huffman-code strings when shorter; off for tests and debugging.
+		huffman             bool         = true
+
+		// Applies the peer's SETTINGS_HEADER_TABLE_SIZE: the table
+		// shrinks to it, and the next block announces the change.
+		def applyPeerTableSize(n int) {
+			peerMax = n
+			let size = n
+			size = table.maxSize when table.maxSize < n && pendingNew < 0
+			pendingMin = (pendingMin < 0 || n < pendingMin) ?? (n, pendingMin)
+			pendingNew = n
+			table.resize(n)
+		}
+
+		// Encodes a block for the fields given, in order.
+		def encode(fields HeaderField[]) byte[] {
+			let out byte[]
+			if pendingNew >= 0 {
+				encodeInteger(out, 5, 0x20, pendingMin) when pendingMin < pendingNew
+				encodeInteger(out, 5, 0x20, pendingNew)
+				pendingMin = -1
+				pendingNew = -1
+			}
+			for let f in fields {
+				encodeField(out, f)
+			}
+			return out
+		}
+
+		internal def encodeField(out byte[], f HeaderField) {
+			if f.sensitive {
+				let (index, _) = lookupStatic(f.name, f.value)
+				if index == 0 {
+					let (dynIndex, _) = table.find(f.name, f.value)
+					index = staticTableLen + dynIndex when dynIndex > 0
+				}
+				encodeInteger(out, 4, 0x10, index)
+				encodeString(out, f.name) when index == 0
+				encodeString(out, f.value)
+				return
+			}
+			let (index, full) = lookupStatic(f.name, f.value)
+			if !full {
+				let (dynIndex, dynFull) = table.find(f.name, f.value)
+				if dynIndex > 0 && (dynFull || index == 0) {
+					index = staticTableLen + dynIndex
+					full = dynFull
+				}
+			}
+			if full {
+				encodeInteger(out, 7, 0x80, index)
+				return
+			}
+			// Literal with incremental indexing.
+			encodeInteger(out, 6, 0x40, index)
+			encodeString(out, f.name) when index == 0
+			encodeString(out, f.value)
+			table.add(f)
+		}
+
+		internal def encodeString(out byte[], s string) {
+			let raw = s.bytes()
+			if huffman {
+				let coded = huffmanEncodedLen(raw)
+				if coded <= raw.len() {
+					encodeInteger(out, 7, 0x80, coded)
+					out.push(...huffmanEncode(raw))
+					return
+				}
+			}
+			encodeInteger(out, 7, 0, raw.len())
+			out.push(...raw)
+		}
+	}
+
+	// encodeInteger appends an integer with an N-bit prefix (§5.1),
+	// `first` holding the bits above the prefix.
+	internal def encodeInteger(out byte[], prefixBits int, first int, value int) {
+		let limit = (1 << prefixBits) - 1
+		if value < limit {
+			out.push(byte(first | value))
+			return
+		}
+		out.push(byte(first | limit))
+		let rest = value - limit
+		for rest >= 128 {
+			out.push(byte((rest & 0x7f) | 0x80))
+			rest >>= 7
+		}
+		out.push(byte(rest))
+	}
+
+	// Decoder reads header blocks (§6) with the dynamic table the peer
+	// drives. `maxDynamicTableSize` is what this side announced; a size
+	// update above it, a bad index, a malformed integer or string, or a
+	// block whose fields exceed `maxHeaderListBytes` fails with a
+	// COMPRESSION_ERROR. One decoder serves one connection's receiving
+	// side.
+	type Decoder {
+		table               DynamicTable = new DynamicTable()
+		maxDynamicTableSize int          = defaultHeaderTableSize
+		// Bytes of names and values (each plus 32) a block may decode to;
+		// 0 for no limit.
+		maxHeaderListBytes  int          = 0
+
+		// Sets what this side announced as SETTINGS_HEADER_TABLE_SIZE.
+		def announceTableSize(n int) {
+			maxDynamicTableSize = n
+			table.resize(n) when table.maxSize > n
+		}
+
+		// Decodes a whole block into its fields, in order. Fails with a
+		// COMPRESSION_ERROR on a bad index, a malformed integer or string,
+		// a size update above the announced limit or after a field, or a
+		// list over `maxHeaderListBytes`.
+		def decode(block byte[]) !HeaderField[] {
+			let fields HeaderField[]
+			let at = 0
+			let total = 0
+			let atStart = true
+			for at < block.len() {
+				let b = int(block[at])
+				if (b & 0x80) != 0 {
+					// Indexed field.
+					let (index, next) = try decodeInteger(block, at, 7)
+					at = next
+					fail connError(ErrorCode.CompressionError, "indexed field with index 0") when index == 0
+					let f = try fieldAt(index)
+					total += fieldSize(f)
+					fields.push(f)
+					atStart = false
+					continue
+				}
+				if (b & 0xe0) == 0x20 {
+					// Dynamic table size update, only at the block start.
+					fail connError(ErrorCode.CompressionError, "table size update after a field") unless atStart
+					let (size, next) = try decodeInteger(block, at, 5)
+					at = next
+					fail connError(ErrorCode.CompressionError, "table size update to {size} exceeds the {maxDynamicTableSize} allowed") when size > maxDynamicTableSize
+					table.resize(size)
+					continue
+				}
+				atStart = false
+				let prefix = 4
+				let indexing = false
+				if (b & 0x40) != 0 {
+					prefix = 6
+					indexing = true
+				}
+				let sensitive = (b & 0xf0) == 0x10
+				let (index, next) = try decodeInteger(block, at, prefix)
+				at = next
+				let name = ""
+				if index > 0 {
+					name = (try fieldAt(index)).name
+				} else {
+					let (text, after) = try decodeString(block, at)
+					name = text
+					at = after
+				}
+				let (value, after) = try decodeString(block, at)
+				at = after
+				let f = HeaderField{name: name, value: value, sensitive: sensitive}
+				table.add(f) when indexing
+				total += fieldSize(f)
+				fail connError(ErrorCode.CompressionError, "header list exceeds {maxHeaderListBytes} bytes") when maxHeaderListBytes > 0 && total > maxHeaderListBytes
+				fields.push(f)
+			}
+			return fields
+		}
+
+		// The field at a static or dynamic index.
+		internal def fieldAt(index int) !HeaderField {
+			return HeaderField{name: staticNames[index - 1], value: staticValues[index - 1]} when index >= 1 && index <= staticTableLen
+			let f = table.get(index - staticTableLen)
+			fail connError(ErrorCode.CompressionError, "index {index} is outside the tables") when f is none
+			return f
+		}
+
+		internal def decodeString(block byte[], at int) !(string, int) {
+			fail connError(ErrorCode.CompressionError, "string cut short") when at >= block.len()
+			let coded = (int(block[at]) & 0x80) != 0
+			let (length, start) = try decodeInteger(block, at, 7)
+			fail connError(ErrorCode.CompressionError, "string of {length} bytes cut short") when start + length > block.len()
+			let raw = block.slice(start, length)
+			raw = try huffmanDecode(raw) when coded
+			return (string(raw), start + length)
+		}
+	}
+
+	// decodeInteger reads an integer with an N-bit prefix at an offset,
+	// returning it and the offset after. Fails on a run past the block
+	// or one longer than 28 bits of continuation.
+	internal def decodeInteger(block byte[], at int, prefixBits int) !(int, int) {
+		fail connError(ErrorCode.CompressionError, "integer cut short") when at >= block.len()
+		let limit = (1 << prefixBits) - 1
+		let value = int(block[at]) & limit
+		let pos = at + 1
+		return (value, pos) when value < limit
+		let shift = 0
+		for {
+			fail connError(ErrorCode.CompressionError, "integer cut short") when pos >= block.len()
+			let b = int(block[pos])
+			pos++
+			value += (b & 0x7f) << shift
+			shift += 7
+			fail connError(ErrorCode.CompressionError, "integer too large") when shift > 28
+			break when (b & 0x80) == 0
+		}
+		return (value, pos)
+	}
+}

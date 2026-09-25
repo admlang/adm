@@ -1,0 +1,1234 @@
+partial module std.net.http.http2 {
+	use (
+		std.io
+		std.time
+	)
+
+	// Window this side keeps per stream, announced through
+	// SETTINGS_INITIAL_WINDOW_SIZE.
+	const defaultStreamWindow = 1024 * 1024
+	// Window this side keeps for the connection, raised by a WINDOW_UPDATE
+	// after the preface.
+	const defaultConnWindow = 4 * 1024 * 1024
+
+	// StreamState is where a stream is in its life (§5.1).
+	enum StreamState {
+		Open,
+		HalfClosedLocal,
+		HalfClosedRemote,
+		Closed,
+	}
+
+	// Stream is one request/response exchange on a connection, as either
+	// side sees it: header fields and DATA come in from the reader task
+	// and are consumed here; `writeHeaders`, `write` and `end` send.
+	// A stream is an io.Reader over the body received and an io.Writer
+	// for the body sent. Reads wait for the peer under `deadline`.
+	type Stream {
+		id              int
+		weak conn       ?Conn
+		state           StreamState   = StreamState.Open
+		// The header block that opened the stream: the request on a
+		// server, the response on a client (1xx heads are skipped).
+		fields          HeaderField[] = []
+		// The `Priority` field value of the client's last PRIORITY_UPDATE
+		// for the stream (RFC 9218), "" when none came.
+		priorityUpdate  string        = ""
+		// The stream's priority (RFC 9218), from the `priority` field of
+		// the request and the updates after it: `urgency` 0, first, to 7.
+		// DATA of a more urgent stream goes out ahead of this one's.
+		// Within one urgency a stream that is not `incremental` is sent
+		// whole, in request order, and incremental ones take turns.
+		urgency         int           = 3
+		incremental     bool          = false
+		haveFields      bool          = false
+		// Trailing fields, after the last DATA.
+		trailers        HeaderField[] = []
+		haveTrailers    bool          = false
+		// END_STREAM received, and sent.
+		endReceived     bool          = false
+		endSent         bool          = false
+		// Why the stream failed: reset by the peer, or the connection went.
+		failure         ?Http2Error   = none
+		// When reads and window waits give up; none for no limit.
+		deadline        ?time.Time    = none
+		// DATA received and not yet read, and the offset into the first.
+		chunks          byte[][]      = []
+		offset          int           = 0
+		// Flow control, kept by the connection: what this side may still
+		// send, what the peer may still send, bytes consumed and not yet
+		// credited, and bytes of body received.
+		sendWindow      int           = 0
+		recvWindow      int           = 0
+		unacked         int           = 0
+		received        int           = 0
+		internal signal channel<none>
+
+		def new(conn Conn, id int, sendWindow int, recvWindow int) {
+			self.conn = conn
+			self.id = id
+			self.sendWindow = sendWindow
+			self.recvWindow = recvWindow
+			self.signal = new channel<none>(1)
+		}
+
+		// Wakes a task waiting on this stream.
+		atomic def wake() {
+			signal <- none when signal.len() == 0
+		}
+
+		// Waits for a wake-up or the deadline. Fails with a `timeout`
+		// Http2Error when the deadline passes.
+		internal def wait() !none {
+			let until = deadline
+			if until is none {
+				select {
+					case signal:
+						signal.flush()
+				}
+				return none
+			}
+			let left = until - time.now()
+			fail timeoutError(id) when left <= 0s
+			let sleep = time.sleepChan(left)
+			select {
+				case signal:
+					signal.flush()
+				case sleep:
+					fail timeoutError(id) when time.now() >= until
+			}
+			return none
+		}
+
+		// The value of a pseudo-header or header among `fields`; "" when
+		// absent.
+		def field(name string) string {
+			for let f in fields {
+				return f.value when f.name == name
+			}
+			return ""
+		}
+
+		// Waits for the opening header block. Fails when the stream was
+		// reset, the connection failed, the deadline passed, or the peer
+		// ended the stream without one.
+		def readHeaders() !HeaderField[] {
+			for {
+				return fields when haveFields
+				let err = failure
+				fail err unless err is none
+				fail streamError(id, ErrorCode.ProtocolError, "stream ended without headers") when endReceived
+				try wait()
+			}
+			return fields
+		}
+
+		// Reads body bytes; 0 at END_STREAM. Implements io.Reader. Fails
+		// when the stream was reset or the deadline passed.
+		def read(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			for {
+				let n = take(buf)
+				if n > 0 {
+					let c = conn
+					c.consumed(self, n) unless c is none
+					return n
+				}
+				return 0 when endReceived
+				let err = failure
+				fail err unless err is none
+				try wait()
+			}
+			return 0
+		}
+
+		// Queues DATA the reader task received.
+		atomic def enqueue(data byte[]) {
+			chunks.push(data)
+		}
+
+		// Copies queued bytes out; 0 when nothing is queued.
+		internal atomic def take(buf byte[]) int {
+			return 0 when chunks.len() == 0
+			let head = chunks[0]
+			let avail = head.len() - offset
+			let n = avail < buf.len() ?? (avail, buf.len())
+			head.slice(offset, n).copy(buf)
+			offset += n
+			if offset >= head.len() {
+				chunks = chunks.slice(1, chunks.len() - 1)
+				offset = 0
+			}
+			return n
+		}
+
+		// Reads the body to its end. Fails as `read` does.
+		def readAll() !byte[] {
+			let out byte[]
+			let buf byte[]
+			buf.len(32 * 1024)
+			for {
+				let n = try read(buf)
+				break when n == 0
+				out.push(...buf.slice(0, n))
+			}
+			return out
+		}
+
+		// Sends the header block that opens this side's message; with
+		// END_STREAM when nothing follows. A client stream takes its
+		// identifier here, so identifiers rise in the order the peer sees
+		// them. Fails when the connection write does.
+		def writeHeaders(fields HeaderField[], endStream bool) !none {
+			let c = try connOrFail()
+			if id == 0 {
+				try c.openStream(self, fields, endStream)
+			} else {
+				try c.writeHeaderBlock(id, fields, endStream)
+			}
+			markEndSent() when endStream
+			return none
+		}
+
+		// Sends body bytes as DATA frames within the flow-control windows,
+		// waiting under the deadline for WINDOW_UPDATE when they are
+		// exhausted. Implements io.Writer. Fails when the stream was reset,
+		// already ended, the deadline passed, or the connection write did.
+		def write(buf byte[]) !int {
+			let c = try connOrFail()
+			let failed ?error = none
+			sendAll(c, buf) onerror (err error) {
+				failed = err
+				recover none
+			}
+			// Whatever the outcome, this stream no longer holds others back.
+			c.release(self)
+			fail failed unless failed is none
+			return buf.len()
+		}
+
+		// sendAll is the loop of `write`: window taken through the
+		// connection's scheduler, a frame sent, until the bytes are out.
+		internal def sendAll(c Conn, buf byte[]) !none {
+			let at = 0
+			for at < buf.len() {
+				let err = failure
+				fail err unless err is none
+				fail streamError(id, ErrorCode.StreamClosed, "stream already ended") when endSent
+				let n = c.reserve(self, buf.len() - at)
+				if n == 0 {
+					try wait()
+					continue
+				}
+				try c.framer.writeData(id, false, buf.slice(at, n))
+				at += n
+			}
+			return none
+		}
+
+		// Writes text as body bytes. Fails as `write` does.
+		def writeString(text string) !int {
+			return try write(text.bytes())
+		}
+
+		// Ends this side's message: an empty DATA with END_STREAM, or the
+		// trailers when given. Fails when the stream was reset or the
+		// connection write did.
+		def end(trailers HeaderField[] = []) !none {
+			return none when endSent
+			let c = try connOrFail()
+			if trailers.len() > 0 {
+				try c.writeHeaderBlock(id, trailers, true)
+			} else {
+				try c.framer.writeData(id, true, [])
+			}
+			markEndSent()
+			return none
+		}
+
+		// Resets the stream with the code; the peer stops sending, and
+		// DATA received and never read is given back to the connection
+		// window. On a stream both sides ended only that happens. Never
+		// fails: a write that does not reach the peer is reported nowhere,
+		// the connection failing is what the peer sees.
+		def reset(code ErrorCode) !none {
+			let c = conn
+			return none when c is none
+			c.discard(self)
+			return none when state == StreamState.Closed
+			failure = streamError(id, code, "reset by this side") when failure is none
+			c.framer.writeRstStream(id, code) onerror recover none
+			c.finishStream(self)
+			wake()
+			return none
+		}
+
+		// updatePriority tells the server a new priority for the request
+		// (client side), as a `Priority` field value such as `u=1, i`.
+		// Fails when the stream has no identifier yet or is done, or the
+		// connection write does.
+		def updatePriority(value string) !none {
+			let c = conn
+			fail streamError(id, ErrorCode.StreamClosed, "stream is not open") when c is none || id == 0 || state == StreamState.Closed
+			return try c.framer.writePriorityUpdate(id, value)
+		}
+
+		// True once both sides ended or the stream was reset.
+		def isDone() bool {
+			return state == StreamState.Closed
+		}
+
+		internal def markEndSent() {
+			endSent = true
+			let c = conn
+			c.streamEnded(self) unless c is none
+		}
+
+		internal def connOrFail() !Conn {
+			let c = conn
+			fail connError(ErrorCode.InternalError, "stream has no connection") when c is none
+			let err = failure
+			fail err unless err is none
+			return c
+		}
+	}
+
+	// asHttp2Error is the error as an Http2Error, none for any other.
+	internal def asHttp2Error(err error) ?Http2Error {
+		return err when err is Http2Error
+		return none
+	}
+
+	// timeoutError is the failure of a wait that passed its deadline.
+	internal def timeoutError(streamID int) Http2Error {
+		return Http2Error{message: "http2: stream {streamID}: timed out", code: "timeout", errorCode: ErrorCode.Cancel, streamID: streamID}
+	}
+
+	// Conn is one HTTP/2 connection: the framer over the transport, the
+	// HPACK codecs, the streams, the windows and the settings of both
+	// sides. A reader task started by `handshake` dispatches every frame;
+	// writes go straight out, serialised by the framer. A client opens
+	// streams with `newStream`; a server gets each stream the peer opens
+	// through `onStream`, run in its own task. Safe from many tasks.
+	type Conn {
+		framer                     Framer
+		encoder                    Encoder               = new Encoder()
+		decoder                    Decoder               = new Decoder()
+		closer                     ?io.Closer            = none
+		isClient                   bool
+		// What this side announces.
+		maxConcurrentStreams       int                   = 250
+		initialWindow              int                   = defaultStreamWindow
+		connWindow                 int                   = defaultConnWindow
+		maxHeaderListBytes         int                   = 1024 * 1024
+		// Closes the connection, GOAWAY first, once no stream has been
+		// open for this long. 0s keeps an idle connection.
+		idleTimeout                duration              = 0s
+		// Sends a PING once nothing has arrived for this long, and closes
+		// the connection when no answer comes within `pingTimeout`. 0s
+		// sends none. Set all three before `handshake`.
+		pingInterval               duration              = 0s
+		pingTimeout                duration              = 15s
+		// What the peer announced.
+		peerInitialWindow          int                   = defaultInitialWindowSize
+		peerMaxConcurrent          int                   = -1
+		peerMaxHeaderList          int                   = -1
+		// Ran the handshake; the peer acknowledged our settings.
+		started                    bool                  = false
+		settingsAcked              bool                  = false
+		goAwaySent                 bool                  = false
+		goAwayReceived             bool                  = false
+		// The last stream the peer will handle, from its GOAWAY.
+		peerLastStreamID           int                   = 0
+		closed                     bool                  = false
+		closeError                 ?error                = none
+		// Called for every stream the peer opens (server side).
+		onStream                   ?def (s Stream) !none = none
+		internal streams           map<int, Stream>
+		// The streams inside a `write`, by identifier with their urgency, and
+		// how many of them another one is holding back. `turn` counts the
+		// windows handed out, `served` holds the turn each open stream
+		// last had.
+		internal sending           map<int, int>
+		internal served            map<int, int>
+		internal deferred          int                   = 0
+		internal turn              int                   = 0
+		internal nextStreamID      int                   = 1
+		internal lastPeerStreamID  int                   = 0
+		internal lastLocalStreamID int                   = 0
+		internal connSendWindow    int                   = defaultInitialWindowSize
+		internal connRecvWindow    int                   = defaultInitialWindowSize
+		internal connUnacked       int                   = 0
+		internal signal            channel<none>
+		internal pongs             byte[][]              = []
+		internal active            int                   = 0
+		internal ended             channel<none>
+		internal idleSince         time.Time             = time.now()
+		internal lastRead          time.Time             = time.now()
+		// Stream 1 of an upgraded connection, until `handshake` runs it.
+		internal upgraded          ?Stream               = none
+
+		def new(reader io.Reader, writer io.Writer, isClient bool, closer ?io.Closer = none) {
+			self.framer = new Framer(reader, writer)
+			self.isClient = isClient
+			self.closer = closer
+			self.streams = map<int, Stream>{}
+			self.sending = map<int, int>{}
+			self.served = map<int, int>{}
+			self.nextStreamID = isClient ?? (1, 2)
+			self.signal = new channel<none>(1)
+			self.ended = new channel<none>(1)
+		}
+
+		// Blocks until the connection has closed, by either side or by a
+		// failure; `closeError` says which.
+		def wait() {
+			for !closed {
+				select {
+					case ended:
+				}
+			}
+			markEnded()
+		}
+
+		// Lets one `wait` through; each passes it on to the next.
+		internal atomic def markEnded() {
+			ended <- none when ended.len() == 0
+		}
+
+		// Runs the connection preface (§3.4): a client sends the magic
+		// and its SETTINGS, a server expects the magic, both send their
+		// SETTINGS and widen the connection window; then the reader task
+		// starts. Fails when the peer's preface is wrong or a write does.
+		def handshake() !none {
+			return none when started
+			started = true
+			decoder.maxHeaderListBytes = maxHeaderListBytes
+			framer.maxHeaderBlockBytes = maxHeaderListBytes
+			if isClient {
+				try writeAll(framer.writer, clientPreface.bytes())
+			} else {
+				let magic byte[]
+				magic.len(clientPreface.len())
+				try io.readFull(framer.reader, magic)
+				fail connError(ErrorCode.ProtocolError, "bad connection preface") unless string(magic) == clientPreface
+			}
+			let settings = [Setting{id:int(SettingID.HeaderTableSize), value:defaultHeaderTableSize}, Setting{id:int(SettingID.InitialWindowSize), value:initialWindow}, Setting{id:int(SettingID.MaxFrameSize), value:framer.maxReadFrameSize}, Setting{id:int(SettingID.MaxHeaderListSize), value:maxHeaderListBytes}]
+			// Stream priorities of RFC 7540 are ignored here, RFC 9218 signals
+			// are taken.
+			settings.push(Setting{id: int(SettingID.NoRFC7540Priorities), value: 1})
+			settings.push(Setting{id: int(SettingID.EnablePush), value: 0}) when isClient
+			settings.push(Setting{id: int(SettingID.MaxConcurrentStreams), value: maxConcurrentStreams}) unless isClient
+			try framer.writeSettings(settings)
+			if connWindow > defaultInitialWindowSize {
+				try framer.writeWindowUpdate(0, connWindow - defaultInitialWindowSize)
+				connRecvWindow = connWindow
+			}
+			idleSince = time.now()
+			lastRead = idleSince
+			let task = async readLoop()
+			task.keepAlive()
+			if idleTimeout > 0s || pingInterval > 0s {
+				let keeper = async keepLoop()
+				keeper.keepAlive()
+			}
+			let first = upgraded
+			let handler = onStream
+			upgraded = none
+			if !(first is none) && !(handler is none) {
+				let answer = async runStream(handler, first)
+				answer.keepAlive()
+			}
+			return none
+		}
+
+		// Takes over a connection that an HTTP/1.1 request upgraded with
+		// `Upgrade: h2c` (RFC 7540 §3.2). Server side, before `handshake`.
+		// `settings` is the decoded `HTTP2-Settings` field, which stands
+		// for the client's first SETTINGS; `fields` and `body` are the
+		// request that asked. It becomes stream 1, ended by the client,
+		// and reaches `onStream` once `handshake` has sent this side's
+		// SETTINGS. Fails with Http2Error when the connection is a client
+		// or already started, `settings` is not whole SETTINGS pairs or
+		// holds a value out of bounds, or `fields` break §8.3.
+		def upgrade(settings byte[], fields HeaderField[], body byte[] = []) !none {
+			fail connError(ErrorCode.ProtocolError, "upgrade on a client or a started connection") when isClient || started
+			fail connError(ErrorCode.ProtocolError, "HTTP2-Settings is not whole SETTINGS pairs") unless settings.len() % 6 == 0
+			try applySettings(try decodeSettings(settings))
+			let s = new Stream(self, 1, peerInitialWindow, initialWindow)
+			try acceptFields(s, fields)
+			s.haveFields = true
+			s.endReceived = true
+			s.state = StreamState.HalfClosedRemote
+			if body.len() > 0 {
+				s.enqueue(body)
+				s.received = body.len()
+				// These bytes never crossed the connection window.
+				connUnacked -= body.len()
+			}
+			streams[1] = s
+			active++
+			lastPeerStreamID = 1
+			upgraded = s
+			return none
+		}
+
+		// The keeper task: enforces `idleTimeout` and `pingInterval` until
+		// the connection closes.
+		internal def keepLoop() {
+			for !closed {
+				let sleep = time.sleepChan(keepStep())
+				select {
+					case ended:
+						markEnded()
+						return
+					case sleep:
+				}
+				return when closed
+				if expireIdle() {
+					close() onerror recover none
+					return
+				}
+				continue unless pingInterval > 0s && time.since(lastRead) >= pingInterval
+				let silent = false
+				ping(pingTimeout) onerror (err error) {
+					silent = true
+					recover 0s
+				}
+				if silent {
+					terminate(connError(ErrorCode.Cancel, "no answer to PING within {pingTimeout}")) unless closed
+					return
+				}
+			}
+		}
+
+		// Sends GOAWAY when the connection sat idle past `idleTimeout`, in
+		// one step with the check, so no stream opens in between.
+		internal atomic def expireIdle() bool {
+			return false unless idleTimeout > 0s && !closed && active == 0 && time.since(idleSince) >= idleTimeout
+			goAway() onerror recover none
+			return true
+		}
+
+		// How long the keeper sleeps: until the earliest moment a timeout
+		// can pass.
+		internal def keepStep() duration {
+			let step = 0s
+			if idleTimeout > 0s {
+				step = idleTimeout
+				step = idleTimeout - time.since(idleSince) when active == 0
+			}
+			if pingInterval > 0s {
+				let left = pingInterval - time.since(lastRead)
+				step = left when step == 0s || left < step
+			}
+			return 10ms when step < 10ms
+			return step
+		}
+
+		// Reports whether a new stream may be opened here: not closed,
+		// no GOAWAY either way, identifiers left.
+		def isUsable() bool {
+			return !closed && !goAwayReceived && !goAwaySent && nextStreamID < maxStreamID
+		}
+
+		// Streams open.
+		def activeStreams() int {
+			return active
+		}
+
+		// hasRoom reports whether a new stream would open now, not wait for
+		// one to end under the peer's SETTINGS_MAX_CONCURRENT_STREAMS.
+		def hasRoom() bool {
+			return isUsable() && (peerMaxConcurrent < 0 || active < peerMaxConcurrent)
+		}
+
+		// Reserves a stream (client side), waiting under `deadline` while
+		// the peer's concurrency limit is reached; its identifier is
+		// assigned when its headers go out. Fails when the connection is
+		// unusable.
+		def newStream(deadline ?time.Time = none) !Stream {
+			for {
+				fail connError(ErrorCode.RefusedStream, "connection is closing") unless isUsable()
+				let s = tryOpen()
+				return s unless s is none
+				let until = deadline
+				if until is none {
+					select {
+						case signal:
+							signal.flush()
+					}
+				} else {
+					let left = until - time.now()
+					fail timeoutError(0) when left <= 0s
+					let sleep = time.sleepChan(left)
+					select {
+						case signal:
+							signal.flush()
+						case sleep:
+					}
+				}
+			}
+			fail connError(ErrorCode.InternalError, "unreachable")
+		}
+
+		internal atomic def tryOpen() ?Stream {
+			return none unless isUsable()
+			return none when peerMaxConcurrent >= 0 && active >= peerMaxConcurrent
+			let s = new Stream(self, 0, peerInitialWindow, initialWindow)
+			active++
+			return s
+		}
+
+		// Gives a reserved client stream its identifier and sends its
+		// opening block, as one unit so identifiers rise in wire order.
+		// Fails when the connection is closed or closing, the identifiers
+		// ran out, or the write did.
+		atomic def openStream(s Stream, fields HeaderField[], endStream bool) !none {
+			fail connError(ErrorCode.RefusedStream, "connection is closed") when closed
+			fail connError(ErrorCode.RefusedStream, "connection is closing") when goAwayReceived || goAwaySent
+			fail connError(ErrorCode.RefusedStream, "stream identifiers exhausted") when nextStreamID >= maxStreamID
+			s.id = nextStreamID
+			nextStreamID += 2
+			streams[s.id] = s
+			setPriority(s, joinedValues(fields, "priority"))
+			lastLocalStreamID = s.id
+			let block = encoder.encode(fields)
+			return try framer.writeHeaders(s.id, endStream, block)
+		}
+
+		// Encodes and writes a header block as one unit, so blocks reach
+		// the peer in the order the encoder produced them. Fails when the
+		// connection is closed or the write does.
+		atomic def writeHeaderBlock(streamID int, fields HeaderField[], endStream bool) !none {
+			fail connError(ErrorCode.RefusedStream, "connection is closed") when closed
+			let block = encoder.encode(fields)
+			return try framer.writeHeaders(streamID, endStream, block)
+		}
+
+		// Takes up to n bytes of send window for a stream; 0 when either
+		// window is empty, or when a more urgent stream (RFC 9218) has
+		// DATA to send and the window to send it: that one goes first.
+		// The stream counts as sending until `release`.
+		atomic def reserve(s Stream, n int) int {
+			sending[s.id] = s.urgency
+			if connSendWindow > 0 && yieldsTo(s) {
+				deferred++
+				return 0
+			}
+			let room = n
+			room = connSendWindow when connSendWindow < room
+			room = s.sendWindow when s.sendWindow < room
+			room = framer.maxWriteFrameSize when framer.maxWriteFrameSize < room
+			if room <= 0 {
+				// Stalled on its own window: whoever waited for it may go.
+				wakeDeferred() when s.sendWindow <= 0
+				return 0
+			}
+			connSendWindow -= room
+			s.sendWindow -= room
+			turn++
+			served[s.id] = turn
+			// The incremental streams of this urgency take the next turns.
+			wakeDeferred() when s.incremental
+			return room
+		}
+
+		// release ends a stream's turn at sending, at the end of a `write`
+		// or of the stream, and wakes the streams that waited for it.
+		atomic def release(s Stream) {
+			return unless sending.hasKey(s.id)
+			sending.delete(s.id)
+			wakeDeferred()
+		}
+
+		// yieldsTo reports whether a stream that goes before s is sending
+		// and has stream window left to do so.
+		internal def yieldsTo(s Stream) bool {
+			for let (id, urgency) in sending {
+				continue when id == s.id || urgency > s.urgency
+				let other = streams.get(id)
+				return true when !(other is none) && other.sendWindow > 0 && other.state != StreamState.Closed && (urgency < s.urgency || goesBefore(other, s))
+			}
+			return false
+		}
+
+		// goesBefore orders two streams of one urgency (RFC 9218 §10): a
+		// stream that is not incremental goes ahead of the requests after
+		// it, and incremental ones take turns, longest unserved first.
+		internal def goesBefore(other Stream, s Stream) bool {
+			return other.id < s.id unless other.incremental
+			return false unless s.incremental
+			let theirs = servedTurn(other.id)
+			let ours = servedTurn(s.id)
+			return theirs < ours || (theirs == ours && other.id < s.id)
+		}
+
+		// servedTurn is the turn a stream last took send window at, 0
+		// before its first.
+		internal def servedTurn(id int) int {
+			return 0 unless served.hasKey(id)
+			return served[id]
+		}
+
+		// wakeDeferred wakes the streams a more urgent one held back.
+		internal def wakeDeferred() {
+			return when deferred == 0
+			deferred = 0
+			wakeStreams()
+		}
+
+		// setPriority takes a `Priority` field value as the stream's
+		// priority.
+		internal def setPriority(s Stream, value string) {
+			let (urgency, incremental) = priorityOf(value)
+			s.urgency = urgency
+			s.incremental = incremental
+			sending[s.id] = urgency when sending.hasKey(s.id)
+		}
+
+		// Credits bytes the application consumed back to the peer, as
+		// WINDOW_UPDATEs once half a window is pending.
+		atomic def consumed(s Stream, n int) {
+			s.unacked += n
+			connUnacked += n
+			if s.unacked >= initialWindow / 2 && !s.endReceived {
+				framer.writeWindowUpdate(s.id, s.unacked) onerror recover none
+				s.recvWindow += s.unacked
+				s.unacked = 0
+			}
+			if connUnacked >= connWindow / 2 {
+				framer.writeWindowUpdate(0, connUnacked) onerror recover none
+				connRecvWindow += connUnacked
+				connUnacked = 0
+			}
+		}
+
+		// Sends a PING and waits for its ACK. Fails after `timeout`.
+		def ping(timeout duration = 10s) !duration {
+			let data byte[]
+			data.len(8)
+			let stamp = time.now().unixNs()
+			for let i = 0; i < 8; i++ {
+				data[i] = byte((stamp >> (i * 8)) & 0xff)
+			}
+			let sent = time.now()
+			try framer.writePing(false, data)
+			let until = sent + timeout
+			for {
+				return time.now() - sent when tookPong(data)
+				let err = closeError
+				fail err unless err is none
+				fail connError(ErrorCode.Cancel, "connection closed") when closed
+				let left = until - time.now()
+				fail timeoutError(0) when left <= 0s
+				let sleep = time.sleepChan(left)
+				select {
+					case signal:
+						signal.flush()
+					case sleep:
+				}
+			}
+			return 0s
+		}
+
+		internal atomic def tookPong(data byte[]) bool {
+			for let i = 0; i < pongs.len(); i++ {
+				if string(pongs[i]) == string(data) {
+					pongs = pongs.slice(0, i) + pongs.slice(i + 1, pongs.len() - i - 1)
+					return true
+				}
+			}
+			return false
+		}
+
+		// Tells the peer no more streams will be accepted past the ones
+		// open, with the code; existing streams finish. Fails when the
+		// write does.
+		def goAway(code ErrorCode = ErrorCode.NoError, debug string = "") !none {
+			return none when goAwaySent
+			goAwaySent = true
+			return try framer.writeGoAway(lastPeerStreamID, code, debug.bytes())
+		}
+
+		// Closes the connection: GOAWAY, every stream failed, the
+		// transport closed. Safe to call more than once.
+		def close() !none {
+			return none when closed
+			goAway() onerror recover none
+			terminate(connError(ErrorCode.Cancel, "connection closed"))
+			return none
+		}
+
+		// Fails every stream and closes the transport.
+		internal def terminate(err error) {
+			let list = markClosed(err)
+			for let s in list {
+				s.wake()
+			}
+			wakeAll()
+			markEnded()
+			let c = closer
+			if !(c is none) {
+				c.close() onerror recover none
+			}
+		}
+
+		internal atomic def markClosed(err error) Stream[] {
+			return [] when closed
+			closed = true
+			closeError = err
+			let list Stream[]
+			let h = asHttp2Error(err)
+			let reason = h is none ?? (connError(ErrorCode.InternalError, "connection failed: {err.message}"), h)
+			for let (_, s) in streams {
+				s.failure = reason when s.failure is none
+				s.state = StreamState.Closed
+				list.push(s)
+			}
+			streams = map<int, Stream>{}
+			active = 0
+			return list
+		}
+
+		internal atomic def wakeAll() {
+			signal <- none when signal.len() == 0
+			for let (_, s) in streams {
+				s.wake()
+			}
+		}
+
+		// The reader task: frames in, dispatched, until the transport or
+		// the protocol fails.
+		internal def readLoop() {
+			for {
+				break when closed
+				let failure ?error = none
+				let frame = framer.readFrame() onerror (err error) {
+					failure = err
+					recover new Frame(FrameType.Unknown, 0)
+				}
+				if !(failure is none) {
+					fatal(failure)
+					return
+				}
+				lastRead = time.now()
+				dispatch(frame) onerror (err error) {
+					failure = err
+					recover none
+				}
+				continue when failure is none
+				let h = asHttp2Error(failure)
+				if !(h is none) && h.streamID != 0 {
+					// A stream error: reset that stream and carry on.
+					framer.writeRstStream(h.streamID, h.errorCode) onerror recover none
+					let s = lookup(h.streamID)
+					if !(s is none) {
+						s.failure = h when s.failure is none
+						finishStream(s)
+						s.wake()
+					}
+					continue
+				}
+				fatal(failure)
+				return
+			}
+		}
+
+		// Ends the connection on a connection error: GOAWAY with the
+		// code, then everything fails.
+		internal def fatal(err error) {
+			let h = asHttp2Error(err)
+			if !(h is none) && !goAwaySent {
+				goAwaySent = true
+				framer.writeGoAway(lastPeerStreamID, h.errorCode, h.message.bytes()) onerror recover none
+			}
+			terminate(err)
+		}
+
+		internal atomic def lookup(id int) ?Stream {
+			return streams.get(id)
+		}
+
+		// Applies one frame to the connection and its streams. Fails with
+		// the connection or stream error the frame provokes.
+		internal atomic def dispatch(frame Frame) !none {
+			match frame.kind {
+				case FrameType.Settings:
+					return try onSettings(frame)
+				case FrameType.WindowUpdate:
+					return try onWindowUpdate(frame)
+				case FrameType.Data:
+					return try onData(frame)
+				case FrameType.Headers:
+					return try onHeaders(frame)
+				case FrameType.RstStream:
+					let s = streams.get(frame.streamID)
+					return none when s is none
+					s.failure = streamError(frame.streamID, frame.errorCode, "reset by peer ({errorCodeName(frame.errorCode)})") when s.failure is none
+					finishStream(s)
+					s.wake()
+					return none
+				case FrameType.Ping:
+					if frame.ack() {
+						pongs.push(frame.data)
+						signal <- none when signal.len() == 0
+						return none
+					}
+					return try framer.writePing(true, frame.data)
+				case FrameType.GoAway:
+					goAwayReceived = true
+					peerLastStreamID = frame.lastStreamID
+					let debug = string(frame.data)
+					for let (id, s) in streams {
+						continue unless isClient && id > frame.lastStreamID
+						s.failure = streamError(id, ErrorCode.RefusedStream, "GOAWAY ({errorCodeName(frame.errorCode)}) before the stream was handled: {debug}") when s.failure is none
+						s.state = StreamState.Closed
+						s.wake()
+					}
+					signal <- none when signal.len() == 0
+					fail connError(frame.errorCode, "peer sent GOAWAY ({errorCodeName(frame.errorCode)}): {debug}") when frame.errorCode != ErrorCode.NoError
+					return none
+				case FrameType.PushPromise:
+					fail connError(ErrorCode.ProtocolError, "PUSH_PROMISE with push disabled")
+				case FrameType.PriorityUpdate:
+					return try onPriorityUpdate(frame)
+				default:
+					return none
+			}
+		}
+
+		internal def onSettings(frame Frame) !none {
+			if frame.ack() {
+				settingsAcked = true
+				return none
+			}
+			try applySettings(frame.settings)
+			try framer.writeSettingsAck()
+			wakeStreams()
+			signal <- none when signal.len() == 0
+			return none
+		}
+
+		// Takes the peer's settings: table size, stream limit, window
+		// (moving every open stream's), frame size, header list size.
+		internal def applySettings(settings Setting[]) !none {
+			for let s in settings {
+				match s.id {
+					case 1:
+						encoder.applyPeerTableSize(s.value)
+					case 3:
+						peerMaxConcurrent = s.value
+					case 4:
+						let delta = s.value - peerInitialWindow
+						peerInitialWindow = s.value
+						for let (_, st) in streams {
+							st.sendWindow += delta
+							fail connError(ErrorCode.FlowControlError, "stream window exceeds 2^31-1") when st.sendWindow > maxWindowSize
+						}
+					case 5:
+						framer.maxWriteFrameSize = s.value
+					case 6:
+						peerMaxHeaderList = s.value
+					case 9:
+						fail connError(ErrorCode.ProtocolError, "SETTINGS_NO_RFC7540_PRIORITIES of {s.value}") when s.value > 1
+					default:
+				}
+			}
+			return none
+		}
+
+		// Records a client's PRIORITY_UPDATE on the stream it names; one for
+		// a stream not open is dropped. Fails with a connection error for
+		// the frame on a stream, from a server, too short, or about stream
+		// 0 or a server's stream.
+		internal def onPriorityUpdate(frame Frame) !none {
+			fail connError(ErrorCode.ProtocolError, "PRIORITY_UPDATE from a server") when isClient
+			fail connError(ErrorCode.ProtocolError, "PRIORITY_UPDATE on stream {frame.streamID}") when frame.streamID != 0
+			fail connError(ErrorCode.FrameSizeError, "PRIORITY_UPDATE of {frame.data.len()} bytes") when frame.data.len() < 4
+			let id = readUint31(frame.data, 0)
+			fail connError(ErrorCode.ProtocolError, "PRIORITY_UPDATE for stream {id}") when id == 0 || id % 2 == 0
+			let s = streams.get(id)
+			return none when s is none
+			s.priorityUpdate = string(frame.data[4:])
+			setPriority(s, s.priorityUpdate)
+			// A stream now less urgent may be holding nothing back any more.
+			wakeDeferred()
+			return none
+		}
+
+		internal def onWindowUpdate(frame Frame) !none {
+			if frame.streamID == 0 {
+				connSendWindow += frame.windowIncrement
+				fail connError(ErrorCode.FlowControlError, "connection window exceeds 2^31-1") when connSendWindow > maxWindowSize
+				wakeStreams()
+				return none
+			}
+			let s = streams.get(frame.streamID)
+			return none when s is none
+			s.sendWindow += frame.windowIncrement
+			fail streamError(frame.streamID, ErrorCode.FlowControlError, "window exceeds 2^31-1") when s.sendWindow > maxWindowSize
+			s.wake()
+			return none
+		}
+
+		internal def onData(frame Frame) !none {
+			let s = streams.get(frame.streamID)
+			if s is none {
+				fail connError(ErrorCode.ProtocolError, "DATA on idle stream {frame.streamID}") unless isKnown(frame.streamID)
+				// A closed stream: the bytes still count against the
+				// connection window.
+				connRecvWindow -= frame.payloadLength
+				creditConn(frame.payloadLength)
+				fail streamError(frame.streamID, ErrorCode.StreamClosed, "DATA on a closed stream")
+			}
+			fail streamError(frame.streamID, ErrorCode.ProtocolError, "DATA before HEADERS") unless s.haveFields
+			fail streamError(frame.streamID, ErrorCode.StreamClosed, "DATA after END_STREAM") when s.endReceived
+			fail connError(ErrorCode.FlowControlError, "DATA exceeds the connection window") when frame.payloadLength > connRecvWindow
+			fail streamError(frame.streamID, ErrorCode.FlowControlError, "DATA exceeds the stream window") when frame.payloadLength > s.recvWindow
+			connRecvWindow -= frame.payloadLength
+			s.recvWindow -= frame.payloadLength
+			s.received += frame.data.len()
+			s.enqueue(frame.data) when frame.data.len() > 0
+			// Padding is consumed here and now.
+			let pad = frame.payloadLength - frame.data.len()
+			if pad > 0 {
+				s.unacked += pad
+				creditConn(pad)
+			}
+			if frame.endStream() {
+				s.endReceived = true
+				streamEndedLocked(s)
+			}
+			s.wake()
+			return none
+		}
+
+		// Credits connection-window bytes without a stream's consumption.
+		internal def creditConn(n int) {
+			connUnacked += n
+			return when connUnacked < connWindow / 2
+			framer.writeWindowUpdate(0, connUnacked) onerror recover none
+			connRecvWindow += connUnacked
+			connUnacked = 0
+		}
+
+		internal def onHeaders(frame Frame) !none {
+			let s = streams.get(frame.streamID)
+			if s is none {
+				fail connError(ErrorCode.ProtocolError, "HEADERS on a stream this client did not open") when isClient
+				fail connError(ErrorCode.ProtocolError, "client opened even stream {frame.streamID}") when frame.streamID % 2 == 0
+				fail connError(ErrorCode.ProtocolError, "stream {frame.streamID} is not above the last opened") when frame.streamID <= lastPeerStreamID
+				// Decoded even when refused, to keep the tables in step.
+				let fields = try decodeBlock(frame.data)
+				lastPeerStreamID = frame.streamID
+				if goAwaySent || active >= maxConcurrentStreams {
+					fail streamError(frame.streamID, ErrorCode.RefusedStream, "too many streams")
+				}
+				let opened = new Stream(self, frame.streamID, peerInitialWindow, initialWindow)
+				try acceptFields(opened, fields)
+				streams[frame.streamID] = opened
+				active++
+				opened.haveFields = true
+				if frame.endStream() {
+					opened.endReceived = true
+					opened.state = StreamState.HalfClosedRemote
+				}
+				let handler = onStream
+				if !(handler is none) {
+					let task = async runStream(handler, opened)
+					task.keepAlive()
+				}
+				return none
+			}
+			let fields = try decodeBlock(frame.data)
+			fail streamError(frame.streamID, ErrorCode.StreamClosed, "HEADERS after END_STREAM") when s.endReceived
+			if !s.haveFields {
+				// A client skips informational responses.
+				let status = valueOf(fields, ":status")
+				if isClient && status.startsWith("1") && status != "101" && !frame.endStream() {
+					return none
+				}
+				try acceptFields(s, fields)
+				s.haveFields = true
+			} else {
+				fail streamError(frame.streamID, ErrorCode.ProtocolError, "trailers without END_STREAM") unless frame.endStream()
+				for let f in fields {
+					fail streamError(frame.streamID, ErrorCode.ProtocolError, "pseudo-header in trailers") when f.name.startsWith(":")
+				}
+				s.trailers = fields
+				s.haveTrailers = true
+			}
+			if frame.endStream() {
+				s.endReceived = true
+				streamEndedLocked(s)
+			}
+			s.wake()
+			return none
+		}
+
+		// Runs the server callback for a stream; a failure resets it.
+		internal def runStream(handler def (s Stream) !none, s Stream) {
+			handler(s) onerror (err error) {
+				s.reset(ErrorCode.InternalError) onerror recover none
+				recover none
+			}
+		}
+
+		// Checks a header block against §8.3: pseudo-headers first, all
+		// names lower-case, no connection-specific fields, `te` only
+		// `trailers`, and the request pseudo-headers present once.
+		internal def acceptFields(s Stream, fields HeaderField[]) !none {
+			let seenRegular = false
+			let method = 0
+			let scheme = 0
+			let path = 0
+			let status = 0
+			for let f in fields {
+				let name = f.name
+				fail streamError(s.id, ErrorCode.ProtocolError, "empty header name") when name == ""
+				fail streamError(s.id, ErrorCode.ProtocolError, "header name is not lower-case: {name}") when name != name.lower()
+				if name.startsWith(":") {
+					fail streamError(s.id, ErrorCode.ProtocolError, "pseudo-header after a regular header") when seenRegular
+					match name {
+						case ":method":
+							method++
+						case ":scheme":
+							scheme++
+						case ":path":
+							path++
+							fail streamError(s.id, ErrorCode.ProtocolError, "empty :path") when f.value == ""
+						case ":authority":
+						case ":status":
+							status++
+						default:
+							fail streamError(s.id, ErrorCode.ProtocolError, "unknown pseudo-header {name}")
+					}
+					continue
+				}
+				seenRegular = true
+				fail streamError(s.id, ErrorCode.ProtocolError, "connection-specific header {name}") when name := "connection" || "keep-alive" || "proxy-connection" || "transfer-encoding" || "upgrade"
+				fail streamError(s.id, ErrorCode.ProtocolError, "te must be trailers") when name == "te" && f.value != "trailers"
+			}
+			if isClient {
+				fail streamError(s.id, ErrorCode.ProtocolError, "response without one :status") unless status == 1
+				fail streamError(s.id, ErrorCode.ProtocolError, "request pseudo-header in a response") when method + scheme + path > 0
+			} else {
+				fail streamError(s.id, ErrorCode.ProtocolError, ":status in a request") when status > 0
+				let connect = valueOf(fields, ":method") == "CONNECT"
+				if connect {
+					fail streamError(s.id, ErrorCode.ProtocolError, "CONNECT with :scheme or :path") when scheme + path > 0
+				} else {
+					fail streamError(s.id, ErrorCode.ProtocolError, "request needs one :method, :scheme and :path") unless method == 1 && scheme == 1 && path == 1
+				}
+			}
+			s.fields = fields
+			// A request's priority orders this side's DATA; a response's says
+			// what the server did with it and orders nothing here.
+			setPriority(s, joinedValues(fields, "priority")) unless isClient
+			return none
+		}
+
+		internal def decodeBlock(block byte[]) !HeaderField[] {
+			return decoder.decode(block) onerror (err error) {
+				fail err when err is Http2Error
+				fail connError(ErrorCode.CompressionError, err.message)
+			}
+		}
+
+		// Reports whether a stream identifier was opened at some point.
+		// Drops the DATA a stream still holds and credits the connection
+		// window for it, since no read will.
+		atomic def discard(s Stream) {
+			let left = 0 - s.offset
+			for let chunk in s.chunks {
+				left += chunk.len()
+			}
+			s.chunks = []
+			s.offset = 0
+			creditConn(left) when left > 0
+		}
+
+		internal def isKnown(id int) bool {
+			return id <= lastPeerStreamID when (id % 2 == 1) != isClient
+			return id < nextStreamID
+		}
+
+		// A stream sent END_STREAM from this side.
+		atomic def streamEnded(s Stream) {
+			streamEndedLocked(s)
+		}
+
+		internal def streamEndedLocked(s Stream) {
+			if s.endSent && s.endReceived {
+				finishStream(s)
+				return
+			}
+			s.state = s.endSent ?? (StreamState.HalfClosedLocal, StreamState.HalfClosedRemote)
+		}
+
+		// Takes a stream out of the table once it is done; a reserved
+		// client stream that never opened frees its slot the same way.
+		def finishStream(s Stream) {
+			return when s.state == StreamState.Closed
+			s.state = StreamState.Closed
+			streams.delete(s.id) when streams.hasKey(s.id)
+			served.delete(s.id) when served.hasKey(s.id)
+			if sending.hasKey(s.id) {
+				sending.delete(s.id)
+				wakeDeferred()
+			}
+			active--
+			idleSince = time.now() when active == 0
+			signal <- none when signal.len() == 0
+		}
+
+		internal def wakeStreams() {
+			for let (_, s) in streams {
+				s.wake()
+			}
+		}
+	}
+
+	// joinedValues is every value of a field in a list as one
+	// comma-separated list, "" when absent.
+	internal def joinedValues(fields HeaderField[], name string) string {
+		let values string[] = []
+		for let f in fields {
+			values.push(f.value) when f.name == name
+		}
+		return values.join(", ")
+	}
+
+	// priorityOf reads a `Priority` field value (RFC 9218 §4), a
+	// structured-field dictionary such as `u=5, i`, into urgency and
+	// incremental. It never fails: a member that is unknown, malformed or
+	// out of range leaves its default, 3 and false.
+	def priorityOf(value string) (int, bool) {
+		let urgency = 3
+		let incremental = false
+		for let member in value.split(",") {
+			// Parameters after `;` carry nothing defined.
+			let item = member.split(";")[0].trim()
+			let at = item.indexOf("=")
+			let name = at < 0 ?? (item, item[0:at].trim())
+			let text = at < 0 ?? ("", item[at + 1:].trim())
+			if name == "u" {
+				urgency = text.toInt<int>() when text.len() == 1 && text >= "0" && text <= "7"
+			}
+			if name == "i" {
+				incremental = true when text := "" || "?1"
+				incremental = false when text == "?0"
+			}
+		}
+		return (urgency, incremental)
+	}
+
+	// valueOf is a field's value in a list, "" when absent.
+	def valueOf(fields HeaderField[], name string) string {
+		for let f in fields {
+			return f.value when f.name == name
+		}
+		return ""
+	}
+}

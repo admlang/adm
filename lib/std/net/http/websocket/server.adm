@@ -1,0 +1,146 @@
+partial module std.net.http.websocket {
+	use (
+		std.bytes
+		std.data.encoding::(base64decode)
+		std.io
+		std.net
+		std.net.http::(Context, Handler, HandlerFunc, HttpError, Method, Request)
+		std.net.url
+	)
+
+	// Upgrader turns a server request into a WebSocket connection: it
+	// checks the upgrade headers, the origin and the protocol version,
+	// picks a subprotocol, hijacks the connection and answers `101`.
+	//
+	//     let ws = new Upgrader()
+	//     ws.subprotocols = ["chat"]
+	//     try mux.get("/ws", def (ctx Context) !none {
+	//         let conn = try ws.upgrade(ctx)
+	//         ...
+	//     })
+	type Upgrader {
+		// Subprotocols offered, in preference order; the first the client
+		// also lists is taken, none when nothing matches.
+		subprotocols    string[]                = []
+		// Decides whether a request's origin is allowed; none accepts a
+		// missing `Origin` and one whose host is the request's own.
+		checkOrigin     ?def (req Request) bool = none
+		// Applied to every connection upgraded.
+		readTimeout     duration                = 0s
+		writeTimeout    duration                = 10s
+		maxMessageSize  int                     = 32 * 1024 * 1024
+		// Agrees to permessage-deflate (RFC 7692) when the client offers it.
+		compression     bool                    = false
+		// With `compression`: each side keeps its compression context
+		// between messages unless the client's offer rules it out. Better
+		// ratios on small similar messages, 32 KiB of history held per
+		// connection.
+		contextTakeover bool                    = false
+
+		def new() {}
+
+		// upgrade checks the request and takes the connection over. On a
+		// request that is not a valid upgrade it answers 400 (or 403 for a
+		// refused origin, 426 with `Sec-WebSocket-Version: 13` for another
+		// version) and fails with WebSocketError Handshake; it also fails
+		// when the response was already committed or the hijack does.
+		def upgrade(ctx Context) !Conn {
+			let req = ctx.request
+			try refuse(ctx, 405, "method {req.method} is not GET") when req.method != Method.GET
+			try refuse(ctx, 400, "Connection header does not name upgrade") unless req.headers.hasToken("Connection", "upgrade")
+			try refuse(ctx, 400, "Upgrade header is not websocket") unless req.headers.hasToken("Upgrade", "websocket")
+			if req.headers.get("Sec-WebSocket-Version") != "13" {
+				ctx.setHeader("Sec-WebSocket-Version", "13")
+				try refuse(ctx, 426, "unsupported Sec-WebSocket-Version {req.headers.get("Sec - WebSocket - Version")}")
+			}
+			let key = req.headers.get("Sec-WebSocket-Key").trim()
+			let decoded = base64decode(key) onerror recover []
+			try refuse(ctx, 400, "Sec-WebSocket-Key is not 16 base64 bytes") when decoded.len() != 16
+			try refuse(ctx, 403, "origin {req.headers.get("Origin")} is not allowed") unless originAllowed(req)
+			let chosen = ""
+			let offered = req.headers.tokens("Sec-WebSocket-Protocol")
+			for let (_, candidate) in subprotocols {
+				continue when chosen != ""
+				chosen = candidate when offered.includes(candidate)
+			}
+			let (stream, buffered) = try ctx.hijack()
+			let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acceptKey(key) + "\r\n"
+			head = head + "Sec-WebSocket-Protocol: " + chosen + "\r\n" when chosen != ""
+			let (extension, serverKeeps, clientKeeps, windowBits) = compression ?? (acceptDeflate(req.headers.values("Sec-WebSocket-Extensions").join(",").split(","), contextTakeover), ("", false, false, 15))
+			head = head + "Sec-WebSocket-Extensions: " + extension + "\r\n" when extension != ""
+			head = head + "\r\n"
+			let bytes = head.bytes()
+			let written = 0
+			for written < bytes.len() {
+				let n = try stream.write(bytes[written:], writeTimeout)
+				fail wsError(ErrorKind.Handshake, "stream wrote nothing") when n <= 0
+				written += n
+			}
+			let conn = new Conn(stream, buffered, false)
+			conn.subprotocol = chosen
+			conn.compression = extension != ""
+			conn.sendContextTakeover = serverKeeps
+			conn.receiveContextTakeover = clientKeeps
+			conn.sendWindowBits = windowBits
+			conn.readTimeout = readTimeout
+			conn.writeTimeout = writeTimeout
+			conn.maxMessageSize = maxMessageSize
+			return conn
+		}
+
+		// originAllowed applies `checkOrigin`, or the same-origin rule.
+		internal def originAllowed(req Request) bool {
+			let allow = checkOrigin
+			return allow(req) unless allow is none
+			return sameOrigin(req)
+		}
+
+		// refuse answers the status with the reason, keeping the headers set
+		// so far (`Sec-WebSocket-Version` on a 426), and fails.
+		internal def refuse(ctx Context, status int, reason string) !none {
+			ctx.text(status, reason) onerror recover none
+			fail wsError(ErrorKind.Handshake, reason)
+		}
+	}
+
+	// sameOrigin reports whether the request has no `Origin`, or one whose
+	// host (with port) is the request's own host, compared case-insensitively.
+	def sameOrigin(req Request) bool {
+		let origin = req.headers.get("Origin")
+		return true when origin == ""
+		let parsed = url.parse(origin) onerror recover new url.URL()
+		return parsed.host.lower() == req.host.lower()
+	}
+
+	// handler is a route handler that upgrades every request and runs
+	// `serve` on the connection, closing it afterwards: with Normal when
+	// `serve` returns, with InternalError when it fails. A refused upgrade
+	// has already been answered, so it is not reported as a failure.
+	def handler(serve def (conn Conn) !none, upgrader ?Upgrader = none) Handler {
+		let ws = new Upgrader()
+		ws = upgrader unless upgrader is none
+		return new HandlerFunc(def (ctx Context) !none {
+			let failed = false
+			let conn = ws.upgrade(ctx) onerror (err error) {
+				failed = true
+				recover new Conn(new net.Connection(-1), new bytes.Reader([]), false)
+			}
+			return none when failed
+			let failure ?error = none
+			serve(conn) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is none {
+				conn.close() onerror recover none
+				return none
+			}
+			if failure is WebSocketError && failure.kind == ErrorKind.Closed {
+				conn.close() onerror recover none
+				return none
+			}
+			conn.close(CloseCode.InternalError, "handler failed") onerror recover none
+			fail failure
+		})
+	}
+}

@@ -1,5 +1,9 @@
 partial module std.services {
-	use std.net
+	use (
+		std.net
+		std.net.dns
+		std.time
+	)
 
 	// Describes an open socket. Only the descriptor for now.
 	struct SocketInfo {
@@ -7,10 +11,74 @@ partial module std.services {
 		fd int
 	}
 
+	internal def checkNameServerQuery(query byte[], server string) !none {
+		fail Error{message: "{server} is not a system name server", code: "EACCES"} unless dns.isSystemServer(server)
+		let message = try dns.decode(query)
+		fail Error{message: "not a DNS query", code: "EINVAL"} when message.response || message.questions.len() == 0
+		for let (_, question) in message.questions {
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", question.name)
+		}
+		return none
+	}
+
+	// One length-prefixed DNS message each way on a connected descriptor.
+	internal def nameServerRoundTrip(fd int, query byte[], timeout duration) !byte[] {
+		let frame byte[] = [byte(query.len() >> 8 & 0xff), byte(query.len() & 0xff)]
+		for let i = 0; i < query.len(); i++ {
+			frame.push(query[i])
+		}
+		let sent = 0
+		for sent < frame.len() {
+			let n = try __net_write(fd, frame[sent:], timeout)
+			fail Error{message: "name server accepts no more bytes", code: "EPIPE"} when n <= 0
+			sent += n
+		}
+		let head = try readExactly(fd, 2, timeout)
+		return try readExactly(fd, int(head[0]) << 8 | int(head[1]), timeout)
+	}
+
+	internal def readExactly(fd int, size int, timeout duration) !byte[] {
+		let out byte[] = []
+		out.len(size)
+		let got = 0
+		for got < size {
+			let n = try __net_read(fd, out[got:], timeout)
+			fail Error{message: "name server closed the connection inside a message", code: "ECONNRESET"} when n <= 0
+			got += n
+		}
+		return out
+	}
+
+	// candidates are the numeric endpoints to try for `host:port`: the
+	// endpoint itself when the host is an IP literal, empty, or a Unix socket
+	// path, else one per address the name resolves to.
+	internal def candidates(addr string) !string[] {
+		return [addr] when addr.startsWith("/")
+		let parsed = net.parseAddress(addr) onerror recover new net.Address()
+		return [addr] when parsed.host == "" || parsed.host.isIP()
+		let out string[]
+		for let (_, ip) in try Network.resolve(parsed.host) {
+			out.push(ip.contains(":") ?? ("[{ip}]:{parsed.port}", "{ip}:{parsed.port}"))
+		}
+		return out
+	}
+
+	// share is the part of the time left that one of `remaining` attempts
+	// may take, so an address that never answers leaves time for the next.
+	internal def share(left duration, remaining int) duration {
+		return left when remaining <= 1
+		let part = duration(int(left) / remaining)
+		return part < 2s ?? (left < 2s ?? (left, 2s), part)
+	}
+
 	// Opens, connects, reads and writes sockets on the application's behalf.
 	//
 	// Every call is checked against the network policy; `std.net` builds on it and is the
 	// usual way in.
+	// Methods that block on a descriptor (accept, connect, read, write, the
+	// datagram pair) are `@query`: a `@commit` holds the service lock, and a
+	// read parked in the netpoller would keep every other task out of the
+	// service until its timeout.
 	service Network {
 		description  = ""
 		dependencies = Dependencies{
@@ -110,17 +178,43 @@ partial module std.services {
 		// (`localAddr` tells which). An existing Unix socket path is not removed.
 		//
 		// Fails when the address does not parse, the policy denies it, or the operating system refuses, for example when the address is in use.
-		@commit(policy = "listen")
+		@query(policy = "listen")
 		def bind(fd int, addr Endpoint) !none {
-			return __net_bind(fd, addr.value())
+			let failure ?error = none
+			for let (_, candidate) in try candidates(addr.value()) {
+				failure = none
+				__net_bind(fd, candidate) onerror (err error) {
+					failure = err
+					recover none
+				}
+				return none when failure is none
+			}
+			fail failure unless failure is none
+			return none
 		}
 
 		// Connects a socket to a remote endpoint, waiting at most `timeout` for
 		// the handshake; a timeout fails with `ETIMEDOUT` and leaves the socket
 		// open for the caller to close or retry.
-		@commit(policy = "connect")
+		//
+		// A host name is resolved by `resolve` and its addresses are tried in
+		// turn. Fails when the name does not resolve, the policy denies the
+		// endpoint, or no address connects.
+		@query(policy = "connect")
 		def connect(fd int, addr Endpoint, timeout duration = 30s) !none {
-			return __net_connect(fd, addr.value(), timeout)
+			let started = time.now()
+			let targets = try candidates(addr.value())
+			let failure ?error = none
+			for let (i, candidate) in targets {
+				failure = none
+				__net_connect(fd, candidate, share(timeout - time.since(started), targets.len() - i)) onerror (err error) {
+					failure = err
+					recover none
+				}
+				return none when failure is none
+			}
+			fail failure unless failure is none
+			return none
 		}
 
 		// Accept a new connection from a listening stream socket FD.
@@ -129,7 +223,7 @@ partial module std.services {
 		// the returned FD and must close it.
 		//
 		// Fails when fd is not listening or the operating system refuses.
-		@commit(policy = "listen")
+		@query(policy = "listen")
 		def accept(fd int) !int {
 			return __net_accept(fd)
 		}
@@ -163,7 +257,7 @@ partial module std.services {
 		// "flush to peer" guarantee.
 		//
 		// Fails when fd is closed, the peer is gone, or the timeout passes.
-		@commit()
+		@query()
 		def write(fd int, data byte[], timeout duration = 30s) !int {
 			//bytesWrittenMetric.update(n)
 			return __net_write(fd, data, timeout)
@@ -176,21 +270,75 @@ partial module std.services {
 		// `timeout` bounds the wait for the FD to become readable.
 		//
 		// Fails when fd is closed or the timeout passes.
-		@commit()
+		@query()
 		def read(fd int, data byte[], timeout duration = 30s) !int {
 			//bytesReadMetric.update(n)
 			return __net_read(fd, data, timeout)
 		}
 
-		// Resolve a DNS name to IP literals (IPv4 and/or IPv6).
+		// Resolve a host name to IP literals (IPv4 and/or IPv6) through the
+		// `std.net.dns` resolver: the hosts file, then the system's name
+		// servers. An IP literal comes back as it is.
 		//
 		// The returned strings never include ports. For "host:port" parsing and
 		// socket endpoint construction, see `std.net.Address`.
 		//
-		// Fails when the name does not resolve.
-		@commit()
-		def resolve(dns string) !string[] {
-			return __net_resolve(dns)
+		// Fails when the name does not resolve or the policy denies connecting to it.
+		@query()
+		def resolve(name string) !string[] {
+			return dns.resolver().lookupHost(name) onerror (err error) {
+				fail Error{message: err.message, code: "dns", cause: err}
+			}
+		}
+
+		// The text of the system's resolver configuration (`/etc/resolv.conf`),
+		// "" when it cannot be read. Read without a storage permission: name
+		// resolution is part of connecting.
+		@query()
+		def resolverConfig() string {
+			let text = __fs_read_all("/etc/resolv.conf") onerror recover []
+			return string(text)
+		}
+
+		// The text of the system's hosts file (`/etc/hosts`), "" when it cannot
+		// be read. Read without a storage permission, as `resolverConfig` is.
+		@query()
+		def hostsFile() string {
+			let text = __fs_read_all("/etc/hosts") onerror recover []
+			return string(text)
+		}
+
+		// Sends a DNS query to one of the system's name servers from a datagram
+		// socket. The server is not checked against the `connect` policy, since
+		// resolving a name is part of connecting to it; the names the query asks
+		// about are, as hosts.
+		//
+		// Fails when `server` is not one of `dns.systemConfig().servers`, the
+		// bytes are not a DNS query, the policy denies one of its names, or the
+		// send is refused or times out.
+		@query()
+		def sendToNameServer(fd int, query byte[], server string, timeout duration = 5s) !int {
+			try checkNameServerQuery(query, server)
+			return __net_send_to(fd, query, server, timeout)
+		}
+
+		// Sends a DNS query to one of the system's name servers over TCP and
+		// returns the response, checked as `sendToNameServer` checks.
+		//
+		// Fails as `sendToNameServer` does, and when the connection fails, times
+		// out or closes before a whole response arrived.
+		@query()
+		def exchangeWithNameServer(query byte[], server string, timeout duration = 5s) !byte[] {
+			try checkNameServerQuery(query, server)
+			let fd = try __net_dial_stream(server, timeout)
+			let failure ?error = none
+			let response = nameServerRoundTrip(fd, query, timeout) onerror (err error) {
+				failure = err
+				recover []
+			}
+			__net_close(fd) onerror recover none
+			fail failure unless failure is none
+			return response
 		}
 
 		// Resolve + connect a stream socket and return a connected file descriptor.
@@ -199,18 +347,40 @@ partial module std.services {
 		// wrappers (`std.net.dialStream`, connection pools, etc.) can build on it.
 		//
 		// Fails when the name does not resolve, the policy denies it, or no address connects within the timeout.
-		@commit(policy = "connect")
+		@query(policy = "connect")
 		def dialStream(addr Endpoint, timeout duration = 30s) !int {
-			return __net_dial_stream(addr.value(), timeout)
+			let started = time.now()
+			let targets = try candidates(addr.value())
+			let failure ?error = none
+			for let (i, candidate) in targets {
+				let fd = -1
+				fd = __net_dial_stream(candidate, share(timeout - time.since(started), targets.len() - i)) onerror (err error) {
+					failure = err
+					recover -1
+				}
+				return fd when fd >= 0
+			}
+			fail failure unless failure is none
+			fail Error{message: "dial: no address to connect to", code: "EADDRNOTAVAIL"}
 		}
 
 		// Send a datagram to a remote address (UDP / Unix datagram).
 		//
 		// Returns the number of bytes sent. For datagrams this is usually either
 		// `data.len()` or an error.
-		@commit(policy = "connect")
+		@query(policy = "connect")
 		def sendTo(fd int, data byte[], addr Endpoint, timeout duration = 30s) !int {
-			return __net_send_to(fd, data, addr.value(), timeout)
+			let failure ?error = none
+			for let (_, candidate) in try candidates(addr.value()) {
+				failure = none
+				let n = __net_send_to(fd, data, candidate, timeout) onerror (err error) {
+					failure = err
+					recover -1
+				}
+				return n when failure is none
+			}
+			fail failure unless failure is none
+			fail Error{message: "send: no address to send to", code: "EADDRNOTAVAIL"}
 		}
 
 		// Receive a datagram and return the byte count and sender address string.
@@ -219,7 +389,7 @@ partial module std.services {
 		// `std.net.Address.parse`.
 		//
 		// Fails when fd is closed or the timeout passes.
-		@commit()
+		@query()
 		def recvFrom(fd int, data byte[], timeout duration = 30s) !(int, string) {
 			return __net_recv_from(fd, data, timeout)
 		}
@@ -296,6 +466,36 @@ partial module std.services {
 		@commit()
 		def setSendBuf(fd int, bytes int) !none {
 			return __net_set_sendbuf(fd, bytes)
+		}
+
+		// Joins a multicast group on a datagram socket, so that what is sent
+		// to the group reaches it: `224.0.0.251`, `ff02::fb`. `iface` names
+		// the interface by its address (IPv4) or its name (IPv6); empty
+		// leaves the choice to the system's routing.
+		//
+		// Fails when the address is no multicast group, the interface does
+		// not exist or has no multicast, or the system refuses.
+		@commit()
+		def joinGroup(fd int, group string, iface string = "") !none {
+			return __net_join_group(fd, group, iface, true)
+		}
+
+		// Leaves a multicast group joined with `joinGroup`.
+		//
+		// Fails when the socket is no member of the group.
+		@commit()
+		def leaveGroup(fd int, group string, iface string = "") !none {
+			return __net_join_group(fd, group, iface, false)
+		}
+
+		// Sets how many hops what the socket sends to a multicast group may
+		// travel (1 stays on the link, which is the system's default), and
+		// whether this host's own members of the group get it too.
+		//
+		// Fails when the operating system rejects the option for this socket.
+		@commit()
+		def setMulticast(fd int, ttl int = 1, loop bool = true) !none {
+			return __net_set_multicast(fd, ttl, loop)
 		}
 
 		// Sets an integer socket option by its `setsockopt` level and name, for

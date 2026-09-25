@@ -1,0 +1,234 @@
+partial module std.net.dns {
+	use std.time
+
+	// Secondary keeps a copy of a zone a primary server holds and answers
+	// from it. `start` transfers the zone; after that the primary's SOA
+	// serial is asked for every `refresh` (every `retry` after a failure)
+	// and the zone is transferred again when the primary is ahead. A
+	// NOTIFY (RFC 1996) for the zone brings that check forward. A copy
+	// that could not be refreshed for the SOA `expire` time is no longer
+	// served. A refresh asks for the changes since the copy's serial
+	// (IXFR), which a primary that remembers them answers with those alone;
+	// the first transfer is whole (AXFR), and so is one after an
+	// incremental transfer that failed.
+	//
+	// ```
+	// let copy = new dns.Secondary("example.test", "192.0.2.53")
+	// try copy.start()
+	// let server = new dns.Server("0.0.0.0:53", copy)
+	// try server.listenAndServe()
+	// ```
+	type Secondary {
+		// The zone, in canonical form.
+		origin        string
+		// The server the zone comes from, as `host` or `host:port`.
+		primary       string
+		// Asks the primary; set its timeout, or `tcp`, here.
+		client        Client
+		// Seconds between serial checks, after a failed one, and until the
+		// copy expires; 0s takes the value of the zone's SOA record.
+		refresh       duration     = 0s
+		retry         duration     = 0s
+		expire        duration     = 0s
+		// Who may transfer the copy from this server, as `Zone.allowTransfer`.
+		allowTransfer string[]     = []
+		// Whose dynamic updates are sent on to the primary (RFC 2136 §6), in
+		// the same forms; nobody's when empty. The primary sees this server
+		// as the sender, so it lists this server's address or the key of
+		// `client`, and it decides about the update itself.
+		allowUpdate   string[]     = []
+		// Called with every failed check or transfer in the background.
+		onError       ?def (error) = none
+
+		internal held            ?Zone     = none
+		internal atomic running  bool      = false
+		internal atomic failed   bool      = false
+		internal atomic notified bool      = false
+		internal checkedAt       time.Time = time.now()
+		internal goodAt          time.Time = time.now()
+
+		def new(origin string, primary string) {
+			self.origin = canonicalName(origin)
+			self.primary = primary
+			self.client = new Client([primary])
+			self.client.useHosts = false
+		}
+
+		// start transfers the zone and keeps it fresh in the background; a
+		// second call does nothing.
+		// Fails as `Client.transfer` does when the first transfer fails.
+		def start() !none {
+			return none when running
+			try pull()
+			running = true
+			let task = async keep()
+			task.keepAlive()
+			return none
+		}
+
+		// close stops refreshing; the copy is served as long as it lasts.
+		def close() {
+			running = false
+		}
+
+		// zone is the copy held now, none before the first transfer.
+		atomic def zone() ?Zone {
+			return held
+		}
+
+		// serial is the SOA serial of the copy, -1 without one.
+		def serial() int {
+			let copy = zone()
+			return -1 when copy is none
+			return serialOf(copy)
+		}
+
+		// refreshNow brings the copy up to the primary's zone, which costs
+		// one SOA record when the primary is not ahead; it reports whether
+		// the copy changed.
+		// Fails as `Client.transfer` does.
+		def refreshNow() !bool {
+			let failure ?error = none
+			let replaced = sync() onerror (err error) {
+				failure = err
+				recover false
+			}
+			checkedAt = time.now()
+			failed = !(failure is none)
+			fail failure unless failure is none
+			goodAt = time.now()
+			return replaced
+		}
+
+		// Implements Handler: a query is answered from the copy,
+		// ServerFailure without one or when it expired. A NOTIFY for the
+		// zone is acknowledged and brings the next serial check forward,
+		// whoever sent it, since the check itself only ever asks `primary`.
+		// A dynamic update from a client `allowUpdate` lists goes to the
+		// primary, whose answer code comes back; an accepted one brings the
+		// next serial check forward too.
+		// Fails as `Zone.serve` does, and as `Client.update` does when the
+		// primary cannot be reached.
+		def serve(request Request) !Message {
+			let query = request.message
+			if query.opcode == Opcode.Notify {
+				let question = query.question()
+				return query.reply(RCode.FormatError) when question is none
+				return query.reply(RCode.NotAuth) when canonicalName(question.name) != origin
+				notified = true
+				let ack = query.reply()
+				ack.authoritative = true
+				return ack
+			}
+			if query.opcode == Opcode.Update {
+				let question = query.question()
+				return query.reply(RCode.FormatError) when question is none
+				return query.reply(RCode.NotAuth) when canonicalName(question.name) != origin
+				let byKey = keyListed(request.key, allowUpdate)
+				return query.reply(RCode.Refused) unless byKey || (request.tcp && listed(request.remote, allowUpdate))
+				query.tsig = none
+				let answer = try client.update(query, primary)
+				notified = true when answer.rcode == RCode.Success
+				return query.reply(answer.rcode)
+			}
+			let copy = zone()
+			return query.reply(RCode.ServerFailure) when copy is none
+			return query.reply(RCode.ServerFailure) when time.since(goodAt) > lifetime(copy)
+			return try copy.serve(request)
+		}
+
+		internal def sync() !bool {
+			let copy = zone()
+			if !(copy is none) {
+				let failure ?error = none
+				let changed = client.transfer(copy, primary) onerror (err error) {
+					failure = err
+					recover false
+				}
+				return changed when failure is none
+			}
+			try pull()
+			return true
+		}
+
+		internal def pull() !none {
+			let copy = try client.transfer(origin, primary)
+			copy.allowTransfer = allowTransfer
+			replace(copy)
+			goodAt = time.now()
+			checkedAt = time.now()
+			failed = false
+			return none
+		}
+
+		internal atomic def replace(copy Zone) {
+			held = copy
+		}
+
+		internal def keep() {
+			for running {
+				time.sleep(100ms)
+				continue unless notified || time.since(checkedAt) >= interval()
+				notified = false
+				let failure ?error = none
+				refreshNow() onerror (err error) {
+					failure = err
+					recover false
+				}
+				let hook = onError
+				continue when failure is none || hook is none
+				hook(failure)
+			}
+		}
+
+		// interval is how long to wait for the next serial check.
+		internal def interval() duration {
+			let wanted = failed ?? (retry, refresh)
+			return wanted when wanted > 0s
+			let copy = zone()
+			let seconds = failed ?? (600, 3600)
+			if !(copy is none) {
+				for let (_, r) in copy.find(origin, RecordType.SOA) {
+					let soa = r.soa
+					continue when soa is none
+					seconds = failed ?? (soa.retry, soa.refresh)
+				}
+			}
+			return duration((seconds < 1 ?? (1, seconds)) * 1000000000)
+		}
+
+		// lifetime is how long the copy may be served without a refresh.
+		internal def lifetime(copy Zone) duration {
+			return expire when expire > 0s
+			let seconds = 604800
+			for let (_, r) in copy.find(origin, RecordType.SOA) {
+				let soa = r.soa
+				continue when soa is none
+				seconds = soa.expire
+			}
+			return duration(seconds * 1000000000)
+		}
+
+		// Stops refreshing when the last reference is released.
+		def dispose() {
+			close()
+		}
+	}
+
+	// serialOf is the SOA serial of the zone, -1 when it has no SOA record.
+	def serialOf(zone Zone) int {
+		for let (_, r) in zone.find(zone.origin, RecordType.SOA) {
+			let soa = r.soa
+			continue when soa is none
+			return soa.serial
+		}
+		return -1
+	}
+
+	// serialAhead reports whether the serial `theirs` is newer than `ours`
+	// in the wrapping arithmetic of RFC 1982.
+	def serialAhead(theirs int, ours int) bool {
+		return false when theirs == ours
+		return ((theirs - ours) & 0xffffffff) < 0x80000000
+	}
+}

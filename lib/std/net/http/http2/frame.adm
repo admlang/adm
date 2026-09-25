@@ -1,0 +1,477 @@
+partial module std.net.http.http2 {
+	use std.io
+
+	// END_STREAM on DATA and HEADERS (§6).
+	const flagEndStream = 0x1
+	// ACK on SETTINGS and PING; the same bit as END_STREAM.
+	const flagAck = 0x1
+	// END_HEADERS on HEADERS, PUSH_PROMISE and CONTINUATION.
+	const flagEndHeaders = 0x4
+	// PADDED on DATA, HEADERS and PUSH_PROMISE.
+	const flagPadded = 0x8
+	// PRIORITY on HEADERS.
+	const flagPriority = 0x20
+
+	// The 9-octet frame header.
+	internal const frameHeaderLen = 9
+
+	// Priority is the dependency a HEADERS or PRIORITY frame carries
+	// (§5.3): deprecated in RFC 9113, decoded and otherwise ignored.
+	struct Priority {
+		streamDependency int
+		exclusive        bool
+		// 1 to 256 (the wire value plus one).
+		weight           int
+	}
+
+	// Frame is one frame decoded, the fields of its kind filled: `data`
+	// is the DATA payload, the header block of HEADERS and PUSH_PROMISE
+	// with every CONTINUATION joined, PING's opaque octets or GOAWAY's
+	// debug data. A frame of a type this side does not know comes back
+	// as `Unknown` with its payload, to be ignored.
+	type Frame {
+		kind             FrameType
+		flags            int       = 0
+		streamID         int       = 0
+		data             byte[]    = []
+		settings         Setting[] = []
+		errorCode        ErrorCode = ErrorCode.NoError
+		lastStreamID     int       = 0
+		windowIncrement  int       = 0
+		priority         ?Priority = none
+		promisedStreamID int       = 0
+		// The wire type of an `Unknown` frame.
+		rawType          int       = 0
+		// The payload length on the wire, padding included: what flow
+		// control charges for a DATA frame.
+		payloadLength    int       = 0
+
+		def new(kind FrameType, streamID int, flags int = 0) {
+			self.kind = kind
+			self.streamID = streamID
+			self.flags = flags
+		}
+
+		// END_STREAM on DATA or HEADERS.
+		def endStream() bool {
+			return (kind := FrameType.Data || FrameType.Headers) && (flags & flagEndStream) != 0
+		}
+
+		// ACK on SETTINGS or PING.
+		def ack() bool {
+			return (kind := FrameType.Settings || FrameType.Ping) && (flags & flagAck) != 0
+		}
+
+		// The kind, flags and stream for logs.
+		def str() string {
+			return "{kind} flags=0x{flags.hex()} stream={streamID} len={data.len()}"
+		}
+	}
+
+	// Framer reads and writes frames on a connection (§4). Reads validate
+	// what the RFC makes a connection or stream error: the frame size
+	// against `maxReadFrameSize`, zero and non-zero stream identifiers
+	// per type, padding, fixed payload lengths, a HEADERS block that a
+	// CONTINUATION on another stream or another frame interrupts. A
+	// HEADERS or PUSH_PROMISE comes back whole: `readFrame` collects its
+	// CONTINUATIONs, at most `maxHeaderBlockBytes` together. Writes
+	// split a header block at `maxWriteFrameSize` and are atomic, so
+	// several tasks may write.
+	type Framer {
+		reader                     io.Reader
+		writer                     io.Writer
+		// SETTINGS_MAX_FRAME_SIZE this side announced: the largest
+		// payload accepted.
+		maxReadFrameSize           int       = defaultMaxFrameSize
+		// The peer's SETTINGS_MAX_FRAME_SIZE: the largest payload sent.
+		maxWriteFrameSize          int       = defaultMaxFrameSize
+		// The largest joined header block accepted.
+		maxHeaderBlockBytes        int       = 1024 * 1024
+		// Frames read and written, for diagnostics.
+		framesRead                 int       = 0
+		framesWritten              int       = 0
+		// True while `readFrame` is collecting a header block, the only
+		// time a CONTINUATION is legal.
+		internal allowContinuation bool      = false
+
+		def new(reader io.Reader, writer io.Writer) {
+			self.reader = reader
+			self.writer = writer
+		}
+
+		// Reads the next frame. Fails with Http2Error on a protocol
+		// violation, or with the reader's error (an `io` end of stream
+		// between frames is reported as a NetError by the stream).
+		def readFrame() !Frame {
+			let frame = try readOne()
+			return frame unless frame.kind := FrameType.Headers || FrameType.PushPromise
+			return frame when (frame.flags & flagEndHeaders) != 0
+			// Collect the CONTINUATION frames of the block.
+			let block = frame.data
+			allowContinuation = true
+			for {
+				let next = readOne() onerror (err error) {
+					allowContinuation = false
+					fail err
+				}
+				fail connError(ErrorCode.ProtocolError, "expected CONTINUATION on stream {frame.streamID}, got {next.kind} on stream {next.streamID}") unless next.kind == FrameType.Continuation && next.streamID == frame.streamID
+				block += next.data
+				fail connError(ErrorCode.EnhanceYourCalm, "header block exceeds {maxHeaderBlockBytes} bytes") when block.len() > maxHeaderBlockBytes
+				break when (next.flags & flagEndHeaders) != 0
+			}
+			allowContinuation = false
+			frame.data = block
+			frame.flags |= flagEndHeaders
+			return frame
+		}
+
+		// Reads one frame off the wire without joining continuations.
+		internal def readOne() !Frame {
+			let head byte[]
+			head.len(frameHeaderLen)
+			try io.readFull(reader, head)
+			let length = int(head[0]) << 16 | int(head[1]) << 8 | int(head[2])
+			let rawType = int(head[3])
+			let flags = int(head[4])
+			let streamID = readUint31(head, 5)
+			fail connError(ErrorCode.FrameSizeError, "frame of {length} bytes exceeds the {maxReadFrameSize}-byte limit") when length > maxReadFrameSize
+			let payload byte[]
+			payload.len(length)
+			try io.readFull(reader, payload) when length > 0
+			framesRead++
+			if rawType == int(FrameType.PriorityUpdate) {
+				let update = new Frame(FrameType.PriorityUpdate, streamID, flags)
+				update.data = payload
+				update.payloadLength = length
+				return update
+			}
+			if rawType > 9 {
+				let unknown = new Frame(FrameType.Unknown, streamID, flags)
+				unknown.rawType = rawType
+				unknown.data = payload
+				return unknown
+			}
+			let kind = frameTypeOf(rawType)
+			let frame = new Frame(kind, streamID, flags)
+			frame.payloadLength = length
+			match kind {
+				case FrameType.Data:
+					fail connError(ErrorCode.ProtocolError, "DATA frame on stream 0") when streamID == 0
+					frame.data = try unpad(payload, flags, 0)
+				case FrameType.Headers:
+					fail connError(ErrorCode.ProtocolError, "HEADERS frame on stream 0") when streamID == 0
+					let body = try unpad(payload, flags, (flags & flagPriority) != 0 ?? (5, 0))
+					if (flags & flagPriority) != 0 {
+						let prio = decodePriority(body, 0)
+						fail streamError(streamID, ErrorCode.ProtocolError, "stream depends on itself") when prio.streamDependency == streamID
+						frame.priority = prio
+						body = body.slice(5, body.len() - 5)
+					}
+					frame.data = body
+				case FrameType.Priority:
+					fail connError(ErrorCode.ProtocolError, "PRIORITY frame on stream 0") when streamID == 0
+					fail streamError(streamID, ErrorCode.FrameSizeError, "PRIORITY frame of {length} bytes") unless length == 5
+					let prio = decodePriority(payload, 0)
+					fail streamError(streamID, ErrorCode.ProtocolError, "stream depends on itself") when prio.streamDependency == streamID
+					frame.priority = prio
+				case FrameType.RstStream:
+					fail connError(ErrorCode.ProtocolError, "RST_STREAM frame on stream 0") when streamID == 0
+					fail connError(ErrorCode.FrameSizeError, "RST_STREAM frame of {length} bytes") unless length == 4
+					frame.errorCode = errorCodeOf(readUint32(payload, 0))
+				case FrameType.Settings:
+					fail connError(ErrorCode.ProtocolError, "SETTINGS frame on stream {streamID}") unless streamID == 0
+					fail connError(ErrorCode.FrameSizeError, "SETTINGS frame of {length} bytes") unless length % 6 == 0
+					fail connError(ErrorCode.FrameSizeError, "SETTINGS ACK with a payload") when (flags & flagAck) != 0 && length > 0
+					frame.settings = try decodeSettings(payload)
+				case FrameType.PushPromise:
+					fail connError(ErrorCode.ProtocolError, "PUSH_PROMISE frame on stream 0") when streamID == 0
+					let body = try unpad(payload, flags, 4)
+					frame.promisedStreamID = readUint31(body, 0)
+					frame.data = body.slice(4, body.len() - 4)
+				case FrameType.Ping:
+					fail connError(ErrorCode.ProtocolError, "PING frame on stream {streamID}") unless streamID == 0
+					fail connError(ErrorCode.FrameSizeError, "PING frame of {length} bytes") unless length == 8
+					frame.data = payload
+				case FrameType.GoAway:
+					fail connError(ErrorCode.ProtocolError, "GOAWAY frame on stream {streamID}") unless streamID == 0
+					fail connError(ErrorCode.FrameSizeError, "GOAWAY frame of {length} bytes") when length < 8
+					frame.lastStreamID = readUint31(payload, 0)
+					frame.errorCode = errorCodeOf(readUint32(payload, 4))
+					frame.data = payload.slice(8, length - 8)
+				case FrameType.WindowUpdate:
+					fail connError(ErrorCode.FrameSizeError, "WINDOW_UPDATE frame of {length} bytes") unless length == 4
+					let increment = readUint31(payload, 0)
+					if increment == 0 {
+						fail connError(ErrorCode.ProtocolError, "WINDOW_UPDATE of 0") when streamID == 0
+						fail streamError(streamID, ErrorCode.ProtocolError, "WINDOW_UPDATE of 0")
+					}
+					frame.windowIncrement = increment
+				case FrameType.Continuation:
+					fail connError(ErrorCode.ProtocolError, "CONTINUATION frame on stream 0") when streamID == 0
+					fail connError(ErrorCode.ProtocolError, "CONTINUATION without a HEADERS before it") unless allowContinuation
+					frame.data = payload
+				default:
+					frame.data = payload
+			}
+			return frame
+		}
+
+		// Writes a DATA frame; `padding` bytes of zero padding when above 0.
+		// Fails when the connection write does, or the payload exceeds the
+		// peer's frame size.
+		atomic def writeData(streamID int, endStream bool, data byte[], padding int = 0) !none {
+			let flags = endStream ?? (flagEndStream, 0)
+			return try writeRaw(FrameType.Data, streamID, flags, data) when padding <= 0
+			return try writeRaw(FrameType.Data, streamID, flags | flagPadded, padded(data, padding))
+		}
+
+		// Writes a header block as HEADERS and the CONTINUATION frames it
+		// needs at `maxWriteFrameSize`. Fails when the connection write does.
+		atomic def writeHeaders(streamID int, endStream bool, block byte[], priority ?Priority = none) !none {
+			let flags = endStream ?? (flagEndStream, 0)
+			let first byte[] = []
+			if !(priority is none) {
+				flags |= flagPriority
+				first = encodePriority(priority)
+			}
+			return try writeBlock(FrameType.Headers, streamID, flags, first, block)
+		}
+
+		// Writes a PUSH_PROMISE and its CONTINUATION frames. Fails when the
+		// connection write does.
+		atomic def writePushPromise(streamID int, promisedID int, block byte[]) !none {
+			let first byte[]
+			first.len(4)
+			putUint32(first, 0, promisedID)
+			return try writeBlock(FrameType.PushPromise, streamID, 0, first, block)
+		}
+
+		internal def writeBlock(kind FrameType, streamID int, flags int, prefix byte[], block byte[]) !none {
+			let room = maxWriteFrameSize - prefix.len()
+			return try writeRaw(kind, streamID, flags | flagEndHeaders, prefix + block) when block.len() <= room
+			try writeRaw(kind, streamID, flags, prefix + block.slice(0, room))
+			let at = room
+			for at < block.len() {
+				let n = block.len() - at
+				n = maxWriteFrameSize when n > maxWriteFrameSize
+				let last = at + n >= block.len()
+				try writeRaw(FrameType.Continuation, streamID, last ?? (flagEndHeaders, 0), block.slice(at, n))
+				at += n
+			}
+			return none
+		}
+
+		// Writes a PRIORITY frame. Fails when the connection write does.
+		atomic def writePriority(streamID int, priority Priority) !none {
+			return try writeRaw(FrameType.Priority, streamID, 0, encodePriority(priority))
+		}
+
+		// Writes a RST_STREAM frame. Fails when the connection write does.
+		atomic def writeRstStream(streamID int, code ErrorCode) !none {
+			let out byte[]
+			out.len(4)
+			putUint32(out, 0, int(code))
+			return try writeRaw(FrameType.RstStream, streamID, 0, out)
+		}
+
+		// Writes a SETTINGS frame with the parameters given. Fails when the
+		// connection write does.
+		atomic def writeSettings(settings Setting[]) !none {
+			let out byte[]
+			for let s in settings {
+				out.push(byte(s.id >> 8))
+				out.push(byte(s.id & 0xff))
+				let v byte[]
+				v.len(4)
+				putUint32(v, 0, s.value)
+				out += v
+			}
+			return try writeRaw(FrameType.Settings, 0, 0, out)
+		}
+
+		// Writes an empty SETTINGS frame with ACK. Fails when the connection
+		// write does.
+		atomic def writeSettingsAck() !none {
+			return try writeRaw(FrameType.Settings, 0, flagAck, [])
+		}
+
+		// Writes a PING with eight opaque bytes, as a request or an ACK.
+		// Fails when the connection write does.
+		atomic def writePing(ack bool, data byte[]) !none {
+			let payload = data.clone()
+			payload.len(8)
+			return try writeRaw(FrameType.Ping, 0, ack ?? (flagAck, 0), payload)
+		}
+
+		// Writes a PRIORITY_UPDATE (RFC 9218 §7.1): the stream it is about
+		// and the new `Priority` field value. Fails when the connection
+		// write does.
+		atomic def writePriorityUpdate(streamID int, value string) !none {
+			let out byte[]
+			out.len(4)
+			putUint32(out, 0, streamID & 0x7fffffff)
+			return try writeRaw(FrameType.PriorityUpdate, 0, 0, out + value.bytes())
+		}
+
+		// Writes a GOAWAY frame. Fails when the connection write does.
+		atomic def writeGoAway(lastStreamID int, code ErrorCode, debug byte[] = []) !none {
+			let out byte[]
+			out.len(8)
+			putUint32(out, 0, lastStreamID & 0x7fffffff)
+			putUint32(out, 4, int(code))
+			return try writeRaw(FrameType.GoAway, 0, 0, out + debug)
+		}
+
+		// Writes a WINDOW_UPDATE; stream 0 is the connection window. Fails
+		// when the connection write does.
+		atomic def writeWindowUpdate(streamID int, increment int) !none {
+			let out byte[]
+			out.len(4)
+			putUint32(out, 0, increment & 0x7fffffff)
+			return try writeRaw(FrameType.WindowUpdate, streamID, 0, out)
+		}
+
+		// Writes a frame of any type, as one write. Fails when the connection
+		// write does, or the payload exceeds the peer's frame size.
+		atomic def writeFrame(kind FrameType, streamID int, flags int, payload byte[]) !none {
+			return try writeRaw(kind, streamID, flags, payload)
+		}
+
+		internal def writeRaw(kind FrameType, streamID int, flags int, payload byte[]) !none {
+			let length = payload.len()
+			fail connError(ErrorCode.FrameSizeError, "frame of {length} bytes exceeds the peer's {maxWriteFrameSize}-byte limit") when length > maxWriteFrameSize
+			let out byte[]
+			out.len(frameHeaderLen)
+			out[0] = byte(length >> 16)
+			out[1] = byte((length >> 8) & 0xff)
+			out[2] = byte(length & 0xff)
+			out[3] = byte(int(kind))
+			out[4] = byte(flags)
+			putUint32(out, 5, streamID & 0x7fffffff)
+			try writeAll(writer, out + payload)
+			framesWritten++
+			return none
+		}
+	}
+
+	// writeAll writes every byte, looping over short writes.
+	internal def writeAll(w io.Writer, data byte[]) !none {
+		let at = 0
+		for at < data.len() {
+			let n = try w.write(data.slice(at, data.len() - at))
+			fail connError(ErrorCode.InternalError, "short write") when n <= 0
+			at += n
+		}
+		return none
+	}
+
+	// unpad strips the PADDED layout: a length byte, `prefix` fixed bytes
+	// the caller keeps, the body, and the padding. Fails with a
+	// PROTOCOL_ERROR when the padding does not fit (§6.1).
+	internal def unpad(payload byte[], flags int, prefix int) !byte[] {
+		if (flags & flagPadded) == 0 {
+			fail connError(ErrorCode.FrameSizeError, "frame shorter than its fixed fields") when payload.len() < prefix
+			return payload
+		}
+		fail connError(ErrorCode.ProtocolError, "padded frame without a pad length") when payload.len() == 0
+		let padLen = int(payload[0])
+		fail connError(ErrorCode.ProtocolError, "padding of {padLen} bytes exceeds the payload") when padLen + 1 + prefix > payload.len()
+		return payload.slice(1, payload.len() - 1 - padLen)
+	}
+
+	// padded prepends the pad length and appends the zero padding.
+	internal def padded(data byte[], padding int) byte[] {
+		let n = padding > 255 ?? (255, padding)
+		let tail byte[]
+		tail.len(n)
+		return byte[byte(n)] + data + tail
+	}
+
+	// decodePriority reads the five priority bytes at an offset.
+	internal def decodePriority(buf byte[], at int) Priority {
+		let raw = readUint32(buf, at)
+		return Priority{streamDependency: raw & 0x7fffffff, exclusive: (raw & 0x80000000) != 0, weight: int(buf[at + 4]) + 1}
+	}
+
+	// encodePriority is the wire form of a priority.
+	internal def encodePriority(p Priority) byte[] {
+		let out byte[]
+		out.len(5)
+		let raw = p.streamDependency & 0x7fffffff
+		raw |= 0x80000000 when p.exclusive
+		putUint32(out, 0, raw)
+		let weight = p.weight - 1
+		weight = 0 when weight < 0
+		weight = 255 when weight > 255
+		out[4] = byte(weight)
+		return out
+	}
+
+	// decodeSettings parses SETTINGS pairs, checking the values §6.5.2
+	// bounds: ENABLE_PUSH 0 or 1, INITIAL_WINDOW_SIZE at most 2^31-1
+	// (FLOW_CONTROL_ERROR), MAX_FRAME_SIZE within 2^14 to 2^24-1.
+	internal def decodeSettings(payload byte[]) !Setting[] {
+		let out Setting[]
+		for let at = 0; at + 6 <= payload.len(); at += 6 {
+			let id = int(payload[at]) << 8 | int(payload[at + 1])
+			let value = readUint32(payload, at + 2)
+			match id {
+				case 2:
+					fail connError(ErrorCode.ProtocolError, "ENABLE_PUSH of {value}") unless value := 0 || 1
+				case 4:
+					fail connError(ErrorCode.FlowControlError, "INITIAL_WINDOW_SIZE of {value}") when value > maxWindowSize
+				case 5:
+					fail connError(ErrorCode.ProtocolError, "MAX_FRAME_SIZE of {value}") when value < defaultMaxFrameSize || value > maxAllowedFrameSize
+				default:
+			}
+			out.push(Setting{id: id, value: value})
+		}
+		return out
+	}
+
+	// frameTypeOf maps a wire type 0 to 9 to the enum.
+	internal def frameTypeOf(raw int) FrameType {
+		match raw {
+			case 0:
+				return FrameType.Data
+			case 1:
+				return FrameType.Headers
+			case 2:
+				return FrameType.Priority
+			case 3:
+				return FrameType.RstStream
+			case 4:
+				return FrameType.Settings
+			case 5:
+				return FrameType.PushPromise
+			case 6:
+				return FrameType.Ping
+			case 7:
+				return FrameType.GoAway
+			case 8:
+				return FrameType.WindowUpdate
+			case 9:
+				return FrameType.Continuation
+			default:
+				return FrameType.Unknown
+		}
+	}
+
+	// readUint32 reads a big-endian 32-bit value at an offset.
+	internal def readUint32(buf byte[], at int) int {
+		return int(buf[at]) << 24 | int(buf[at + 1]) << 16 | int(buf[at + 2]) << 8 | int(buf[at + 3])
+	}
+
+	// readUint31 reads a 32-bit value with its reserved high bit cleared.
+	internal def readUint31(buf byte[], at int) int {
+		return readUint32(buf, at) & 0x7fffffff
+	}
+
+	// putUint32 writes a big-endian 32-bit value at an offset.
+	internal def putUint32(buf byte[], at int, value int) {
+		buf[at] = byte((value >> 24) & 0xff)
+		buf[at + 1] = byte((value >> 16) & 0xff)
+		buf[at + 2] = byte((value >> 8) & 0xff)
+		buf[at + 3] = byte(value & 0xff)
+	}
+}

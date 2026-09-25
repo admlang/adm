@@ -1,0 +1,274 @@
+partial module std.net.http {
+	use (
+		std.bytes
+		std.net
+		std.net.url
+		std.net.url::(URL)
+		std.time
+	)
+
+	// Proxy names the proxy a request goes through, or none for a direct
+	// connection. `Transport` tunnels https through it with `CONNECT`,
+	// sends http requests to it in absolute form, and dials through a
+	// `socks5://` proxy with SOCKS5 (RFC 1928, username/password auth).
+	// The proxy URL's user info becomes `Proxy-Authorization: Basic`.
+	interface Proxy {
+		// Fails when the proxy setting for the request cannot be parsed.
+		def proxyFor(req Request) !?URL
+	}
+
+	// The proxy environment, read once when the process starts.
+	@env("HTTP_PROXY")
+	internal const envHTTPProxy string
+
+	@env("http_proxy")
+	internal const envHTTPProxyLower string
+
+	@env("HTTPS_PROXY")
+	internal const envHTTPSProxy string
+
+	@env("https_proxy")
+	internal const envHTTPSProxyLower string
+
+	@env("ALL_PROXY")
+	internal const envAllProxy string
+
+	@env("all_proxy")
+	internal const envAllProxyLower string
+
+	@env("NO_PROXY")
+	internal const envNoProxy string
+
+	@env("no_proxy")
+	internal const envNoProxyLower string
+
+	// EnvironmentProxy reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+	// `NO_PROXY` (and their lowercase forms) once, the way curl and Go
+	// do: `NO_PROXY` is a comma list of hosts, domain suffixes
+	// (`.example.com`), IPs and CIDR blocks, or `*` for everything;
+	// `localhost` and loopback never go through a proxy.
+	type EnvironmentProxy {
+		httpProxy  ?URL     = none
+		httpsProxy ?URL     = none
+		noProxy    string[] = []
+
+		def new() {
+			let all = firstSet(envAllProxy, envAllProxyLower)
+			httpProxy = parseProxyURL(firstSet(envHTTPProxy, envHTTPProxyLower, all))
+			httpsProxy = parseProxyURL(firstSet(envHTTPSProxy, envHTTPSProxyLower, all))
+			for let entry in firstSet(envNoProxy, envNoProxyLower).split(",") {
+				let host = entry.trim().lower()
+				noProxy.push(host) when host != ""
+			}
+		}
+
+		// Implements Proxy.
+		def proxyFor(req Request) !?URL {
+			let host = req.url.hostname()
+			return none when bypasses(host)
+			return req.url.scheme.lower() == "https" ?? (httpsProxy, httpProxy)
+		}
+
+		// Reports whether `host` (with or without port) bypasses the proxy
+		// under `NO_PROXY`.
+		def bypasses(host string) bool {
+			let name = hostOnly(host).lower().trimPrefix("[").trimSuffix("]")
+			return true when name == "" || name == "localhost" || name.endsWith(".localhost") || name == "::1" || name.startsWith("127.")
+			for let rule in noProxy {
+				return true when rule == "*"
+				let bare = hostOnly(rule).trimPrefix("[").trimSuffix("]")
+				continue when bare == ""
+				return true when bare == name
+				if bare.contains("/") {
+					return true when cidrContains(bare, name)
+					continue
+				}
+				// A suffix rule, with or without its leading dot.
+				let suffix = bare.startsWith(".") ?? (bare, "." + bare)
+				return true when name.endsWith(suffix)
+			}
+			return false
+		}
+	}
+
+	// firstSet is the first non-empty value in the list, "" when none.
+	internal def firstSet(values ...string) string {
+		for let v in values {
+			return v.trim() when v.trim() != ""
+		}
+		return ""
+	}
+
+	// parseProxyURL reads a proxy setting, adding `http://` when the
+	// scheme is missing; none when empty or unparsable.
+	internal def parseProxyURL(text string) ?URL {
+		let value = text.trim()
+		return none when value == ""
+		value = "http://" + value unless value.contains("://")
+		let parsed = url.parse(value) onerror recover new URL()
+		return none when parsed.host == ""
+		return parsed
+	}
+
+	// StaticProxy sends everything through one proxy URL.
+	type StaticProxy {
+		target URL
+
+		def new(target URL) {
+			self.target = target
+		}
+
+		// Implements Proxy.
+		def proxyFor(req Request) !?URL {
+			return target
+		}
+	}
+
+	// proxyFromEnvironment is the `Proxy` a new `Transport` uses; a
+	// process reads the variables once.
+	internal let sharedEnvironmentProxy ?EnvironmentProxy = none
+
+	def proxyFromEnvironment() Proxy {
+		let current = sharedEnvironmentProxy
+		return current unless current is none
+		let made = new EnvironmentProxy()
+		sharedEnvironmentProxy = made
+		return made
+	}
+
+	// connectTunnel asks an HTTP proxy for a tunnel to `target`
+	// ("host:443") over an open connection to it.
+	// Fails with HttpError (op "proxy") when the proxy answers anything
+	// but 2xx, carrying the status in `text`.
+	internal def connectTunnel(conn net.Connection, target string, proxyAuth string, timeout duration) !none {
+		let head = "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
+		head += "Proxy-Authorization: " + proxyAuth + "\r\n" when proxyAuth != ""
+		head += "\r\n"
+		try conn.writeAll(head.bytes(), timeout)
+		let stream = new ConnStream(conn)
+		stream.readTimeout = timeout
+		let probe = new Request()
+		probe.method = Method.CONNECT
+		let res = try readResponse(new WireReader(stream), probe)
+		fail HttpError{message: "proxy refused the tunnel to {target}: {res.status} {res.reason}", op: "proxy", text: res.status.str(), status: res.status} unless res.status >= 200 && res.status < 300
+		return none
+	}
+
+	// socks5Connect performs the SOCKS5 greeting, optional
+	// username/password authentication, and CONNECT to `target` over an
+	// open connection to the proxy.
+	// Fails with HttpError (op "proxy") on a reply other than success,
+	// naming the reply code in `text`.
+	internal def socks5Connect(conn net.Connection, target string, user string, password string, timeout duration) !none {
+		let host = hostOnly(target)
+		let port = portOfTarget(target)
+		let wantAuth = user != ""
+		let greeting byte[] = wantAuth ?? ([0x05, 0x02, 0x00, 0x02], [0x05, 0x01, 0x00])
+		try conn.writeAll(greeting, timeout)
+		let choice = try readExact(conn, 2, timeout)
+		fail HttpError{message: "not a SOCKS5 proxy", op: "proxy", text: choice[0].str()} when choice[0] != 0x05
+		if choice[1] == 0x02 {
+			fail HttpError{message: "SOCKS5 proxy wants a username and password", op: "proxy", text: "2"} unless wantAuth
+			let auth byte[] = [0x01]
+			let userBytes = user.bytes()
+			let passBytes = password.bytes()
+			fail HttpError{message: "SOCKS5 credentials are too long", op: "proxy", text: "auth"} when userBytes.len() > 255 || passBytes.len() > 255
+			auth.push(byte(userBytes.len()))
+			auth = auth.concat(userBytes)
+			auth.push(byte(passBytes.len()))
+			auth = auth.concat(passBytes)
+			try conn.writeAll(auth, timeout)
+			let verdict = try readExact(conn, 2, timeout)
+			fail HttpError{message: "SOCKS5 proxy rejected the credentials", op: "proxy", text: verdict[1].str()} unless verdict[1] == 0x00
+		} else if choice[1] != 0x00 {
+			fail HttpError{message: "SOCKS5 proxy offers no usable authentication method", op: "proxy", text: choice[1].str()}
+		}
+		let request byte[] = [0x05, 0x01, 0x00]
+		let ip4 = ipv4Value(host)
+		if ip4 >= 0 {
+			request.push(0x01)
+			request.push(byte((ip4 >> 24) & 0xFF))
+			request.push(byte((ip4 >> 16) & 0xFF))
+			request.push(byte((ip4 >> 8) & 0xFF))
+			request.push(byte(ip4 & 0xFF))
+		} else {
+			let nameBytes = host.trimPrefix("[").trimSuffix("]").bytes()
+			fail HttpError{message: "SOCKS5 host name is too long", op: "proxy", text: host} when nameBytes.len() > 255
+			request.push(0x03)
+			request.push(byte(nameBytes.len()))
+			request = request.concat(nameBytes)
+		}
+		request.push(byte((port >> 8) & 0xFF))
+		request.push(byte(port & 0xFF))
+		try conn.writeAll(request, timeout)
+		let reply = try readExact(conn, 4, timeout)
+		fail HttpError{message: "SOCKS5 connect failed: " + socksReplyText(reply[1]), op: "proxy", text: reply[1].str()} unless reply[1] == 0x00
+		// The bound address that follows depends on its type.
+		match int(reply[3]) {
+			case 0x01:
+				try readExact(conn, 4 + 2, timeout)
+			case 0x04:
+				try readExact(conn, 16 + 2, timeout)
+			case 0x03:
+				let size = try readExact(conn, 1, timeout)
+				try readExact(conn, int(size[0]) + 2, timeout)
+			default:
+				fail HttpError{message: "SOCKS5 reply has an unknown address type", op: "proxy", text: reply[3].str()}
+		}
+		return none
+	}
+
+	// portOfTarget is the port of "host:port" (IPv6 in brackets), 80
+	// when there is none.
+	internal def portOfTarget(target string) int {
+		let n = target.len()
+		for let i = n - 1; i >= 0; i-- {
+			let c = target[i]
+			break when c == ']'
+			if c == ':' {
+				let text = target[i + 1:]
+				return text.isNumeric() && text != "" ?? (text.toInt<int>(), 80)
+			}
+		}
+		return 80
+	}
+
+	// socksReplyText names a SOCKS5 reply code.
+	internal def socksReplyText(code byte) string {
+		match int(code) {
+			case 0x01:
+				return "general failure"
+			case 0x02:
+				return "connection not allowed by ruleset"
+			case 0x03:
+				return "network unreachable"
+			case 0x04:
+				return "host unreachable"
+			case 0x05:
+				return "connection refused"
+			case 0x06:
+				return "TTL expired"
+			case 0x07:
+				return "command not supported"
+			case 0x08:
+				return "address type not supported"
+			default:
+				return "reply code " + code.str()
+		}
+	}
+
+	// readExact reads n bytes from the connection, failing when it
+	// closes first.
+	internal def readExact(conn net.Connection, n int, timeout duration) !byte[] {
+		let out byte[] = []
+		let chunk byte[] = []
+		chunk.len(n)
+		for {
+			return out when out.len() >= n
+			let got = try conn.read(chunk.slice(0, n - out.len()), timeout)
+			fail HttpError{message: "proxy closed the connection during the handshake", op: "proxy", code: "eof"} when got <= 0
+			out = out.concat(chunk.slice(0, got))
+		}
+		return out
+	}
+}

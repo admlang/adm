@@ -1,0 +1,403 @@
+partial module std.net.dns.dnssec {
+	use (
+		std.crypto::(ECDSAPrivateKey, Ed25519PrivateKey, PrivateKey, RSAPrivateKey, ecdhKeyPair, generateEd25519Key, generateRSAKey)
+		std.crypto.hash::(digest)
+		std.net.dns
+		std.time
+	)
+
+	// KeyRole is what a zone uses a key for; the value is the DNSKEY flags.
+	enum KeyRole {
+		// Signs the records of the zone.
+		ZoneSigning = 256,
+		// Signs the DNSKEY set, and is the key the parent's DS names. A zone
+		// with one key for both gives it this role.
+		KeySigning = 257,
+	}
+
+	// Key is a signing key of a zone: the DNSKEY record the zone publishes
+	// and the private key behind it.
+	type Key {
+		record dns.Record
+		secret PrivateKey
+		// False for a key that is only published: `signZone` puts its
+		// DNSKEY record in the zone and makes no signatures with it, which
+		// is how a new key is announced before it takes over (RFC 6781
+		// §4.1.1 pre-publish) and how an old one lingers after.
+		signs  bool       = true
+
+		// sign makes the RRSIG record over the record set: every record of
+		// one name, class and type. The signature is valid from an hour
+		// before `now`, the present when none, for `validity`.
+		// Fails with Bogus when the records are not one set or lie outside
+		// the key's zone, and when the private key cannot sign.
+		def sign(records dns.Record[], validity duration = 720h, now ?time.Time = none) !dns.Record {
+			let zoneKey = record.dnskey
+			fail bogus("the key record has no DNSKEY data", record.name) when zoneKey is none
+			fail bogus("the record set is empty", record.name) when records.len() == 0
+			let first = records[0]
+			let owner = dns.canonicalName(first.name)
+			fail bogus("{owner} is outside the key's zone {record.name}", owner) unless dns.isSubdomain(owner, record.name)
+			for let (_, r) in records {
+				fail bogus("the records are not one set", owner) when dns.canonicalName(r.name) != owner || r.wireType() != first.wireType() || r.class != first.class
+			}
+			fail bogus("DNSSEC algorithm {zoneKey.algorithm} is not supported", owner) unless signs(zoneKey.algorithm)
+
+			let at = now is none ?? (time.now(), now)
+			let seconds = int(at.unixNs() / 1000000000)
+			let labels = dns.nameLabels(owner)
+			let count = labels.len() > 0 && labels[0] == "*" ?? (labels.len() - 1, labels.len())
+			let out = new dns.Record()
+			out.name = owner
+			out.kind = dns.RecordType.RRSIG
+			out.code = dns.RecordType.RRSIG.value
+			out.class = first.class
+			out.ttl = first.ttl
+			out.rrsig = dns.RRSIG{
+				covered:     first.kind,
+				coveredCode: first.wireType(),
+				algorithm:   zoneKey.algorithm,
+				labels:      count,
+				originalTTL: first.ttl,
+				expiration:  (seconds + int(validity) / 1000000000) & 0xffffffff,
+				inception:   (seconds - 3600) & 0xffffffff,
+				keyTag:      zoneKey.keyTag(),
+				signer:      dns.canonicalName(record.name),
+			}
+
+			let data = try signedData(records, out)
+			let hash = hashOf(zoneKey.algorithm)
+			let sum byte[] = []
+			sum = digest(hash, data) unless hash is none
+			let signature byte[]
+			let key = secret
+			if key is Ed25519PrivateKey {
+				let ed Ed25519PrivateKey = key
+				signature = ed.sign(data)
+			}
+			if key is RSAPrivateKey && !(hash is none) {
+				let rsa RSAPrivateKey = key
+				signature = try rsa.signPKCS1v15(hash, sum)
+			}
+			if key is ECDSAPrivateKey {
+				let ec ECDSAPrivateKey = key
+				let size = (ec.curve.bitsize + 7) / 8
+				let (r, s) = try ec.sign(sum)
+				signature = try r.bytes(size)
+				pushBytes(signature, try s.bytes(size))
+			}
+			let made = out.rrsig
+			fail bogus("the signature was not made", owner) when made is none
+			made.signature = signature
+			return out
+		}
+
+		// childRecords is the CDS and the CDNSKEY record this key asks its
+		// parent to publish or change its DS with (RFC 7344, RFC 8078): the
+		// same data as the key's own DS (`dsFor`) and DNSKEY records,
+		// owned by the zone apex with the key record's TTL.
+		// Fails when the key record has no DNSKEY data.
+		def childRecords(digestType DigestType = DigestType.SHA256) !dns.Record[] {
+			let zoneKey = record.dnskey
+			fail bogus("the key record has no DNSKEY data", record.name) when zoneKey is none
+			let cds = try dsFor(record, digestType, record.ttl)
+			cds.kind = dns.RecordType.CDS
+			cds.code = dns.RecordType.CDS.value
+			let cdnskey = new dns.Record()
+			cdnskey.name = dns.canonicalName(record.name)
+			cdnskey.kind = dns.RecordType.CDNSKEY
+			cdnskey.code = dns.RecordType.CDNSKEY.value
+			cdnskey.ttl = record.ttl
+			cdnskey.dnskey = zoneKey
+			return [cds, cdnskey]
+		}
+	}
+
+	// deleteChildRecords is the CDS and CDNSKEY pair that asks the parent
+	// to remove every DS of the zone (RFC 8078 §4): CDS "0 0 0 00" and
+	// CDNSKEY "0 3 0 AA==", each carrying one zero byte of otherwise
+	// meaningless data.
+	def deleteChildRecords(zone string, ttl int = 3600) dns.Record[] {
+		let owner = dns.canonicalName(zone)
+		let cds = new dns.Record()
+		cds.name = owner
+		cds.kind = dns.RecordType.CDS
+		cds.code = dns.RecordType.CDS.value
+		cds.ttl = ttl
+		cds.ds = dns.DS{keyTag: 0, algorithm: 0, digestType: 0, digest: [byte(0)]}
+		let cdnskey = new dns.Record()
+		cdnskey.name = owner
+		cdnskey.kind = dns.RecordType.CDNSKEY
+		cdnskey.code = dns.RecordType.CDNSKEY.value
+		cdnskey.ttl = ttl
+		cdnskey.dnskey = dns.DNSKEY{flags: 0, protocol: 3, algorithm: 0, key: [byte(0)]}
+		return [cds, cdnskey]
+	}
+
+	// generateKey draws a new key for the zone: ECDSA over P-256 or, for
+	// `ECDSAP384SHA384`, over P-384, Ed25519, and RSA with a modulus of 2048
+	// bits for the RSA algorithms.
+	// Fails with Bogus for an algorithm `supports` refuses, and when the
+	// random source is unavailable.
+	def generateKey(zone string, role KeyRole = KeyRole.KeySigning, algorithm dns.Algorithm = dns.Algorithm.ECDSAP256SHA256, ttl int = 3600) !Key {
+		let ec = curveOf(algorithm.value)
+		return try keyFrom(zone, try generateEd25519Key(), role, algorithm, ttl) when algorithm == dns.Algorithm.ED25519
+		if ec is none {
+			fail bogus("keys of {algorithm.name} cannot be generated", zone) unless supports(algorithm)
+			return try keyFrom(zone, try generateRSAKey(2048), role, algorithm, ttl)
+		}
+		let pair = try ecdhKeyPair(ec)
+		return try keyFrom(zone, new ECDSAPrivateKey(ec, pair.scalar, pair.public), role, algorithm, ttl)
+	}
+
+	// keyFrom makes a private key the signing key of the zone. With no
+	// algorithm, an RSA key signs `RSASHA256`, an ECDSA key what its curve
+	// calls for and an Ed25519 key `ED25519`.
+	// Fails with Bogus when the algorithm does not go with the key.
+	def keyFrom(zone string, secret PrivateKey, role KeyRole = KeyRole.KeySigning, algorithm ?dns.Algorithm = none, ttl int = 3600) !Key {
+		let data = new dns.DNSKEY()
+		data.flags = role.value
+		if secret is RSAPrivateKey {
+			let rsa RSAPrivateKey = secret
+			let chosen = algorithm is none ?? (dns.Algorithm.RSASHA256, algorithm)
+			fail bogus("an RSA key cannot sign {chosen.name}", zone) when !supports(chosen) || !(curveOf(chosen.value) is none)
+			data.algorithm = chosen.value
+			// RFC 3110: the length of the exponent, the exponent, the modulus.
+			let exponent byte[]
+			for let e = rsa.e; e > 0; e = e >> 8 {
+				exponent.unshift(byte(e & 0xff))
+			}
+			data.key = [byte(exponent.len())]
+			pushBytes(data.key, exponent)
+			pushBytes(data.key, rsa.n.bytes())
+		}
+		if secret is Ed25519PrivateKey {
+			let ed Ed25519PrivateKey = secret
+			fail bogus("an Ed25519 key cannot sign {algorithm.name}", zone) when !(algorithm is none) && algorithm != dns.Algorithm.ED25519
+			data.algorithm = dns.Algorithm.ED25519.value
+			data.key = ed.public.bytes
+		}
+		if secret is ECDSAPrivateKey {
+			let ec ECDSAPrivateKey = secret
+			let chosen = ec.curve.name == "P-256" ?? (dns.Algorithm.ECDSAP256SHA256, dns.Algorithm.ECDSAP384SHA384)
+			fail bogus("DNSSEC has no algorithm for the curve {ec.curve.name}", zone) unless ec.curve.name := "P-256" || "P-384"
+			fail bogus("a {ec.curve.name} key cannot sign {algorithm.name}", zone) when !(algorithm is none) && algorithm != chosen
+			data.algorithm = chosen.value
+			let size = (ec.curve.bitsize + 7) / 8
+			data.key = try ec.point.x.bytes(size)
+			pushBytes(data.key, try ec.point.y.bytes(size))
+		}
+		let out = new Key()
+		out.record = dns.dnskeyRecord(zone, data, ttl)
+		out.secret = secret
+		return out
+	}
+
+	// signZone signs the zone in place (RFC 4035 §2): it publishes the
+	// DNSKEY record of every key, links the names with NSEC records and
+	// signs every record set the zone is authoritative for. Earlier NSEC,
+	// NSEC3 and RRSIG records are replaced, so it is also how a changed zone
+	// is signed again. Only a key whose `signs` is true makes signatures,
+	// which is how a key is published before it takes over or kept after
+	// it stops (RFC 6781 §4.1.1); among the signing keys, those of the role
+	// `KeySigning` sign the DNSKEY set and, when the zone already carries
+	// them, the CDS and CDNSKEY sets at the apex (RFC 7344 §4.1), and the
+	// others sign the rest. With signing keys of one role only, they sign
+	// everything. A delegation keeps its NS records and the glue below it
+	// unsigned. The signatures are valid as `Key.sign` says.
+	//
+	// With `hashed`, the names are linked by NSEC3 records over their hashes
+	// instead (RFC 5155), which keeps the zone from being walked: its salt
+	// and iterations are used, and with its opt-out flag the delegations
+	// without DS records stay out of the chain. RFC 9276 advises no salt
+	// and no extra iterations, which is `new dns.NSEC3()`.
+	//
+	// Fails with Bogus when there is no key that signs, a key belongs to
+	// another zone or the zone has no SOA record, and as `Key.sign` does.
+	def signZone(zone dns.Zone, keys Key[], validity duration = 720h, now ?time.Time = none, hashed ?dns.NSEC3 = none) !none {
+		fail bogus("the zone needs a key to be signed", zone.origin) when keys.len() == 0
+		let keySigning Key[]
+		let zoneSigning Key[]
+		for let (_, key) in keys {
+			fail bogus("the key of {key.record.name} cannot sign {zone.origin}", zone.origin) when dns.canonicalName(key.record.name) != zone.origin
+			let data = key.record.dnskey
+			fail bogus("the key record has no DNSKEY data", zone.origin) when data is none
+			continue unless key.signs
+			if data.isEntryPoint() {
+				keySigning.push(key)
+			} else {
+				zoneSigning.push(key)
+			}
+		}
+		fail bogus("no key of {zone.origin} signs", zone.origin) when keySigning.len() == 0 && zoneSigning.len() == 0
+		keySigning = zoneSigning when keySigning.len() == 0
+		zoneSigning = keySigning when zoneSigning.len() == 0
+		let soa = zone.find(zone.origin, dns.RecordType.SOA)
+		fail bogus("the zone has no SOA record", zone.origin) when soa.len() == 0
+		let start = soa[0].soa
+		fail bogus("the zone has no SOA record", zone.origin) when start is none
+		let negativeTTL = start.minimum < soa[0].ttl ?? (start.minimum, soa[0].ttl)
+
+		zone.remove(zone.origin, dns.RecordType.DNSKEY)
+		for let (_, key) in keys {
+			try zone.add(key.record)
+		}
+		for let (_, r) in zone.all() {
+			zone.remove(r.name, r.kind) when r.kind := dns.RecordType.RRSIG || dns.RecordType.NSEC || dns.RecordType.NSEC3 || dns.RecordType.NSEC3PARAM
+		}
+		if !(hashed is none) {
+			let param = new dns.NSEC3()
+			param.hashAlgorithm = hashed.hashAlgorithm
+			param.iterations = hashed.iterations
+			param.salt = hashed.salt
+			let said = new dns.Record()
+			said.name = zone.origin
+			said.kind = dns.RecordType.NSEC3PARAM
+			said.code = dns.RecordType.NSEC3PARAM.value
+			said.ttl = 0
+			said.nsec3 = param
+			try zone.add(said)
+		}
+		// The records by owner.
+		let byName = map<string, dns.Record[]>{}
+		let names string[]
+		for let (_, r) in zone.all() {
+			let owner = dns.canonicalName(r.name)
+			let held = byName.get(owner)
+			if held is none {
+				names.push(owner)
+				byName[owner] = [r]
+			} else {
+				held.push(r)
+				byName[owner] = held
+			}
+		}
+		names = names.sort((a string, b string) => dns.compareNames(a, b) < 0)
+
+		// A delegation is a name below the apex with NS records; the names
+		// below one are glue.
+		let cuts string[]
+		for let (_, owner) in names {
+			continue when owner == zone.origin
+			for let (_, r) in recordsAt(byName, owner) {
+				if r.kind == dns.RecordType.NS {
+					cuts.push(owner)
+					break
+				}
+			}
+		}
+		let signedNames string[]
+		for let (_, owner) in names {
+			let glue = false
+			for let (_, cut) in cuts {
+				glue = true when owner != cut && dns.isSubdomain(owner, cut)
+			}
+			signedNames.push(owner) unless glue
+		}
+
+		for let (i, owner) in signedNames {
+			let held = recordsAt(byName, owner)
+			let delegation = cuts.includes(owner)
+			let kinds int[]
+			let sets = map<int, dns.Record[]>{}
+			for let (_, r) in held {
+				let code = r.wireType()
+				let set = sets.get(code)
+				if set is none {
+					kinds.push(code)
+					sets[code] = [r]
+				} else {
+					set.push(r)
+					sets[code] = set
+				}
+			}
+			if hashed is none {
+				let chain = new dns.NSEC()
+				chain.next = signedNames[(i + 1) % signedNames.len()]
+				chain.types = kinds.clone()
+				chain.types.push(dns.RecordType.RRSIG.value)
+				chain.types.push(dns.RecordType.NSEC.value)
+				chain.types = chain.types.sort((a int, b int) => a < b)
+				let link = new dns.Record()
+				link.name = owner
+				link.kind = dns.RecordType.NSEC
+				link.code = dns.RecordType.NSEC.value
+				link.ttl = negativeTTL
+				link.nsec = chain
+				try zone.add(link)
+				kinds.push(link.code)
+				sets[link.code] = [link]
+			}
+
+			for let (_, code) in kinds {
+				// The parent signs the DS of a delegation and its NSEC only.
+				continue when delegation && !(code := dns.RecordType.DS.value || dns.RecordType.NSEC.value)
+				// The key signing keys also sign the CDS and CDNSKEY sets a
+				// zone publishes to change its DS (RFC 7344 §4.1).
+				let signers = (code := dns.RecordType.DNSKEY.value || dns.RecordType.CDS.value || dns.RecordType.CDNSKEY.value) ?? (keySigning, zoneSigning)
+				for let (_, key) in signers {
+					let set = sets.get(code)
+					try zone.add(try key.sign(set, validity, now)) unless set is none
+				}
+			}
+		}
+		return none when hashed is none
+
+		// The hashed chain: a link for every signed name and for the names
+		// without records above one.
+		let hashes = map<string, byte[]>{}
+		let typesOf = map<string, int[]>{}
+		for let (_, owner) in signedNames {
+			let kinds int[]
+			for let (_, r) in recordsAt(byName, owner) {
+				kinds.push(r.wireType()) unless kinds.includes(r.wireType())
+			}
+			let secured = !cuts.includes(owner) || kinds.includes(dns.RecordType.DS.value)
+			continue when hashed.optOut() && !secured
+			kinds.push(dns.RecordType.RRSIG.value) when secured
+			let label = dns.hashLabel(try hashed.hash(owner))
+			fail bogus("two names of the zone share the hash {label}", owner) when typesOf.hasKey(label)
+			hashes[label] = try hashed.hash(owner)
+			typesOf[label] = kinds.sort((a int, b int) => a < b)
+			let above = parentOf(owner)
+			for above != zone.origin && dns.isSubdomain(above, zone.origin) && !byName.hasKey(above) {
+				let between = dns.hashLabel(try hashed.hash(above))
+				if !typesOf.hasKey(between) {
+					hashes[between] = try hashed.hash(above)
+					typesOf[between] = []
+				}
+				above = parentOf(above)
+			}
+		}
+		let labels = typesOf.keys().sort((a string, b string) => a < b)
+		for let (i, label) in labels {
+			let data = new dns.NSEC3()
+			data.hashAlgorithm = hashed.hashAlgorithm
+			data.flags = hashed.flags & 1
+			data.iterations = hashed.iterations
+			data.salt = hashed.salt
+			let following = hashes.get(labels[(i + 1) % labels.len()])
+			let listed = typesOf.get(label)
+			continue when following is none || listed is none
+			data.next = following
+			data.types = listed
+			let link = new dns.Record()
+			link.name = zone.origin == "." ?? (label, "{label}.{zone.origin}")
+			link.kind = dns.RecordType.NSEC3
+			link.code = dns.RecordType.NSEC3.value
+			link.ttl = negativeTTL
+			link.nsec3 = data
+			try zone.add(link)
+			for let (_, key) in zoneSigning {
+				try zone.add(try key.sign([link], validity, now))
+			}
+		}
+		return none
+	}
+
+	internal def recordsAt(byName map<string, dns.Record[]>, owner string) dns.Record[] {
+		let held = byName.get(owner)
+		return [] when held is none
+		return held
+	}
+}

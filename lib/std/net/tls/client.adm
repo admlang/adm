@@ -1,0 +1,660 @@
+partial module std.net.tls {
+	use (
+		std.crypto
+		std.crypto::(PublicKey, RSAPrivateKey, RSAPublicKey, ECDSAPublicKey, ECDHKeyPair, rand, x25519, x25519Base, ecdhKeyPair, ecdh, marshalPoint, unmarshalPoint, scalarBaseMult, p256, p384, constantTimeEqual)
+		std.crypto.hash::(Hash, hashSize, digest)
+		std.crypto.x509
+		std.crypto.x509::(Certificate, CertPool, VerifyOptions, CertificateError, InvalidReason, parseCertificate, parseIPText)
+		std.time
+	)
+
+	// The TLS 1.2 downgrade sentinel a TLS 1.3 server writes into the end
+	// of its random when it negotiates that version (RFC 8446 §4.1.3).
+	const downgradeTLS12 = "444F574E47524401"
+	// The same for TLS 1.1 and below.
+	const downgradeTLS11 = "444F574E47524400"
+
+	// ClientHandshake runs the TLS 1.3 client handshake of RFC 8446 §2 over
+	// a record layer: ClientHello, an optional HelloRetryRequest round,
+	// ServerHello, the encrypted server flight with chain verification and
+	// the signature over the transcript, then Finished both ways. `run`
+	// leaves the record layer keyed for application data and the traffic
+	// secrets in `schedule`. When the config's `minVersion` allows it and
+	// the server answers with TLS 1.2, the handshake of RFC 5246 §7.3 runs
+	// instead: ECDHE with an AEAD suite and the extended master secret,
+	// resumed from a session ticket (RFC 5077) when the cache holds one.
+	type ClientHandshake {
+		config             Config
+		records            RecordLayer
+		schedule           KeySchedule
+		hello              ClientHello
+		helloBytes         byte[]
+		x25519Private      byte[]
+		ecdheKey           ?ECDHKeyPair
+		// For a test: the P-256 or P-384 scalar to use on a retry instead
+		// of a random one.
+		ecdheScalar        ?bigint
+		// The session offered for resumption and its pre-shared key.
+		session            ?ClientSession
+		psk                byte[]
+		resumed            bool                = false
+		suite              CipherSuite         = CipherSuite.AES128GCMSHA256
+		hash               Hash                = Hash.SHA256
+		state              ConnectionState
+		reader             HandshakeReader
+		// The server's CertificateRequest, none when it sent none.
+		certificateRequest ?CertificateRequest
+
+		def new(config Config, records RecordLayer) {
+			self.config = config
+			self.records = records
+			reader = new HandshakeReader(records)
+			schedule = new KeySchedule(Hash.SHA256)
+		}
+
+		// run performs the whole handshake. Fails with TLSError naming the
+		// alert to send, CertificateError when the chain does not verify,
+		// NetError from the transport.
+		def run() !none {
+			fail tlsError(Alert.InternalError, "a server name is required unless insecureSkipVerify is set") when config.serverName == "" && !config.insecureSkipVerify
+			try buildHello() when helloBytes.len() == 0
+			records.version = 0x0301
+			try records.write(recordHandshake, helloBytes)
+			records.version = 0x0303
+			schedule.update(helloBytes)
+
+			let (sh, raw) = try readServerHello()
+			return try run12(sh, raw) when !sh.isHelloRetryRequest && sh.supportedVersion == 0
+			if sh.isHelloRetryRequest {
+				try processHelloRetryRequest(sh, raw)
+				let (second, secondRaw) = try readServerHello()
+				fail tlsError(Alert.UnexpectedMessage, "second HelloRetryRequest") when second.isHelloRetryRequest
+				sh = second
+				raw = secondRaw
+			}
+			try processServerHello(sh, raw)
+			// Middlebox compatibility (RFC 8446 §D.4): a dummy
+			// change_cipher_spec when a legacy session id was sent. From
+			// here on this side writes under the handshake key, alerts
+			// included.
+			try records.write(recordChangeCipherSpec, byte[1]) when hello.sessionID.len() > 0
+			let (hsKey, hsIV) = try trafficKeyFor(suite, hash, schedule.clientHandshakeTrafficSecret)
+			records.setWriteKey(hsKey, hsIV)
+
+			let (kind, body, message) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected EncryptedExtensions, got message {kind}") when kind != handshakeEncryptedExtensions
+			try processEncryptedExtensions(try parseEncryptedExtensions(body))
+			schedule.update(message)
+
+			if resumed {
+				try finishResumed()
+				return none
+			}
+			let (kind2, body2, message2) = try reader.next()
+			if kind2 == handshakeCertificateRequest {
+				certificateRequest = try parseCertificateRequest(body2)
+				schedule.update(message2)
+				let (kind3, body3, message3) = try reader.next()
+				kind2 = kind3
+				body2 = body3
+				message2 = message3
+			}
+			fail tlsError(Alert.UnexpectedMessage, "expected Certificate, got message {kind2}") when kind2 != handshakeCertificate
+			try processCertificate(try parseCertificateMessage(body2))
+			schedule.update(message2)
+
+			let (kind4, body4, message4) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected CertificateVerify, got message {kind4}") when kind4 != handshakeCertificateVerify
+			try processCertificateVerify(try parseCertificateVerify(body4))
+			schedule.update(message4)
+
+			try finishHandshake()
+			return none
+		}
+
+		// finishResumed completes a resumed handshake: the server sends no
+		// certificate, its Finished comes right after EncryptedExtensions,
+		// and the state repeats what the original connection verified.
+		internal def finishResumed() !none {
+			let offered = session
+			fail tlsError(Alert.InternalError, "resumed without a session") when offered is none
+			state.resumed = true
+			state.peerCertificates = offered.peerCertificates
+			state.verifiedChains = offered.verifiedChains
+			return try finishHandshake()
+		}
+
+		// finishHandshake reads the server Finished, keys application data,
+		// sends the client Finished and derives the resumption secret.
+		internal def finishHandshake() !none {
+			let (kind5, body5, message5) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected Finished, got message {kind5}") when kind5 != handshakeFinished
+			let expected = try schedule.verifyData(schedule.serverHandshakeTrafficSecret)
+			fail tlsError(Alert.DecryptError, "server Finished does not verify") unless constantTimeEqual(expected, body5)
+			schedule.update(message5)
+
+			try schedule.deriveMaster()
+			let (readKey, readIV) = try trafficKeyFor(suite, hash, schedule.serverTrafficSecret)
+			records.setReadKey(readKey, readIV)
+
+			try answerCertificateRequest()
+			let finished = marshalFinished(try schedule.verifyData(schedule.clientHandshakeTrafficSecret))
+			try records.write(recordHandshake, finished)
+			schedule.update(finished)
+			let (appKey, appIV) = try trafficKeyFor(suite, hash, schedule.clientTrafficSecret)
+			records.setWriteKey(appKey, appIV)
+			try schedule.deriveResumption()
+
+			state.version = Version.TLS13
+			state.cipherSuite = suite
+			state.serverName = config.serverName
+			state.handshakeComplete = true
+			return none
+		}
+
+		// answerCertificateRequest sends the first chain of the config whose
+		// key signs with a scheme the server listed, with its
+		// CertificateVerify over the transcript, or an empty Certificate to
+		// decline. Nothing to do when the server asked for none.
+		internal def answerCertificateRequest() !none {
+			let request = certificateRequest
+			return none when request is none
+			let chosen ?KeyPair = none
+			let scheme ?SignatureScheme = none
+			for let (_, pair) in config.certificates {
+				continue unless chosen is none
+				let key = pair.privateKey
+				continue when key is none
+				let candidate = signatureSchemeFor(key, request.signatureAlgorithms)
+				continue when candidate is none
+				chosen = pair
+				scheme = candidate
+			}
+			if chosen is none {
+				let declined = marshalCertificateMessage(CertificateMessage{requestContext: request.requestContext})
+				try records.write(recordHandshake, declined)
+				schedule.update(declined)
+				return none
+			}
+			let entries CertificateEntry[]
+			for let (_, der) in chosen.chain {
+				entries.push(CertificateEntry{data: der, extensions: []})
+			}
+			let cert = marshalCertificateMessage(CertificateMessage{requestContext: request.requestContext, entries: entries})
+			try records.write(recordHandshake, cert)
+			schedule.update(cert)
+			fail tlsError(Alert.InternalError, "no signature scheme selected") when scheme is none
+			let verify = marshalCertificateVerify(CertificateVerify{algorithm: int(scheme), signature: try chosen.sign(certificateVerifyContent("TLS 1.3, client CertificateVerify", schedule.transcriptHash()), scheme)})
+			try records.write(recordHandshake, verify)
+			schedule.update(verify)
+			return none
+		}
+
+		// buildHello prepares the ClientHello with a fresh random, legacy
+		// session id and X25519 share, offering the cached session for the
+		// server when there is one. Fails when the random source does.
+		def buildHello() !none {
+			let offer13 = config.maxVersion == Version.TLS13
+			let offer12 = config.minVersion == Version.TLS12
+			fail tlsError(Alert.InternalError, "minVersion is above maxVersion") unless offer13 || offer12
+			let suites = config.cipherSuites
+			if suites.len() == 0 {
+				suites = defaultCipherSuites() when offer13
+				suites = suites + defaultTLS12CipherSuites() when offer12
+			}
+			let codes int[]
+			for let (_, s) in suites {
+				let allowed = suiteIsTLS13(s) ?? (offer13, offer12)
+				codes.push(int(s)) when allowed
+			}
+			fail tlsError(Alert.InternalError, "no cipher suite fits the versions of the config") when codes.len() == 0
+			hello = ClientHello{random: try rand(32), sessionID: try rand(32), cipherSuites: codes, supportedGroups: [groupX25519, groupSecp256r1, groupSecp384r1], signatureAlgorithms: signatureSchemeCodes(supportedSignatureSchemes()), alpnProtocols: config.alpn}
+			if offer13 {
+				x25519Private = try rand(32)
+				hello.supportedVersions.push(0x0304)
+				hello.keyShares = [KeyShare{group:groupX25519, data:try x25519Base(x25519Private)}]
+				hello.pskModes = [pskModeDHE]
+			}
+			if offer12 {
+				hello.supportedVersions.push(0x0303)
+				hello.signatureAlgorithms = signatureSchemeCodes(supportedTLS12SignatureSchemes())
+				hello.ecPointFormats = true
+				hello.extendedMasterSecret = true
+				hello.secureRenegotiation = true
+			}
+			hello.serverName = config.serverName when parseIPText(config.serverName) is none
+			try offerSession() when offer13
+			offerTicket() when offer12
+			helloBytes = marshalClientHello(hello)
+			try bindHello()
+			return none
+		}
+
+		// offerSession adds the cached session for the server name as a
+		// pre-shared key, with a binder placeholder of the right size, and
+		// switches the transcript hash to the session's suite. Fails only
+		// when HKDF does.
+		internal def offerSession() !none {
+			let cache = config.sessionCache
+			return none when cache is none
+			return none when config.serverName == ""
+			let found = cache.get(config.serverName)
+			return none when found is none
+			return none when found.version != Version.TLS13
+			session = found
+			psk = found.psk
+			hash = suiteHash(found.suite)
+			schedule.hash = hash
+			let placeholder byte[]
+			placeholder.len(hashSize(hash))
+			hello.pskIdentities = [PSKIdentity{identity:found.ticket, obfuscatedTicketAge:obfuscatedTicketAge(found)}]
+			hello.pskBinders = [placeholder]
+			return none
+		}
+
+		// offerTicket sends the session_ticket extension of RFC 5077 when
+		// the config has a cache: with the ticket of the cached TLS 1.2
+		// session for the server name when its suite is on offer, else
+		// empty, which asks the server for one.
+		internal def offerTicket() {
+			let cache = config.sessionCache
+			return when cache is none || config.serverName == ""
+			hello.offersSessionTicket = true
+			let found = cache.get(config.serverName)
+			return when found is none
+			return unless found.version == Version.TLS12 && hello.cipherSuites.includes(int(found.suite))
+			session = found
+			hello.sessionTicket = found.ticket
+		}
+
+		// bindHello writes the binder into the encoded ClientHello: the MAC
+		// over the transcript so far plus the message up to the binders
+		// list (RFC 8446 §4.2.11.2). Nothing to do without an offer.
+		internal def bindHello() !none {
+			return none when psk.len() == 0
+			let cut = helloBytes.len() - clientHelloBindersLength(hello)
+			let sum = digest(hash, schedule.transcript + helloBytes[0:cut])
+			let binder = try pskBinder(hash, psk, sum)
+			for let i = 0; i < binder.len(); i++ {
+				helloBytes[cut + 3 + i] = binder[i]
+			}
+			return none
+		}
+
+		internal def readServerHello() !(ServerHello, byte[]) {
+			let (kind, body, message) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected ServerHello, got message {kind}") when kind != handshakeServerHello
+			return (try parseServerHello(body), message)
+		}
+
+		// checkServerHello validates the fields shared by ServerHello and
+		// HelloRetryRequest and returns the suite.
+		internal def checkServerHello(sh ServerHello) !CipherSuite {
+			fail tlsError(Alert.ProtocolVersion, "server negotiated TLS 1.2, which this client does not speak") when sh.supportedVersion == 0
+			fail tlsError(Alert.IllegalParameter, "server selected version {sh.supportedVersion}") when sh.supportedVersion != 0x0304
+			fail tlsError(Alert.ProtocolVersion, "server selected TLS 1.3, above maxVersion") when config.maxVersion != Version.TLS13
+			fail tlsError(Alert.UnsupportedExtension, "ServerHello carries a TLS 1.2 extension") when sh.extendedMasterSecret || sh.secureRenegotiation || sh.ecPointFormats || sh.serverNameAck || sh.sessionTicket || sh.alpnProtocol != ""
+			let tail = sh.random[24:].hex()
+			fail tlsError(Alert.IllegalParameter, "server random carries a downgrade sentinel") when tail := downgradeTLS12 || downgradeTLS11
+			fail tlsError(Alert.IllegalParameter, "server did not echo the legacy session id") when sh.sessionID.hex() != hello.sessionID.hex()
+			let selected = cipherSuiteOf(sh.cipherSuite)
+			fail tlsError(Alert.IllegalParameter, "server selected an unsupported cipher suite {sh.cipherSuite}") when selected is none
+			fail tlsError(Alert.IllegalParameter, "server selected a TLS 1.2 cipher suite for TLS 1.3") unless suiteIsTLS13(selected)
+			fail tlsError(Alert.IllegalParameter, "server selected a cipher suite that was not offered") unless hello.cipherSuites.includes(sh.cipherSuite)
+			fail tlsError(Alert.IllegalParameter, "server selected a pre-shared key that was not offered") when sh.selectedIdentity >= 0 && hello.pskIdentities.len() == 0
+			fail tlsError(Alert.IllegalParameter, "server selected pre-shared key {sh.selectedIdentity}") when sh.selectedIdentity > 0
+			return selected
+		}
+
+		internal def processHelloRetryRequest(sh ServerHello, raw byte[]) !none {
+			suite = try checkServerHello(sh)
+			hash = suiteHash(suite)
+			schedule.hash = hash
+			fail tlsError(Alert.IllegalParameter, "HelloRetryRequest changes nothing") when sh.selectedGroup == 0 && sh.cookie.len() == 0
+			if sh.selectedGroup != 0 {
+				fail tlsError(Alert.IllegalParameter, "HelloRetryRequest selects a group that was not offered") unless hello.supportedGroups.includes(sh.selectedGroup)
+				for let (_, share) in hello.keyShares {
+					fail tlsError(Alert.IllegalParameter, "HelloRetryRequest selects a group already shared") when share.group == sh.selectedGroup
+				}
+				hello.keyShares = [try keyShareFor(sh.selectedGroup)]
+			}
+			hello.cookie = sh.cookie
+			hello.earlyData = false
+			schedule.replaceWithMessageHash()
+			schedule.update(raw)
+			let shareBody byte[]
+			for let (_, share) in hello.keyShares {
+				shareBody = shareBody + u16(share.group) + vec16(share.data)
+			}
+			helloBytes = try retryClientHello(helloBytes, vec16(shareBody), sh.cookie)
+			try bindHello()
+			try records.write(recordHandshake, helloBytes)
+			schedule.update(helloBytes)
+			return none
+		}
+
+		internal def keyShareFor(group int) !KeyShare {
+			if group == groupX25519 {
+				x25519Private = try rand(32)
+				return KeyShare{group: group, data: try x25519Base(x25519Private)}
+			}
+			let curve = group == groupSecp256r1 ?? (p256, p384)
+			let pair = try ecdhKeyPair(curve)
+			let fixed = ecdheScalar
+			pair = ECDHKeyPair{scalar: fixed, public: scalarBaseMult(curve, fixed)} unless fixed is none
+			ecdheKey = pair
+			return KeyShare{group: group, data: marshalPoint(curve, pair.public)}
+		}
+
+		internal def processServerHello(sh ServerHello, raw byte[]) !none {
+			let selected = try checkServerHello(sh)
+			fail tlsError(Alert.IllegalParameter, "ServerHello changes the cipher suite of the HelloRetryRequest") when hello.cookie.len() > 0 && selected != suite
+			suite = selected
+			hash = suiteHash(suite)
+			schedule.hash = hash
+			let share = sh.keyShare
+			fail tlsError(Alert.MissingExtension, "ServerHello has no key share") when share is none
+			let shared = try sharedSecret(share)
+			if sh.selectedIdentity == 0 {
+				fail tlsError(Alert.IllegalParameter, "server resumed with a cipher suite of another hash") when suiteHash(selected) != hash
+				resumed = true
+			}
+			schedule.update(raw)
+			schedule.deriveEarly(resumed ?? (psk, []))
+			try schedule.deriveHandshake(shared)
+			let (key, iv) = try trafficKeyFor(suite, hash, schedule.serverHandshakeTrafficSecret)
+			records.setReadKey(key, iv)
+			return none
+		}
+
+		// sharedSecret completes the key exchange with the server's share.
+		internal def sharedSecret(share KeyShare) !byte[] {
+			let offered = false
+			for let (_, mine) in hello.keyShares {
+				offered = true when mine.group == share.group
+			}
+			fail tlsError(Alert.IllegalParameter, "server key share uses group {share.group}, which was not shared") unless offered
+			if share.group == groupX25519 {
+				return x25519(x25519Private, share.data) onerror fail tlsError(Alert.IllegalParameter, "server X25519 share is invalid")
+			}
+			let key = ecdheKey
+			fail tlsError(Alert.InternalError, "no ECDHE key for group {share.group}") when key is none
+			let curve = share.group == groupSecp256r1 ?? (p256, p384)
+			let peer = unmarshalPoint(curve, share.data) onerror fail tlsError(Alert.IllegalParameter, "server ECDHE share is not a point on the curve")
+			return ecdh(curve, key.scalar, peer) onerror fail tlsError(Alert.IllegalParameter, "server ECDHE share is invalid")
+		}
+
+		internal def processEncryptedExtensions(ee EncryptedExtensions) !none {
+			if ee.alpnProtocol != "" {
+				fail tlsError(Alert.UnsupportedExtension, "server selected ALPN protocol {ee.alpnProtocol} without an offer") when config.alpn.len() == 0
+				fail tlsError(Alert.IllegalParameter, "server selected ALPN protocol {ee.alpnProtocol}, which was not offered") unless config.alpn.includes(ee.alpnProtocol)
+			}
+			state.alpn = ee.alpnProtocol
+			return none
+		}
+
+		internal def processCertificate(msg CertificateMessage) !none {
+			fail tlsError(Alert.IllegalParameter, "server Certificate carries a request context") when msg.requestContext.len() > 0
+			fail tlsError(Alert.DecodeError, "server sent no certificates") when msg.entries.len() == 0
+			let chain Certificate[]
+			for let (_, entry) in msg.entries {
+				let cert = parseCertificate(entry.data) onerror fail tlsError(Alert.BadCertificate, "server certificate does not parse")
+				chain.push(cert)
+			}
+			state.peerCertificates = chain
+			return none when config.insecureSkipVerify
+			let intermediates = new CertPool()
+			for let i = 1; i < chain.len(); i++ {
+				intermediates.addCert(chain[i])
+			}
+			let opts = VerifyOptions{dnsName: config.serverName, roots: config.rootCAs, intermediates: intermediates}
+			let failure ?error = none
+			let chains = chain[0].verify(opts) onerror (err error) {
+				failure = err
+				recover []
+			}
+			fail chainError(failure) unless failure is none
+			state.verifiedChains = chains
+			return none
+		}
+
+		internal def processCertificateVerify(cv CertificateVerify) !none {
+			fail tlsError(Alert.InternalError, "no peer certificate") when state.peerCertificates.len() == 0
+			return try verifyCertificateVerify(cv, state.peerCertificates[0].publicKey, "TLS 1.3, server CertificateVerify", schedule.transcriptHash())
+		}
+
+		// run12 continues as TLS 1.2 after a ServerHello without
+		// supported_versions: Certificate, ServerKeyExchange and
+		// ServerHelloDone in the clear, then ClientKeyExchange,
+		// change_cipher_spec and Finished both ways. A CertificateRequest
+		// is answered with the first chain of the config whose key the
+		// server takes, signed over the handshake so far in
+		// CertificateVerify, or declined with an empty Certificate.
+		internal def run12(sh ServerHello, raw byte[]) !none {
+			try checkServerHello12(sh)
+			records.legacy = true
+			schedule.update(raw)
+			return try resume12(sh) when resumed
+
+			let (kind, body, message) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected Certificate, got message {kind}") when kind != handshakeCertificate
+			let entries CertificateEntry[]
+			for let (_, der) in try parseCertificate12(body) {
+				entries.push(CertificateEntry{data: der, extensions: []})
+			}
+			try processCertificate(CertificateMessage{requestContext: [], entries: entries})
+			schedule.update(message)
+
+			let (kind2, body2, message2) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected ServerKeyExchange, got message {kind2}") when kind2 != handshakeServerKeyExchange
+			let kx = try parseServerKeyExchange(body2)
+			fail tlsError(Alert.IllegalParameter, "server exchanges keys over group {kx.group}, which was not offered") unless hello.supportedGroups.includes(kx.group)
+			try verifyKeyExchange(kx, state.peerCertificates[0].publicKey, hello.random + sh.random, suiteSignsWithRSA(suite))
+			schedule.update(message2)
+
+			let (kind3, body3, message3) = try reader.next()
+			let request ?CertificateRequest12 = none
+			if kind3 == handshakeCertificateRequest {
+				request = try parseCertificateRequest12(body3)
+				schedule.update(message3)
+				let (kind4, body4, message4) = try reader.next()
+				kind3 = kind4
+				body3 = body4
+				message3 = message4
+			}
+			fail tlsError(Alert.UnexpectedMessage, "expected ServerHelloDone, got message {kind3}") when kind3 != handshakeServerHelloDone
+			fail tlsError(Alert.DecodeError, "ServerHelloDone of {body3.len()} bytes") when body3.len() > 0
+			fail tlsError(Alert.UnexpectedMessage, "handshake data after ServerHelloDone") when reader.buffer.len() > 0
+			schedule.update(message3)
+
+			let presented ?KeyPair = none
+			if !(request is none) {
+				presented = clientPairFor(request)
+				let chain byte[][]
+				chain = presented.chain unless presented is none
+				let certificate = marshalCertificate12(chain)
+				try records.write(recordHandshake, certificate)
+				schedule.update(certificate)
+			}
+			let key = try newEphemeralKey(kx.group)
+			let preMaster = try key.sharedSecret(kx.point)
+			let exchange = marshalClientKeyExchange(key.public)
+			try records.write(recordHandshake, exchange)
+			schedule.update(exchange)
+			let master = extendedMasterSecret(hash, preMaster, schedule.transcriptHash())
+			let keys = keyBlock(suite, master, hello.random, sh.random)
+			if !(presented is none) && !(request is none) {
+				let signer = presented.privateKey
+				fail tlsError(Alert.InternalError, "certificate has no private key") when signer is none
+				let scheme = keyExchangeSchemeFor(signer, request.signatureAlgorithms)
+				fail tlsError(Alert.InternalError, "no signature scheme selected") when scheme is none
+				let verify = marshalCertificateVerify(CertificateVerify{algorithm: int(scheme), signature: try presented.sign(schedule.transcript, scheme)})
+				try records.write(recordHandshake, verify)
+				schedule.update(verify)
+			}
+
+			try records.write(recordChangeCipherSpec, byte[1])
+			records.setWriteKey(try suiteAEAD(suite, keys.clientKey), keys.clientIV)
+			let finished = marshalFinished(finishedVerifyData(hash, master, "client finished", schedule.transcriptHash()))
+			try records.write(recordHandshake, finished)
+			schedule.update(finished)
+
+			records.stageReadKey(try suiteAEAD(suite, keys.serverKey), keys.serverIV)
+			let ticket = try readTicket12(sh)
+			try readServerFinished12(master)
+			try storeSession12(ticket, master) unless ticket is none
+			return none
+		}
+
+		// resume12 completes a TLS 1.2 handshake the server resumed from
+		// the ticket offered (RFC 5077 §3.1): the master secret of the
+		// session keys the connection under the new randoms, the server's
+		// change_cipher_spec and Finished come first, a fresh ticket
+		// replaces the one used, and the state repeats what the original
+		// connection verified.
+		internal def resume12(sh ServerHello) !none {
+			let offered = session
+			fail tlsError(Alert.InternalError, "resumed without a session") when offered is none
+			let master = offered.psk
+			let keys = keyBlock(suite, master, hello.random, sh.random)
+			records.stageReadKey(try suiteAEAD(suite, keys.serverKey), keys.serverIV)
+			let ticket = try readTicket12(sh)
+			state.resumed = true
+			state.peerCertificates = offered.peerCertificates
+			state.verifiedChains = offered.verifiedChains
+			try readServerFinished12(master)
+
+			try records.write(recordChangeCipherSpec, byte[1])
+			records.setWriteKey(try suiteAEAD(suite, keys.clientKey), keys.clientIV)
+			try records.write(recordHandshake, marshalFinished(finishedVerifyData(hash, master, "client finished", schedule.transcriptHash())))
+			try storeSession12(ticket, master) unless ticket is none
+			return none
+		}
+
+		// readTicket12 reads the NewSessionTicket a TLS 1.2 ServerHello
+		// announced, none when it announced none.
+		internal def readTicket12(sh ServerHello) !?NewSessionTicket12 {
+			return none unless sh.sessionTicket
+			let (kind, body, message) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected NewSessionTicket, got message {kind}") when kind != handshakeNewSessionTicket
+			fail tlsError(Alert.UnexpectedMessage, "NewSessionTicket came after change_cipher_spec") when records.isProtected()
+			schedule.update(message)
+			return try parseNewSessionTicket12(body)
+		}
+
+		// readServerFinished12 reads the server's Finished, which must come
+		// under the keys its change_cipher_spec switched to, checks it over
+		// the handshake so far and completes the state.
+		internal def readServerFinished12(master byte[]) !none {
+			let (kind, body, message) = try reader.next()
+			fail tlsError(Alert.UnexpectedMessage, "expected Finished, got message {kind}") when kind != handshakeFinished
+			fail tlsError(Alert.UnexpectedMessage, "server Finished came before change_cipher_spec") unless records.isProtected()
+			let expected = finishedVerifyData(hash, master, "server finished", schedule.transcriptHash())
+			fail tlsError(Alert.DecryptError, "server Finished does not verify") unless constantTimeEqual(expected, body)
+			schedule.update(message)
+			state.version = Version.TLS12
+			state.cipherSuite = suite
+			state.serverName = config.serverName
+			state.handshakeComplete = true
+			return none
+		}
+
+		// storeSession12 caches a TLS 1.2 session under the server name: the
+		// ticket, the master secret it resumes, and what the server
+		// presented. A lifetime hint of 0 means the seven-day cap.
+		internal def storeSession12(ticket NewSessionTicket12, master byte[]) !none {
+			let cache = config.sessionCache
+			return none when cache is none || config.serverName == "" || ticket.ticket.len() == 0
+			let lifetime = ticket.lifetimeHint
+			lifetime = sessionTicketLifetime when lifetime <= 0
+			cache.put(config.serverName, ClientSession{version: Version.TLS12, ticket: ticket.ticket, psk: master, lifetime: lifetime, ageAdd: 0, receivedAt: time.now(), suite: suite, alpn: state.alpn, peerCertificates: state.peerCertificates, verifiedChains: state.verifiedChains})
+			return none
+		}
+
+		// clientPairFor is the first chain of the config a TLS 1.2
+		// CertificateRequest takes: its key type listed, and a signature
+		// scheme for it accepted. None declines.
+		internal def clientPairFor(request CertificateRequest12) ?KeyPair {
+			for let (_, pair) in config.certificates {
+				let key = pair.privateKey
+				continue when key is none
+				let wanted = key is RSAPrivateKey ?? (certificateTypeRSASign, certificateTypeECDSASign)
+				continue unless request.certificateTypes.includes(wanted)
+				return pair unless keyExchangeSchemeFor(key, request.signatureAlgorithms) is none
+			}
+			return none
+		}
+
+		// checkServerHello12 validates a TLS 1.2 ServerHello and takes its
+		// suite and ALPN protocol: the version must be allowed and not a
+		// downgrade (RFC 8446 §4.1.3), the suite a TLS 1.2 one that was
+		// offered, the extended master secret agreed. A server that echoes
+		// the session id resumed the session whose ticket was offered
+		// (RFC 5077 §3.4), which must keep its suite.
+		internal def checkServerHello12(sh ServerHello) !none {
+			fail tlsError(Alert.ProtocolVersion, "server negotiated TLS 1.2, which this client does not speak") when config.minVersion != Version.TLS12
+			let tail = sh.random[24:].hex()
+			fail tlsError(Alert.IllegalParameter, "server random carries a downgrade sentinel") when tail == downgradeTLS11 || (tail == downgradeTLS12 && config.maxVersion == Version.TLS13)
+			let selected = cipherSuiteOf(sh.cipherSuite)
+			fail tlsError(Alert.IllegalParameter, "server selected an unsupported cipher suite {sh.cipherSuite}") when selected is none
+			fail tlsError(Alert.IllegalParameter, "server selected a TLS 1.3 cipher suite for TLS 1.2") when suiteIsTLS13(selected)
+			fail tlsError(Alert.IllegalParameter, "server selected a cipher suite that was not offered") unless hello.cipherSuites.includes(sh.cipherSuite)
+			fail tlsError(Alert.IllegalParameter, "ServerHello carries a TLS 1.3 extension") when !(sh.keyShare is none) || sh.selectedIdentity >= 0 || sh.cookie.len() > 0
+			let echoed = sh.sessionID.len() > 0 && sh.sessionID.hex() == hello.sessionID.hex()
+			fail tlsError(Alert.IllegalParameter, "server resumed a session that was not offered") when echoed && hello.sessionTicket.len() == 0
+			fail tlsError(Alert.UnsupportedExtension, "server announces a session ticket that was not asked for") when sh.sessionTicket && !hello.offersSessionTicket
+			fail tlsError(Alert.HandshakeFailure, "server does not agree to the extended master secret") unless sh.extendedMasterSecret
+			try processEncryptedExtensions(EncryptedExtensions{alpnProtocol: sh.alpnProtocol})
+			let offered = session
+			if echoed {
+				fail tlsError(Alert.InternalError, "resumed without a session") when offered is none
+				fail tlsError(Alert.IllegalParameter, "server resumed with another cipher suite") when offered.suite != selected
+			}
+			suite = selected
+			hash = suiteHash(suite)
+			schedule.hash = hash
+			session = none unless echoed
+			psk = []
+			resumed = echoed
+			return none
+		}
+	}
+
+	// chainError maps a verification failure to the alert it deserves.
+	internal def chainError(failure error) TLSError {
+		let alert = Alert.BadCertificate
+		if failure is CertificateError {
+			alert = Alert.CertificateExpired when failure.reason == InvalidReason.Expired
+			alert = Alert.UnknownCA when failure.reason == InvalidReason.UnknownAuthority
+			alert = Alert.UnsupportedCertificate when failure.reason == InvalidReason.UnsupportedAlgorithm
+		}
+		return TLSError{message: "tls: {failure.message}", cause: failure, alert: alert}
+	}
+
+	// verifyCertificateVerify checks a peer's CertificateVerify with the
+	// public key of its leaf over the transcript hash: RSA-PSS with a salt
+	// as long as the hash, or ECDSA on the curve the scheme names. Fails
+	// with TLSError when the scheme is unsupported or does not fit the key,
+	// or the signature does not verify.
+	internal def verifyCertificateVerify(cv CertificateVerify, key ?PublicKey, context string, transcriptHash byte[]) !none {
+		let scheme = try offeredScheme(cv.algorithm, supportedSignatureSchemes())
+		if key is ECDSAPublicKey {
+			let ec ECDSAPublicKey = key
+			let wanted = scheme == SignatureScheme.ECDSASecp256r1SHA256 ?? ("P-256", "P-384")
+			fail tlsError(Alert.IllegalParameter, "ECDSA key on {ec.curve.name} with scheme {scheme}") unless isECDSAScheme(scheme) && ec.curve.name == wanted
+		}
+		return try verifySignature(key, certificateVerifyContent(context, transcriptHash), cv.signature, scheme)
+	}
+
+	// verifyKeyExchange checks the signature of a TLS 1.2 ServerKeyExchange
+	// with the public key of the server's leaf over both randoms and the
+	// ECDHE parameters (RFC 8422 §5.4): RSA-PSS or RSA PKCS#1 v1.5 for an
+	// RSA suite, ECDSA for an ECDSA one. Fails with TLSError when the scheme
+	// was not offered or does not fit the key or the suite, or the
+	// signature does not verify.
+	internal def verifyKeyExchange(kx ServerKeyExchange, key ?PublicKey, randoms byte[], wantsRSA bool) !none {
+		fail tlsError(Alert.IllegalParameter, "RSA certificate with an ECDSA cipher suite") when key is RSAPublicKey && !wantsRSA
+		fail tlsError(Alert.IllegalParameter, "ECDSA certificate with an RSA cipher suite") when key is ECDSAPublicKey && wantsRSA
+		return try verifySignature(key, randoms + serverKeyExchangeParams(kx.group, kx.point), kx.signature, try offeredScheme(kx.algorithm, supportedTLS12SignatureSchemes()))
+	}
+}

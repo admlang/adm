@@ -1,0 +1,344 @@
+// Automated trust anchor maintenance (RFC 5011): `TrustAnchors` tracks the
+// keys of a zone through Pending, Valid, Missing and Revoked as its DNSKEY
+// set rolls over, holding each change down for a fixed time before it
+// takes effect, so a key signing key can be replaced without every
+// resolver needing a manual update.
+//
+// ```
+// let anchors = new dnssec.TrustAnchors(".", dnssec.rootAnchors())
+// let validator = new dnssec.Validator(client, anchors.records())
+// if try anchors.update(validator) {
+//     // anchors.str() is what to keep for the next run.
+// }
+// ```
+
+partial module std.net.dns.dnssec {
+	use (
+		std.net.dns
+		std.time
+	)
+
+	// AnchorState is where a trust anchor key stands in RFC 5011's state
+	// machine (§4.2). A key that has not been accepted yet is simply
+	// absent (the RFC's Start state); once a revoked key's remove
+	// hold-down elapses it is dropped instead of being kept as Removed.
+	enum AnchorState {
+		// AddPend: a new secure entry point key, signed by a key already
+		// trusted, waiting out the add hold-down before it is trusted.
+		Pending,
+		// Valid: trusted to validate the zone.
+		Valid,
+		// Missing: was Valid, absent from the last DNSKEY set seen; still
+		// trusted in case it reappears.
+		Missing,
+		// Revoked: seen with the REVOKE flag, self-signed by the revoked
+		// key, waiting out the remove hold-down before it is dropped.
+		Revoked,
+	}
+
+	// TrackedKey is one key of a trust point under RFC 5011 maintenance.
+	type TrackedKey {
+		// The DNSKEY record as last seen.
+		record dns.Record
+		state  AnchorState
+		// When the key was first seen (`Pending`), or entered its current
+		// state.
+		since  time.Time
+	}
+
+	// TrustAnchors maintains the trust anchors of a zone automatically
+	// (RFC 5011 §4): `update` asks a `Validator` for the zone's DNSKEY set
+	// and walks every tracked key through the state machine as the set
+	// changes.
+	//
+	// A DS record given to `new` names no key of its own, so it cannot be
+	// tracked; it is kept in `seeds` and stays part of `records()` until a
+	// DNSKEY of the zone that matches it becomes `Valid`, which the first
+	// successful `update` does immediately (RFC 5011 §4.1). With the
+	// default root anchors, that is how the root's current key signing
+	// keys become trusted.
+	type TrustAnchors {
+		zone           string
+		// Keys under RFC 5011 maintenance.
+		keys           TrackedKey[] = []
+		// Anchors that name no key of their own: the DS records given to
+		// `new`, kept until a DNSKEY they name becomes `Valid`.
+		seeds          dns.Record[] = []
+		// How long a new key must be seen before it is trusted (RFC 5011
+		// §4.1 recommends 30 days); the DNSKEY set's own TTL is used
+		// instead when it is longer.
+		addHoldDown    duration     = 720h
+		// How long a revoked key is still refused before it is dropped.
+		removeHoldDown duration     = 720h
+
+		// new seeds `keys` with the DNSKEY records among `anchors`,
+		// already `Valid`, and `seeds` with the rest, their DS records.
+		def new(zone string = ".", anchors dns.Record[] = []) {
+			self.zone = dns.canonicalName(zone)
+			let at = time.now()
+			for let (_, r) in anchors {
+				if r.dnskey is none {
+					seeds.push(r)
+				} else {
+					let tracked = new TrackedKey()
+					tracked.record = r
+					tracked.state = AnchorState.Valid
+					tracked.since = at
+					keys.push(tracked)
+				}
+			}
+		}
+
+		// records is what a `Validator` should trust now: the DNSKEY
+		// records that are `Valid` or `Missing`, plus `seeds` while none
+		// of them is.
+		def records() dns.Record[] {
+			let out dns.Record[]
+			let trusted = false
+			for let (_, k) in keys {
+				trusted = true when k.state == AnchorState.Valid
+			}
+			for let (_, k) in keys {
+				out.push(k.record) when k.state := AnchorState.Valid || AnchorState.Missing
+			}
+			if !trusted {
+				for let (_, s) in seeds {
+					out.push(s)
+				}
+			}
+			return out
+		}
+
+		// update asks `validator` for the zone's DNSKEY set and walks
+		// every tracked key through RFC 5011's state machine (§4.2): a
+		// new secure entry point key not yet tracked becomes `Pending`
+		// (or `Valid` at once when it matches a seed DS); a `Pending` key
+		// held for `addHoldDown`, or the set's TTL when that is longer,
+		// becomes `Valid`; a `Pending` key that disappears is dropped; a
+		// `Valid` key that disappears becomes `Missing`, and one that
+		// reappears becomes `Valid` again; a tracked key seen with the
+		// REVOKE flag whose own signature over the set verifies becomes
+		// `Revoked`; a `Revoked` key held for `removeHoldDown` is
+		// dropped. `records()` replaces `validator.anchors` and
+		// `validator.forget()` is called when anything changed.
+		// Returns whether anything changed.
+		// Fails with Bogus when the response is not secure; nothing
+		// changes.
+		def update(validator Validator, now ?time.Time = none) !bool {
+			let response = try validator.query(zone, dns.RecordType.DNSKEY)
+			fail bogus("the DNSKEY set of {zone} is not secure", zone) unless response.authenticData
+			let held = setIn(recordSets(response.answers), zone, dns.RecordType.DNSKEY.value)
+			fail bogus("{zone} has no DNSKEY records", zone) when held is none
+			let at = now is none ?? (time.now(), now)
+			let hold = holdDown(held.records)
+			let changed = false
+
+			for let (_, r) in held.records {
+				let data = r.dnskey
+				continue when data is none || !data.isEntryPoint() || data.isRevoked()
+				continue unless indexOf(r) < 0
+				let tracked = new TrackedKey()
+				tracked.record = r
+				tracked.since = at
+				tracked.state = matchesSeed(r) ?? (AnchorState.Valid, AnchorState.Pending)
+				keys.push(tracked)
+				changed = true
+			}
+
+			let kept TrackedKey[]
+			for let (_, k) in keys {
+				let present = memberOf(held.records, k.record)
+				if k.state == AnchorState.Pending {
+					if present is none {
+						changed = true
+						continue
+					}
+					if at.since(k.since) >= hold {
+						k.state = AnchorState.Valid
+						changed = true
+					}
+					kept.push(k)
+					continue
+				}
+				if k.state == AnchorState.Valid && present is none {
+					k.state = AnchorState.Missing
+					changed = true
+				} else if k.state == AnchorState.Missing && !(present is none) {
+					k.state = AnchorState.Valid
+					changed = true
+				}
+				kept.push(k)
+			}
+			keys = kept
+
+			for let (_, k) in keys {
+				continue when k.state == AnchorState.Revoked
+				let present = memberOf(held.records, k.record)
+				continue when present is none
+				let data = present.dnskey
+				continue when data is none || !data.isRevoked()
+				continue unless revokedBy(held, present, at)
+				k.record = present
+				k.state = AnchorState.Revoked
+				k.since = at
+				changed = true
+			}
+
+			let final TrackedKey[]
+			for let (_, k) in keys {
+				if k.state == AnchorState.Revoked && at.since(k.since) >= removeHoldDown {
+					changed = true
+					continue
+				}
+				final.push(k)
+			}
+			keys = final
+
+			if changed {
+				validator.anchors = records()
+				validator.forget()
+			}
+			return changed
+		}
+
+		// str renders the tracked keys and seeds as text, one per line,
+		// for `parseTrustAnchors` to read back: the state (or `seed`),
+		// the time it was seen in Unix seconds, then the DNSKEY record in
+		// zone file form.
+		def str() string {
+			let out string[]
+			for let (_, s) in seeds {
+				out.push("seed {s.str()}")
+			}
+			for let (_, k) in keys {
+				out.push("{k.state.name} {int(k.since.unixNs() / 1000000000)} {k.record.str()}")
+			}
+			return out.join("\n")
+		}
+
+		internal def indexOf(record dns.Record) int {
+			for let (i, k) in keys {
+				return i when sameKey(k.record, record)
+			}
+			return -1
+		}
+
+		internal def matchesSeed(key dns.Record) bool {
+			for let (_, s) in seeds {
+				return true when !(s.ds is none) && matches(s, key)
+			}
+			return false
+		}
+
+		// holdDown is the greater of `addHoldDown` and the DNSKEY set's
+		// TTL (RFC 5011 §4.1: the add hold-down must span at least one
+		// refresh of the set).
+		internal def holdDown(records dns.Record[]) duration {
+			let ttl = 0
+			for let (_, r) in records {
+				ttl = r.ttl when r.ttl > ttl
+			}
+			let span = duration(int64(ttl) * 1000000000)
+			return addHoldDown > span ?? (addHoldDown, span)
+		}
+	}
+
+	// sameKey reports whether two DNSKEY records are the same key: the
+	// same algorithm and public key bytes, ignoring flags, since revoking
+	// a key changes its flags and so its key tag (RFC 5011 §4.2).
+	internal def sameKey(a dns.Record, b dns.Record) bool {
+		let x = a.dnskey
+		let y = b.dnskey
+		return false when x is none || y is none
+		return false when x.algorithm != y.algorithm
+		return compareBytes(x.key, y.key) == 0
+	}
+
+	// memberOf is the record among `records` that is the same key as
+	// `key`, none when there is none.
+	internal def memberOf(records dns.Record[], key dns.Record) ?dns.Record {
+		for let (_, r) in records {
+			return r when sameKey(r, key)
+		}
+		return none
+	}
+
+	// revokedBy reports whether `key`'s own signature over the DNSKEY set
+	// in `held` verifies: RFC 5011 §4.2 requires the trust point to be
+	// able to validate the set using the revoked key itself before it
+	// moves to `Revoked`.
+	internal def revokedBy(held RecordSet, key dns.Record, at time.Time) bool {
+		let data = key.dnskey
+		return false when data is none
+		for let (_, sig) in held.signatures {
+			let info = sig.rrsig
+			continue when info is none || info.keyTag != data.keyTag() || info.algorithm != data.algorithm
+			let ok = true
+			verify(held.records, sig, key, at) onerror (err error) {
+				ok = false
+				recover none
+			}
+			return true when ok
+		}
+		return false
+	}
+
+	// stateOf is the trust anchor state named by its `AnchorState.name`.
+	// Fails with Malformed when the text is none of them.
+	internal def stateOf(text string) !AnchorState {
+		return AnchorState.Pending when text == AnchorState.Pending.name
+		return AnchorState.Valid when text == AnchorState.Valid.name
+		return AnchorState.Missing when text == AnchorState.Missing.name
+		return AnchorState.Revoked when text == AnchorState.Revoked.name
+		fail dns.errorOf(dns.ErrorKind.Malformed, "\"{text}\" is not a trust anchor state")
+	}
+
+	// recordFrom reads the DNSKEY or DS record a trust anchor line ends
+	// with, as `TrustAnchors.str` writes it.
+	internal def recordFrom(line string) !dns.Record {
+		let zone = try dns.parseZone(line + "\n", ".")
+		let records = zone.all()
+		fail dns.errorOf(dns.ErrorKind.Malformed, "the line has no record") when records.len() == 0
+		return records[0]
+	}
+
+	// parseTrustAnchors reads the text `TrustAnchors.str` writes: lines
+	// starting with `;`, and empty lines, are ignored. `zone` is the
+	// owner name of the first record read.
+	// Fails with Malformed when a line is not one `str` could have
+	// written.
+	def parseTrustAnchors(text string) !TrustAnchors {
+		let out = new TrustAnchors()
+		let zoneSet = false
+		for let (_, raw) in text.split("\n") {
+			let line = raw.trim()
+			continue when line == "" || line.startsWith(";")
+			let record ?dns.Record = none
+			if line.startsWith("seed ") {
+				let seed = try recordFrom(line[5:])
+				out.seeds.push(seed)
+				record = seed
+			} else {
+				let firstSpace = line.indexOf(" ")
+				fail dns.errorOf(dns.ErrorKind.Malformed, "the line has no state") when firstSpace < 0
+				let state = try stateOf(line[:firstSpace])
+				let rest = line[firstSpace + 1:]
+				let secondSpace = rest.indexOf(" ")
+				fail dns.errorOf(dns.ErrorKind.Malformed, "the line has no time") when secondSpace < 0
+				let seconds = rest[:secondSpace]
+				fail dns.errorOf(dns.ErrorKind.Malformed, "\"{seconds}\" is not a time") unless seconds.isNumeric()
+				let tracked = new TrackedKey()
+				tracked.record = try recordFrom(rest[secondSpace + 1:])
+				tracked.state = state
+				tracked.since = time.fromUnixNs(int64(seconds.toInt<int>()) * 1000000000)
+				out.keys.push(tracked)
+				record = tracked.record
+			}
+			if !zoneSet && !(record is none) {
+				out.zone = dns.canonicalName(record.name)
+				zoneSet = true
+			}
+		}
+		return out
+	}
+}

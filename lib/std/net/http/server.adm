@@ -1,4 +1,903 @@
 partial module std.net.http {
-	// Server is the HTTP server; it has no members yet.
-	type Server {}
+	use (
+		std.bytes
+		std.io
+		std.metrics
+		std.net
+		std.net.http.http2
+		std.net.tls
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// Handler answers one request through its context. A `ServeMux` is
+	// one, a `HandlerFunc` wraps a closure into one, and middleware
+	// wraps one handler in another.
+	interface Handler {
+		// Failing is the same as `ctx.error(500)` plus the server's
+		// `onError` hook, or the status of an `HttpError` from
+		// `ctx.abort`: a handler fails instead of formatting its own
+		// error page. A response already committed is left as it is.
+		def serve(ctx Context) !none
+	}
+
+	// HandlerFunc makes a closure a `Handler`.
+	//
+	//     mux.handle("GET /ping", new HandlerFunc(def (ctx Context) !none {
+	//         return ctx.text("pong")
+	//     }))
+	type HandlerFunc {
+		fn def(Context) !none
+
+		def new(fn def(Context) !none) {
+			self.fn = fn
+		}
+
+		// Implements Handler.
+		def serve(ctx Context) !none {
+			return fn(ctx)
+		}
+	}
+
+	// Middleware runs around a handler: before `next`, after it, or
+	// instead of it.
+	//
+	//     def timing(ctx Context, next Handler) !none {
+	//         let started = time.now()
+	//         ctx.onFinish(def () { log.info("served in " + time.since(started).str()) })
+	//         return next.serve(ctx)
+	//     }
+	interface Middleware {
+		def handle(ctx Context, next Handler) !none
+	}
+
+	// MiddlewareFunc makes a closure a `Middleware`.
+	type MiddlewareFunc {
+		fn def(Context, Handler) !none
+
+		def new(fn def(Context, Handler) !none) {
+			self.fn = fn
+		}
+
+		// Implements Middleware.
+		def handle(ctx Context, next Handler) !none {
+			return fn(ctx, next)
+		}
+	}
+
+	// wrap applies middleware to a handler, first in the list outermost,
+	// and returns the resulting handler.
+	def wrap(h Handler, middleware ...Middleware) Handler {
+		let result = h
+		for let i = middleware.len() - 1; i >= 0; i-- {
+			result = new MiddlewareHandler(middleware[i], result)
+		}
+		return result
+	}
+
+	// MiddlewareHandler is one link of a middleware chain: the middleware
+	// and the handler it runs around.
+	internal type MiddlewareHandler {
+		middleware Middleware
+		next       Handler
+
+		def new(middleware Middleware, next Handler) {
+			self.middleware = middleware
+			self.next = next
+		}
+
+		// Implements Handler.
+		def serve(ctx Context) !none {
+			return middleware.handle(ctx, next)
+		}
+	}
+
+	// ConnState is where a server connection is in its life, reported to
+	// `Server.onConnection`.
+	enum ConnState {
+		// Accepted, nothing read yet.
+		New      = "new",
+		// Reading or answering a request.
+		Active   = "active",
+		// Between requests on a keep-alive connection.
+		Idle     = "idle",
+		// A handler hijacked it; the server is done with it.
+		Hijacked = "hijacked",
+		Closed   = "closed",
+	}
+
+	// Server accepts HTTP/1.1 connections and answers each request with
+	// `handler`, one task per connection. A zero server serves on
+	// ":8080" with `notFoundHandler()`; set the fields before `start`.
+	// Implements `net.Server`, so `start` returns at once and `close`
+	// stops it; `listenAndServe` is the blocking form, `serve` the form
+	// over a listener the caller made (an ephemeral port in tests).
+	//
+	//     let mux = new ServeMux()
+	//     mux.get("/", def (ctx Context) !none { return ctx.text("hi") })
+	//     let server = new Server(":8080", mux)
+	//     try server.listenAndServe()
+	//
+	// Timeouts are per phase: `readHeaderTimeout` from accept (or the
+	// end of the previous response) to the end of the header block,
+	// `readTimeout` for the whole request including the body,
+	// `writeTimeout` from the end of the header read to the end of the
+	// response write, `idleTimeout` between keep-alive requests. 0s is
+	// no limit; the defaults are the ones a public server wants.
+	type Server {
+		addr                 string      = ":8080"
+		handler              ?Handler    = none
+		readTimeout          duration    = 60s
+		readHeaderTimeout    duration    = 10s
+		writeTimeout         duration    = 60s
+		idleTimeout          duration    = 120s
+		// Largest request header block; 1 MiB.
+		maxHeaderBytes       int         = 1024 * 1024
+		// Largest request body a handler may read before the read fails
+		// and the server answers 413; 0 is no limit. Per-route limits
+		// come from `maxBytes`.
+		maxBodyBytes         int         = 0
+		keepAlive            bool        = true
+		// Serves HTTP/2 to a client that asks for it: `h2` through ALPN
+		// over TLS, the connection preface on a plain connection.
+		http2                bool        = true
+		// Streams a client may have open on one HTTP/2 connection
+		// (SETTINGS_MAX_CONCURRENT_STREAMS); one past it is refused.
+		maxConcurrentStreams int         = 250
+		// Sent as the `Server` header; "" sends none.
+		serverHeader         string      = "adm"
+		// Connections accepted at once; an accept past it waits. 0 is
+		// no limit.
+		maxConnections       int         = 0
+		// Accept queue length for `listenAndServe`.
+		backlog              int         = 128
+		// TLS settings; set, every accepted connection is a TLS server
+		// connection. `listenAndServeTLS` adds its key pair to these. An
+		// empty `alpn` is filled with `http/1.1`, after `h2` with `http2`.
+		tls                  ?tls.Config = none
+
+		internal listener            ?net.Listener = none
+		internal atomic conns        ServerConn[]  = []
+		internal atomic running      bool          = false
+		internal atomic shuttingDown bool          = false
+		internal errorHooks          ErrorHook[]   = []
+		internal connHooks           ConnHook[]    = []
+
+		// Shared by every server of the process.
+		@metric("net.http.server.requests.total")
+		internal requestsMetric metrics.Counter
+		@metric("net.http.server.errors.total")
+		internal errorsMetric metrics.Counter
+		@metric("net.http.server.connections.open")
+		internal connectionsMetric metrics.Gauge
+		internal shutdownHooks CancelHook[] = []
+
+		def new(addr string = ":8080", handler ?Handler = none) {
+			self.addr = addr
+			self.handler = handler
+		}
+
+		// Binds `addr` and serves until `close` or `shutdown`.
+		// Fails with PolicyDenied when the policy denies listening there,
+		// NetError when the address cannot be bound, else as `serve` does.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Like `listenAndServe` over TLS with the PEM certificate chain
+		// and key files, added to `tls` (a fresh config when none is set).
+		// When the pair is the config's only certificate and no
+		// `getCertificate` is set, the files are watched
+		// (`tls.KeyPairFile`): a renewal that replaces them is presented
+		// by the next handshake, without a restart.
+		// Fails with TLSError when the files do not hold a matching pair,
+		// the file error when one cannot be read, and as `listenAndServe`
+		// does after.
+		def listenAndServeTLS(certFile string, keyFile string) !none {
+			tls = try withWatchedKeyPair(tls, certFile, keyFile)
+			return try listenAndServe()
+		}
+
+		// Accepts on the listener until it closes; each connection runs
+		// in its own task. Returns none after `close` or `shutdown`.
+		// Fails with NetError when accept fails for another reason.
+		def serve(ln net.Listener) !none {
+			fail HttpError{message: "server is already serving", op: "server", text: addr} when running
+			listener = ln
+			running = true
+			shuttingDown = false
+			for {
+				break unless running
+				// Hold the accept while the connection cap is reached.
+				for {
+					break when maxConnections <= 0 || conns.len() < maxConnections || !running
+					time.sleep(1ms)
+				}
+				break unless running
+				let failure ?error = none
+				let accepted ?net.Connection = none
+				accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					if listenerClosed(failure) {
+						// Closed before this task took the listener.
+						running = false
+						return none
+					}
+					fail failure unless failure is net.NetError
+					report(failure, none)
+					time.sleep(5ms)
+					continue
+				}
+				continue when accepted is none
+				// Accepted while `close` or `shutdown` ran: not served.
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				let sc = new ServerConn(self, accepted, tls)
+				track(sc)
+				notify(accepted, ConnState.New)
+				let task = async sc.serve()
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with NetError when the address cannot be bound.
+		def start() !none {
+			return none when running
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Runs `serve` for `start`; an accept failure goes to `onError`.
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror (err error) {
+				report(err, none)
+				recover none
+			}
+		}
+
+		// `accept` as an optional, so a failure can recover to none.
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		// Implements net.Server: stops accepting and closes every
+		// connection at once, in-flight requests included. A second
+		// call does nothing.
+		def close() !none {
+			return none unless running || !(listener is none)
+			running = false
+			shuttingDown = true
+			closeListener()
+			closeConnections()
+			return none
+		}
+
+		// Stops accepting, lets in-flight requests finish, closes idle
+		// connections, then returns. Connections still busy when
+		// `deadline` passes are closed. Hijacked connections are not
+		// touched. Registered shutdown hooks run first.
+		// Fails with HttpError (op "timeout") when the deadline passed
+		// with requests still running.
+		def shutdown(deadline duration = 30s) !none {
+			let hooks = shutdownHooks
+			for let hook in hooks {
+				hook.run()
+			}
+			shuttingDown = true
+			running = false
+			closeListener()
+			let limit = time.now() + deadline
+			for {
+				closeIdleConnections()
+				return none when conns.len() == 0
+				if time.now().after(limit) {
+					let busy = conns.len()
+					closeConnections()
+					fail HttpError{message: "shutdown deadline passed with {busy} connections busy", op: "timeout", text: addr}
+				}
+				time.sleep(5ms)
+			}
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed
+		// before `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// Registers fn to run when `shutdown` begins: close a database,
+		// stop a long-poll broker.
+		def onShutdown(fn def ()) {
+			shutdownHooks.push(new CancelHook(fn))
+		}
+
+		// Registers fn to receive every error the server swallows: a
+		// handler that failed, a request that did not parse, an accept
+		// error. The context is none when there is no request yet.
+		def onError(fn def(error, ?Context)) {
+			errorHooks.push(new ErrorHook(fn))
+		}
+
+		// Registers fn to see each connection state change, for
+		// connection metrics and draining.
+		def onConnection(fn def(net.Connection, ConnState)) {
+			connHooks.push(new ConnHook(fn))
+		}
+
+		// Open connections right now.
+		def connectionCount() int {
+			return conns.len()
+		}
+
+		// Runs the `onError` hooks with an error the server swallowed;
+		// `recoverer` reports through it too.
+		def report(err error, ctx ?Context) {
+			errorsMetric.inc()
+			for let hook in errorHooks {
+				hook.fn(err, ctx)
+			}
+		}
+
+		// Counts a request handed to the handler.
+		def countRequest() {
+			requestsMetric.inc()
+		}
+
+		// Runs the `onConnection` hooks for a state change.
+		def notify(conn net.Connection, state ConnState) {
+			for let hook in connHooks {
+				hook.fn(conn, state)
+			}
+		}
+
+		// Closes every open connection now, hijacked ones excepted;
+		// `httptest.Server.closeClientConnections` uses it.
+		def closeConnections() {
+			let open = conns
+			conns = []
+			connectionsMetric.set(-float64(open.len()))
+			for let sc in open {
+				sc.close()
+			}
+		}
+
+		// True while `shutdown` is draining, so a connection closes after
+		// its current request.
+		def draining() bool {
+			return shuttingDown
+		}
+
+		// Records an accepted connection.
+		atomic def track(sc ServerConn) {
+			conns.push(sc)
+			connectionsMetric.inc()
+		}
+
+		// Forgets a connection that closed or was hijacked.
+		atomic def untrack(sc ServerConn) {
+			let kept ServerConn[] = []
+			for let c in conns {
+				kept.push(c) unless c == sc
+			}
+			connectionsMetric.dec() when kept.len() < conns.len()
+			conns = kept
+		}
+
+		// Closes connections between requests, for `shutdown`.
+		internal def closeIdleConnections() {
+			let open = conns
+			for let sc in open {
+				sc.close() when sc.state == ConnState.Idle || sc.state == ConnState.New || sc.drained()
+			}
+		}
+
+		internal def closeListener() {
+			let ln = listener
+			return when ln is none
+			ln.close() onerror recover none
+			listener = none
+		}
+
+		// Binds `addr` with the socket options a server wants, once the
+		// `listen` permission allows `http://addr` (`https` with `tls`
+		// set; a Unix socket path as it is).
+		// Fails with PolicyDenied when the policy denies the endpoint, and
+		// with NetError as `net.Socket.bind` and `listen` do.
+		internal def bind() !net.Listener {
+			let scheme = tls is none ?? ("http", "https")
+			let endpoint = addr.startsWith("/") ?? (addr, scheme + "://" + addr)
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", endpoint)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = net.SocketDomain.IPv4
+			if a.isUnix {
+				domain = net.SocketDomain.Unix
+			} else if a.isIPv6 {
+				domain = net.SocketDomain.IPv6
+			}
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		def str() string {
+			return "Server(" + addr + ")"
+		}
+	}
+
+	internal type ErrorHook {
+		fn def(error, ?Context)
+
+		def new(fn def(error, ?Context)) {
+			self.fn = fn
+		}
+	}
+
+	internal type ConnHook {
+		fn def(net.Connection, ConnState)
+
+		def new(fn def(net.Connection, ConnState)) {
+			self.fn = fn
+		}
+	}
+
+	// listenerClosed reports whether an accept failed because the
+	// listener was closed.
+	internal def listenerClosed(err error) bool {
+		return false unless err is net.NetError
+		return err.kind == net.ErrorCode.Closed
+	}
+
+	// ConnStream is a connection as the wire reader and the response
+	// writer see it: `read` and `write` with the timeout of the phase
+	// the server or transport is in, 0s for none.
+	internal type ConnStream {
+		conn         net.Stream
+		readTimeout  duration   = 30s
+		writeTimeout duration   = 30s
+
+		def new(conn net.Stream) {
+			self.conn = conn
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			return conn.read(buf, phaseTimeout(readTimeout))
+		}
+
+		// Implements io.Writer.
+		def write(buf byte[]) !int {
+			return conn.write(buf, phaseTimeout(writeTimeout))
+		}
+	}
+
+	// phaseTimeout turns the "no limit" 0s into the longest wait a
+	// socket read takes.
+	internal def phaseTimeout(d duration) duration {
+		return d when d > 0s
+		return 24h
+	}
+
+	// ContinueReader sends `100 Continue` the first time a handler reads
+	// a body the client is holding back for it.
+	internal type ContinueReader {
+		inner io.Reader
+		sink  ResponseSink
+		sent  bool         = false
+
+		def new(inner io.Reader, sink ResponseSink) {
+			self.inner = inner
+			self.sink = sink
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			if !sent {
+				sent = true
+				try sink.writeInterim(100, new Header())
+			}
+			return inner.read(buf)
+		}
+	}
+
+	// How much of an unread request body a connection drains before it
+	// closes instead, so a client that sent a large body it did not
+	// need to does not hold the connection.
+	internal const maxDrainBytes = 256 * 1024
+
+	// ServerConn is one accepted connection: its wire reader, its state,
+	// and the request loop. `serve` reads a request, builds the
+	// `ResponseWriter` over the connection and the `Context`, runs the
+	// handler, finishes the response (drains an unread body, sends
+	// chunked trailers), and repeats while keep-alive holds. It turns a
+	// handler failure into the `HttpError` status or 500, answers a
+	// malformed request with 400, an oversized header with 431, and
+	// `Expect: 100-continue` with the interim response when the handler
+	// first reads the body.
+	internal type ServerConn {
+		weak server ?Server
+		conn        net.Connection
+		// The TLS connection over `conn`, when the server has a config.
+		secured     ?tls.Conn      = none
+		stream      ConnStream
+		wire        WireReader
+
+		state ConnState {
+			value ConnState = ConnState.New
+
+			def get() ConnState {
+				return value
+			}
+
+			def set(val ConnState) {
+				value = val
+			}
+		}
+		remote           net.Address
+		requests         int               = 0
+		closed           bool              = false
+		// The HTTP/2 connection, once the client's preface or an
+		// `Upgrade: h2c` request chose it, and that request.
+		multiplexed      ?http2.Conn       = none
+		internal upgrade ?CleartextUpgrade = none
+
+		def new(server Server, conn net.Connection, config ?tls.Config) {
+			self.server = server
+			self.conn = conn
+			if config is none {
+				self.stream = new ConnStream(conn)
+			} else {
+				if config.alpn.len() == 0 {
+					config.alpn = server.http2 ?? ([alpnH2, alpnHTTP11], [alpnHTTP11])
+				}
+				let secure = secureServerStream(conn, config)
+				self.secured = secure
+				self.stream = new ConnStream(secure)
+			}
+			self.wire = new WireReader(self.stream)
+			self.remote = conn.remoteAddr()
+		}
+
+		// The request loop: one request after another until the
+		// connection closes, is hijacked, or keep-alive ends.
+		def serve() {
+			for {
+				let srv = server
+				break when srv is none
+				let outcome = serveOne(srv)
+				if outcome == "h2" {
+					serveHTTP2(srv, upgrade)
+					break
+				}
+				break when outcome == "close"
+				if outcome == "hijacked" {
+					srv.untrack(self)
+					srv.notify(conn, ConnState.Hijacked)
+					return
+				}
+				requests++
+				setState(ConnState.Idle)
+			}
+			close()
+		}
+
+		// Serves one request. Returns "keep" to read the next, "close"
+		// to close the connection, "hijacked" when the handler took it,
+		// "h2" when the connection opened with the HTTP/2 preface or the
+		// request switched it with `Upgrade: h2c`.
+		internal def serveOne(srv Server) string {
+			stream.readTimeout = requests == 0 ?? (srv.readHeaderTimeout, srv.idleTimeout)
+			stream.writeTimeout = srv.writeTimeout
+			let failure ?error = none
+			// The TLS handshake runs first, within the header timeout, so a
+			// failed one closes the connection without an HTTP answer.
+			let secure = secured
+			if !(secure is none) && !secure.connectionState().handshakeComplete {
+				secure.handshake(phaseTimeout(srv.readHeaderTimeout)) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					srv.report(failure, none)
+					return "close"
+				}
+			}
+			if requests == 0 && srv.http2 {
+				let preface = false
+				preface = speaksHTTP2() onerror (err error) {
+					failure = err
+					recover false
+				}
+				if !(failure is none) {
+					answerReadError(srv, failure)
+					return "close"
+				}
+				return "h2" when preface
+			}
+			let parsed ?Request = none
+			parsed = tryRead(srv.maxHeaderBytes) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				answerReadError(srv, failure)
+				return "close"
+			}
+			let req = parsed
+			return "close" when req is none
+			setState(ConnState.Active)
+			stream.readTimeout = srv.readTimeout
+			if srv.http2 && secure is none {
+				let switched = false
+				switched = switchToHTTP2(req) onerror (err error) {
+					failure = err
+					recover false
+				}
+				if !(failure is none) {
+					answerReadError(srv, failure)
+					return "close"
+				}
+				return "h2" when switched
+			}
+			req.remote = remote
+			if !(secure is none) {
+				req.tls = true
+				req.tlsState = secure.connectionState()
+			}
+			req.deadline = time.now() + srv.readTimeout when srv.readTimeout > 0s
+			req.limitBody(srv.maxBodyBytes) when srv.maxBodyBytes > 0
+			let sink = new WireSink(stream, req)
+			let waiting ?ContinueReader = none
+			let body = req.body
+			if req.expectsContinue() && !(body is none) {
+				let cont = new ContinueReader(body, sink)
+				req.body = cont
+				waiting = cont
+			}
+			let close = req.connectionClose || !srv.keepAlive || srv.draining()
+			let writer = new ResponseWriter(req, sink, stream.conn, new bytes.Reader(wire.buffered()))
+			writer.headers.set("Server", srv.serverHeader) when srv.serverHeader != ""
+			writer.headers.set("Connection", "close") when close
+			let ctx = new Context(req, writer)
+			ctx.server = srv
+			let handler = srv.handler
+			let h Handler = handler is none ?? (notFoundHandler(), handler)
+			srv.countRequest()
+			h.serve(ctx) onerror (err error) {
+				srv.report(err, ctx)
+				answerFailure(writer, err)
+				recover none
+			}
+			return "hijacked" when writer.hijacked()
+			let ended = true
+			writer.end() onerror (err error) {
+				srv.report(err, ctx)
+				ended = false
+				recover none
+			}
+			return "close" unless ended
+			close = true when writer.headers.hasToken("Connection", "close")
+			// A body the handler never asked for: the client is still
+			// holding it back, so closing is cheaper than asking for it.
+			let cont = waiting
+			close = true when !(cont is none) && !cont.sent
+			return "close" when close
+			return "close" unless drainBody(req)
+			return "keep"
+		}
+
+		// Reports whether the connection opens with the HTTP/2 preface,
+		// reading no further than the first byte that differs from it.
+		// Fails when the connection read does.
+		internal def speaksHTTP2() !bool {
+			let want = http2.clientPreface.bytes()
+			let n = 1
+			for {
+				let got = try wire.peek(n)
+				return false when got.len() < n
+				for let i = 0; i < got.len() && i < want.len(); i++ {
+					return false when got[i] != want[i]
+				}
+				return true when got.len() >= want.len()
+				n = got.len() + 1
+			}
+			return false
+		}
+
+		// Answers an `Upgrade: h2c` request with `101 Switching Protocols`
+		// and keeps it for `serveHTTP2`; false for any other request.
+		// Fails when the body read or the write does.
+		internal def switchToHTTP2(req Request) !bool {
+			let asked = try cleartextUpgrade(req)
+			return false when asked is none
+			try writeFully(stream, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n".bytes())
+			upgrade = asked
+			return true
+		}
+
+		// Runs the connection as HTTP/2 until it closes: every stream the
+		// client opens is served in its own task, and so is the request
+		// that upgraded the connection, as stream 1.
+		internal def serveHTTP2(srv Server, first ?CleartextUpgrade = none) {
+			setState(ConnState.Active)
+			stream.readTimeout = 0s
+			stream.writeTimeout = srv.writeTimeout
+			let h2 = new http2.Conn(wire, stream, false)
+			h2.idleTimeout = srv.idleTimeout
+			h2.maxConcurrentStreams = srv.maxConcurrentStreams
+			let from = remote
+			let secure = secured
+			h2.onStream = def (s http2.Stream) !none {
+				return try serveStream(srv, s, from, secure)
+			}
+			multiplexed = h2
+			let failure ?error = none
+			if !(first is none) {
+				h2.upgrade(first.settings, first.fields, first.body) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				srv.report(failure, none)
+				return
+			}
+			// An upgraded client still owes its preface.
+			stream.readTimeout = srv.readHeaderTimeout unless first is none
+			h2.handshake() onerror (err error) {
+				failure = err
+				recover none
+			}
+			stream.readTimeout = 0s
+			if !(failure is none) {
+				srv.report(failure, none)
+				return
+			}
+			h2.wait()
+		}
+
+		// True for an HTTP/2 connection with no stream open, which
+		// `shutdown` may close; it tells the client to open no more first.
+		def drained() bool {
+			let h2 = multiplexed
+			return false when h2 is none
+			h2.goAway() onerror recover none
+			return h2.activeStreams() == 0
+		}
+
+		// `readRequest` as an optional, so a failure can recover to none.
+		internal def tryRead(maxHeaderBytes int) !?Request {
+			return try readRequest(wire, maxHeaderBytes)
+		}
+
+		// Reads what is left of the request body so the next request
+		// starts at the right byte; false when there is too much of it.
+		internal def drainBody(req Request) bool {
+			let body = req.body
+			return true when body is none
+			let chunk byte[] = []
+			chunk.len(16 * 1024)
+			let total = 0
+			for {
+				let n = body.read(chunk) onerror recover -1
+				return false when n < 0
+				break when n == 0
+				total += n
+				return false when total > maxDrainBytes
+			}
+			return true
+		}
+
+		// Answers a request that did not parse: 431 for a header block
+		// past the limit, 408 for a read timeout, 400 otherwise; nothing
+		// for a connection that just closed.
+		internal def answerReadError(srv Server, err error) {
+			if err is HttpError {
+				return when err.code == "eof"
+				srv.report(err, none)
+				let status = 400
+				status = 431 when err.op == "header" && err.message.contains("exceeds")
+				status = 431 when err.op == "line"
+				answerRaw(status, err.message)
+				return
+			}
+			if err is net.NetError {
+				answerRaw(408, "request timed out") when err.kind == net.ErrorCode.TimedOut && requests == 0
+				return
+			}
+			srv.report(err, none)
+			answerRaw(400, err.message)
+		}
+
+		// Answers a handler failure when the response is still open.
+		internal def answerFailure(writer ResponseWriter, err error) {
+			answerHandlerFailure(writer, err)
+		}
+
+		// Writes a complete plain-text response and marks the connection
+		// for closing.
+		internal def answerRaw(status int, message string) {
+			let body = message.bytes()
+			let head = "HTTP/1.1 " + status.str() + " " + statusText(status) + "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " + body.len().str() + "\r\nConnection: close\r\n\r\n"
+			writeFully(stream, head.bytes().concat(body)) onerror recover none
+		}
+
+		internal def setState(val ConnState) {
+			state = val
+			let srv = server
+			srv.notify(conn, val) unless srv is none
+		}
+
+		def close() {
+			return when closed
+			closed = true
+			let h2 = multiplexed
+			if !(h2 is none) {
+				h2.close() onerror recover none
+			}
+			let secure = secured
+			if !(secure is none) {
+				secure.close() onerror recover none
+			}
+			conn.close() onerror recover none
+			let srv = server
+			return when srv is none
+			srv.untrack(self)
+			srv.notify(conn, ConnState.Closed)
+		}
+	}
+
+	// Answers a handler failure when the response is still open: the
+	// status of an `HttpError`, 413 for a body past its limit, else 500.
+	internal def answerHandlerFailure(writer ResponseWriter, err error) {
+		return when writer.written() || writer.hijacked()
+		let status = 500
+		let message = ""
+		if err is HttpError {
+			status = err.status when err.status > 0
+			status = 413 when err.code == "too-large"
+			message = err.message when err.status > 0
+		}
+		writer.error(status, message) onerror recover none
+	}
+
+	// withWatchedKeyPair is `withKeyPair` for the pair of two PEM files,
+	// watched for renewal when it is the config's only certificate and no
+	// `getCertificate` is set. Module level, where `tls` is the module and
+	// not the server's field. Fails as `tls.watchKeyPair` does.
+	internal def withWatchedKeyPair(config ?tls.Config, certFile string, keyFile string) !tls.Config {
+		let files = try tls.watchKeyPair(certFile, keyFile)
+		let cfg = withKeyPair(config, try files.keyPair())
+		cfg.getCertificate = files.getter() when cfg.getCertificate is none && cfg.certificates.len() == 1
+		return cfg
+	}
+
+	// withKeyPair is the config with the pair added to its certificates, a
+	// fresh config when none is set.
+	internal def withKeyPair(config ?tls.Config, pair tls.KeyPair) tls.Config {
+		let cfg = tls.Config{}
+		cfg = config unless config is none
+		cfg.certificates = cfg.certificates + [pair]
+		return cfg
+	}
+
+	// secureServerStream wraps an accepted socket as the server side of a
+	// TLS connection; the handshake runs on the first read.
+	internal def secureServerStream(conn net.Connection, config tls.Config) tls.Conn {
+		return tls.server(conn, config)
+	}
 }

@@ -1,4 +1,1000 @@
 partial module std.net.dns {
-	// Client is the DNS client; it has no members yet.
-	type Client {}
+	use (
+		std.crypto.x509::(parseIPText)
+		std.net
+		std.services::(Network, Policy)
+		std.time
+	)
+
+	// Transport carries a query to a server in place of plain UDP and TCP:
+	// DNS over TLS or HTTPS from `std.net.dns.secure`, or a double in a test.
+	interface Transport {
+		// exchange sends the query to the server, named as the client's
+		// `servers` list names it, and returns its response. `timeout` bounds
+		// the exchange. Fails when no response comes.
+		def exchange(query Message, server string, timeout duration) !Message
+	}
+
+	// Client is a stub resolver: it sends queries to recursive servers over
+	// UDP, falls back to TCP when an answer is truncated, and completes
+	// short names with a search list.
+	//
+	// ```
+	// let client = new dns.Client(["1.1.1.1", "8.8.8.8"])
+	// let mail = try client.lookupMX("example.com")
+	// ```
+	type Client {
+		// Servers to ask, as `host` or `host:port`. When empty, the system's
+		// resolver configuration supplies them with `search`, `ndots`,
+		// `timeout`, `attempts` and `rotate` on first use, and
+		// `127.0.0.1:53` when there is none.
+		servers          string[]   = []
+		// Domains tried behind a name that is not fully qualified.
+		search           string[]   = []
+		// A name with at least this many dots is tried as it is first.
+		ndots            int        = 1
+		// How long one server gets to answer.
+		timeout          duration   = 5s
+		// How often the list of servers is gone through.
+		attempts         int        = 2
+		// Start each query at the next server instead of the first.
+		rotate           bool       = false
+		// Ask over TCP only.
+		tcp              bool       = false
+		// The EDNS(0) payload size to advertise; 0 sends plain DNS.
+		udpSize          int        = defaultUDPSize
+		recursionDesired bool       = true
+		// Answer `lookupHost` and `lookupAddr` from the hosts file first.
+		useHosts         bool       = true
+		// Ask the names under `.local` by multicast DNS (RFC 6762) on the
+		// local link instead of the servers, as the system's resolver does.
+		multicast        bool       = true
+		// Set to keep responses for their TTL.
+		cache            ?Cache     = none
+		// Set to reach the servers another way than UDP and TCP on port 53;
+		// `tcp`, `udpSize` on the wire and the TCP fallback are then the
+		// transport's business, and so is the policy check.
+		transport        ?Transport = none
+		// Set to sign every message with the TSIG key (RFC 8945) and to take
+		// only answers the server signed with it: queries, transfers,
+		// NOTIFY and dynamic updates alike.
+		key              ?TSIGKey   = none
+
+		internal configured bool   = false
+		internal fromSystem bool   = false
+		internal generation int    = 0
+		internal hosts      ?Hosts = none
+		internal next       int    = 0
+
+		def new(servers string[] = []) {
+			self.servers = servers
+		}
+
+		// exchange sends the query to one server and returns its response,
+		// whatever its code. A truncated UDP response is asked for again
+		// over TCP. Responses that do not match the query's id and question
+		// are dropped.
+		//
+		// The policy is asked about `dns://host:port` under
+		// `adm.network.connect`. One of the system's name servers
+		// (`isSystemServer`) is exempt, since resolving a name is part of
+		// connecting to it; there the policy is asked about the name in the
+		// question instead, as a host.
+		//
+		// With a `transport` the query goes through it instead, and the
+		// response is only checked against the question.
+		//
+		// Fails with PolicyDenied when the policy denies, with Timeout when
+		// no response comes in time, with Malformed or BadName when the
+		// query does not encode or the response answers another question,
+		// with BadSignature when `key` is set and the response is not signed
+		// with it, as the `Network` service does when the server cannot be
+		// reached, and as the transport does.
+		def exchange(query Message, server string) !Message {
+			seal(query)
+			let carrier = transport
+			if !(carrier is none) {
+				let response = try carrier.exchange(query, server, timeout)
+				let mismatch = errorOf(ErrorKind.Malformed, "{server} answered another question")
+				mismatch.server = server
+				fail mismatch unless answers(query, response)
+				try authenticate(query, response)
+				return response
+			}
+			let addr = serverAddress(server)
+			let system = isSystemServer(addr)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr) unless system
+			let wire = try query.encode()
+			if !tcp {
+				let response = try overUDP(query, wire, addr, system)
+				if !response.truncated {
+					try authenticate(query, response)
+					return response
+				}
+			}
+			let response = try overTCP(query, wire, addr, system)
+			try authenticate(query, response)
+			return response
+		}
+
+		// seal has `encode` sign the query when the client has a key.
+		internal def seal(query Message) {
+			let signer = key
+			query.key = signer unless signer is none
+		}
+
+		// forged reports a response to a signed query that carries a MAC the
+		// key did not make.
+		internal def forged(query Message, response Message) bool {
+			let signer = query.key
+			let sent = query.tsig
+			let got = response.tsig
+			return false when signer is none || sent is none
+			return false when got is none || got.mac.len() == 0
+			return tsigFault(signer, response, sent.mac, [], false, none) == tsigBadSignature
+		}
+
+		// authenticate checks the signature of the response to a signed query.
+		// Fails with BadSignature.
+		internal def authenticate(query Message, response Message) !none {
+			let stream = new TSIGStream(query.key, query)
+			return try stream.accept(response, [])
+		}
+
+		// exchange asks the configured servers in turn, `attempts` times
+		// over, until one answers with something other than a server
+		// failure, and returns that response whatever its code. With a
+		// cache, a kept response is returned without asking. A name under
+		// `.local` is asked by multicast DNS when `multicast` is set and no
+		// `transport` is: the first answer from the link is returned, and
+		// NameError when none comes within three seconds.
+		//
+		// Fails with NoServers when the query has no question, else with the
+		// last server's failure as the form with a server does; when every
+		// server answered with a failure code the last such response is
+		// returned.
+		def exchange(query Message) !Message {
+			let question = query.question()
+			fail errorOf(ErrorKind.NoServers, "query has no question") when question is none
+			configure()
+			let kept = cache
+			let options = query.edns
+			let signed = !(options is none) && options.dnssecOK
+			if !(kept is none) {
+				let hit = kept.get(question, signed)
+				if !(hit is none) {
+					hit.id = query.id
+					return hit
+				}
+			}
+			if multicast && transport is none && isLocalName(question.name) {
+				let response = try overMulticast(query)
+				kept.put(question, response, signed) unless kept is none
+				return response
+			}
+			let failure ?error = none
+			let refusal ?Message = none
+			let first = rotate ?? (advance(), 0)
+			for let attempt = 0; attempt < attempts; attempt++ {
+				for let i = 0; i < servers.len(); i++ {
+					let server = servers[(first + i) % servers.len()]
+					let response ?Message = none
+					response = tryExchange(query, server) onerror (err error) {
+						failure = err
+						recover none
+					}
+					continue when response is none
+					if response.rcode := RCode.ServerFailure || RCode.Refused || RCode.NotImplemented {
+						refusal = response
+						continue
+					}
+					kept.put(question, response, signed) unless kept is none
+					return response
+				}
+			}
+			return refusal unless refusal is none
+			fail failure unless failure is none
+			fail errorOf(ErrorKind.NoServers, "no server to ask", question.name)
+		}
+
+		// query asks the servers for the records of the name and returns
+		// the response, whatever its code. The name is taken as it is,
+		// without the search list.
+		// Fails as `exchange` does.
+		def query(name string, kind RecordType = RecordType.A, class RecordClass = RecordClass.IN) !Message {
+			let message = try newQuery(name, kind, class)
+			message.recursionDesired = recursionDesired
+			message.edns = EDNS{udpSize: udpSize} when udpSize > 0
+			return try exchange(message)
+		}
+
+		// lookup returns the records of the type for the name, following the
+		// aliases the response carries. A name that is not fully qualified
+		// (no trailing dot) is completed with the search list.
+		//
+		// Fails with NotFound when the name does not exist, with NoData when
+		// it has no record of the type, with ServerFailed when the server
+		// answers with another failure code, else as `exchange` does.
+		def lookup(name string, kind RecordType = RecordType.A) !Record[] {
+			configure()
+			let sawName = false
+			for let (_, candidate) in candidates(name) {
+				let response = try query(candidate, kind)
+				if response.rcode == RCode.NameError {
+					continue
+				}
+				if response.rcode != RCode.Success {
+					let failure = errorOf(ErrorKind.ServerFailed, "{candidate}: server answered {response.rcode.name}", candidate)
+					failure.rcode = response.rcode
+					fail failure
+				}
+				sawName = true
+				let found = answersFor(response, candidate, kind)
+				return found when found.len() > 0
+			}
+			fail errorOf(ErrorKind.NoData, "{name} has no {kind.name} record", name) when sawName
+			let missing = errorOf(ErrorKind.NotFound, "{name} does not exist", name)
+			missing.rcode = RCode.NameError
+			fail missing
+		}
+
+		// lookupHost returns the IPv4 and IPv6 addresses of the host, from
+		// the hosts file when it lists the name. An IP address is returned
+		// as it is.
+		// Fails as `lookup` does when the name has neither kind of address.
+		def lookupHost(name string) !string[] {
+			return [name] unless parseIPText(name) is none
+			configure()
+			let local = hosts
+			if !(local is none) {
+				let listed = local.addresses(name)
+				return listed when listed.len() > 0
+			}
+			let out string[]
+			let failure ?error = none
+			// Both families are asked for at once; IPv4 addresses come first.
+			let pending = async attempt(name, RecordType.AAAA)
+			let v4 = lookup(name, RecordType.A) onerror (err error) {
+				failure = err
+				recover []
+			}
+			let other = await pending
+			let v6 = other.records
+			failure = other.failure when failure is none
+			for let (_, r) in v4 {
+				out.push(r.address)
+			}
+			for let (_, r) in v6 {
+				out.push(r.address)
+			}
+			fail failure unless failure is none || out.len() > 0
+			return out
+		}
+
+		// lookupAddr returns the names of the IP address (a reverse lookup),
+		// from the hosts file when it lists the address.
+		// Fails with BadName when the text is not an IP address, else as
+		// `lookup` does.
+		def lookupAddr(ip string) !string[] {
+			let reverse = try reverseName(ip)
+			configure()
+			let local = hosts
+			if !(local is none) {
+				let listed = local.names(ip)
+				return listed when listed.len() > 0
+			}
+			let out string[]
+			for let (_, r) in try lookup(reverse + ".", RecordType.PTR) {
+				out.push(r.target)
+			}
+			return out
+		}
+
+		// lookupMX returns the mail exchanges of the domain, the one to try
+		// first in front. Fails as `lookup` does.
+		def lookupMX(name string) !Record[] {
+			let found = try lookup(name, RecordType.MX)
+			return found.sort((a, b) => a.priority < b.priority)
+		}
+
+		// lookupTXT returns the text of every TXT record of the name, the
+		// strings of one record joined. Fails as `lookup` does.
+		def lookupTXT(name string) !string[] {
+			let out string[]
+			for let (_, r) in try lookup(name, RecordType.TXT) {
+				out.push(r.text.join(""))
+			}
+			return out
+		}
+
+		// lookupSRV returns the servers of `_srv._proto.name`, ordered
+		// by priority and then by falling weight. Fails as `lookup` does.
+		def lookupSRV(srv string, proto string, name string) !Record[] {
+			let found = try lookup("_{srv}._{proto}.{name}", RecordType.SRV)
+			return found.sort((a, b) => a.priority < b.priority || (a.priority == b.priority && a.weight > b.weight))
+		}
+
+		// lookupNS returns the name servers of the zone. Fails as `lookup` does.
+		def lookupNS(name string) !string[] {
+			let out string[]
+			for let (_, r) in try lookup(name, RecordType.NS) {
+				out.push(r.target)
+			}
+			return out
+		}
+
+		// lookupCNAME returns the name the alias points at.
+		// Fails with NoData when the name is not an alias, else as `lookup` does.
+		def lookupCNAME(name string) !string {
+			let found = try lookup(name, RecordType.CNAME)
+			return found[0].target
+		}
+
+		// attempt is `lookup` with its failure as a value, for a task to return.
+		// transfer asks the server for the whole zone (AXFR, RFC 5936) over
+		// TCP and returns it as a Zone, to read with `all` or to serve as a
+		// secondary. `timeout` bounds the connection and every message of
+		// the transfer, not the transfer as a whole.
+		//
+		// The policy is asked about `dns://host:port` under
+		// `adm.network.connect`, a system name server included.
+		//
+		// Fails with PolicyDenied when the policy denies, with ServerFailed
+		// when the server answers with a failure code (Refused when it does
+		// not transfer the zone to this client, NotAuth when it does not
+		// hold it), with Malformed when the transfer does not start with
+		// the zone's SOA record or ends before the closing one, with
+		// Timeout when a message does not come in time, with BadName when
+		// the zone is not a name or a record lies outside it, and as the
+		// `Network` service does when the server cannot be reached.
+		def transfer(zone string, server string) !Zone {
+			let addr = serverAddress(server)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr)
+			return try transferOver(zone, try net.dialStream(addr, timeout), addr)
+		}
+
+		// transfer brings a copy of a zone up to the server's with an
+		// incremental transfer (IXFR, RFC 1995) over TCP: only what changed
+		// since the copy's serial travels when the server remembers that far,
+		// the whole zone when it does not, or when the copy has no SOA record
+		// yet. The copy is changed in place; it reports whether it was.
+		// Fails as `transfer` of a whole zone does, and as `Zone.patch` and
+		// `Zone.replace` do on what the server sent.
+		def transfer(copy Zone, server string) !bool {
+			let addr = serverAddress(server)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr)
+			return try refresh(copy, try net.dialStream(addr, timeout), addr)
+		}
+
+		// transfer brings the copy up to date on a stream the caller opened,
+		// as the form with a zone name does for a whole transfer.
+		// Fails as the form with a server does, PolicyDenied aside.
+		def transfer(copy Zone, stream net.Stream) !bool {
+			return try refresh(copy, stream, "the server")
+		}
+
+		internal def refresh(copy Zone, conn net.Stream, addr string) !bool {
+			let held = copy.find(copy.origin, RecordType.SOA)
+			if held.len() == 0 {
+				let whole = try transferOver(copy.origin, conn, addr)
+				try copy.replace(whole.all())
+				return true
+			}
+			let query ?Message = none
+			let failure ?error = none
+			query = tryIncrementalQuery(copy.origin, held[0]) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if query is none {
+				conn.close() onerror recover none
+				fail failure unless failure is none
+				fail errorOf(ErrorKind.Malformed, "no transfer query")
+			}
+			let records Record[] = []
+			records = readChanges(conn, query, addr, serialOf(copy)) onerror (err error) {
+				failure = err
+				recover []
+			}
+			conn.close() onerror recover none
+			if !(failure is none) {
+				fail timeoutError(query, addr) when failure.code == net.ErrorCode.TimedOut.value
+				fail failure
+			}
+			return false when records.len() < 2
+			let second = records[1]
+			if second.kind != RecordType.SOA || canonicalName(second.name) != copy.origin {
+				try copy.replace(records)
+				return true
+			}
+			let steps ZoneChange[]
+			let removing = false
+			for let (_, r) in records[1:] {
+				let top = r.kind == RecordType.SOA && canonicalName(r.name) == copy.origin
+				if top && !removing {
+					steps.push(ZoneChange{before: r, after: r})
+					removing = true
+					continue
+				}
+				let step = steps[steps.len() - 1]
+				if top {
+					step.after = r
+					removing = false
+				} else if removing {
+					step.removed.push(r)
+				} else {
+					step.added.push(r)
+				}
+			}
+			try copy.patch(steps)
+			return true
+		}
+
+		// notify tells a secondary server that the zone changed (NOTIFY, RFC
+		// 1996), so that it checks the serial now instead of at its next
+		// refresh; a primary calls it after a change, once per secondary.
+		// Fails with ServerFailed when the server answers with a failure
+		// code (NotAuth when it does not hold the zone, NotImplemented when
+		// it takes no NOTIFY), else as `exchange` with a server does.
+		def notify(zone string, server string) !none {
+			let message = try newQuery(zone, RecordType.SOA)
+			message.opcode = Opcode.Notify
+			message.recursionDesired = false
+			message.authoritative = true
+			let response = try exchange(message, server)
+			return none when response.rcode == RCode.Success
+			let refusal = errorOf(ErrorKind.ServerFailed, "{zone}: {server} answered {response.rcode.name} to the NOTIFY", zone)
+			refusal.rcode = response.rcode
+			refusal.server = server
+			fail refusal
+		}
+
+		// update sends the dynamic update (RFC 2136) to the zone's primary
+		// server, over TCP, since a `Zone` takes none over UDP; with a
+		// `transport`, through it.
+		// Fails with ServerFailed when the server answers with a failure
+		// code, which `rcode` names: NXRRSet, YXRRSet, NameError or YXDomain
+		// for a prerequisite the zone does not meet, Refused for a client
+		// the zone does not list, NotAuth for a zone the server does not
+		// hold, NotZone for a name outside the zone. Else as `exchange` with
+		// a server does, and as `Update.message`.
+		def update(update Update, server string) !none {
+			let message = try update.message()
+			let response = try overStream(message, server)
+			return none when response.rcode == RCode.Success
+			let refusal = errorOf(ErrorKind.ServerFailed, "{update.zone}: {server} answered {response.rcode.name} to the update", update.zone)
+			refusal.rcode = response.rcode
+			refusal.server = server
+			fail refusal
+		}
+
+		// update sends an update message that is already built, as a server
+		// does that passes one on, and returns the response whatever its
+		// code.
+		// Fails as `exchange` with a server does.
+		def update(message Message, server string) !Message {
+			return try overStream(message, server)
+		}
+
+		// overStream is `exchange` with a server, without the try over UDP.
+		internal def overStream(query Message, server string) !Message {
+			let carrier = transport
+			return try exchange(query, server) unless carrier is none
+			let addr = serverAddress(server)
+			let system = isSystemServer(addr)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr) unless system
+			seal(query)
+			let response = try overTCP(query, try query.encode(), addr, system)
+			try authenticate(query, response)
+			return response
+		}
+
+		// transfer asks for the zone on a stream the caller opened, which
+		// makes it a transfer over TLS (RFC 9103) with a connection from
+		// `secure.TLSTransport.dial`. The stream is closed afterwards. The
+		// policy was the business of whoever opened the stream.
+		// Fails as the form with a server does, PolicyDenied aside.
+		def transfer(zone string, stream net.Stream) !Zone {
+			return try transferOver(zone, stream, "the server")
+		}
+
+		internal def transferOver(zone string, conn net.Stream, addr string) !Zone {
+			let failure ?error = none
+			let query ?Message = none
+			query = tryTransferQuery(zone) onerror (err error) {
+				failure = err
+				recover none
+			}
+			let records Record[] = []
+			if !(query is none) {
+				records = readTransfer(conn, query, addr) onerror (err error) {
+					failure = err
+					recover []
+				}
+			}
+			conn.close() onerror recover none
+			fail errorOf(ErrorKind.Malformed, "no transfer query") when query is none && failure is none
+			if !(failure is none) {
+				fail failure when query is none
+				fail timeoutError(query, addr) when failure.code == net.ErrorCode.TimedOut.value
+				fail failure
+			}
+			let out = new Zone(zone)
+			for let (_, r) in records {
+				try out.add(r)
+			}
+			return out
+		}
+
+		// readTransfer sends the AXFR query and collects the records up to
+		// the second SOA record, which it leaves out.
+		// The AXFR query for the zone, as an optional so a failure can
+		// recover to none.
+		// The IXFR query from the copy's SOA record, as an optional so a
+		// failure can recover to none.
+		internal def tryIncrementalQuery(zone string, soa Record) !?Message {
+			let query = try newQuery(zone, RecordType.IXFR)
+			query.recursionDesired = false
+			query.authorities = [soa]
+			return query
+		}
+
+		internal def tryTransferQuery(zone string) !?Message {
+			let query = try newQuery(zone, RecordType.AXFR)
+			query.recursionDesired = false
+			return query
+		}
+
+		internal def readTransfer(conn net.Stream, query Message, addr string) !Record[] {
+			let origin = query.questions[0].name
+			let records Record[]
+			seal(query)
+			try writeFrame(conn, try query.encode(), timeout)
+			let signed = new TSIGStream(query.key, query)
+			let closed = false
+			for !closed {
+				let part = try readPart(conn, query, addr, signed)
+				for let (_, r) in part.answers {
+					let top = r.kind == RecordType.SOA && canonicalName(r.name) == origin
+					if top && records.len() > 0 {
+						closed = true
+						break
+					}
+					if records.len() == 0 && !top {
+						let unordered = errorOf(ErrorKind.Malformed, "{addr} did not start the transfer of {origin} with its SOA record", origin)
+						unordered.server = addr
+						fail unordered
+					}
+					records.push(r)
+				}
+			}
+			try signed.end()
+			return records
+		}
+
+		// readPart reads one message of a transfer.
+		// Fails with Malformed when the stream ends or the message is not
+		// an answer to the query or is empty, with ServerFailed on a
+		// failure code, and with BadSignature as `TSIGStream.accept` does.
+		internal def readPart(conn net.Stream, query Message, addr string, signed TSIGStream) !Message {
+			let origin = query.questions[0].name
+			let frame = try readFrame(conn, timeout, timeout)
+			let broken = errorOf(ErrorKind.Malformed, "{addr} ended the transfer of {origin} early", origin)
+			broken.server = addr
+			fail broken when frame is none
+			let part = try decode(frame)
+			fail broken unless part.response && part.id == query.id
+			try signed.accept(part, frame)
+			if part.rcode != RCode.Success {
+				let refusal = errorOf(ErrorKind.ServerFailed, "{origin}: {addr} answered {part.rcode.name} to the transfer", origin)
+				refusal.rcode = part.rcode
+				refusal.server = addr
+				fail refusal
+			}
+			fail broken when part.answers.len() == 0
+			return part
+		}
+
+		// readChanges sends the IXFR query and collects the answer without
+		// the SOA record that closes it: the server's SOA record alone when
+		// the copy at serial `ours` is not behind; followed by the zone for a
+		// whole transfer; followed by the steps for an incremental one, which
+		// ends at the SOA record of the server's serial where a step would
+		// start.
+		internal def readChanges(conn net.Stream, query Message, addr string, ours int) !Record[] {
+			let origin = query.questions[0].name
+			let records Record[]
+			seal(query)
+			try writeFrame(conn, try query.encode(), timeout)
+			let signed = new TSIGStream(query.key, query)
+			let target = -1
+			let incremental = false
+			let removing = false
+			let closed = false
+			for !closed {
+				let part = try readPart(conn, query, addr, signed)
+				for let (_, r) in part.answers {
+					let top = r.kind == RecordType.SOA && canonicalName(r.name) == origin
+					if records.len() == 0 {
+						let unordered = errorOf(ErrorKind.Malformed, "{addr} did not start the transfer of {origin} with its SOA record", origin)
+						unordered.server = addr
+						fail unordered unless top
+						target = serialIn(r)
+						records.push(r)
+						continue
+					}
+					incremental = top when records.len() == 1
+					let last = top && (!incremental || !removing && records.len() > 1 && serialIn(r) == target)
+					if last {
+						closed = true
+						break
+					}
+					removing = !removing when top
+					records.push(r)
+				}
+				closed = true when records.len() == 1 && !serialAhead(target, ours)
+			}
+			try signed.end()
+			return records
+		}
+
+		internal def attempt(name string, kind RecordType) LookupOutcome {
+			let out = LookupOutcome{}
+			out.records = lookup(name, kind) onerror (err error) {
+				out.failure = err
+				recover []
+			}
+			return out
+		}
+
+		// configure reads the system's configuration once: the servers when
+		// none are set, and the hosts file.
+		internal def configure() {
+			if fromSystem {
+				let current = systemConfig()
+				return when generation == configGeneration
+				apply(current)
+				return
+			}
+			return when configured
+			configured = true
+			if servers.len() == 0 {
+				fromSystem = true
+				apply(systemConfig())
+			}
+			return unless useHosts
+			hosts = systemHosts()
+		}
+
+		// apply takes the servers and the name completion of a configuration.
+		internal def apply(config Config) {
+			generation = configGeneration
+			servers = config.servers
+			search = config.search
+			ndots = config.ndots
+			timeout = config.timeout
+			attempts = config.attempts
+			rotate = config.rotate
+		}
+
+		internal atomic def advance() int {
+			next = (next + 1) % 65536
+			return next
+		}
+
+		// candidates are the names to ask for, in order.
+		internal def candidates(name string) string[] {
+			return [name] when name.endsWith(".") || search.len() == 0
+			// A name of the local link is whole as it is (RFC 6762 §3).
+			return [name] when multicast && isLocalName(name)
+			let dots = name.split(".").len() - 1
+			let out string[]
+			out.push(name) when dots >= ndots
+			for let (_, domain) in search {
+				out.push(name + "." + domain)
+			}
+			out.push(name) when dots < ndots
+			return out
+		}
+
+		// `exchange` as an optional, so a failure can recover to none.
+		internal def tryExchange(query Message, server string) !?Message {
+			return try exchange(query, server)
+		}
+
+		internal def overUDP(query Message, wire byte[], addr string, system bool) !Message {
+			let target = try net.parseAddress(addr)
+			let fd = try Network.socketFd(target.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+			let started = time.now()
+			let result ?Message = none
+			let failure ?error = none
+			if system {
+				Network.sendToNameServer(fd, wire, addr, timeout) onerror (err error) {
+					failure = err
+					recover 0
+				}
+			} else {
+				Network.sendTo(fd, wire, addr, timeout) onerror (err error) {
+					failure = err
+					recover 0
+				}
+			}
+			let buf byte[] = []
+			buf.len(udpSize > 4096 ?? (udpSize, 4096))
+			for failure is none {
+				let left = timeout - time.since(started)
+				if left <= 0s {
+					failure = timeoutError(query, addr)
+					break
+				}
+				let (n, sender) = Network.recvFrom(fd, buf, left) onerror (err error) {
+					failure = err
+					recover (0, "")
+				}
+				break unless failure is none
+				let from = net.parseAddress(sender) onerror recover new net.Address()
+				continue unless sentBy(from, target)
+				let response ?Message = none
+				response = tryDecode(buf[:n]) onerror recover none
+				continue when response is none
+				continue unless answers(query, response)
+				// An answer with a signature that fails is somebody else's;
+				// the server's own may still come.
+				continue when forged(query, response)
+				result = response
+				break
+			}
+			Network.close(fd) onerror recover none
+			if result is none {
+				fail timeoutError(query, addr) when failure is none
+				fail timeoutError(query, addr) when failure.code == net.ErrorCode.TimedOut.value
+				fail failure
+			}
+			return result
+		}
+
+		// overMulticast asks the link once as a one-shot querier does (RFC
+		// 6762 §5.1): from a port of its own, so that the answer comes back
+		// by unicast, with the question sent again after a second.
+		internal def overMulticast(query Message) !Message {
+			let asked = query.recursionDesired
+			query.recursionDesired = false
+			let failure ?error = none
+			let nothing byte[]
+			let wire = query.encode() onerror (err error) {
+				failure = err
+				recover nothing
+			}
+			query.recursionDesired = asked
+			fail failure unless failure is none
+			let fd = try Network.socketFd(net.SocketDomain.IPv4, net.SocketType.Datagram)
+			let started = time.now()
+			let limit = timeout < 3s ?? (timeout, 3s)
+			let result ?Message = none
+			let sent = 0
+			let buf byte[] = []
+			buf.len(9000)
+			for failure is none && result is none {
+				let spent = time.since(started)
+				break when spent >= limit
+				if sent == 0 || (sent == 1 && spent >= 1s) {
+					Network.sendToNameServer(fd, wire, multicastServer, limit) onerror (err error) {
+						failure = err
+						recover 0
+					}
+					sent++
+					continue
+				}
+				let wait = sent == 1 && spent < 1s ?? (1s - spent, limit - spent)
+				let timedOut = false
+				let (n, _) = Network.recvFrom(fd, buf, wait) onerror (err error) {
+					timedOut = err.code == net.ErrorCode.TimedOut.value
+					failure = err unless timedOut
+					recover (0, "")
+				}
+				continue when timedOut || n == 0
+				let response ?Message = none
+				response = tryDecode(buf[:n]) onerror recover none
+				continue when response is none
+				continue unless answers(query, response) && response.answers.len() > 0
+				result = response
+			}
+			Network.close(fd) onerror recover none
+			fail failure unless failure is none
+			return query.reply(RCode.NameError) when result is none
+			return result
+		}
+
+		internal def overTCP(query Message, wire byte[], addr string, system bool) !Message {
+			let result ?Message = none
+			let failure ?error = none
+			if system {
+				result = systemRoundTrip(wire, addr) onerror (err error) {
+					failure = err
+					recover none
+				}
+			} else {
+				let conn = try net.dialStream(addr, timeout)
+				result = tcpRoundTrip(conn, wire) onerror (err error) {
+					failure = err
+					recover none
+				}
+				conn.close() onerror recover none
+			}
+			if !(failure is none) {
+				fail timeoutError(query, addr) when failure.code == net.ErrorCode.TimedOut.value
+				fail failure
+			}
+			fail errorOf(ErrorKind.Malformed, "{addr} closed the connection without answering") when result is none
+			let mismatch = errorOf(ErrorKind.Malformed, "{addr} answered another question")
+			mismatch.server = addr
+			fail mismatch unless answers(query, result)
+			return result
+		}
+
+		internal def systemRoundTrip(wire byte[], addr string) !?Message {
+			return try decode(try Network.exchangeWithNameServer(wire, addr, timeout))
+		}
+
+		internal def tcpRoundTrip(conn net.Connection, wire byte[]) !?Message {
+			let started = time.now()
+			try writeFrame(conn, wire, timeout)
+			let frame = try readFrame(conn, timeout - time.since(started), timeout)
+			return none when frame is none
+			return try decode(frame)
+		}
+
+		internal def timeoutError(query Message, addr string) DNSError {
+			let question = query.question()
+			let name = question is none ?? ("", question.name)
+			let failure = errorOf(ErrorKind.Timeout, "{addr} did not answer within {int(timeout) / 1000000}ms", name)
+			failure.server = addr
+			return failure
+		}
+	}
+
+	// sentBy reports whether a datagram came from the server that was asked:
+	// the same port, and the same address when the server is named by one.
+	internal def sentBy(from net.Address, server net.Address) bool {
+		return false when from.port != server.port
+		let asked = parseIPText(server.host)
+		return true when asked is none
+		let sender = parseIPText(from.host)
+		return false when sender is none
+		return sender.hex() == asked.hex()
+	}
+
+	// LookupOutcome is what one lookup gave: its records, or why it failed.
+	internal struct LookupOutcome {
+		records Record[] = []
+		failure ?error   = none
+	}
+
+	// `decode` as an optional, so a failure can recover to none.
+	internal def tryDecode(data byte[]) !?Message {
+		return try decode(data)
+	}
+
+	// answers reports whether the response belongs to the query: the same
+	// id and, when it repeats a question, the same one.
+	internal def answers(query Message, response Message) bool {
+		return false unless response.response && response.id == query.id
+		let asked = query.question()
+		let echoed = response.question()
+		return true when asked is none
+		return true when echoed is none
+		return canonicalName(asked.name) == canonicalName(echoed.name) && asked.kind == echoed.kind && asked.code == echoed.code && asked.class == echoed.class
+	}
+
+	// answersFor picks the records of the type for the name out of the
+	// answer section, following aliases from the name.
+	internal def answersFor(response Message, name string, kind RecordType) Record[] {
+		let out Record[]
+		let owner = canonicalName(name)
+		for let hop = 0; hop < 16; hop++ {
+			let alias = ""
+			for let (_, r) in response.answers {
+				continue unless canonicalName(r.name) == owner
+				out.push(r) when r.kind == kind || kind == RecordType.ANY
+				alias = r.target when r.kind == RecordType.CNAME
+			}
+			return out when out.len() > 0 || alias == "" || kind == RecordType.CNAME
+			owner = canonicalName(alias)
+		}
+		return out
+	}
+
+	// writeFrame sends one message with the two-byte length that frames DNS
+	// on a stream (RFC 1035 §4.2.2). Fails when the write does or times out.
+	def writeFrame(conn net.Stream, wire byte[], timeout duration) !none {
+		let frame byte[] = [byte(wire.len() >> 8 & 0xff), byte(wire.len() & 0xff)]
+		for let i = 0; i < wire.len(); i++ {
+			frame.push(wire[i])
+		}
+		let sent = 0
+		for sent < frame.len() {
+			let n = try conn.write(frame[sent:], timeout)
+			fail net.errorOf(net.ErrorCode.Pipe, "write", "", "connection accepts no more bytes") when n <= 0
+			sent += n
+		}
+		return none
+	}
+
+	// readFrame reads one length-prefixed message: `wait` is how long the
+	// first byte may take, `timeout` every read after it. none when the
+	// peer closed the connection before a message started.
+	// Fails when a read does or times out, or the peer closes mid-message.
+	def readFrame(conn net.Stream, wait duration, timeout duration) !?byte[] {
+		let head = try readFull(conn, 2, wait, timeout)
+		return none when head is none
+		let size = int(head[0]) << 8 | int(head[1])
+		let body = try readFull(conn, size, timeout, timeout)
+		fail net.errorOf(net.ErrorCode.ConnReset, "read", "", "connection closed inside a message") when body is none
+		return body
+	}
+
+	internal def readFull(conn net.Stream, size int, wait duration, timeout duration) !?byte[] {
+		let out byte[] = []
+		out.len(size)
+		let got = 0
+		for got < size {
+			let n = try conn.read(out[got:], got == 0 ?? (wait, timeout))
+			if n <= 0 {
+				return none when got == 0
+				fail net.errorOf(net.ErrorCode.ConnReset, "read", "", "connection closed inside a message")
+			}
+			got += n
+		}
+		return out
+	}
+
+	internal let defaultClient ?Client = none
+
+	// resolver is the client the module-level lookups and the `Network`
+	// service share: configured from the system on first use, with a `Cache`,
+	// since every connection to a host name starts here.
+	def resolver() Client {
+		let existing = defaultClient
+		return existing unless existing is none
+		let created = new Client()
+		created.cache = new Cache()
+		defaultClient = created
+		return created
+	}
+
+	// lookup is `Client.lookup` on the shared `resolver()`.
+	// Fails as it does.
+	def lookup(name string, kind RecordType = RecordType.A) !Record[] {
+		return try resolver().lookup(name, kind)
+	}
+
+	// lookupHost is `Client.lookupHost` on the shared `resolver()`.
+	// Fails as it does.
+	def lookupHost(name string) !string[] {
+		return try resolver().lookupHost(name)
+	}
+
+	// lookupAddr is `Client.lookupAddr` on the shared `resolver()`.
+	// Fails as it does.
+	def lookupAddr(ip string) !string[] {
+		return try resolver().lookupAddr(ip)
+	}
+
+	// lookupMX is `Client.lookupMX` on the shared `resolver()`.
+	// Fails as it does.
+	def lookupMX(name string) !Record[] {
+		return try resolver().lookupMX(name)
+	}
+
+	// lookupTXT is `Client.lookupTXT` on the shared `resolver()`.
+	// Fails as it does.
+	def lookupTXT(name string) !string[] {
+		return try resolver().lookupTXT(name)
+	}
+
+	// lookupSRV is `Client.lookupSRV` on the shared `resolver()`.
+	// Fails as it does.
+	def lookupSRV(srv string, proto string, name string) !Record[] {
+		return try resolver().lookupSRV(srv, proto, name)
+	}
 }

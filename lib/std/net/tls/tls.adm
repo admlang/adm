@@ -1,0 +1,493 @@
+partial module std.net.tls {
+	use (
+		std.io
+		std.net
+		std.crypto.hash::(Hash)
+		std.crypto.cipher::(AEAD)
+		std.crypto.x509::(Certificate, CertPool)
+		std.time
+		std.time::(Time)
+	)
+
+	// Config steers a connection. On a client: the name the server must
+	// present (also sent as SNI), the roots that anchor its chain (none
+	// means the system pool), whether to skip verification altogether, the
+	// ALPN protocols to offer in preference order, and the suites to offer
+	// (empty means every suite this module implements). On a server: the
+	// chains to present, the ALPN protocols to accept in preference order,
+	// the suites and groups to take, and the key its session tickets are
+	// sealed under.
+	struct Config {
+		serverName         string                                = ""
+		rootCAs            ?CertPool
+		insecureSkipVerify bool                                  = false
+		alpn               string[]                              = []
+		// The versions to negotiate, both ends included; TLS 1.3 is taken
+		// when both sides speak it. TLS 1.2 is ECDHE with an AEAD suite and
+		// the extended master secret only; `minVersion: Version.TLS13`
+		// turns it off.
+		minVersion         Version                               = Version.TLS12
+		maxVersion         Version                               = Version.TLS13
+		cipherSuites       CipherSuite[]                         = []
+		// Groups to exchange keys over, in preference order; empty means
+		// X25519, P-256, P-384. A server answers a client that shared no
+		// key for its choice with a HelloRetryRequest.
+		curvePreferences   CurveID[]                             = []
+		// Where session tickets go and resumption offers come from, keyed
+		// by server name; none disables resumption. Client only.
+		sessionCache       ?SessionCache
+		// The chains to present. A server presents the one whose leaf
+		// matches the client's server name, else the first; a client asked
+		// for a certificate presents the first whose key signs with a
+		// scheme the server accepts, else declines.
+		certificates       KeyPair[]                             = []
+		// Server only: whether to ask the client for a certificate and
+		// what to make of the answer.
+		clientAuth         ClientAuthType                        = ClientAuthType.NoClientCert
+		// Server only: the roots a client's chain is verified against when
+		// `clientAuth` verifies; none means the system pool.
+		clientCAs          ?CertPool
+		// Server only: picks the chain for a ClientHello, ahead of
+		// `certificates`; none to fall back on them.
+		getCertificate     ?def (info ClientHelloInfo) !?KeyPair = none
+		// Server only: the AES key (16, 24 or 32 bytes) session tickets are
+		// sealed under; a client resumes with a ticket this key opens.
+		// Empty issues no tickets.
+		sessionTicketKey   byte[]                                = []
+	}
+
+	// ClientSession is a resumable session: the ticket, the pre-shared key
+	// it stands for (the master secret at TLS 1.2), its lifetime, and what
+	// the server presented, which a resumed connection reports again.
+	struct ClientSession {
+		version          Version         = Version.TLS13
+		ticket           byte[]
+		psk              byte[]
+		lifetime         int
+		ageAdd           int
+		receivedAt       Time
+		suite            CipherSuite
+		alpn             string          = ""
+		peerCertificates Certificate[]
+		verifiedChains   Certificate[][]
+	}
+
+	// sessionIsValid reports whether a session's ticket may still be
+	// offered: within its lifetime, and RFC 8446 §4.6.1's seven-day cap.
+	def sessionIsValid(session ClientSession) bool {
+		let age = int(time.since(session.receivedAt)) / 1000000000
+		return age >= 0 && age < session.lifetime && age < 7 * 24 * 3600
+	}
+
+	// obfuscatedTicketAge is a session's ticket age in milliseconds plus
+	// the server's ageAdd, modulo 2^32, as the offer carries it.
+	def obfuscatedTicketAge(session ClientSession) int {
+		let ms = int(time.since(session.receivedAt)) / 1000000
+		return (ms + session.ageAdd) & 0xFFFFFFFF
+	}
+
+	// SessionCache keeps the newest resumable session per server name.
+	// Safe from many tasks.
+	type SessionCache {
+		sessions map<string, ClientSession>
+
+		def new() {}
+
+		// get is the session for a server name, none when there is none
+		// or it expired (an expired one is dropped).
+		atomic def get(key string) ?ClientSession {
+			let found = sessions.get(key)
+			return none when found is none
+			return found when sessionIsValid(found)
+			sessions.delete(key)
+			return none
+		}
+
+		// put stores a session, replacing an older one for the name.
+		atomic def put(key string, session ClientSession) {
+			sessions[key] = session
+		}
+
+		// remove forgets the session for a name.
+		atomic def remove(key string) {
+			sessions.delete(key)
+		}
+
+		// count is how many names have a session.
+		atomic def count() int {
+			return sessions.len()
+		}
+	}
+
+	// ConnectionState describes a connection once its handshake is done:
+	// the negotiated version, suite and ALPN protocol, the peer's chain as
+	// sent (leaf first; on a server the client's, when it presented one),
+	// the chains verification built (empty when verification was skipped),
+	// the name verified (on a server, the name the client asked for) and
+	// whether the session was resumed.
+	struct ConnectionState {
+		version           Version         = Version.TLS13
+		cipherSuite       CipherSuite     = CipherSuite.AES128GCMSHA256
+		alpn              string          = ""
+		peerCertificates  Certificate[]
+		verifiedChains    Certificate[][]
+		serverName        string          = ""
+		resumed           bool            = false
+		handshakeComplete bool            = false
+	}
+
+	// Conn is a TLS connection, client or server side, over a
+	// net.Connection or over any reader and writer pair. The handshake runs
+	// on the first read or write, or on `handshake()`; reads and writes
+	// then carry application data. Implements std.io.Reader, Writer and
+	// Closer, and reads and writes with a timeout like net.Connection.
+	type Conn {
+		config           Config
+		records          RecordLayer
+		transport        ?net.Connection
+		isClient         bool               = true
+		state            ConnectionState
+		suite            CipherSuite        = CipherSuite.AES128GCMSHA256
+		hash             Hash               = Hash.SHA256
+		// The current application traffic secrets, rotated by KeyUpdate.
+		readSecret       byte[]
+		writeSecret      byte[]
+		// The resumption master secret, for the session tickets received.
+		resumptionSecret byte[]
+		// Session tickets the server sent, newest last.
+		tickets          NewSessionTicket[]
+		// Decrypted application data not yet handed to a reader.
+		pending          byte[]
+		// Handshake bytes of a post-handshake message not yet complete.
+		handshakeBuffer  byte[]
+		closed           bool               = false
+		peerClosed       bool               = false
+		// For a test: the handshake to run instead of a fresh one.
+		prepared         ?ClientHandshake
+		preparedServer   ?ServerHandshake
+
+		def new(conn net.Connection, config Config, isClient bool = true) {
+			self.config = config
+			self.isClient = isClient
+			records = new RecordLayer(conn, conn)
+			records.conn = conn
+			transport = conn
+		}
+
+		def new(reader io.Reader, writer io.Writer, config Config, isClient bool = true) {
+			self.config = config
+			self.isClient = isClient
+			records = new RecordLayer(reader, writer)
+		}
+
+		// handshake runs the handshake of this side once, each
+		// transport read or write bounded by the timeout; later calls do
+		// nothing. On failure this side sends the matching alert and the
+		// connection is unusable. Fails with TLSError, NetError from the
+		// transport, or the x509 CertificateError of a rejected chain.
+		def handshake(timeout duration = 30s) !none {
+			return none when state.handshakeComplete
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			records.timeout = timeout
+			return try runClient() when isClient
+			return try runServer()
+		}
+
+		internal def runClient() !none {
+			let hs = new ClientHandshake(config, records)
+			let ready = prepared
+			hs = ready unless ready is none
+			let failure ?error = none
+			hs.run() onerror (err error) {
+				failure = err
+				recover none
+			}
+			try failWithAny(failure) unless failure is none
+			suite = hs.suite
+			hash = hs.hash
+			readSecret = hs.schedule.serverTrafficSecret
+			writeSecret = hs.schedule.clientTrafficSecret
+			resumptionSecret = hs.schedule.resumptionMasterSecret
+			handshakeBuffer = hs.reader.buffer
+			state = hs.state
+			return none
+		}
+
+		internal def runServer() !none {
+			let hs = new ServerHandshake(config, records)
+			let ready = preparedServer
+			hs = ready unless ready is none
+			let failure ?error = none
+			hs.run() onerror (err error) {
+				failure = err
+				recover none
+			}
+			try failWithAny(failure) unless failure is none
+			suite = hs.suite
+			hash = hs.hash
+			readSecret = hs.schedule.clientTrafficSecret
+			writeSecret = hs.schedule.serverTrafficSecret
+			resumptionSecret = hs.schedule.resumptionMasterSecret
+			handshakeBuffer = hs.reader.buffer
+			state = hs.state
+			return none
+		}
+
+		// read copies decrypted application data into data and returns the
+		// count; 0 once the peer sent close_notify. Post-handshake messages
+		// (session tickets, key updates) are handled on the way. Fails with
+		// TLSError for a protocol violation or a fatal alert from the peer,
+		// NetError from the transport.
+		def read(data byte[], timeout duration) !int {
+			try handshake()
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			return 0 when data.len() == 0
+			for pending.len() == 0 {
+				return 0 when peerClosed
+				records.timeout = timeout
+				try dispatch(try readRecord())
+			}
+			let n = pending.copy(data)
+			pending = pending[n:]
+			return n
+		}
+
+		// read with the default 30s timeout. Implements std.io.Reader. Fails
+		// as read does.
+		def read(data byte[]) !int {
+			return try read(data, 30s)
+		}
+
+		// write encrypts and sends all of data and returns its length.
+		// Fails with TLSError when the connection is closed, NetError from
+		// the transport.
+		def write(data byte[], timeout duration) !int {
+			try handshake()
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			records.timeout = timeout
+			try records.write(recordApplicationData, data)
+			return data.len()
+		}
+
+		// write with the default 30s timeout. Implements std.io.Writer. Fails
+		// as write does.
+		def write(data byte[]) !int {
+			return try write(data, 30s)
+		}
+
+		// writeAll writes every byte of data; the same as write, kept for
+		// callers written against net.Connection. Fails as write does.
+		def writeAll(data byte[], timeout duration = 30s) !none {
+			try write(data, timeout)
+			return none
+		}
+
+		// close sends close_notify, when the handshake completed and the
+		// alert was not sent yet, and closes the transport. Closing twice
+		// does nothing. Fails when the transport refuses to close.
+		def close() !none {
+			return none when closed
+			closed = true
+			if state.handshakeComplete {
+				records.writeAlert(Alert.CloseNotify, false) onerror recover none
+			}
+			let conn = transport
+			return try conn.close() unless conn is none
+			return none
+		}
+
+		// isOpen reports whether close was not called yet.
+		def isOpen() bool {
+			return !closed
+		}
+
+		// connectionState is the negotiated state, `handshakeComplete`
+		// false until the handshake ran.
+		def connectionState() ConnectionState {
+			return state
+		}
+
+		// remoteAddr is the transport's peer address, empty over a plain
+		// reader and writer.
+		def remoteAddr() net.Address {
+			let conn = transport
+			return conn.remoteAddr() unless conn is none
+			return new net.Address()
+		}
+
+		// localAddr is the transport's local address, empty over a plain
+		// reader and writer.
+		def localAddr() net.Address {
+			let conn = transport
+			return conn.localAddr() unless conn is none
+			return new net.Address()
+		}
+
+		// Closes the transport when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// readRecord reads one record, sending the alert and closing the
+		// connection when the record layer rejects it.
+		internal def readRecord() !Record {
+			let failure ?error = none
+			let record = records.read() onerror (err error) {
+				failure = err
+				recover Record{contentType: 0, payload: []}
+			}
+			try failWithAny(failure) unless failure is none
+			return record
+		}
+
+		// dispatch handles one record read after the handshake.
+		internal def dispatch(record Record) !none {
+			switch {
+				case record.contentType == recordApplicationData:
+					pending = record.payload
+				case record.contentType == recordAlert:
+					try handleAlert(record.payload)
+				case record.contentType == recordHandshake:
+					handshakeBuffer = handshakeBuffer + record.payload
+					for {
+						let next = splitHandshake(handshakeBuffer)
+						break when next is none
+						let (kind, body, used) = next
+						handshakeBuffer = handshakeBuffer[used:]
+						try handlePostHandshake(kind, body)
+					}
+				default:
+					try failWith(tlsError(Alert.UnexpectedMessage, "unexpected record type {record.contentType} after the handshake"))
+			}
+			return none
+		}
+
+		internal def handleAlert(payload byte[]) !none {
+			try failWith(tlsError(Alert.DecodeError, "alert record of {payload.len()} bytes")) when payload.len() != 2
+			let alert = alertOf(int(payload[1]))
+			if alert == Alert.CloseNotify {
+				peerClosed = true
+				return none
+			}
+			// TLS 1.2 has warnings a connection outlives (RFC 5246 §7.2.2).
+			return none when state.version == Version.TLS12 && payload[0] == 1
+			closed = true
+			fail peerAlert(alert)
+		}
+
+		internal def handlePostHandshake(kind int, body byte[]) !none {
+			if state.version == Version.TLS12 {
+				// The only messages TLS 1.2 has here ask to renegotiate,
+				// which is declined with a warning (RFC 5246 §7.2.2).
+				let asks = kind == (isClient ?? (handshakeHelloRequest, handshakeClientHello))
+				try failWith(tlsError(Alert.UnexpectedMessage, "unexpected handshake message {kind} after the handshake")) unless asks
+				records.writeAlert(Alert.NoRenegotiation, false) onerror recover none
+				return none
+			}
+			switch {
+				case kind == handshakeNewSessionTicket:
+					try failWith(tlsError(Alert.UnexpectedMessage, "client sent a NewSessionTicket")) unless isClient
+					let ticket = try parseNewSessionTicket(body)
+					tickets.push(ticket)
+					try storeSession(ticket)
+				case kind == handshakeKeyUpdate:
+					let requested = try parseKeyUpdate(body)
+					readSecret = try nextTrafficSecret(hash, readSecret)
+					let (readKey, readIV) = try trafficKeyFor(suite, hash, readSecret)
+					records.setReadKey(readKey, readIV)
+					if requested {
+						try records.write(recordHandshake, marshalKeyUpdate(false))
+						writeSecret = try nextTrafficSecret(hash, writeSecret)
+						let (writeKey, writeIV) = try trafficKeyFor(suite, hash, writeSecret)
+						records.setWriteKey(writeKey, writeIV)
+					}
+				default:
+					try failWith(tlsError(Alert.UnexpectedMessage, "unexpected handshake message {kind} after the handshake"))
+			}
+			return none
+		}
+
+		// storeSession turns a ticket into a cached session when the config
+		// has a cache and a server name.
+		internal def storeSession(ticket NewSessionTicket) !none {
+			let cache = config.sessionCache
+			return none when cache is none
+			return none when config.serverName == ""
+			let psk = try resumptionPSK(hash, resumptionSecret, ticket.nonce)
+			cache.put(config.serverName, ClientSession{ticket: ticket.ticket, psk: psk, lifetime: ticket.lifetime, ageAdd: ticket.ageAdd, receivedAt: time.now(), suite: suite, alpn: state.alpn, peerCertificates: state.peerCertificates, verifiedChains: state.verifiedChains})
+			return none
+		}
+
+		// failWith sends the alert of a failure detected here, marks the
+		// connection closed and fails with it.
+		internal def failWith(err TLSError) !none {
+			sendAlertFor(err)
+			closed = true
+			fail err
+		}
+
+		// failWithAny sends the alert of a failure detected here, when it
+		// is one, marks the connection closed and fails with it.
+		internal def failWithAny(err error) !none {
+			sendAlertFor(err)
+			closed = true
+			fail err
+		}
+
+		internal def sendAlertFor(err error) {
+			return unless err is TLSError
+			return when err.fromPeer
+			records.writeAlert(err.alert) onerror recover none
+		}
+	}
+
+	// trafficKeyFor derives a record-layer key and IV from a traffic secret.
+	// Fails when HKDF does or the key length does not fit the suite.
+	def trafficKeyFor(suite CipherSuite, hash Hash, secret byte[]) !(AEAD, byte[]) {
+		let (key, iv) = try trafficKeys(hash, secret, suiteKeySize(suite))
+		return (try suiteAEAD(suite, key), iv)
+	}
+
+	// withServerName is the config with another server name; the given
+	// one is left as it is.
+	def withServerName(config Config, name string) Config {
+		return Config{serverName: name, rootCAs: config.rootCAs, insecureSkipVerify: config.insecureSkipVerify, alpn: config.alpn, minVersion: config.minVersion, maxVersion: config.maxVersion, cipherSuites: config.cipherSuites, curvePreferences: config.curvePreferences, sessionCache: config.sessionCache, certificates: config.certificates, clientAuth: config.clientAuth, clientCAs: config.clientCAs, getCertificate: config.getCertificate, sessionTicketKey: config.sessionTicketKey}
+	}
+
+	// client wraps an open connection as a TLS client without running the
+	// handshake; the first read, write or `handshake()` does.
+	def client(conn net.Connection, config Config) Conn {
+		return new Conn(conn, config)
+	}
+
+	// server wraps an accepted connection as a TLS server without running
+	// the handshake; the first read, write or `handshake()` does. The config
+	// needs a certificate, through `certificates` or `getCertificate`.
+	def server(conn net.Connection, config Config) Conn {
+		return new Conn(conn, config, false)
+	}
+
+	// dial connects to "host:port" over TCP and runs the handshake. When the
+	// config names no server, the host of the address is verified and sent
+	// as SNI. Fails with NetError when the dial does, TLSError or
+	// CertificateError when the handshake does.
+	def dial(address string, config Config, timeout duration = 30s) !Conn {
+		let cfg = config
+		if cfg.serverName == "" {
+			let addr = new net.Address()
+			addr.parse(address) onerror recover none
+			cfg = withServerName(config, addr.host)
+		}
+		let conn = try net.dialStream(address, timeout)
+		let out = new Conn(conn, cfg)
+		out.records.timeout = timeout
+		let failure ?error = none
+		out.handshake() onerror (err error) {
+			failure = err
+			recover none
+		}
+		return out when failure is none
+		conn.close() onerror recover none
+		fail failure
+	}
+}

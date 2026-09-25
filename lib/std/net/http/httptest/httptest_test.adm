@@ -1,0 +1,746 @@
+module std.net.http.httptest {
+	use (
+		std.bytes
+		std.crypto.x509::(CertPool)
+		std.metrics
+		std.net
+		std.net.http
+		std.net.http.http2
+		std.net.http.http2::(HeaderField)
+		std.net.http::(Context, Handler, Method)
+		std.net.tls
+		std.net.url
+		std.services::(Diagnostics, Policy)
+		std.testing
+		std.time
+	)
+
+	// TimedStream is a socket as an io.Reader and io.Writer with fixed
+	// timeouts, and its closer.
+	internal type TimedStream {
+		conn net.Stream
+
+		def new(conn net.Stream) {
+			self.conn = conn
+		}
+
+		def read(buf byte[]) !int {
+			return conn.read(buf, 10s)
+		}
+
+		def write(buf byte[]) !int {
+			return conn.write(buf, 10s)
+		}
+
+		def close() !none {
+			return conn.close()
+		}
+	}
+
+	// dialHTTP2 opens an HTTP/2 connection to the server with prior
+	// knowledge: the preface on a plain socket.
+	// heldRequest gets /held and returns the body, "failed: …" on a failure.
+	internal async def heldRequest(client http.Client) string {
+		let failure = ""
+		let res = client.get("/held") onerror (err error) {
+			failure = "failed: " + err.message
+			recover new http.Response()
+		}
+		return failure when failure != ""
+		let text = res.text() onerror recover "failed: body"
+		return text
+	}
+
+	internal def dialHTTP2(ts Server) !http2.Conn {
+		let sock = new TimedStream(try net.dialStream(ts.address().str(), 5s))
+		let conn = new http2.Conn(sock, sock, true, sock)
+		try conn.handshake()
+		return conn
+	}
+
+	// Sends one request on a new stream and returns the response fields
+	// and body.
+	internal def exchange(conn http2.Conn, method string, path string, body byte[] = []) !(HeaderField[], byte[]) {
+		let s = try conn.newStream(time.now() + 10s)
+		s.deadline = time.now() + 10s
+		let fields = [HeaderField{name:":method", value:method}, HeaderField{name:":scheme", value:"http"}, HeaderField{name:":path", value:path}, HeaderField{name:":authority", value:"example.test"}, HeaderField{name:"content-type", value:"text/plain"}]
+		try s.writeHeaders(fields, body.len() == 0)
+		if body.len() > 0 {
+			try s.write(body)
+			try s.end()
+		}
+		let head = try s.readHeaders()
+		return (head, try s.readAll())
+	}
+
+	// readHead reads an HTTP/1.1 head off the socket, to the blank line and
+	// not a byte past it.
+	internal def readHead(sock TimedStream) !string {
+		let out byte[] = []
+		let one byte[] = []
+		one.len(1)
+		for !string(out).endsWith("\r\n\r\n") {
+			let n = try sock.read(one)
+			break when n == 0
+			out.push(one[0])
+		}
+		return string(out)
+	}
+
+	// readStream reads frames until the stream ends and returns its
+	// response fields and body. Every header block goes through the
+	// decoder, to keep its table in step.
+	internal def readStream(framer http2.Framer, decoder http2.Decoder, streamID int) !(HeaderField[], byte[]) {
+		let head HeaderField[] = []
+		let body byte[] = []
+		for {
+			let frame = try framer.readFrame()
+			if frame.kind == http2.FrameType.Headers {
+				let fields = try decoder.decode(frame.data)
+				head = fields when frame.streamID == streamID && head.len() == 0
+			}
+			continue unless frame.streamID == streamID
+			body = body + frame.data when frame.kind == http2.FrameType.Data
+			break when frame.endStream()
+		}
+		return (head, body)
+	}
+
+	// echoMux is the handler the loopback suites serve: a few routes that
+	// exercise bodies, redirects, streaming and failures.
+	internal def echoMux() !http.ServeMux {
+		let mux = new http.ServeMux()
+		try mux.get("/ping", def (ctx Context) !none {return ctx.text("pong")})
+		try mux.post("/upload", def (ctx Context) !none {
+			let data = try ctx.bytes()
+			return ctx.text(data.len().str())
+		})
+		try mux.post("/echo", def (ctx Context) !none {
+			let text = try ctx.text()
+			ctx.setHeader("X-Seen-Type", ctx.header("Content-Type"))
+			return ctx.text(text)
+		})
+		try mux.get("/old", def (ctx Context) !none {return ctx.redirect("/ping", 302)})
+		try mux.get("/loop", def (ctx Context) !none {return ctx.redirect("/loop", 302)})
+		try mux.get("/stream", def (ctx Context) !none {
+			ctx.setHeader("Content-Type", "text/plain")
+			for let i = 0; i < 3; i++ {
+				try ctx.response.writeString("chunk{i};")
+				try ctx.flush()
+			}
+			return none
+		})
+		try mux.get("/fail", def (ctx Context) !none {fail ctx.abort(418, "short and stout")})
+		try mux.get("/slow", def (ctx Context) !none {
+			time.sleep(300ms)
+			return ctx.text("late")
+		})
+		try mux.get("/users/\{id\}", def (ctx Context) !none {return ctx.text("user " + ctx.param("id"))})
+		try mux.post("/reject", def (ctx Context) !none {fail ctx.abort(413, "too large")})
+		try mux.get("/secure", def (ctx Context) !none {
+			let state = ctx.request.tlsState
+			return ctx.text("plain") when state is none
+			return ctx.text("tls {ctx.request.isSecure()} {ctx.request.scheme()} {state.alpn} {state.serverName} {state.resumed}")
+		})
+		return mux
+	}
+
+	check "HTTP loopback" {
+		@test()
+		def servesRequestsOverTheWire() !none {
+			let ts = try Server.start(try echoMux())
+			let client = ts.client()
+			let res = try client.get("/ping")
+			assert res.status == 200
+			assert (try res.text()) == "pong"
+			assert res.headers.get("Server") == "adm"
+			assert res.headers.get("Date") != ""
+			let user = try client.get("/users/42")
+			assert (try user.text()) == "user 42"
+			let missing = try client.get("/nope")
+			assert missing.status == 404
+			try missing.close()
+			let failed = try client.get("/fail")
+			assert failed.status == 418
+			assert (try failed.text()).trim() == "short and stout"
+			assert ts.requests == 4
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def servesHTTPSWithTheBuiltInCertificate() !none {
+			let ts = try Server.start(try echoMux())
+			let plain = try ts.client().get("/secure")
+			assert (try plain.text()) == "plain"
+			try ts.close()
+
+			let secure = new Server(try echoMux())
+			try secure.startTLS()
+			assert secure.url.startsWith("https://127.0.0.1:")
+			assert !(secure.certificate() is none)
+			let client = secure.client()
+			let res = try client.get("/secure")
+			assert res.status == 200
+			let seen = try res.text()
+			fail "unexpected /secure answer: {seen}" when seen != "tls true https http/1.1 localhost false"
+			let pong = try client.get("/ping")
+			assert (try pong.text()) == "pong"
+			let echoed = try client.post("/echo", "over tls")
+			assert (try echoed.text()) == "over tls"
+			assert secure.requests == 3
+			// A client that does not trust the certificate is refused.
+			let untrusting = new http.Client(secure.url)
+			let reason = "ok"
+			untrusting.get("/ping") onerror (err error) {
+				reason = err.message
+				recover res
+			}
+			assert reason != "ok"
+			try secure.close()
+			return none
+		}
+
+		@test()
+		def sendsBodiesBothWays() !none {
+			let ts = try Server.start(try echoMux())
+			let client = ts.client()
+			let data byte[] = []
+			data.len(70000)
+			let up = try client.post("/upload", "application/octet-stream", data)
+			assert (try up.text()) == "70000"
+			let echoed = try client.post("/echo", "hello there")
+			assert (try echoed.text()) == "hello there"
+			assert echoed.headers.get("X-Seen-Type").startsWith("text/plain")
+			let streamed = try client.post("/echo", "text/plain", new bytes.Reader("chunked body".bytes()))
+			assert (try streamed.text()) == "chunked body"
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def holdsTheBodyForExpectContinue() !none {
+			let ts = try Server.start(try echoMux())
+			let client = ts.client()
+			// The server answers `100 Continue` when the handler reads.
+			let req = try client.request(Method.POST, "/echo")
+			req.replaceBody("held back".bytes())
+			req.headers.set("Content-Type", "text/plain")
+			req.headers.set("Expect", "100-continue")
+			let started = time.now()
+			let res = try client.do(req)
+			assert res.status == 200
+			assert (try res.text()) == "held back"
+			assert time.now() - started < 900ms
+			// A handler that answers without reading gets its status
+			// through before the body goes.
+			let refused = try client.request(Method.POST, "/reject")
+			let big byte[] = []
+			big.len(100000)
+			refused.replaceBody(big)
+			refused.headers.set("Expect", "100-continue")
+			let rejected = try client.do(refused)
+			assert rejected.status == 413
+			assert (try rejected.text()).trim() == "too large"
+			// The pool dropped that connection; the next request works.
+			let pong = try client.get("/ping")
+			assert (try pong.text()) == "pong"
+			assert ts.requests == 3
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def followsRedirectsAndStopsLoops() !none {
+			let ts = try Server.start(try echoMux())
+			let client = ts.client()
+			let res = try client.get("/old")
+			assert res.status == 200
+			assert (try res.text()) == "pong"
+			let req = res.request
+			assert !(req is none)
+			let looped = client.get("/loop")
+			assert looped is error
+			let plain = ts.client()
+			plain.redirects = new http.DefaultRedirects(0)
+			let stop = plain.get("/old")
+			assert stop is error
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def readsChunkedStreams() !none {
+			let ts = try Server.start(try echoMux())
+			let res = try ts.client().get("/stream")
+			assert res.status == 200
+			assert res.headers.get("Transfer-Encoding") == "chunked"
+			assert (try res.text()) == "chunk0;chunk1;chunk2;"
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def reusesPooledConnections() !none {
+			let ts = try Server.start(try echoMux())
+			let transport = new http.Transport()
+			let client = new http.Client(ts.url)
+			client.transport = transport
+			let first = try client.get("/ping")
+			try first.close()
+			assert transport.idleCount() == 1
+			let second = try client.get("/ping")
+			assert (try second.text()) == "pong"
+			assert transport.idleCount() == 1
+			assert transport.activeCount() == 0
+			transport.closeIdle()
+			assert transport.idleCount() == 0
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def appliesClientTimeouts() !none {
+			let ts = try Server.start(try echoMux())
+			let client = ts.client()
+			client.timeout = 50ms
+			let res = client.get("/slow")
+			assert res is error
+			let relaxed = ts.client()
+			let ok = try relaxed.get("/slow")
+			assert (try ok.text()) == "late"
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def countsRequestsAndConnections() !none {
+			let sent = try Diagnostics.register<metrics.Counter>("net.http.client.requests.total")
+			let failed = try Diagnostics.register<metrics.Counter>("net.http.client.errors.total")
+			let dials = try Diagnostics.register<metrics.Counter>("net.http.client.dials.total")
+			let idle = try Diagnostics.register<metrics.Gauge>("net.http.client.connections.idle")
+			let active = try Diagnostics.register<metrics.Gauge>("net.http.client.connections.active")
+			let served = try Diagnostics.register<metrics.Counter>("net.http.server.requests.total")
+			let faults = try Diagnostics.register<metrics.Counter>("net.http.server.errors.total")
+			let open = try Diagnostics.register<metrics.Gauge>("net.http.server.connections.open")
+			let sentBefore = sent.value()
+			let failedBefore = failed.value()
+			let dialsBefore = dials.value()
+			let servedBefore = served.value()
+			let faultsBefore = faults.value()
+			let idleBefore = idle.value()
+			let activeBefore = active.value()
+			let openBefore = open.value()
+
+			let ts = try Server.start(try echoMux())
+			let transport = new http.Transport()
+			let client = new http.Client(ts.url)
+			client.transport = transport
+			let first = try client.get("/ping")
+			assert active.value() == activeBefore + 1.0
+			try first.close()
+			let second = try client.get("/fail")
+			try second.close()
+			assert sent.value() == sentBefore + 2
+			assert dials.value() == dialsBefore + 1
+			assert served.value() == servedBefore + 2
+			assert faults.value() == faultsBefore + 1
+			assert idle.value() == idleBefore + 1.0
+			assert active.value() == activeBefore
+			assert open.value() == openBefore + 1.0
+
+			transport.closeIdle()
+			assert idle.value() == idleBefore
+			try ts.close()
+			assert open.value() == openBefore
+			let gone = client.get("/ping")
+			assert gone is error
+			assert failed.value() == failedBefore + 1
+			return none
+		}
+
+		@test()
+		def honoursTheNetworkPolicy() !none {
+			let ts = try Server.start(try echoMux())
+			try Policy.configure("[adm.network.connect]\nhost.deny = [\"blocked.invalid\"]\n\n[adm.network.listen]\nhost.deny = [\"203.0.113.9\"]\n")
+			// The proxy is the address dialed; the rule names the host behind it.
+			let t = new http.Transport()
+			t.proxy = new http.StaticProxy(try url.parse(ts.url))
+			let blocked = new http.Client("http://blocked.invalid")
+			blocked.transport = t
+			let seen = try ts.client().get("/ping")
+			let code = ""
+			blocked.get("/ping") onerror (err error) {
+				code = err.code
+				recover seen
+			}
+			assert code == "policy.denied"
+			assert (try seen.text()) == "pong"
+			assert ts.requests == 1
+
+			let server = new http.Server("203.0.113.9:0", try echoMux())
+			code = ""
+			server.listenAndServe() onerror (err error) {
+				code = err.code
+				recover none
+			}
+			assert code == "policy.denied"
+			try Policy.configure("")
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def recordsWithoutASocket() !none {
+			let mux = try echoMux()
+			let rec = new ResponseRecorder()
+			let req = try newRequest(Method.GET, "/users/7")
+			try mux.serve(rec.context(req))
+			assert rec.status == 200
+			assert rec.text() == "user 7"
+			assert rec.header("Content-Type").startsWith("text/plain")
+			let posted = new ResponseRecorder()
+			let upload = try newRequest(Method.POST, "/upload", "abc")
+			try mux.serve(posted.context(upload))
+			assert posted.text() == "3"
+			let result = posted.result()
+			assert result.status == 200
+			assert (try result.text()) == "3"
+			return none
+		}
+
+		@test()
+		def servesHTTP2OverThePreface() !none {
+			let ts = try Server.start(try echoMux())
+			let conn = try dialHTTP2(ts)
+			let (head, body) = try exchange(conn, "GET", "/ping")
+			assert http2.valueOf(head, ":status") == "200"
+			assert http2.valueOf(head, "content-length") == "4"
+			assert http2.valueOf(head, "server") == "adm"
+			assert http2.valueOf(head, "connection") == ""
+			assert string(body) == "pong"
+			// A large body up through the windows, the count back.
+			let data byte[] = []
+			data.len(70000)
+			let (upHead, upBody) = try exchange(conn, "POST", "/upload", data)
+			assert http2.valueOf(upHead, ":status") == "200"
+			assert string(upBody) == "70000"
+			let (echoHead, echoBody) = try exchange(conn, "POST", "/echo", "hello".bytes())
+			assert http2.valueOf(echoHead, "x-seen-type") == "text/plain"
+			assert string(echoBody) == "hello"
+			// A streamed response has no length; a failure keeps its status.
+			let (streamHead, streamBody) = try exchange(conn, "GET", "/stream")
+			assert http2.valueOf(streamHead, "content-length") == ""
+			assert http2.valueOf(streamHead, "transfer-encoding") == ""
+			assert string(streamBody) == "chunk0;chunk1;chunk2;"
+			let (failHead, _) = try exchange(conn, "GET", "/fail")
+			assert http2.valueOf(failHead, ":status") == "418"
+			let (headHead, headBody) = try exchange(conn, "HEAD", "/ping")
+			assert http2.valueOf(headHead, "content-length") == "4"
+			assert headBody.len() == 0
+			// Streams run side by side: the slow one does not hold the rest.
+			let slow = async exchange(conn, "GET", "/slow")
+			let started = time.now()
+			let (_, quick) = try exchange(conn, "GET", "/users/7")
+			assert string(quick) == "user 7"
+			assert time.now() - started < 250ms
+			let (_, late) = try await slow
+			assert string(late) == "late"
+			try conn.close()
+			// The same port still answers HTTP/1.1.
+			let res = try ts.client().get("/ping")
+			assert (try res.text()) == "pong"
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def upgradesToHTTP2InCleartext() !none {
+			let ts = try Server.start(try echoMux())
+			let sock = new TimedStream(try net.dialStream(ts.address().str(), 5s))
+			// HTTP2-Settings: INITIAL_WINDOW_SIZE 65535, base64url.
+			let ask = "POST /upload HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAQAAP__\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+			try sock.write(ask.bytes())
+			let switched = try readHead(sock)
+			assert switched.startsWith("HTTP/1.1 101 ")
+			assert switched.lower().contains("upgrade: h2c")
+			// The client's preface, then the answer to the request on stream 1.
+			try sock.write(http2.clientPreface.bytes())
+			let framer = new http2.Framer(sock, sock)
+			try framer.writeSettings([])
+			let decoder = new http2.Decoder()
+			let (head, body) = try readStream(framer, decoder, 1)
+			assert http2.valueOf(head, ":status") == "200"
+			assert string(body) == "5"
+			// The connection goes on as HTTP/2.
+			let encoder = new http2.Encoder()
+			let fields = [HeaderField{name:":method", value:"GET"}, HeaderField{name:":scheme", value:"http"}, HeaderField{name:":path", value:"/ping"}, HeaderField{name:":authority", value:"example.test"}]
+			try framer.writeHeaders(3, true, encoder.encode(fields))
+			let (next, pong) = try readStream(framer, decoder, 3)
+			assert http2.valueOf(next, ":status") == "200"
+			assert string(pong) == "pong"
+			try sock.close()
+			// Without the settings field the request stays on HTTP/1.1.
+			let plain = new TimedStream(try net.dialStream(ts.address().str(), 5s))
+			try plain.write("GET /ping HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n".bytes())
+			let kept = try readHead(plain)
+			assert kept.startsWith("HTTP/1.1 200 ")
+			try plain.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def clientSpeaksHTTP2ByPriorKnowledge() !none {
+			let ts = try Server.start(try echoMux())
+			let t = new http.Transport()
+			t.http2PriorKnowledge = true
+			let client = new http.Client(ts.url)
+			client.transport = t
+			let res = try client.get("/ping")
+			assert res.proto == "HTTP/2.0"
+			assert (try res.text()) == "pong"
+			let data byte[] = []
+			data.len(70000)
+			let up = try client.post("/upload", "application/octet-stream", data)
+			assert up.proto == "HTTP/2.0"
+			assert (try up.text()) == "70000"
+			assert t.sessionCount() == 1
+			assert t.idleCount() == 0
+			// Off by default: plain http is HTTP/1.1.
+			let old = try ts.client().get("/ping")
+			assert old.proto == "HTTP/1.1"
+			try old.close()
+			try t.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def opensAnotherHTTP2SessionAtTheStreamLimit() !none {
+			let mux = new http.ServeMux()
+			let arrived = 0
+			let release = false
+			try mux.get("/held", def (ctx Context) !none {
+				arrived++
+				for !release {
+					time.sleep(2ms)
+				}
+				return ctx.text("held")
+			})
+			try mux.get("/ping", def (ctx Context) !none {return ctx.text("pong")})
+			let ts = try Server.start(mux)
+			let srv = ts.config()
+			fail "no server config" when srv is none
+			srv.maxConcurrentStreams = 2
+
+			// No cap: two held streams fill the first session, the third
+			// request dials a second one.
+			let t = new http.Transport()
+			t.http2PriorKnowledge = true
+			let client = new http.Client(ts.url)
+			client.transport = t
+			assert (try (try client.get("/ping")).text()) == "pong"
+			assert t.sessionCount() == 1
+			let first = async heldRequest(client)
+			let second = async heldRequest(client)
+			for arrived < 2 {
+				time.sleep(2ms)
+			}
+			assert t.sessionCount() == 1
+			let third = try client.get("/ping")
+			assert third.proto == "HTTP/2.0" && (try third.text()) == "pong"
+			assert t.sessionCount() == 2
+			release = true
+			assert (await first) == "held" && (await second) == "held"
+			try t.close()
+
+			// Capped at one connection: the third request waits for a stream.
+			release = false
+			arrived = 0
+			let capped = new http.Transport()
+			capped.http2PriorKnowledge = true
+			capped.maxConnsPerHost = 1
+			let strict = new http.Client(ts.url)
+			strict.transport = capped
+			let a = async heldRequest(strict)
+			let b = async heldRequest(strict)
+			for arrived < 2 {
+				time.sleep(2ms)
+			}
+			let waiting = async heldRequest(strict)
+			time.sleep(50ms)
+			assert arrived == 2 && capped.sessionCount() == 1
+			release = true
+			assert (await a) == "held" && (await b) == "held" && (await waiting) == "held"
+			assert arrived == 3 && capped.sessionCount() == 1
+			try capped.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def reflectsPriorityUpdatesInTheRequest() !none {
+			// The handler answers once the update has come, with the
+			// header it was sent and the priority the request reports.
+			let mux = new http.ServeMux()
+			try mux.get("/priority", def (ctx Context) !none {
+				let s = ctx.request.stream
+				for let i = 0; i < 500 && !(s is none) && s.priorityUpdate == ""; i++ {
+					time.sleep(2ms)
+				}
+				return ctx.text(ctx.request.headers.get("Priority") + " | " + ctx.request.priority().str())
+			})
+			let ts = try Server.start(mux)
+			let conn = try dialHTTP2(ts)
+			let s = try conn.newStream(time.now() + 10s)
+			s.deadline = time.now() + 10s
+			try s.writeHeaders([HeaderField{name:":method", value:"GET"}, HeaderField{name:":scheme", value:"http"}, HeaderField{name:":path", value:"/priority"}, HeaderField{name:":authority", value:"example.test"}, HeaderField{name:"priority", value:"u=5"}], true)
+			try s.updatePriority("u=1, i")
+			try s.readHeaders()
+			let answer = string(try s.readAll())
+			fail "handler saw {answer}" unless answer == "u=5 | u=1, i"
+			try conn.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def joinsSplitCookiesOverHTTP2() !none {
+			let mux = new http.ServeMux()
+			try mux.get("/cookies", def (ctx Context) !none {
+				return ctx.text(ctx.request.proto + " " + ctx.request.headers.values("Cookie").join(" | "))
+			})
+			let ts = try Server.start(mux)
+			let t = new http.Transport()
+			t.http2PriorKnowledge = true
+			let client = new http.Client(ts.url)
+			client.transport = t
+			let req = try http.newRequest(Method.GET, ts.url + "/cookies")
+			req.headers.set("Cookie", "a=1; b=2; c=3")
+			let res = try client.do(req)
+			// Sent a pair a field, handed to the handler as one header again.
+			assert (try res.text()) == "HTTP/2.0 a=1; b=2; c=3"
+			try t.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def servesHTTP2OverTLS() !none {
+			let ts = new Server(try echoMux())
+			try ts.startTLS()
+			// ALPN picks `h2` for a client that offers it.
+			let raw = try tls.dial(ts.address().str(), tls.Config{insecureSkipVerify: true, alpn: ["h2", "http/1.1"]}, 5s)
+			try raw.handshake()
+			assert raw.connectionState().alpn == "h2"
+			let sock = new TimedStream(raw)
+			let conn = new http2.Conn(sock, sock, true, sock)
+			try conn.handshake()
+			let (head, body) = try exchange(conn, "GET", "/secure")
+			assert http2.valueOf(head, ":status") == "200"
+			assert string(body).startsWith("tls true https h2 ")
+			try conn.close()
+			// A client that offers only HTTP/1.1 keeps it.
+			let res = try ts.client().get("/secure")
+			assert (try res.text()).startsWith("tls true https http/1.1 ")
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def closesIdleHTTP2Sessions() !none {
+			let ts = new Server(try echoMux())
+			try ts.startTLS()
+			let cert = ts.certificate()
+			fail "the TLS server has no certificate" when cert is none
+			let pool = new CertPool()
+			pool.addCert(cert)
+			let t = new http.Transport()
+			t.tls = trustingConfig(pool)
+			t.idleTimeout = 200ms
+			t.pingInterval = 50ms
+			let client = new http.Client(ts.url)
+			client.transport = t
+			let dials = try Diagnostics.register<metrics.Counter>("net.http.client.dials.total")
+			let before = dials.value()
+			let first = try client.get("/ping")
+			assert first.proto == "HTTP/2.0"
+			assert (try first.text()) == "pong"
+			// Pings answered meanwhile do not count as use.
+			time.sleep(120ms)
+			assert t.sessionCount() == 1
+			let second = try client.get("/ping")
+			assert (try second.text()) == "pong"
+			assert dials.value() == before + 1
+			let limit = time.now() + 3s
+			for t.sessionCount() > 0 && time.now().before(limit) {
+				time.sleep(10ms)
+			}
+			assert t.sessionCount() == 0
+			let third = try client.get("/ping")
+			assert (try third.text()) == "pong"
+			assert dials.value() == before + 2
+			try t.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def clientSpeaksHTTP2OverTLS() !none {
+			let ts = new Server(try echoMux())
+			try ts.startTLS()
+			let cert = ts.certificate()
+			fail "the TLS server has no certificate" when cert is none
+			let pool = new CertPool()
+			pool.addCert(cert)
+			let t = new http.Transport()
+			t.tls = trustingConfig(pool)
+			let client = new http.Client(ts.url)
+			client.transport = t
+			let res = try client.get("/secure")
+			assert res.proto == "HTTP/2.0"
+			assert (try res.text()).startsWith("tls true https h2 ")
+			// Bodies both ways, a streamed response, a failure status.
+			let data byte[] = []
+			data.len(70000)
+			let up = try client.post("/upload", "application/octet-stream", data)
+			assert (try up.text()) == "70000"
+			let streamed = try client.get("/stream")
+			assert streamed.contentLength == -1
+			assert (try streamed.text()) == "chunk0;chunk1;chunk2;"
+			let failed = try client.get("/fail")
+			assert failed.status == 418
+			try failed.close()
+			// Requests share the one connection and do not wait for each other.
+			let slow = async client.get("/slow")
+			let started = time.now()
+			let quick = try client.get("/users/9")
+			assert (try quick.text()) == "user 9"
+			assert time.now() - started < 250ms
+			let late = try await slow
+			assert (try late.text()) == "late"
+			assert t.sessionCount() == 1
+			assert t.idleCount() == 0
+			// The server closes the connection: the next request dials anew.
+			ts.closeClientConnections()
+			time.sleep(50ms)
+			let again = try client.get("/ping")
+			assert again.proto == "HTTP/2.0"
+			assert (try again.text()) == "pong"
+			assert t.sessionCount() == 1
+			// With `http2` off the same server is spoken to in HTTP/1.1.
+			let plain = new http.Transport()
+			plain.tls = trustingConfig(pool)
+			plain.http2 = false
+			client.transport = plain
+			let old = try client.get("/secure")
+			assert old.proto == "HTTP/1.1"
+			assert (try old.text()).startsWith("tls true https http/1.1 ")
+			try t.close()
+			try plain.close()
+			try ts.close()
+			return none
+		}
+	}
+}

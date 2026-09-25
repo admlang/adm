@@ -1,0 +1,836 @@
+partial module std.net.multipart {
+	use (
+		std.crypto
+		std.errors
+		std.formats
+		std.io
+		std.net.url::(Values)
+		std.os
+		std.services::(Runtime)
+	)
+
+	// MultipartError is the payload of every failure here: a missing or
+	// malformed boundary, a part whose headers do not parse, a body cut
+	// short, a form larger than its limit.
+	struct MultipartError {
+		message string
+		code    string            = "multipart"
+		cause   ?error
+		stack   errors.StackTrace
+		// The operation that failed: "boundary", "header", "part", "form", "write".
+		op      string
+	}
+
+	// Part is one section of a multipart body: its MIME headers and its
+	// content, read through the `io.Reader` interface up to the next
+	// boundary. A part is valid until the next call to `Reader.nextPart()`.
+	//
+	// Example:
+	// ```example
+	// let part = try reader.nextPart()
+	// if part is none {
+	//     return
+	// }
+	// println(part.formName(), part.fileName())
+	// let data = try part.bytes()
+	// ```
+	type Part {
+		// Headers in canonical form (`Content-Disposition`, `Content-Type`),
+		// each with every value it appeared with.
+		headers    map<string, string[]>
+		// The reader this part belongs to, which delivers its content; weak,
+		// since the reader holds the current part.
+		weak owner ?Reader
+		// Set once the part's content was read up to its delimiter.
+		done       bool                  = false
+		// Set once any content was handed out, so a delimiter at the start
+		// of the buffer is content rather than an empty part.
+		consumed   bool                  = false
+
+		def new(owner Reader, headers map<string, string[]>) {
+			self.owner = owner
+			self.headers = headers
+		}
+
+		// header returns the first value of a header, case-insensitive;
+		// empty when absent.
+		def header(name string) string {
+			let values = headers.get(canonicalHeaderKey(name))
+			return "" when values is none
+			return "" when values.len() == 0
+			return values[0]
+		}
+
+		// formName is the `name` parameter of a `form-data` Content-Disposition,
+		// empty for a part that is not a form field.
+		def formName() string {
+			let disposition = formats.parseMediaType(header("Content-Disposition")) onerror recover new formats.MediaType("", "")
+			return "" unless disposition.mainType == "form-data"
+			return orEmpty(disposition.param("name"))
+		}
+
+		// fileName is the `filename` parameter of the Content-Disposition,
+		// stripped of any directory, none when the part is not a file.
+		def fileName() ?string {
+			let disposition = formats.parseMediaType(header("Content-Disposition")) onerror recover new formats.MediaType("", "")
+			let name = disposition.param("filename")
+			return none when name is none
+			return baseName(name)
+		}
+
+		// contentType is the parsed `Content-Type` of the part, or
+		// `text/plain` when the header is absent, as RFC 2046 defaults. Fails
+		// when the header does not parse as a media type.
+		def contentType() !formats.MediaType {
+			let value = header("Content-Type")
+			return new formats.MediaType("text", "plain") when value == ""
+			return formats.parseMediaType(value) onerror (err error) {
+				fail MultipartError{message: "part Content-Type does not parse: {value}", op: "header", cause: err}
+			}
+		}
+
+		// read fills buf with the next bytes of the part; 0 at the end of the
+		// part. Fails when the body ends before the closing boundary.
+		def read(buf byte[]) !int {
+			let reader = owner
+			fail MultipartError{message: "the part's reader is gone", op: "part"} when reader is none
+			return reader.readChunk(self, buf)
+		}
+
+		// bytes reads the rest of the part into memory. Fails like `read`.
+		def bytes() !byte[] {
+			let out byte[] = []
+			let chunk byte[] = []
+			chunk.len(4096)
+			for {
+				let n = try read(chunk)
+				break when n == 0
+				out = out.concat(chunk.slice(0, n))
+			}
+			return out
+		}
+
+		// text reads the rest of the part as a string. Fails like `read`.
+		def text() !string {
+			return string(try bytes())
+		}
+	}
+
+	// Reader walks the parts of a multipart body (RFC 2046) delimited by a
+	// boundary: `--boundary` lines between parts, `--boundary--` at the end.
+	// A preamble before the first boundary and an epilogue after the last
+	// are skipped. Part headers may be folded, and their names are
+	// canonicalised. Lines may end in CR LF or a bare LF.
+	//
+	// Example:
+	// ```example
+	// let reader = try multipart.readerFor(body, request.header("Content-Type"))
+	// for {
+	//     let part = try reader.nextPart()
+	//     break when part is none
+	//     println(part.formName(), try part.text())
+	// }
+	// ```
+	type Reader {
+		// Directory for the files `readForm` spills; empty picks `TMPDIR`
+		// or `/tmp`.
+		tempDir            string    = ""
+		internal source    io.Reader
+		// The delimiter the body uses.
+		boundary           string
+		internal delimiter byte[]
+		internal buf       byte[]    = []
+		internal eof       bool      = false
+		internal finished  bool      = false
+		internal current   ?Part     = none
+		internal partsRead int       = 0
+
+		def new(source io.Reader, boundary string) {
+			self.source = source
+			self.boundary = boundary
+			self.delimiter = ("--" + boundary).bytes()
+		}
+
+		// nextPart returns the next part, none after the closing boundary.
+		// The previous part is drained first. Fails with MultipartError
+		// (op "part" or "header") on a malformed body.
+		def nextPart() !?Part {
+			return none when finished
+			let previous = current
+			try drain(previous) unless previous is none
+			current = none
+			for {
+				let line = try readLine()
+				if line is none {
+					fail MultipartError{message: "multipart body ends before a boundary", op: "part"} when partsRead == 0
+					fail MultipartError{message: "multipart body ends without the closing boundary", op: "part"}
+				} else {
+					let kind = boundaryLine(line)
+					if kind == 2 {
+						finished = true
+						return none
+					}
+					continue unless kind == 1
+					let headers = try readHeaders()
+					let part = new Part(self, headers)
+					current = part
+					partsRead++
+					return part
+				}
+			}
+			fail MultipartError{message: "unreachable", op: "part"}
+		}
+
+		// readForm reads every remaining part as a form: fields go into
+		// `Form.values`, files into `Form.files`. File contents stay in
+		// memory up to `maxMemory` bytes in total; beyond that they spill
+		// into temporary files that `Form.removeAll()` deletes. Parts without
+		// a field name are skipped. Fails with MultipartError (op "form")
+		// when the field values exceed the 10 MiB allowance or a spill file
+		// cannot be written, and like `nextPart` on a malformed body.
+		def readForm(maxMemory int) !Form {
+			let form = new Form()
+			let memoryLeft = maxMemory
+			let valueBytesLeft = 10 * 1024 * 1024
+			for {
+				let part = try nextPart()
+				break when part is none
+				let name = part.formName()
+				continue when name == ""
+				let fileName = part.fileName()
+				if fileName is none {
+					let data = try part.bytes()
+					valueBytesLeft -= data.len()
+					fail MultipartError{message: "multipart form values exceed 10 MiB", op: "form"} when valueBytesLeft < 0
+					form.values.add(name, string(data))
+					continue
+				}
+				let header = new FileHeader(name, fileName, part.headers)
+				let content byte[] = []
+				let spilled = false
+				let chunk byte[] = []
+				chunk.len(4096)
+				let path = ""
+				let file ?os.File = none
+				for {
+					let n = try part.read(chunk)
+					break when n == 0
+					let piece = chunk.slice(0, n)
+					if !spilled && content.len() + n > memoryLeft {
+						spilled = true
+						path = try spillPath()
+						let opened = os.open(path, "w") onerror (err error) {
+							fail MultipartError{message: "cannot create spill file {path}", op: "form", cause: err}
+						}
+						file = opened
+						try writeAll(opened, content)
+						content = []
+					}
+					if spilled {
+						try writeAll(file, piece) unless file is none
+					} else {
+						content = content.concat(piece)
+					}
+					header.size += n
+				}
+				if file is none {
+					memoryLeft -= content.len()
+					header.content = content
+				} else {
+					try file.close()
+					header.tempPath = path
+				}
+				let list = form.files.get(name)
+				if list is none {
+					form.files.set(name, [header])
+				} else {
+					list.push(header)
+					form.files.set(name, list)
+				}
+			}
+			return form
+		}
+
+		// spillPath names a fresh temporary file for a large upload.
+		internal def spillPath() !string {
+			let dir = tempDir
+			if dir == "" {
+				let env = Runtime.getEnv("TMPDIR")
+				dir = env is none ?? ("/tmp", orEmpty(env))
+				dir = "/tmp" when dir == ""
+			}
+			let random = crypto.rand(12) onerror (err error) {
+				fail MultipartError{message: "cannot name a spill file", op: "form", cause: err}
+			}
+			return dir + "/adm-multipart-" + random.hex()
+		}
+
+		// boundaryLine classifies a line: 1 for a delimiter, 2 for the
+		// closing delimiter, 0 for anything else. Trailing whitespace after
+		// a delimiter is allowed.
+		internal def boundaryLine(line byte[]) int {
+			return 0 when line.len() < delimiter.len()
+			for let i = 0; i < delimiter.len(); i++ {
+				return 0 when line[i] != delimiter[i]
+			}
+			let rest = line.slice(delimiter.len(), line.len() - delimiter.len())
+			let closing = rest.len() >= 2 && rest[0] == 0x2D && rest[1] == 0x2D
+			rest = rest.slice(2, rest.len() - 2) when closing
+			for let b in rest {
+				return 0 unless b := 0x20 || 0x09
+			}
+			return closing ?? (2, 1)
+		}
+
+		// readHeaders reads the header block of a part up to the empty line,
+		// folding continuation lines.
+		internal def readHeaders() !map<string, string[]> {
+			let headers = map<string, string[]>{}
+			let lastName = ""
+			for {
+				let line = try readLine()
+				let text = ""
+				if line is none {
+					fail MultipartError{message: "multipart body ends inside part headers", op: "header"}
+				} else {
+					text = string(line)
+				}
+				break when text == ""
+				if (text.startsWith(" ") || text.startsWith("\t")) && lastName != "" {
+					let values = orNoStrings(headers.get(lastName))
+					values.set(values.len() - 1, values[values.len() - 1] + " " + text.trim())
+					headers.set(lastName, values)
+					continue
+				}
+				let colon = text.indexOf(":")
+				fail MultipartError{message: "malformed part header line: {text}", op: "header"} when colon <= 0
+				let name = canonicalHeaderKey(text[:colon].trim())
+				let value = text[colon + 1:].trim()
+				let values = orNoStrings(headers.get(name))
+				values.push(value)
+				headers.set(name, values)
+				lastName = name
+			}
+			return headers
+		}
+
+		// readLine returns the next line without its CR LF or LF, none at the
+		// end of the body.
+		internal def readLine() !?byte[] {
+			for {
+				let nl = indexOfByte(buf, 0x0A, 0)
+				if nl >= 0 {
+					let end = nl
+					end-- when end > 0 && buf[end - 1] == 0x0D
+					let line = buf.slice(0, end)
+					buf = buf.slice(nl + 1, buf.len() - nl - 1)
+					return line
+				}
+				if eof {
+					return none when buf.len() == 0
+					let line = buf
+					buf = []
+					return line
+				}
+				try fill()
+			}
+			fail MultipartError{message: "unreachable", op: "part"}
+		}
+
+		// fill reads more of the body into the buffer; sets eof at its end.
+		internal def fill() !none {
+			let chunk byte[] = []
+			chunk.len(4096)
+			let n = source.read(chunk) onerror (err error) {
+				fail MultipartError{message: "cannot read multipart body", op: "part", cause: err}
+			}
+			if n == 0 {
+				eof = true
+				return none
+			}
+			buf = buf.concat(chunk.slice(0, n))
+			return none
+		}
+
+		// drain reads the rest of a part and discards it.
+		internal def drain(part Part) !none {
+			let chunk byte[] = []
+			chunk.len(4096)
+			for {
+				let n = try readChunk(part, chunk)
+				break when n == 0
+			}
+			return none
+		}
+
+		// readChunk delivers part content up to the next delimiter line: the
+		// bytes before `\\n--boundary` (a preceding CR belongs to the line
+		// end, not the content). The delimiter line itself is left for
+		// `nextPart`. `Part.read` calls this; it is not meant to be called
+		// directly. Fails when the body ends before the closing boundary.
+		def readChunk(part Part, out byte[]) !int {
+			return 0 when part.done || out.len() == 0
+			for {
+				let at = findDelimiter(part.consumed)
+				if at >= 0 {
+					// The line end before the delimiter belongs to the
+					// delimiter, not to the content.
+					let end = at
+					end-- when end > 0 && buf[end - 1] == 0x0A
+					end-- when end > 0 && buf[end - 1] == 0x0D
+					if end == 0 {
+						buf = buf.slice(at, buf.len() - at)
+						part.done = true
+						return 0
+					}
+					let n = end < out.len() ?? (end, out.len())
+					copyInto(out, buf, n)
+					buf = buf.slice(n, buf.len() - n)
+					part.consumed = true
+					return n
+				}
+				// Keep a tail that could be the start of a delimiter.
+				let keep = delimiter.len() + 2
+				if buf.len() > keep {
+					let n = buf.len() - keep
+					n = out.len() when n > out.len()
+					copyInto(out, buf, n)
+					buf = buf.slice(n, buf.len() - n)
+					part.consumed = true
+					return n
+				}
+				fail MultipartError{message: "multipart body ends without the closing boundary", op: "part"} when eof
+				try fill()
+			}
+			fail MultipartError{message: "unreachable", op: "part"}
+		}
+
+		// findDelimiter returns the offset where `--boundary` begins, when it
+		// follows a line end in the buffer, -1 when absent. Before any
+		// content was consumed, a delimiter at the very start of the buffer
+		// (a part with no content) counts too.
+		internal def findDelimiter(consumed bool) int {
+			return 0 when !consumed && startsWithAt(buf, delimiter, 0)
+			let from = 0
+			for {
+				let nl = indexOfByte(buf, 0x0A, from)
+				return -1 when nl < 0
+				return nl + 1 when startsWithAt(buf, delimiter, nl + 1)
+				from = nl + 1
+			}
+			return -1
+		}
+	}
+
+	// readerFor builds a Reader from a `Content-Type` header value, taking
+	// the boundary from it. Fails with MultipartError (op "boundary") when
+	// the type is not `multipart/*` or has no boundary.
+	//
+	// Example:
+	// ```example
+	// let reader = try multipart.readerFor(body, "multipart/form-data; boundary=xyz")
+	// ```
+	def readerFor(source io.Reader, contentType string) !Reader {
+		let mt = formats.parseMediaType(contentType) onerror (err error) {
+			fail MultipartError{message: "Content-Type does not parse: {contentType}", op: "boundary", cause: err}
+		}
+		fail MultipartError{message: "Content-Type is not multipart: {contentType}", op: "boundary"} unless mt.isMultipart()
+		let boundary = mt.boundary()
+		fail MultipartError{message: "Content-Type has no boundary: {contentType}", op: "boundary"} when boundary is none
+		fail MultipartError{message: "Content-Type has an empty boundary", op: "boundary"} when boundary == ""
+		return new Reader(source, boundary)
+	}
+
+	// FileHeader describes one uploaded file of a form: its field name, the
+	// client's file name, its headers and size. `open()` reads the content,
+	// whether it stayed in memory or was spilled to a temporary file.
+	//
+	// Example:
+	// ```example
+	// for let f in form.filesFor("avatar") {
+	//     println(f.filename, f.size)
+	//     let data = try (try f.open()).bytes()
+	// }
+	// ```
+	type FileHeader {
+		// The form field the file was sent under.
+		field    string
+		// The file name the client gave, without directories.
+		filename string
+		// The part's headers, canonical names.
+		headers  map<string, string[]>
+		// Size of the content in bytes.
+		size     int                   = 0
+		// The content when it stayed in memory.
+		content  byte[]                = []
+		// The temporary file the content was spilled to, empty otherwise.
+		tempPath string                = ""
+
+		def new(field string, filename string, headers map<string, string[]>) {
+			self.field = field
+			self.filename = filename
+			self.headers = headers
+		}
+
+		// contentType is the part's parsed `Content-Type`, `application/octet-stream`
+		// when absent. Fails when the header does not parse as a media type.
+		def contentType() !formats.MediaType {
+			let values = headers.get("Content-Type")
+			return new formats.MediaType("application", "octet-stream") when values is none
+			return new formats.MediaType("application", "octet-stream") when values.len() == 0
+			return formats.parseMediaType(values[0]) onerror (err error) {
+				fail MultipartError{message: "file Content-Type does not parse: {values[0]}", op: "form", cause: err}
+			}
+		}
+
+		// spilled reports content that lives in a temporary file rather than
+		// in memory.
+		def spilled() bool {
+			return tempPath != ""
+		}
+
+		// open returns a reader over the file content, in memory or from the
+		// temporary file. Fails when the temporary file cannot be read.
+		def open() !FileReader {
+			return new FileReader(content) when tempPath == ""
+			let data = os.readFile(tempPath) onerror (err error) {
+				fail MultipartError{message: "cannot read spill file {tempPath}", op: "form", cause: err}
+			}
+			return new FileReader(data)
+		}
+	}
+
+	// FileReader reads an uploaded file's content from the start.
+	type FileReader {
+		internal data   byte[]
+		internal offset int    = 0
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		// read fills buf with the next bytes of the file; 0 at the end.
+		// Never fails: the content was loaded when the reader was opened.
+		def read(buf byte[]) !int {
+			return 0 when offset >= data.len() || buf.len() == 0
+			let n = data.len() - offset
+			n = buf.len() when n > buf.len()
+			for let i = 0; i < n; i++ {
+				buf[i] = data[offset + i]
+			}
+			offset += n
+			return n
+		}
+
+		// bytes returns the rest of the file. Never fails.
+		def bytes() !byte[] {
+			let out = data.slice(offset, data.len() - offset)
+			offset = data.len()
+			return out
+		}
+
+		// close releases nothing today, since the content is in memory; it
+		// exists so callers can treat the reader like a file. Never fails.
+		def close() !none {
+			return none
+		}
+	}
+
+	// Form is a parsed `multipart/form-data` body: the text fields as
+	// `Values` and the uploaded files by field name, in the order they
+	// appeared.
+	//
+	// Example:
+	// ```example
+	// let form = try reader.readForm(32 * 1024 * 1024)
+	// println(form.values.get("title"))
+	// println(form.filesFor("attachments").len())
+	// try form.removeAll()
+	// ```
+	type Form {
+		values Values
+		files  map<string, FileHeader[]>
+
+		def new() {
+			self.values = new Values()
+			self.files = map<string, FileHeader[]>{}
+		}
+
+		// filesFor lists the files uploaded under a field, empty when none.
+		def filesFor(field string) FileHeader[] {
+			let list = files.get(field)
+			return [] when list is none
+			return list
+		}
+
+		// removeAll deletes the temporary files the form spilled to disk.
+		// Safe to call more than once. Fails when a file cannot be deleted.
+		def removeAll() !none {
+			for let (_, list) in files {
+				for let f in list {
+					continue when f.tempPath == ""
+					let path = f.tempPath
+					f.tempPath = ""
+					os.remove(path) onerror (err error) {
+						fail MultipartError{message: "cannot delete spill file {path}", op: "form", cause: err}
+					}
+				}
+			}
+			return none
+		}
+	}
+
+	// Writer builds a multipart body on an `io.Writer`: one part per
+	// `createPart`/`createFormFile`/`createFormField` call, closed with the
+	// final boundary by `close()`. The boundary is 60 random hex characters
+	// unless `chooseBoundary` picked one.
+	//
+	// Example:
+	// ```example
+	// let buf = new bytes.Buffer()
+	// let w = new multipart.Writer(buf)
+	// try w.writeField("title", "holiday")
+	// let file = try w.createFormFile("photo", "beach.jpg")
+	// try file.write(imageBytes)
+	// try w.close()
+	// request.setHeader("Content-Type", w.formDataContentType())
+	// ```
+	type Writer {
+		// The delimiter in use; read it after `close()` for the header.
+		boundary         string      = ""
+		// Where the body goes; part writers push their content here.
+		sink             io.Writer
+		internal started bool        = false
+		internal closed  bool        = false
+		internal current ?PartWriter = none
+
+		def new(sink io.Writer) {
+			self.sink = sink
+		}
+
+		// chooseBoundary replaces the random delimiter: 1 to 70 characters
+		// from the RFC 2046 boundary alphabet, not ending in a space. Must be
+		// called before the first part. Fails with MultipartError (op
+		// "boundary") otherwise.
+		def chooseBoundary(value string) !none {
+			fail MultipartError{message: "boundary cannot change after the first part", op: "boundary"} when started
+			fail MultipartError{message: "boundary must be 1 to 70 characters", op: "boundary"} when value.len() < 1 || value.len() > 70
+			fail MultipartError{message: "boundary cannot end in a space", op: "boundary"} when value.endsWith(" ")
+			for let i = 0; i < value.len(); i++ {
+				let c = value[i]
+				continue when c.isASCII() && c.isAlphanumeric()
+				continue when c := '\'' || '(' || ')' || '+' || '_' || ',' || '-' || '.' || '/' || ':' || '=' || '?' || ' '
+				fail MultipartError{message: "boundary holds a character outside the RFC 2046 alphabet: '{c}'", op: "boundary"}
+			}
+			boundary = value
+			return none
+		}
+
+		// formDataContentType is the `Content-Type` header value a request
+		// carrying this body needs: `multipart/form-data; boundary=...`,
+		// quoted when the boundary needs it.
+		def formDataContentType() string {
+			ensureBoundary()
+			return formats.formatMediaType("multipart", "form-data", map<string, string>{"boundary": boundary})
+		}
+
+		// createPart writes the boundary and the headers of a new part and
+		// returns the writer for its content; the previous part is finished.
+		// Fails with MultipartError (op "write") when the sink fails or the
+		// body was closed.
+		def createPart(headers map<string, string[]>) !PartWriter {
+			fail MultipartError{message: "multipart body is closed", op: "write"} when closed
+			ensureBoundary()
+			finishCurrent()
+			let block = started ?? ("\r\n--" + boundary + "\r\n", "--" + boundary + "\r\n")
+			let names string[] = []
+			for let (name, _) in headers {
+				names.push(name)
+			}
+			names.sort((a, b) => a < b)
+			for let name in names {
+				for let value in orNoStrings(headers.get(name)) {
+					block += name + ": " + value + "\r\n"
+				}
+			}
+			block += "\r\n"
+			try writeAll(sink, block.bytes())
+			started = true
+			let part = new PartWriter(self)
+			current = part
+			return part
+		}
+
+		// createFormFile starts a file part: `Content-Disposition: form-data;
+		// name="field"; filename="name"` and `Content-Type: application/octet-stream`.
+		// Fails like `createPart`.
+		def createFormFile(field string, filename string) !PartWriter {
+			let headers = map<string, string[]>{}
+			headers.set("Content-Disposition", ["form-data; name=\"" + escapeQuotes(field) + "\"; filename=\"" + escapeQuotes(filename) + "\""])
+			headers.set("Content-Type", ["application/octet-stream"])
+			return createPart(headers)
+		}
+
+		// createFormField starts a plain field part. Fails like `createPart`.
+		def createFormField(field string) !PartWriter {
+			let headers = map<string, string[]>{}
+			headers.set("Content-Disposition", ["form-data; name=\"" + escapeQuotes(field) + "\""])
+			return createPart(headers)
+		}
+
+		// writeField writes a whole field part in one call. Fails like
+		// `createPart`.
+		def writeField(field string, value string) !none {
+			let part = try createFormField(field)
+			try part.writeString(value)
+			return none
+		}
+
+		// close writes the closing boundary. The body is not valid before.
+		// Fails with MultipartError (op "write") when the sink fails; a
+		// second call does nothing.
+		def close() !none {
+			return none when closed
+			ensureBoundary()
+			finishCurrent()
+			current = none
+			let tail = started ?? ("\r\n--" + boundary + "--\r\n", "--" + boundary + "--\r\n")
+			try writeAll(sink, tail.bytes())
+			closed = true
+			return none
+		}
+
+		// finishCurrent invalidates the part writer handed out last.
+		internal def finishCurrent() {
+			let previous = current
+			previous.active = false unless previous is none
+			current = none
+		}
+
+		// ensureBoundary picks the random delimiter when none was chosen.
+		internal def ensureBoundary() {
+			return when boundary != ""
+			let random = crypto.rand(30) onerror recover []
+			boundary = random.hex()
+			boundary = "adm-multipart-boundary-" + "0".repeat(37) when boundary == ""
+		}
+	}
+
+	// PartWriter is the content sink of one part; writing to it after the
+	// next part was created fails.
+	type PartWriter {
+		// The body this part belongs to; weak, since the body holds its
+		// current part.
+		weak owner ?Writer
+		// Cleared when the next part starts; writes then fail.
+		active     bool    = true
+
+		def new(owner Writer) {
+			self.owner = owner
+		}
+
+		// write appends content to the part. Fails with MultipartError (op
+		// "write") when the part is no longer current or the sink fails.
+		def write(buf byte[]) !int {
+			fail MultipartError{message: "part is no longer current", op: "write"} unless active
+			let body = owner
+			fail MultipartError{message: "the part's body is gone", op: "write"} when body is none
+			try writeAll(body.sink, buf)
+			return buf.len()
+		}
+
+		// writeString writes text content. Fails like `write`.
+		def writeString(text string) !int {
+			return write(text.bytes())
+		}
+	}
+
+	// writeAll pushes every byte into the sink, retrying short writes.
+	internal def writeAll(sink io.Writer, data byte[]) !none {
+		let offset = 0
+		for offset < data.len() {
+			let rest = data.slice(offset, data.len() - offset)
+			let n = sink.write(rest) onerror (err error) {
+				fail MultipartError{message: "cannot write multipart body", op: "write", cause: err}
+			}
+			fail MultipartError{message: "multipart sink accepted nothing", op: "write"} when n <= 0
+			offset += n
+		}
+		return none
+	}
+
+	// canonicalHeaderKey renders a header name the MIME way: the first
+	// letter of every dash-separated word upper-cased, the rest lower-cased
+	// (`content-type` becomes `Content-Type`).
+	def canonicalHeaderKey(name string) string {
+		let out = ""
+		let upper = true
+		for let i = 0; i < name.len(); i++ {
+			let c = name[i]
+			if c == '-' {
+				out += "-"
+				upper = true
+				continue
+			}
+			out += upper ?? (string(c.upper()), string(c.lower()))
+			upper = false
+		}
+		return out
+	}
+
+	// escapeQuotes protects a field or file name inside a quoted parameter.
+	internal def escapeQuotes(text string) string {
+		return text.replace("\\", "\\\\").replace("\"", "\\\"")
+	}
+
+	// baseName strips any directory from a client file name.
+	internal def baseName(name string) string {
+		let cut = name
+		let slash = lastIndexOf(cut, "/")
+		cut = cut[slash + 1:] when slash >= 0
+		let back = lastIndexOf(cut, "\\")
+		cut = cut[back + 1:] when back >= 0
+		return cut
+	}
+
+	internal def lastIndexOf(text string, needle string) int {
+		let last = -1
+		let at = text.indexOf(needle)
+		for at >= 0 {
+			last = at
+			at = text.indexOf(needle, at + 1)
+		}
+		return last
+	}
+
+	internal def indexOfByte(data byte[], want byte, from int) int {
+		for let i = from; i < data.len(); i++ {
+			return i when data[i] == want
+		}
+		return -1
+	}
+
+	internal def startsWithAt(data byte[], prefix byte[], at int) bool {
+		return false when at < 0 || data.len() - at < prefix.len()
+		for let i = 0; i < prefix.len(); i++ {
+			return false when data[at + i] != prefix[i]
+		}
+		return true
+	}
+
+	internal def copyInto(out byte[], src byte[], n int) {
+		for let i = 0; i < n; i++ {
+			out[i] = src[i]
+		}
+	}
+
+	internal def orEmpty(value ?string) string {
+		return "" when value is none
+		return value
+	}
+
+	internal def orNoStrings(list ?string[]) string[] {
+		return [] when list is none
+		return list
+	}
+}

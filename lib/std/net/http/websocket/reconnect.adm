@@ -1,0 +1,351 @@
+partial module std.net.http.websocket {
+	use (
+		std.crypto::(rand)
+		std.data.encoding
+		std.time
+	)
+
+	// ReconnectOptions steers a ReconnectingConn: how it dials, the wait
+	// before a redial (doubling from `minDelay` to `maxDelay`, each wait
+	// shortened at random by up to half), how many dials in a row may fail
+	// before it gives up (0 for no limit), and how many messages written
+	// while disconnected are held for the next connection (0 to fail such
+	// writes with NotOpen instead).
+	struct ReconnectOptions {
+		dial        DialOptions = DialOptions{}
+		minDelay    duration    = 500ms
+		maxDelay    duration    = 30s
+		maxAttempts int         = 0
+		queueSize   int         = 256
+	}
+
+	// ReconnectingConn is a client connection that dials again when it
+	// drops. The task that reads drives it: a read that fails redials with
+	// backoff, runs `onConnect`, sends what was written in the meantime
+	// and goes on reading, so a task must be reading for the connection to
+	// come back. Only the peer's Normal close is reported to the reader;
+	// the read after it dials again.
+	//
+	// A message written while disconnected is queued, up to `queueSize`,
+	// and goes out in order after `onConnect` on the next connection. That
+	// is no delivery guarantee: a message written just before a drop was
+	// handed to a connection that lost it.
+	//
+	//     let ws = new ReconnectingConn("wss://example.org/feed")
+	//     ws.onConnect = def (conn Conn) !none {
+	//         return conn.writeText("subscribe prices")
+	//     }
+	//     for {
+	//         let text = try ws.readText()
+	//     }
+	type ReconnectingConn {
+		target    string
+		options   ReconnectOptions
+		// Runs on every new connection before queued messages go out: the
+		// place to authenticate, subscribe again or start `keepAlive`. A
+		// failure counts as a failed dial.
+		onConnect ?def (conn Conn) !none = none
+		// How many connections were made so far.
+		connects  int                    = 0
+
+		internal conn       ?Conn     = none
+		// Counts connections and drops, so a drop reported for a
+		// connection already replaced is ignored.
+		internal generation int       = 0
+		// True once connected with the queue sent: writes go straight out.
+		internal live       bool      = false
+		internal queue      Message[]
+		internal closing    bool      = false
+		// Why the last redial gave up, none while it has not.
+		internal gaveUp     ?error    = none
+
+		def new(target string, options ReconnectOptions = ReconnectOptions{}) {
+			self.target = target
+			self.options = options
+		}
+
+		// connect dials now when there is no connection, as a read would,
+		// and tries again after a redial that gave up. Fails with
+		// WebSocketError NotOpen after `close`, and with the last dial's
+		// failure after `maxAttempts` of them.
+		def connect() !none {
+			gaveUp = none
+			try connected()
+			return none
+		}
+
+		// readMessage returns the next message, dialing first when there is
+		// no connection and again whenever the connection fails. Fails with
+		// WebSocketError Closed for the peer's Normal close, NotOpen after
+		// `close`, and with the last dial's failure once `maxAttempts` dials
+		// in a row failed.
+		def readMessage() !(MessageType, byte[]) {
+			for {
+				let (current, serial) = try connected()
+				let failure ?error = none
+				let (kind, data) = current.readMessage() onerror (err error) {
+					failure = err
+					recover (MessageType.Binary, [])
+				}
+				return (kind, data) when failure is none
+				fail wsError(ErrorKind.NotOpen, "connection is closed") when closing
+				drop(serial)
+				current.close() onerror recover none
+				fail failure when failure is WebSocketError && failure.kind == ErrorKind.Closed && failure.closeCode == int(CloseCode.Normal)
+			}
+			fail wsError(ErrorKind.NotOpen, "unreachable")
+		}
+
+		// readText is `readMessage` for a text message. Fails as it does,
+		// and with Protocol when the message is binary.
+		def readText() !string {
+			let (kind, data) = try readMessage()
+			fail wsError(ErrorKind.Protocol, "expected a text message, got binary") when kind != MessageType.Text
+			return string(data)
+		}
+
+		// readJSON reads a text message and decodes it into target. Fails
+		// as readMessage does, and when the text is not JSON for target.
+		def readJSON(target any) !none {
+			let text = try readText()
+			let codec = new encoding.JSON()
+			return try codec.decode(text, target)
+		}
+
+		// writeMessage sends one message, or queues it while there is no
+		// connection or the queue is still going out. A write the
+		// connection fails is queued as well. Fails with WebSocketError
+		// QueueFull when `queueSize` messages wait already, NotOpen after
+		// `close` or while disconnected with a `queueSize` of 0, and with
+		// the last dial's failure after a redial gave up.
+		def writeMessage(kind MessageType, data byte[]) !none {
+			for let attempt = 0; attempt < 2; attempt++ {
+				let (current, serial) = try submit(kind, data)
+				return none when current is none
+				let failed = false
+				current.writeMessage(kind, data) onerror (err error) {
+					failed = true
+					recover none
+				}
+				return none unless failed
+				drop(serial)
+			}
+			return try enqueue(kind, data)
+		}
+
+		// writeText sends a text message. Fails as writeMessage does.
+		def writeText(text string) !none {
+			return try writeMessage(MessageType.Text, text.bytes())
+		}
+
+		// writeBinary sends a binary message. Fails as writeMessage does.
+		def writeBinary(data byte[]) !none {
+			return try writeMessage(MessageType.Binary, data)
+		}
+
+		// writeJSON sends a value as a text message. Fails as writeMessage
+		// does.
+		def writeJSON(value any) !none {
+			let codec = new encoding.JSON()
+			return try writeMessage(MessageType.Text, codec.encode(value))
+		}
+
+		// current is the connection in use, none while disconnected: for
+		// `ping`, `writer`, `reader` and the settings of a Conn.
+		def current() ?Conn {
+			return conn
+		}
+
+		// isConnected reports whether there is a connection and the queue
+		// has gone out.
+		def isConnected() bool {
+			return live
+		}
+
+		// pending counts the messages waiting for the next connection.
+		def pending() int {
+			return queue.len()
+		}
+
+		// close ends it for good: the connection is closed as Conn.close
+		// does, queued messages are dropped (`pending` tells how many there
+		// are), and a reader waiting to redial fails with NotOpen. Fails
+		// only when the stream refuses to close.
+		def close(code CloseCode = CloseCode.Normal, reason string = "") !none {
+			let open = shut()
+			return none when open is none
+			return try open.close(code, reason)
+		}
+
+		// Closes the connection when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// shut marks the end and hands over the connection to close.
+		internal atomic def shut() ?Conn {
+			closing = true
+			live = false
+			queue = []
+			let open = conn
+			conn = none
+			return open
+		}
+
+		// submit decides a write: the connection to send on when it is
+		// live, else none with the message queued.
+		internal atomic def submit(kind MessageType, data byte[]) !(?Conn, int) {
+			try refuseWhenOver()
+			return (conn, generation) when live
+			try hold(kind, data)
+			return (none, generation)
+		}
+
+		// enqueue queues a message whatever the state.
+		internal atomic def enqueue(kind MessageType, data byte[]) !none {
+			try refuseWhenOver()
+			return try hold(kind, data)
+		}
+
+		// refuseWhenOver fails once closed or after a redial gave up.
+		internal def refuseWhenOver() !none {
+			fail wsError(ErrorKind.NotOpen, "connection is closed") when closing
+			let reason = gaveUp
+			fail reason unless reason is none
+			return none
+		}
+
+		// hold appends to the queue. Fails with QueueFull at the limit,
+		// NotOpen when nothing may be queued.
+		internal def hold(kind MessageType, data byte[]) !none {
+			fail wsError(ErrorKind.NotOpen, "not connected") when options.queueSize <= 0
+			fail wsError(ErrorKind.QueueFull, "{queue.len()} messages are queued already") when queue.len() >= options.queueSize
+			queue.push(Message{kind: kind, data: data})
+			return none
+		}
+
+		// takeQueued removes the oldest queued message; with none left the
+		// connection goes live.
+		internal atomic def takeQueued() ?Message {
+			if queue.len() == 0 {
+				live = !closing
+				return none
+			}
+			return queue.shift()
+		}
+
+		// putBack returns a message that did not go out to the front.
+		internal atomic def putBack(message Message) {
+			queue = [message] + queue
+		}
+
+		// drop forgets the connection of that serial, unless a newer one
+		// replaced it.
+		internal atomic def drop(serial int) {
+			return unless serial == generation
+			generation++
+			live = false
+			conn = none
+		}
+
+		// adopt takes a new connection in, not live until the queue is out.
+		// Returns false when `close` came first.
+		internal atomic def adopt(fresh Conn) bool {
+			return false when closing
+			generation++
+			connects++
+			conn = fresh
+			return true
+		}
+
+		// connected returns the connection and its serial, dialing until
+		// there is one and the queue went out on it.
+		internal def connected() !(Conn, int) {
+			let delay = options.minDelay
+			let failures = 0
+			for {
+				fail wsError(ErrorKind.NotOpen, "connection is closed") when closing
+				let reason = gaveUp
+				fail reason unless reason is none
+				let existing = conn
+				return (existing, generation) when !(existing is none) && live
+				let failure ?error = none
+				let fresh = existing
+				if fresh is none {
+					fresh = open() onerror (err error) {
+						failure = err
+						recover none
+					}
+				}
+				if !(fresh is none) {
+					send(fresh) onerror (err error) {
+						failure = err
+						recover none
+					}
+					return (fresh, generation) when failure is none
+					drop(generation)
+					fresh.close() onerror recover none
+				}
+				failures++
+				if options.maxAttempts > 0 && failures >= options.maxAttempts {
+					giveUp(failure)
+					continue
+				}
+				time.sleep(jitter(delay))
+				delay = delay + delay
+				delay = options.maxDelay when delay > options.maxDelay
+			}
+			fail wsError(ErrorKind.NotOpen, "unreachable")
+		}
+
+		// open dials, runs `onConnect` and takes the connection in. Fails
+		// as `dial` and `onConnect` do, NotOpen when `close` came meanwhile.
+		internal def open() !?Conn {
+			let (fresh, _) = try dial(target, options.dial)
+			let hook = onConnect
+			let failure ?error = none
+			if !(hook is none) {
+				hook(fresh) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			failure = wsError(ErrorKind.NotOpen, "connection is closed") when failure is none && !adopt(fresh)
+			return fresh when failure is none
+			fresh.close() onerror recover none
+			fail failure
+		}
+
+		// send writes the queue out in order; the message a write fails on
+		// goes back to the front.
+		internal def send(fresh Conn) !none {
+			for {
+				let next = takeQueued()
+				return none when next is none
+				let failure ?error = none
+				fresh.writeMessage(next.kind, next.data) onerror (err error) {
+					failure = err
+					recover none
+				}
+				continue when failure is none
+				putBack(next)
+				fail failure
+			}
+			fail wsError(ErrorKind.NotOpen, "unreachable")
+		}
+
+		// giveUp records why redialing stopped and drops the queue.
+		internal atomic def giveUp(failure ?error) {
+			queue = []
+			gaveUp = failure
+			gaveUp = wsError(ErrorKind.NotOpen, "gave up redialing") when failure is none
+		}
+
+		// jitter shortens a wait at random by up to half.
+		internal def jitter(delay duration) duration {
+			let half = int(delay) / 2
+			let roll = rand(1) onerror recover byte[255]
+			return duration(half + half * int(roll[0]) / 255)
+		}
+	}
+}

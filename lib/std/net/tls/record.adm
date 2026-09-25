@@ -1,0 +1,296 @@
+partial module std.net.tls {
+	use (
+		std.io
+		std.net
+		std.crypto.cipher::(AEAD)
+	)
+
+	// Record content types of RFC 8446 §5.1, the byte on the wire. The
+	// legacy change_cipher_spec, dropped on receipt.
+	const recordChangeCipherSpec = 20
+	// An alert: level and description.
+	const recordAlert = 21
+	// Handshake messages.
+	const recordHandshake = 22
+	// Application data, and every protected record's outer type.
+	const recordApplicationData = 23
+
+	// The most plaintext one record carries (2^14).
+	const maxPlaintext = 16384
+	// The most ciphertext one record carries: plaintext, inner content
+	// type and tag.
+	const maxCiphertext = 16384 + 256
+	internal const recordHeaderSize = 5
+
+	// Record is one record read from the peer: the content type, the inner
+	// one once records are protected, and the plaintext.
+	struct Record {
+		contentType int
+		payload     byte[]
+	}
+
+	// TrafficKey protects one direction: the AEAD under the traffic key, the
+	// IV the sequence number is folded into (RFC 8446 §5.3) and the sequence
+	// number of the next record.
+	type TrafficKey {
+		cipher   AEAD
+		iv       byte[]
+		sequence uint64 = 0
+
+		def new(cipher AEAD, iv byte[]) {
+			self.cipher = cipher
+			self.iv = iv
+		}
+
+		// nonce is the IV xor the big-endian sequence number, right aligned;
+		// it advances the sequence number.
+		def nonce() byte[] {
+			let out = iv.clone()
+			let seq = sequence
+			for let i = 0; i < 8; i++ {
+				let at = out.len() - 1 - i
+				out[at] = out[at] ^ byte(seq & 0xFF)
+				seq = seq >> 8
+			}
+			sequence++
+			return out
+		}
+
+		// sequenceBytes is the sequence number as eight big-endian bytes.
+		internal def sequenceBytes() byte[] {
+			let out byte[]
+			out.len(8)
+			let seq = sequence
+			for let i = 7; i >= 0; i-- {
+				out[i] = byte(seq & 0xFF)
+				seq = seq >> 8
+			}
+			return out
+		}
+
+		// explicitNonce is how many nonce bytes travel with a TLS 1.2 record:
+		// the eight AES-GCM keeps out of its 4-byte salt (RFC 5288 §3), none
+		// for ChaCha20-Poly1305, whose nonce is the TLS 1.3 one (RFC 7905 §2).
+		internal def explicitNonce() int {
+			return 12 - iv.len()
+		}
+
+		// additionalData is what a TLS 1.2 AEAD record authenticates beside
+		// its content (RFC 5246 §6.2.3.3): the sequence number, the content
+		// type, the version and the plaintext length.
+		internal def additionalData(header byte[], length int) byte[] {
+			return sequenceBytes() + byte[header[0], header[1], header[2], byte(length >> 8), byte(length & 0xFF)]
+		}
+
+		// seal12 protects one TLS 1.2 fragment and returns the record body;
+		// the explicit nonce is the sequence number. It advances the
+		// sequence number.
+		def seal12(header byte[], chunk byte[]) byte[] {
+			let aad = additionalData(header, chunk.len())
+			return cipher.seal(nonce(), chunk, aad) when explicitNonce() == 0
+			let explicit = sequenceBytes()
+			sequence++
+			return explicit + cipher.seal(iv + explicit, chunk, aad)
+		}
+
+		// open12 authenticates and decrypts one TLS 1.2 record body. It
+		// advances the sequence number. Fails with BadRecordMAC.
+		def open12(header byte[], body byte[]) !byte[] {
+			let explicit = explicitNonce()
+			let length = body.len() - explicit - cipher.overhead()
+			fail tlsError(Alert.BadRecordMAC, "record authentication failed") when length < 0
+			let aad = additionalData(header, length)
+			let at = iv + body[0:explicit]
+			if explicit == 0 {
+				at = nonce()
+			} else {
+				sequence++
+			}
+			return cipher.open(at, body[explicit:], aad) onerror fail tlsError(Alert.BadRecordMAC, "record authentication failed")
+		}
+	}
+
+	// RecordLayer reads and writes TLS records (RFC 8446 §5) over a byte
+	// stream: 5-byte headers, fragmentation to 2^14 bytes, AEAD protection
+	// per direction once a traffic key is set, inner content types and
+	// padding removal. It reads and writes through the net.Connection with
+	// `timeout` when one is given, any io.Reader and io.Writer pair otherwise.
+	type RecordLayer {
+		reader      io.Reader
+		writer      io.Writer
+		conn        ?net.Connection
+		timeout     duration        = 30s
+		readKey     ?TrafficKey
+		writeKey    ?TrafficKey
+		// The legacy version written into record headers: 0x0301 for the
+		// first ClientHello, 0x0303 afterwards (RFC 8446 §5.1).
+		version     int             = 0x0301
+		// TLS 1.2 record protection (RFC 5246 §6.2.3.3) once keys are set:
+		// the content type stays in the header and a change_cipher_spec
+		// record switches the read key to the staged one.
+		legacy      bool            = false
+		nextReadKey ?TrafficKey
+
+		def new(reader io.Reader, writer io.Writer) {
+			self.reader = reader
+			self.writer = writer
+		}
+
+		// stageReadKey keeps the key a TLS 1.2 peer's change_cipher_spec
+		// switches incoming records to.
+		def stageReadKey(cipher AEAD, iv byte[]) {
+			nextReadKey = new TrafficKey(cipher, iv)
+		}
+
+		// setReadKey protects incoming records with a fresh sequence number.
+		def setReadKey(cipher AEAD, iv byte[]) {
+			readKey = new TrafficKey(cipher, iv)
+		}
+
+		// setWriteKey protects outgoing records with a fresh sequence number.
+		def setWriteKey(cipher AEAD, iv byte[]) {
+			writeKey = new TrafficKey(cipher, iv)
+		}
+
+		// isProtected reports whether incoming records are decrypted.
+		def isProtected() bool {
+			return !(readKey is none)
+		}
+
+		// read returns the next record, decrypted when a read key is set.
+		// Fails with TLSError: RecordOverflow for a record above the limit,
+		// BadRecordMAC when authentication fails, UnexpectedMessage for a
+		// plaintext record of the wrong type or an empty protected one,
+		// DecodeError when the stream ends inside a record. An unprotected
+		// change_cipher_spec record comes back as is at any time, for the
+		// caller to drop; under TLS 1.2 it installs the staged read key, and
+		// fails with UnexpectedMessage when none is staged.
+		def read() !Record {
+			let header byte[]
+			header.len(recordHeaderSize)
+			try readInto(header)
+			let kind = int(header[0])
+			let length = int(header[3]) << 8 | int(header[4])
+			let key = readKey
+			if key is none || (kind == recordChangeCipherSpec && !legacy) {
+				fail tlsError(Alert.RecordOverflow, "record of {length} bytes exceeds the plaintext limit") when length > maxPlaintext
+				fail tlsError(Alert.UnexpectedMessage, "unexpected record type {kind}") unless kind := recordAlert || recordHandshake || recordChangeCipherSpec
+				let body byte[]
+				body.len(length)
+				try readInto(body)
+				if legacy && kind == recordChangeCipherSpec {
+					let next = nextReadKey
+					fail tlsError(Alert.UnexpectedMessage, "change_cipher_spec before the keys are agreed") when next is none
+					readKey = next
+					nextReadKey = none
+				}
+				return Record{contentType: kind, payload: body}
+			}
+			fail tlsError(Alert.RecordOverflow, "record of {length} bytes exceeds the ciphertext limit") when length > maxCiphertext
+			if legacy {
+				fail tlsError(Alert.UnexpectedMessage, "unexpected record type {kind} while protected") unless kind := recordAlert || recordHandshake || recordApplicationData
+				let body byte[]
+				body.len(length)
+				try readInto(body)
+				let plaintext = try key.open12(header, body)
+				fail tlsError(Alert.RecordOverflow, "record of {plaintext.len()} bytes exceeds the plaintext limit") when plaintext.len() > maxPlaintext
+				return Record{contentType: kind, payload: plaintext}
+			}
+			fail tlsError(Alert.UnexpectedMessage, "unexpected record type {kind} while protected") when kind != recordApplicationData
+			let body byte[]
+			body.len(length)
+			try readInto(body)
+			let plaintext = key.cipher.open(key.nonce(), body, header) onerror fail tlsError(Alert.BadRecordMAC, "record authentication failed")
+			let end = plaintext.len()
+			for end > 0 && plaintext[end - 1] == 0 {
+				end--
+			}
+			fail tlsError(Alert.UnexpectedMessage, "protected record has no content type") when end == 0
+			return Record{contentType: int(plaintext[end - 1]), payload: plaintext[0:end - 1]}
+		}
+
+		// write sends payload as one or more records of the content type,
+		// fragmenting at 2^14 bytes and protecting them when a write key is
+		// set. Fails as the underlying write does.
+		def write(contentType int, payload byte[]) !none {
+			let off = 0
+			for off < payload.len() {
+				let end = off + maxPlaintext
+				end = payload.len() when end > payload.len()
+				try writeFragment(contentType, payload[off:end])
+				off = end
+			}
+			return none
+		}
+
+		// writeAlert sends an alert record, fatal unless told otherwise.
+		// Fails as the underlying write does.
+		def writeAlert(alert Alert, fatal bool = true) !none {
+			let level = fatal ?? (2, 1)
+			return try writeFragment(recordAlert, byte[byte(level), byte(int(alert))])
+		}
+
+		internal def writeFragment(contentType int, chunk byte[]) !none {
+			let key = writeKey
+			let header byte[]
+			header.len(recordHeaderSize)
+			if key is none {
+				header[0] = byte(contentType)
+				header[1] = byte(version >> 8)
+				header[2] = byte(version & 0xFF)
+				header[3] = byte(chunk.len() >> 8)
+				header[4] = byte(chunk.len() & 0xFF)
+				return try writeOut(header + chunk)
+			}
+			if legacy {
+				header[0] = byte(contentType)
+				header[1] = 3
+				header[2] = 3
+				let sealed = key.seal12(header, chunk)
+				header[3] = byte(sealed.len() >> 8)
+				header[4] = byte(sealed.len() & 0xFF)
+				return try writeOut(header + sealed)
+			}
+			let inner = chunk + byte[byte(contentType)]
+			let length = inner.len() + key.cipher.overhead()
+			header[0] = byte(recordApplicationData)
+			header[1] = 3
+			header[2] = 3
+			header[3] = byte(length >> 8)
+			header[4] = byte(length & 0xFF)
+			return try writeOut(header + key.cipher.seal(key.nonce(), inner, header))
+		}
+
+		// readInto fills buf from the stream. Fails with DecodeError when
+		// the stream ends first; a transport failure propagates as is.
+		internal def readInto(buf byte[]) !none {
+			let connection = conn
+			if connection is none {
+				io.readFull(reader, buf) onerror (err error) {
+					fail err when err is net.NetError
+					fail tlsError(Alert.DecodeError, "stream ended inside a record")
+				}
+				return none
+			}
+			let n = 0
+			for n < buf.len() {
+				let got = try connection.read(buf[n:], timeout)
+				fail tlsError(Alert.DecodeError, "stream ended inside a record") when got == 0
+				n += got
+			}
+			return none
+		}
+
+		internal def writeOut(data byte[]) !none {
+			let connection = conn
+			return try connection.writeAll(data, timeout) unless connection is none
+			let off = 0
+			for off < data.len() {
+				let n = try writer.write(data[off:])
+				fail tlsError(Alert.InternalError, "transport wrote nothing") when n == 0
+				off += n
+			}
+			return none
+		}
+	}
+}

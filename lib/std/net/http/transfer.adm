@@ -1,0 +1,531 @@
+partial module std.net.http {
+	use (
+		std.io
+		std.net.url
+		std.time
+	)
+
+	// WireReader buffers a connection so the parser can read lines and the
+	// body readers can take over at the exact byte the headers ended.
+	// Implements std.io.Reader; what it has buffered but not handed out is
+	// `buffered()`, which a hijacker takes with the connection.
+	type WireReader {
+		internal source io.Reader
+		internal buf    byte[]    = []
+		internal eof    bool      = false
+
+		def new(source io.Reader) {
+			self.source = source
+		}
+
+		// Reads one line without its line ending (`\r\n` or `\n`); none
+		// at the end of the stream. A final line without an ending is
+		// still a line. Fails when the source does, or the line is longer
+		// than maxBytes (0 for no limit), with an HttpError (op "line").
+		def readLine(maxBytes int = 0) !?string {
+			for {
+				let nl = indexOfByte(buf, 0x0A)
+				if nl >= 0 {
+					let end = nl
+					end-- when end > 0 && buf[end - 1] == 0x0D
+					fail HttpError{message: "line exceeds {maxBytes} bytes", op: "line"} when maxBytes > 0 && end > maxBytes
+					let line = string(buf.slice(0, end))
+					buf = buf.slice(nl + 1, buf.len() - nl - 1)
+					return line
+				}
+				fail HttpError{message: "line exceeds {maxBytes} bytes", op: "line"} when maxBytes > 0 && buf.len() > maxBytes
+				if eof {
+					return none when buf.len() == 0
+					let line = string(buf)
+					buf = []
+					return line
+				}
+				try fill()
+			}
+			return none
+		}
+
+		// Reads into buf from what is buffered first, then the source.
+		// Returns 0 at the end of the stream. Fails when the source does.
+		def read(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			if self.buf.len() == 0 {
+				return 0 when eof
+				try fill()
+				return 0 when self.buf.len() == 0
+			}
+			let n = self.buf.len() < buf.len() ?? (self.buf.len(), buf.len())
+			self.buf.slice(0, n).copy(buf)
+			self.buf = self.buf.slice(n, self.buf.len() - n)
+			return n
+		}
+
+		// The next n bytes without consuming them, fewer when the source
+		// ends first. Fails when the source does.
+		def peek(n int) !byte[] {
+			for buf.len() < n && !eof {
+				try fill()
+			}
+			return buf.len() > n ?? (buf.slice(0, n), buf)
+		}
+
+		// Bytes read from the source and not yet handed out.
+		def buffered() byte[] {
+			return buf
+		}
+
+		// Reports whether the source has ended and nothing is buffered.
+		def atEnd() bool {
+			return eof && buf.len() == 0
+		}
+
+		internal def fill() !none {
+			let chunk byte[] = []
+			chunk.len(8192)
+			let n = try source.read(chunk)
+			if n <= 0 {
+				eof = true
+				return none
+			}
+			buf = buf.concat(chunk.slice(0, n))
+			return none
+		}
+	}
+
+	internal def indexOfByte(data byte[], want byte) int {
+		for let i = 0; i < data.len(); i++ {
+			return i when data[i] == want
+		}
+		return -1
+	}
+
+	// LengthReader hands out exactly n bytes of the wire, then reports the
+	// end. Implements std.io.Reader.
+	type LengthReader {
+		internal source    io.Reader
+		internal remaining int
+
+		def new(source io.Reader, n int) {
+			self.source = source
+			self.remaining = n
+		}
+
+		// Reads up to the bytes left. Fails when the source ends early
+		// (HttpError, op "body") or fails.
+		def read(buf byte[]) !int {
+			return 0 when remaining <= 0 || buf.len() == 0
+			let want = buf.len() < remaining ?? (buf.len(), remaining)
+			let target = want == buf.len() ?? (buf, buf.slice(0, want))
+			let n = try source.read(target)
+			fail HttpError{message: "body ended {remaining} bytes early", op: "body"} when n <= 0
+			target.copy(buf) when want != buf.len()
+			remaining -= n
+			return n
+		}
+
+		// Bytes still to read.
+		def left() int {
+			return remaining
+		}
+	}
+
+	// EmptyBody is the body of a message that has none: every read returns
+	// 0. Implements std.io.Reader.
+	type EmptyBody {
+		def new() {}
+
+		def read(buf byte[]) !int {
+			return 0
+		}
+	}
+
+	// ChunkedReader decodes a `chunked` transfer coding: chunk-size lines
+	// (hex, with extensions ignored), the chunks, and the last chunk with
+	// its trailers. Implements std.io.Reader.
+	type ChunkedReader {
+		internal source    WireReader
+		internal remaining int        = 0
+		internal done      bool       = false
+		internal trailers  Header
+
+		def new(source io.Reader) {
+			self.source = new WireReader(source)
+			self.trailers = new Header()
+		}
+
+		// Over the parser's own wire reader, so bytes buffered past the
+		// body (the next request) are not lost behind a second buffer.
+		def new(source WireReader) {
+			self.source = source
+			self.trailers = new Header()
+		}
+
+		// Reads decoded body bytes into buf. Returns 0 at the end of the
+		// last chunk, and from then on. Fails when the framing is malformed
+		// or the source fails.
+		def read(buf byte[]) !int {
+			return 0 when done || buf.len() == 0
+			if remaining == 0 {
+				try beginChunk()
+				return 0 when done
+			}
+			let want = buf.len() < remaining ?? (buf.len(), remaining)
+			let target = want == buf.len() ?? (buf, buf.slice(0, want))
+			let n = try source.read(target)
+			fail HttpError{message: "chunk ended {remaining} bytes early", op: "body"} when n <= 0
+			target.copy(buf) when want != buf.len()
+			remaining -= n
+			if remaining == 0 {
+				// The CRLF that ends the chunk data.
+				let end = try source.readLine(16)
+				if !(end is none) {
+					fail HttpError{message: "chunk data is not followed by a line ending", op: "body"} when end != ""
+				}
+			}
+			return n
+		}
+
+		// The trailer fields that followed the last chunk; empty until
+		// `read` has returned 0.
+		def trailer() Header {
+			return trailers
+		}
+
+		// Reads the size line of the next chunk; a size of 0 reads the
+		// trailers and marks the end.
+		internal def beginChunk() !none {
+			let line = try source.readLine(1024)
+			fail HttpError{message: "chunked body ended before the last chunk", op: "body"} when line is none
+			let text = line.trim()
+			let semi = text.indexOf(";")
+			let sizeText = semi >= 0 ?? (text[:semi].trim(), text)
+			fail HttpError{message: "invalid chunk size: {text}", op: "body", text: text} unless isHexDigits(sizeText)
+			let size = parseInt<int>(sizeText, 16)
+			if size == 0 {
+				for {
+					let t = try source.readLine(64 * 1024)
+					break when t is none || t == ""
+					let colon = t.indexOf(":")
+					fail HttpError{message: "malformed trailer line: {t}", op: "body", text: t} when colon <= 0
+					trailers.add(t[:colon].trim(), t[colon + 1:].trim())
+				}
+				done = true
+				return none
+			}
+			remaining = size
+			return none
+		}
+	}
+
+	internal def isHexDigits(text string) bool {
+		return false when text == ""
+		for let ch in text {
+			return false unless ch.isDigit() || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+		}
+		return true
+	}
+
+	// ChunkedWriter encodes a `chunked` transfer coding: every write is
+	// one chunk, and `close` writes the last chunk and the trailers.
+	// Implements std.io.WriteCloser.
+	type ChunkedWriter {
+		internal sink io.Writer
+
+		def new(sink io.Writer) {
+			self.sink = sink
+		}
+
+		// Writes buf as one chunk; an empty buf writes nothing, since an
+		// empty chunk would end the body. Fails when the sink does.
+		def write(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			try writeFully(sink, (buf.len().hex() + "\r\n").bytes())
+			try writeFully(sink, buf)
+			try writeFully(sink, "\r\n".bytes())
+			return buf.len()
+		}
+
+		// Writes the last chunk, the trailers and the final blank line.
+		// The sink stays open. Fails when the sink does.
+		def close(trailer ?Header = none) !none {
+			try writeFully(sink, "0\r\n".bytes())
+			try trailer.write(sink) unless trailer is none
+			try writeFully(sink, "\r\n".bytes())
+			return none
+		}
+	}
+
+	// writeFully writes all of data, looping over short writes. Fails when
+	// the sink fails or accepts nothing.
+	internal def writeFully(sink io.Writer, data byte[]) !none {
+		let offset = 0
+		for offset < data.len() {
+			let n = try sink.write(data.slice(offset, data.len() - offset))
+			fail HttpError{message: "sink accepted nothing", op: "write"} when n <= 0
+			offset += n
+		}
+		return none
+	}
+
+	// copyBody streams a reader into a writer and returns the byte count.
+	// Fails when a read or write does.
+	internal def copyBody(source io.Reader, sink io.Writer) !int {
+		let chunk byte[] = []
+		chunk.len(32 * 1024)
+		let total = 0
+		for {
+			let n = try source.read(chunk)
+			break when n <= 0
+			try writeFully(sink, chunk.slice(0, n))
+			total += n
+		}
+		return total
+	}
+
+	// readAll reads a reader to its end. Fails when a read does.
+	internal def readAll(source io.Reader) !byte[] {
+		let out byte[] = []
+		let chunk byte[] = []
+		chunk.len(32 * 1024)
+		for {
+			let n = try source.read(chunk)
+			break when n <= 0
+			out = out.concat(chunk.slice(0, n))
+		}
+		return out
+	}
+
+	// MaxBytesReader caps a body at maxBytes: a read past the cap fails
+	// with an `HttpError` (op "body", code "too-large"), so a server can
+	// answer 413 instead of buffering an unbounded body. Implements
+	// std.io.Reader.
+	type MaxBytesReader {
+		internal source   io.Reader
+		internal maxBytes int
+		internal count    int       = 0
+
+		def new(source io.Reader, maxBytes int) {
+			self.source = source
+			self.maxBytes = maxBytes
+		}
+
+		// Reads from the source, counting. Fails when the count would pass
+		// maxBytes, or the source fails.
+		def read(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			let room = maxBytes - count
+			room = 0 when room < 0
+			// Ask for one byte past the cap, so a body exactly at the cap
+			// is told apart from one over it: at the cap, a read that
+			// yields nothing is the clean end.
+			let want = buf.len() < room + 1 ?? (buf.len(), room + 1)
+			let target = want == buf.len() ?? (buf, buf.slice(0, want))
+			let n = try source.read(target)
+			return 0 when n <= 0
+			target.copy(buf) when want != buf.len()
+			count += n
+			fail HttpError{message: "body exceeds {maxBytes} bytes", code: "too-large", op: "body"} when count > maxBytes
+			return n
+		}
+
+		// Bytes left under the cap.
+		def remaining() int {
+			return maxBytes - count
+		}
+	}
+
+	// readRequest parses one request from the reader: the request line,
+	// the header block (folded lines joined, at most maxHeaderBytes), then
+	// the body framed by `Content-Length`, `Transfer-Encoding: chunked`, or
+	// nothing. A request with both a length and a chunked coding, or with
+	// two different lengths, is refused (RFC 9112 §6.3, request smuggling).
+	// The body reader reads from the same reader, so it must be read to the
+	// end (or the connection closed) before the next request is read.
+	// Fails with an `HttpError` (op "request") when the message is
+	// malformed, and with the reader's error when it fails; a clean end of
+	// stream before the request line fails with `code` "eof".
+	def readRequest(r io.Reader, maxHeaderBytes int = 1024 * 1024) !Request {
+		return try readRequest(new WireReader(r), maxHeaderBytes)
+	}
+
+	// readRequest reads from a wire reader the caller keeps: a server reads
+	// every request of a connection through one, so what it buffered past a
+	// body (the next pipelined request) is not lost. Fails as `readRequest`
+	// over a plain reader does.
+	def readRequest(wire WireReader, maxHeaderBytes int = 1024 * 1024) !Request {
+		// Empty lines before the request line are tolerated (RFC 9112 §2.2).
+		let first = ""
+		for {
+			let line = try wire.readLine(maxHeaderBytes)
+			fail HttpError{message: "connection closed before a request line", code: "eof", op: "request"} when line is none
+			first = line
+			break when first.trim() != ""
+		}
+		let parts = first.split(" ").filter(p => p != "")
+		fail HttpError{message: "malformed request line: {first}", op: "request", text: first} when parts.len() != 3
+		let req = new Request()
+		req.method = parseMethod(parts[0])
+		fail HttpError{message: "invalid method: {parts[0]}", op: "request", text: first} when req.method == Method.Other && !validToken(parts[0])
+		req.rawMethod = parts[0]
+		req.proto = parts[2]
+		fail HttpError{message: "unsupported protocol: {parts[2]}", op: "request", text: first} unless validProto(parts[2])
+		if parts[1] == "*" {
+			req.url = new url.URL()
+			req.url.path = "*"
+		} else {
+			req.url = url.parseRequest(parts[1]) onerror (err error) {
+				fail HttpError{message: "invalid request target: {parts[1]}", op: "request", text: first, cause: err}
+			}
+		}
+
+		req.headers = try readHeaderLines(wire, maxHeaderBytes)
+		let host = req.headers.get("Host")
+		req.headers.del("Host")
+		req.host = req.url.host != "" ?? (req.url.host, host)
+		req.received = time.now()
+		let framing = try frameBody(req.headers, req.method, 0, false, wire)
+		req.contentLength = framing.length
+		req.body = framing.body
+		req.transferEncoding = framing.encodings
+		req.chunkedBody = framing.chunked
+		req.connectionClose = shouldClose(req.proto, req.headers)
+		return req
+	}
+
+	// readResponse parses one response to the request from the reader:
+	// status line, headers and the body framed as for `readRequest`, with
+	// no body for a HEAD request, 1xx, 204 and 304, and a read-to-close
+	// body when nothing frames it. 1xx interim responses are consumed and
+	// the final one returned, except 101, which is returned as is. Fails
+	// as `readRequest` does, op "response".
+	def readResponse(r io.Reader, request Request, maxHeaderBytes int = 1024 * 1024) !Response {
+		return try readResponse(new WireReader(r), request, maxHeaderBytes)
+	}
+
+	// readResponse reads from a wire reader the caller keeps, as a client
+	// does for every response on a pooled connection. Fails as
+	// `readResponse` over a plain reader does.
+	def readResponse(wire WireReader, request Request, maxHeaderBytes int = 1024 * 1024) !Response {
+		let res = try readResponseHead(wire, request, maxHeaderBytes)
+		// An interim response precedes the final one; 101 is final for
+		// the caller, who takes over the connection.
+		for res.isInterim() {
+			res = try readResponseHead(wire, request, maxHeaderBytes)
+		}
+		return try frameResponse(res, wire)
+	}
+
+	// readResponseHead reads one status line and header block, interim
+	// or final, without framing the body: a client waiting for `100
+	// Continue` reads heads one at a time, then hands the final one to
+	// `frameResponse`. Fails on a closed connection (code `eof`), a
+	// malformed status line or an oversized header block.
+	def readResponseHead(wire WireReader, request Request, maxHeaderBytes int = 1024 * 1024) !Response {
+		let res = new Response()
+		let line = try wire.readLine(maxHeaderBytes)
+		fail HttpError{message: "connection closed before a status line", code: "eof", op: "response"} when line is none
+		let text = line.trim()
+		let sp = text.indexOf(" ")
+		fail HttpError{message: "malformed status line: {text}", op: "response", text: text} when sp < 0
+		res.proto = text[:sp]
+		fail HttpError{message: "unsupported protocol: {res.proto}", op: "response", text: text} unless validProto(res.proto)
+		let rest = text[sp + 1:].trim()
+		let codeText = rest.len() >= 3 ?? (rest[:3], rest)
+		fail HttpError{message: "malformed status code: {rest}", op: "response", text: text} unless codeText.len() == 3 && isDigits(codeText)
+		res.status = parseInt<int>(codeText)
+		res.reason = rest.len() > 3 ?? (rest[3:].trim(), "")
+		res.headers = try readHeaderLines(wire, maxHeaderBytes)
+		res.request = request
+		res.received = time.now()
+		return res
+	}
+
+	// frameResponse attaches the body to a final head from
+	// `readResponseHead`: its framing from the headers and the method,
+	// read from the wire reader. Fails on a transfer coding other than
+	// chunked or a malformed `Content-Length`.
+	def frameResponse(res Response, wire WireReader) !Response {
+		let request = res.request
+		let method = request is none ?? (Method.GET, request.method)
+		let framing = try frameBody(res.headers, method, res.status, true, wire)
+		res.contentLength = framing.length
+		res.body = framing.body
+		res.transferEncoding = framing.encodings
+		res.chunkedBody = framing.chunked
+		res.connectionClose = shouldClose(res.proto, res.headers) || (res.contentLength < 0 && res.transferEncoding.len() == 0 && !(res.body is none))
+		return res
+	}
+
+	// readHeaderLines collects the header block up to the blank line and
+	// parses it. Fails on a malformed line or a block over the limit.
+	internal def readHeaderLines(wire WireReader, maxHeaderBytes int) !Header {
+		let block = ""
+		for {
+			let line = try wire.readLine(maxHeaderBytes)
+			break when line is none || line == ""
+			block += line + "\r\n"
+			fail HttpError{message: "header block exceeds {maxHeaderBytes} bytes", op: "header"} when block.len() > maxHeaderBytes
+		}
+		return try parseHeaderBlock(block, maxHeaderBytes)
+	}
+
+	// Framing is how a message body is delimited: its length when known
+	// (-1 otherwise), the reader that yields it (none for no body), and the
+	// transfer codings applied.
+	struct Framing {
+		length    int
+		body      ?io.Reader
+		encodings string[]
+		// The chunked reader behind `body` when the coding is chunked, for
+		// the trailers it collects.
+		chunked   ?ChunkedReader
+	}
+
+	// frameBody decides how the body is delimited and builds its reader.
+	// For a response, HEAD requests and the bodiless statuses have none;
+	// for a request, no framing means no body. Fails on an unsupported
+	// coding, conflicting or malformed lengths.
+	internal def frameBody(headers Header, method Method, status int, isResponse bool, wire WireReader) !Framing {
+		let bodiless = isResponse && (method == Method.HEAD || (status >= 100 && status < 200) || status == 204 || status == 304)
+		return Framing{length: 0, body: none, encodings: [], chunked: none} when bodiless
+		let encodings = headers.tokens("Transfer-Encoding")
+		let lengths = headers.values("Content-Length")
+		if encodings.len() > 0 {
+			fail HttpError{message: "unsupported transfer coding: {encodings.join(", ")}", op: "body"} unless encodings.len() == 1 && encodings[0].lower() == "chunked"
+			// A length beside a chunked coding is the request-smuggling
+			// shape; the coding wins and the length is discarded.
+			headers.del("Content-Length")
+			let reader = new ChunkedReader(wire)
+			return Framing{length: -1, body: reader, encodings: ["chunked"], chunked: reader}
+		}
+		if lengths.len() > 0 {
+			let first = lengths[0].trim()
+			for let other in lengths {
+				fail HttpError{message: "conflicting Content-Length values", op: "body"} when other.trim() != first
+			}
+			fail HttpError{message: "invalid Content-Length: {first}", op: "body", text: first} unless isDigits(first)
+			let n = parseInt<int>(first)
+			return Framing{length: 0, body: new EmptyBody(), encodings: [], chunked: none} when n == 0
+			return Framing{length: n, body: new LengthReader(wire, n), encodings: [], chunked: none}
+		}
+		// Nothing frames a response body: it runs to the connection's close.
+		return Framing{length: -1, body: wire, encodings: [], chunked: none} when isResponse
+		return Framing{length: 0, body: none, encodings: [], chunked: none}
+	}
+
+	// shouldClose reads the keep-alive rules: HTTP/1.0 closes unless asked
+	// to keep alive, HTTP/1.1 keeps alive unless asked to close.
+	internal def shouldClose(proto string, headers Header) bool {
+		return true when headers.hasToken("Connection", "close")
+		return !headers.hasToken("Connection", "keep-alive") when proto == "HTTP/1.0"
+		return false
+	}
+
+	internal def validProto(text string) bool {
+		return text == "HTTP/1.1" || text == "HTTP/1.0"
+	}
+
+	internal def validToken(text string) bool {
+		return validHeaderFieldName(text)
+	}
+}

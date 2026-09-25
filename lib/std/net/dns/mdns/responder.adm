@@ -1,0 +1,358 @@
+partial module std.net.dns.mdns {
+	use (
+		std.net
+		std.net.dns
+		std.services::(Network)
+		std.time
+	)
+
+	// Responder answers the link's questions about this host: its name
+	// under `.local`, and the services it offers (RFC 6762, RFC 6763).
+	// `start` makes sure nobody else holds the names (three probes, 250 ms
+	// apart), announces them twice and answers from then on; `close` says
+	// goodbye, so that the hosts that listened forget them at once.
+	//
+	// Other responders on the same host, the system's among them, go on
+	// working: the port is shared. The policy is asked for `listen` on
+	// port 5353 and for `connect` to the group, `224.0.0.251:5353`, and to
+	// every host that asks for its answer by unicast.
+	type Responder {
+		// The host's name without `.local`: a single label.
+		hostname  string
+		// The addresses to answer with; when empty, the address the host
+		// reaches the link from.
+		addresses string[]     = []
+		// Seconds other hosts may keep the host's records; the service
+		// pointers, which several hosts share, are kept 75 minutes.
+		ttl       int          = 120
+		// Called in the background with every failed send or receive.
+		onError   ?def (error) = none
+
+		internal services       Service[] = []
+		internal fd             int       = -1
+		internal atomic running bool      = false
+
+		def new(hostname string) {
+			self.hostname = dns.canonicalName(hostname)
+		}
+
+		// add offers a service, under this host unless it names another. A
+		// running responder announces it at its next answer only; add
+		// before `start`.
+		def add(entry Service) {
+			let offered = entry
+			offered.host = hostName() when offered.host == ""
+			services.push(offered)
+		}
+
+		// hostName is the host's full name: `hostname.local`.
+		def hostName() string {
+			return dns.isLocalName(hostname) ?? (hostname, hostname + ".local")
+		}
+
+		// isRunning reports whether the responder answers.
+		def isRunning() bool {
+			return running
+		}
+
+		// start joins the group, probes for the names, and answers in the
+		// background. It returns after the probes, about a second later.
+		// Fails with Conflict when another host answers for the host name
+		// or a service instance, with BadName when a name is no domain
+		// name, with PolicyDenied when the policy denies the port, and as
+		// the `Network` service does when the group cannot be joined, as on
+		// a host without a network.
+		def start() !none {
+			return none when running
+			let sock = try Network.socketFd(net.SocketDomain.IPv4, net.SocketType.Datagram)
+			let failure ?error = none
+			open(sock) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is none {
+				fd = sock
+				probe() onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				fd = -1
+				Network.close(sock) onerror recover none
+				fail failure
+			}
+			running = true
+			let serving = async serve()
+			serving.keepAlive()
+			let telling = async announce()
+			telling.keepAlive()
+			return none
+		}
+
+		// close sends the goodbye and stops answering.
+		def close() {
+			return when !running
+			running = false
+			let farewell = records(0)
+			send(farewell, dns.multicastServer, 0, none) onerror recover none
+			Network.close(fd) onerror recover none
+			fd = -1
+		}
+
+		// Closes the responder when the last reference is released.
+		def dispose() {
+			close()
+		}
+
+		internal def open(sock int) !none {
+			try Network.setReuseAddr(sock)
+			Network.setReusePort(sock) onerror recover none
+			try Network.bind(sock, "0.0.0.0:5353")
+			try Network.joinGroup(sock, "224.0.0.251")
+			try Network.setMulticast(sock, 255, true)
+			if addresses.len() == 0 {
+				let own = try ownAddress()
+				addresses = [own]
+			}
+			return none
+		}
+
+		// ownAddress is the address the host sends to the group from.
+		internal def ownAddress() !string {
+			let probeSock = try Network.socketFd(net.SocketDomain.IPv4, net.SocketType.Datagram)
+			let failure ?error = none
+			Network.connect(probeSock, dns.multicastServer, 1s) onerror (err error) {
+				failure = err
+				recover none
+			}
+			let local = ""
+			if failure is none {
+				local = Network.localAddr(probeSock) onerror (err error) {
+					failure = err
+					recover ""
+				}
+			}
+			Network.close(probeSock) onerror recover none
+			fail failure unless failure is none
+			return (try net.parseAddress(local)).host
+		}
+
+		// records is everything the responder answers with, at the TTL given
+		// for the host's own records; 0 makes them the goodbye.
+		internal def records(seconds int) dns.Record[] {
+			let out dns.Record[]
+			for let (_, ip) in addresses {
+				let address = dns.addressRecord(hostName(), ip, seconds)
+				address.cacheFlush = true
+				out.push(address)
+			}
+			for let (_, entry) in services {
+				let instance = instanceName(entry)
+				let shared = seconds == 0 ?? (0, 4500)
+				out.push(dns.ptrRecord(typeName(entry.kind), instance, shared))
+				out.push(dns.ptrRecord(serviceTypes, typeName(entry.kind), shared))
+				let location = dns.srvRecord(instance, 0, 0, entry.port, entry.host, seconds)
+				location.cacheFlush = true
+				out.push(location)
+				// A service without TXT strings has one empty string (RFC 6763 §6.1).
+				let what = dns.txtRecord(instance, entry.text.len() == 0 ?? ([""], entry.text), seconds)
+				what.cacheFlush = true
+				out.push(what)
+			}
+			return out
+		}
+
+		// probe asks three times whether somebody holds one of the names
+		// the host wants for itself (RFC 6762 §8.1).
+		// Fails with Conflict on an answer.
+		internal def probe() !none {
+			let wanted string[] = [hostName()]
+			for let (_, entry) in services {
+				wanted.push(instanceName(entry))
+			}
+			let question = new dns.Message()
+			for let (_, name) in wanted {
+				question.questions.push(dns.Question{name: name, kind: dns.RecordType.ANY, code: dns.RecordType.ANY.value, unicastResponse: true})
+			}
+			for let (_, r) in records(ttl) {
+				question.authorities.push(r) unless r.kind == dns.RecordType.PTR
+			}
+			let wire = try question.encode()
+			let buf byte[] = []
+			buf.len(9000)
+			for let round = 0; round < 3; round++ {
+				try Network.sendToNameServer(fd, wire, dns.multicastServer, 1s)
+				let started = time.now()
+				for {
+					// A wait of nothing would be a wait without end.
+					let left = 250ms - time.since(started)
+					break when left < 1ms
+					let quiet = false
+					let (n, from) = Network.recvFrom(fd, buf, left) onerror (err error) {
+						quiet = true
+						recover (0, "")
+					}
+					continue when quiet || n == 0
+					let message = dns.decode(buf[:n]) onerror recover new dns.Message()
+					continue unless message.response
+					for let (_, r) in message.answers {
+						continue unless wanted.includes(dns.canonicalName(r.name))
+						continue when ours(r)
+						fail dns.errorOf(dns.ErrorKind.Conflict, "{from} already answers for {r.name}", r.name)
+					}
+				}
+			}
+			return none
+		}
+
+		// ours reports whether a record says what this responder says: the
+		// host's other responders and its own echo are no conflict.
+		internal def ours(r dns.Record) bool {
+			for let (_, mine) in records(ttl) {
+				return true when mine.kind == r.kind && sameName(mine.name, r.name) && mine.rdata() == r.rdata()
+			}
+			return false
+		}
+
+		// announce sends everything unasked, twice, a second apart (RFC 6762
+		// §8.3).
+		internal def announce() {
+			for let round = 0; round < 2 && running; round++ {
+				send(records(ttl), dns.multicastServer, 0, none) onerror (err error) {
+					report(err)
+					recover none
+				}
+				time.sleep(1s)
+			}
+		}
+
+		internal def serve() {
+			let buf byte[] = []
+			buf.len(9000)
+			for running {
+				let quiet = false
+				let failure ?error = none
+				let (n, from) = Network.recvFrom(fd, buf, 1s) onerror (err error) {
+					quiet = err.code == net.ErrorCode.TimedOut.value
+					failure = err unless quiet
+					recover (0, "")
+				}
+				if !(failure is none) {
+					break unless running
+					report(failure)
+					time.sleep(50ms)
+					continue
+				}
+				continue when quiet || n == 0
+				let message = dns.decode(buf[:n]) onerror recover new dns.Message()
+				continue when message.response || message.questions.len() == 0
+				answer(message, from) onerror (err error) {
+					report(err)
+					recover none
+				}
+			}
+		}
+
+		// answer replies to a query with the records it asks for and the
+		// asker does not list as known (RFC 6762 §7.1). The reply goes to
+		// the group, or to the asker alone when it asked so or is no
+		// multicast DNS host itself, which shows in its port (§6.7). An
+		// asker on this host gets the group even when it asked for a
+		// unicast reply: every responder of the host holds port 5353, and
+		// the kernel hands a unicast datagram to one of them only, not
+		// necessarily the asker (§15.1).
+		internal def answer(query dns.Message, from string) !none {
+			let sender = try net.parseAddress(from)
+			let legacy = sender.port != 5353
+			let direct = legacy
+			let local = addresses.includes(sender.host) || sender.host.startsWith("127.")
+			let found dns.Record[]
+			for let (_, question) in query.questions {
+				direct = true when question.unicastResponse && !local
+				let kinds int[]
+				for let (_, r) in records(ttl) {
+					continue unless sameName(r.name, question.name)
+					kinds.push(r.wireType()) unless kinds.includes(r.wireType())
+					continue unless question.kind == dns.RecordType.ANY || question.kind == r.kind
+					let known = false
+					for let (_, have) in query.answers {
+						known = true when have.kind == r.kind && sameName(have.name, r.name) && have.rdata() == r.rdata() && have.ttl * 2 >= r.ttl
+					}
+					collect(found, r) unless known
+				}
+				// A name of ours without the type asked for: say so, that the
+				// asker need not wait for an answer (RFC 6762 §6.1).
+				let code = question.kind == dns.RecordType.Unknown ?? (question.code, question.kind.value)
+				collect(found, absent(question.name, kinds)) when kinds.len() > 0 && !kinds.includes(code) && question.kind != dns.RecordType.ANY
+			}
+			return none when found.len() == 0
+			return try send(found, direct ?? (from, dns.multicastServer), legacy ?? (query.id, 0), legacy ?? (query, none))
+		}
+
+		// send writes one response: the answers, and beside each pointer and
+		// each service what a browser would ask for next. A host that is no
+		// multicast DNS host gets its id and question back, short TTLs and
+		// no cache-flush bit, which it would take for a class (§6.7).
+		internal def send(answers dns.Record[], to string, id int, asked ?dns.Message) !none {
+			let response = new dns.Message()
+			response.id = id
+			response.response = true
+			response.authoritative = true
+			if !(asked is none) {
+				for let (_, question) in asked.questions {
+					response.questions.push(dns.Question{name: question.name, kind: question.kind, code: question.code, class: question.class})
+				}
+			}
+			let everything = records(answers.len() > 0 && answers[0].ttl == 0 ?? (0, ttl))
+			for let (_, r) in answers {
+				response.answers.push(r)
+				continue unless r.kind := dns.RecordType.PTR || dns.RecordType.SRV
+				for let (_, extra) in everything {
+					let follows = sameName(extra.name, r.target) && extra.kind != dns.RecordType.PTR
+					continue unless follows
+					let listed = false
+					for let (_, have) in answers {
+						listed = true when have.kind == extra.kind && sameName(have.name, extra.name)
+					}
+					collect(response.additionals, extra) unless listed
+				}
+			}
+			if !(asked is none) {
+				plain(response.answers)
+				plain(response.additionals)
+			}
+			try Network.sendTo(fd, try response.encode(9000), to, 1s)
+			return none
+		}
+
+		// absent is the NSEC record that lists the only types a name has.
+		internal def absent(name string, kinds int[]) dns.Record {
+			let data = new dns.NSEC()
+			data.next = dns.canonicalName(name)
+			data.types = kinds.sort((a int, b int) => a < b)
+			let out = new dns.Record()
+			out.name = dns.canonicalName(name)
+			out.kind = dns.RecordType.NSEC
+			out.code = dns.RecordType.NSEC.value
+			out.ttl = ttl
+			out.cacheFlush = true
+			out.nsec = data
+			return out
+		}
+
+		internal def report(failure error) {
+			let hook = onError
+			hook(failure) unless hook is none
+		}
+	}
+
+	// plain makes records fit for a host that is no multicast DNS host.
+	internal def plain(records dns.Record[]) {
+		for let (i, r) in records {
+			let copy = r.withTTL(r.ttl > 10 ?? (10, r.ttl))
+			copy.cacheFlush = false
+			records[i] = copy
+		}
+	}
+}

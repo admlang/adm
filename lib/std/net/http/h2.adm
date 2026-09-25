@@ -1,0 +1,320 @@
+partial module std.net.http {
+	use (
+		std.data.encoding
+		std.net
+		std.net.http.http2
+		std.net.tls
+		std.net.url
+		std.time
+	)
+
+	// The ALPN identifiers a server offers: HTTP/2 first.
+	internal const alpnH2 = "h2"
+	internal const alpnHTTP11 = "http/1.1"
+
+	// StreamSink frames a response as HTTP/2 onto one stream: `:status`
+	// and the fields in lower case, without the connection-specific ones,
+	// then DATA, then END_STREAM or the trailers.
+	internal type StreamSink {
+		stream http2.Stream
+
+		def new(stream http2.Stream) {
+			self.stream = stream
+		}
+
+		def writeInterim(status int, headers Header) !none {
+			return try stream.writeHeaders(headerBlock(status, headers), false)
+		}
+
+		def writeHead(status int, headers Header, length int, hasBody bool) !none {
+			headers.set("Content-Length", length.str()) when length >= 0 && statusHasBody(status) && !headers.has("Content-Length")
+			let last = !hasBody || (length == 0 && !headers.has("Trailer"))
+			return try stream.writeHeaders(headerBlock(status, headers), last)
+		}
+
+		def writeBody(buf byte[]) !none {
+			try stream.write(buf)
+			return none
+		}
+
+		def end(trailer ?Header) !none {
+			let fields http2.HeaderField[] = []
+			fields = headerFields(trailer) unless trailer is none
+			return try stream.end(fields)
+		}
+	}
+
+	// StreamBody is a message body read from a stream: a request's on the
+	// server, a response's on the client. At its end the trailing fields
+	// become the message's trailer.
+	internal type StreamBody {
+		stream  http2.Stream
+		trailer Header
+
+		def new(stream http2.Stream, trailer Header) {
+			self.stream = stream
+			self.trailer = trailer
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			let n = try stream.read(buf)
+			return n when n > 0 || buf.len() == 0
+			for let f in stream.trailers {
+				trailer.add(f.name, f.value)
+			}
+			return 0
+		}
+	}
+
+	// Fields HTTP/2 forbids in a message (RFC 9113 §8.2.2).
+	internal def connectionSpecific(name string) bool {
+		return name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade"
+	}
+
+	// headerFields is the header as HTTP/2 fields: names in lower case,
+	// connection-specific fields and the ones `Connection` names left out,
+	// credentials marked never to be indexed. `Cookie` goes out one pair a
+	// field (RFC 9113 §8.2.3), so a pair that stays the same between
+	// requests is indexed although its neighbours change.
+	internal def headerFields(headers Header) http2.HeaderField[] {
+		let dropped = headers.tokens("Connection")
+		let out http2.HeaderField[] = []
+		for let key in headers.keys() {
+			let name = key.lower()
+			continue when connectionSpecific(name) || dropped.includes(name)
+			let secret = name == "authorization" || name == "proxy-authorization"
+			for let value in headers.values(key) {
+				if name == "cookie" {
+					for let piece in value.split(";") {
+						let pair = piece.trim()
+						out.push(http2.HeaderField{name: name, value: pair, sensitive: pair.len() < 20}) unless pair == ""
+					}
+					continue
+				}
+				out.push(http2.HeaderField{name: name, value: value, sensitive: secret})
+			}
+		}
+		return out
+	}
+
+	// headerBlock is a response's header block, `:status` first.
+	internal def headerBlock(status int, headers Header) http2.HeaderField[] {
+		return [http2.HeaderField{name:":status", value:status.str()}] + headerFields(headers)
+	}
+
+	// requestFromStream builds the request a stream's opening block
+	// describes: the pseudo-headers become method, target and host, the
+	// `cookie` fields one header, the stream the body. Fails with an
+	// HttpError when the target does not parse.
+	internal def requestFromStream(s http2.Stream, fields http2.HeaderField[]) !Request {
+		let req = new Request()
+		req.proto = "HTTP/2.0"
+		req.stream = s
+		let method = http2.valueOf(fields, ":method")
+		req.method = parseMethod(method)
+		req.rawMethod = method
+		let path = http2.valueOf(fields, ":path")
+		let authority = http2.valueOf(fields, ":authority")
+		if path := "*" || "" {
+			req.url = new url.URL()
+			req.url.path = path == "" ?? ("", "*")
+		} else {
+			req.url = url.parseRequest(path) onerror (err error) {
+				fail HttpError{message: "invalid request target: {path}", status: 400, op: "request", text: path, cause: err}
+			}
+		}
+		req.headers = new Header()
+		let cookies string[] = []
+		for let f in fields {
+			continue when f.name.startsWith(":")
+			if f.name == "cookie" {
+				cookies.push(f.value)
+				continue
+			}
+			req.headers.add(f.name, f.value)
+		}
+		req.headers.set("Cookie", cookies.join("; ")) when cookies.len() > 0
+		let host = req.headers.get("Host")
+		req.headers.del("Host")
+		req.host = authority != "" ?? (authority, host)
+		req.received = time.now()
+		// Ended with no DATA; a short body may have ended the stream
+		// before this task ran, and is still there to read.
+		if s.endReceived && s.received == 0 {
+			req.contentLength = 0
+			req.body = new EmptyBody()
+			return req
+		}
+		let declared = try req.headers.contentLength()
+		req.contentLength = declared unless declared is none
+		req.body = new StreamBody(s, req.trailer)
+		return req
+	}
+
+	// serveStream answers one HTTP/2 stream as `ServerConn.serveOne` does
+	// an HTTP/1.1 request: builds the request, runs the handler over a
+	// `ResponseWriter` on the stream, ends the response. A request that
+	// cannot be built or answered resets the stream.
+	internal def serveStream(srv Server, s http2.Stream, remote net.Address, secured ?tls.Conn) !none {
+		let fields = try s.readHeaders()
+		s.deadline = time.now() + srv.readTimeout when srv.readTimeout > 0s
+		let sink = new StreamSink(s)
+		let failure ?error = none
+		let parsed ?Request = none
+		parsed = buildRequest(s, fields) onerror (err error) {
+			failure = err
+			recover none
+		}
+		let req = parsed
+		if req is none {
+			srv.report(failure, none) unless failure is none
+			let answer = new ResponseWriter(new Request(), sink)
+			answer.error(400) onerror recover none
+			return try answer.end()
+		}
+		req.remote = remote
+		if !(secured is none) {
+			req.tls = true
+			req.tlsState = secured.connectionState()
+		}
+		req.deadline = s.deadline
+		req.limitBody(srv.maxBodyBytes) when srv.maxBodyBytes > 0
+		let body = req.body
+		req.body = new ContinueReader(body, sink) when req.expectsContinue() && !(body is none)
+		let writer = new ResponseWriter(req, sink)
+		writer.headers.set("Server", srv.serverHeader) when srv.serverHeader != ""
+		let ctx = new Context(req, writer)
+		ctx.server = srv
+		let handler = srv.handler
+		let h Handler = handler is none ?? (notFoundHandler(), handler)
+		srv.countRequest()
+		h.serve(ctx) onerror (err error) {
+			srv.report(err, ctx)
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			// Past the head nothing can say the body is broken but a reset.
+			return try s.reset(http2.ErrorCode.InternalError) when writer.written()
+			answerHandlerFailure(writer, failure)
+		}
+		s.deadline = time.now() + srv.writeTimeout when srv.writeTimeout > 0s
+		try writer.end()
+		// A body the handler left unread: tell the peer to stop sending,
+		// and give what arrived back to the connection window.
+		return try s.reset(http2.ErrorCode.NoError)
+	}
+
+	// requestBlock is a request's header block: the pseudo-headers, then
+	// the fields without `Host` and the connection-specific ones, with the
+	// body length when it is known. `scheme` stands in for the URL's on a
+	// request a server read, whose URL is the target alone.
+	internal def requestBlock(req Request, scheme string = "") http2.HeaderField[] {
+		let method = req.method == Method.Other && req.rawMethod != "" ?? (req.rawMethod, req.method.value)
+		let authority = req.host != "" ?? (req.host, req.url.host)
+		let via = scheme == "" ?? (req.url.scheme.lower(), scheme)
+		let out = [http2.HeaderField{name:":method", value:method}, http2.HeaderField{name:":scheme", value:via}, http2.HeaderField{name:":authority", value:authority}, http2.HeaderField{name:":path", value:req.requestURI()}]
+		let fields = req.headers.clone()
+		fields.del("Host")
+		// `TE` may only say `trailers` (RFC 9113 §8.2.2).
+		fields.del("TE") unless fields.get("TE").trim().lower() == "trailers"
+		let size = req.bodyLength()
+		fields.set("Content-Length", size.str()) when size > 0
+		return out + headerFields(fields)
+	}
+
+	// CleartextUpgrade is an HTTP/1.1 request that asked for `Upgrade: h2c`,
+	// in the form stream 1 of the HTTP/2 connection takes it.
+	internal type CleartextUpgrade {
+		settings byte[]
+		fields   http2.HeaderField[]
+		body     byte[]
+	}
+
+	// The largest request body read into memory to upgrade a connection;
+	// a request with more is answered over HTTP/1.1.
+	internal const maxUpgradeBodyBytes = 64 * 1024
+
+	// cleartextUpgrade reads an `Upgrade: h2c` request (RFC 7540 §3.2) for
+	// the switch: `Connection` names `Upgrade` and `HTTP2-Settings`, there
+	// is one `HTTP2-Settings` field and it decodes, and the body is at
+	// most `maxUpgradeBodyBytes` of known length with no `Expect`. None
+	// for any other request, which stays on HTTP/1.1 with its body
+	// unread. Fails when the body read does.
+	internal def cleartextUpgrade(req Request) !?CleartextUpgrade {
+		return none unless req.proto == "HTTP/1.1" && req.headers.hasToken("Upgrade", "h2c")
+		return none unless req.headers.hasToken("Connection", "upgrade") && req.headers.hasToken("Connection", "http2-settings")
+		let offered = req.headers.values("HTTP2-Settings")
+		return none unless offered.len() == 1
+		return none when req.expectsContinue() || req.contentLength < 0 || req.contentLength > maxUpgradeBodyBytes
+		// The field is base64url without padding (RFC 4648 §5).
+		let codec = encoding.Base64{urlSafe: true, padded: false}
+		let malformed = false
+		let settings = codec.decode(offered[0].trim()) onerror {
+			malformed = true
+			recover []
+		}
+		return none when malformed || settings.len() % 6 != 0
+		let body = try req.bytes()
+		return CleartextUpgrade{settings: settings, fields: requestBlock(req, "http"), body: body}
+	}
+
+	// exchangeHTTP2 sends the request on a new stream of the connection
+	// and reads the response head; the body is the stream. A server that
+	// answers before it read the request body wins over the write that
+	// failed for it. Fails with Http2Error: `RefusedStream` when the
+	// connection took no new stream or a GOAWAY left this one unhandled,
+	// so the request may go again elsewhere; code "timeout" past the
+	// request's deadline or `headerTimeout`.
+	internal def exchangeHTTP2(conn http2.Conn, req Request, headerTimeout duration) !Response {
+		let limit = req.deadline
+		let s = try conn.newStream(limit)
+		s.deadline = limit
+		let size = req.bodyLength()
+		try s.writeHeaders(requestBlock(req), size == 0)
+		if size != 0 {
+			let failure ?error = none
+			sendStreamBody(req, s) onerror (err error) {
+				failure = err
+				recover none
+			}
+			fail failure unless failure is none || s.haveFields
+		}
+		if headerTimeout > 0s {
+			let until = time.now() + headerTimeout
+			s.deadline = until when limit is none || until.before(limit)
+		}
+		let fields = try s.readHeaders()
+		s.deadline = limit
+		let res = new Response()
+		res.proto = "HTTP/2.0"
+		res.request = req
+		let status = http2.valueOf(fields, ":status")
+		fail HttpError{message: "malformed :status: {status}", op: "transport", text: status} unless status.len() == 3 && isDigits(status)
+		res.status = parseInt<int>(status)
+		for let f in fields {
+			res.headers.add(f.name, f.value) unless f.name.startsWith(":")
+		}
+		if req.method == Method.HEAD || !statusHasBody(res.status) {
+			res.contentLength = 0
+			res.body = new EmptyBody()
+			return res
+		}
+		let declared = try res.headers.contentLength()
+		res.contentLength = declared unless declared is none
+		res.body = new StreamBody(s, res.trailer)
+		return res
+	}
+
+	// Sends the request body as DATA and ends the stream.
+	internal def sendStreamBody(req Request, s http2.Stream) !none {
+		try req.writeBody(s, false)
+		return try s.end()
+	}
+
+	// `requestFromStream` as an optional, so a failure can recover to none.
+	internal def buildRequest(s http2.Stream, fields http2.HeaderField[]) !?Request {
+		return try requestFromStream(s, fields)
+	}
+}

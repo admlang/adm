@@ -1,4 +1,518 @@
 partial module std.net.dns {
-	// Server is the DNS server; it has no members yet.
-	type Server {}
+	use (
+		std.net
+		std.net.tcp
+		std.net.udp
+		std.services::(Policy)
+		std.time
+	)
+
+	// Request is one query a server received.
+	struct Request {
+		message Message
+		// Who asked.
+		remote  net.Address
+		// The query came over TCP, so the response is not cut to a UDP size.
+		tcp     bool        = false
+		// The name of the TSIG key that signed the query, which the server
+		// verified; "" for an unsigned query.
+		key     string      = ""
+	}
+
+	// Handler answers DNS queries.
+	interface Handler {
+		// serve returns the response to the request, usually built from
+		// `request.message.reply()`. The server sets the id, cuts the
+		// response to the size the client takes over UDP and sends it.
+		// Failing answers the client with ServerFailure and reports the
+		// error to the server's `onError`.
+		def serve(request Request) !Message
+	}
+
+	// HandlerFunc makes a function a Handler.
+	type HandlerFunc {
+		fn def(Request) !Message
+
+		def new(fn def(Request) !Message) {
+			self.fn = fn
+		}
+
+		// Implements Handler. Fails as the function does.
+		def serve(request Request) !Message {
+			return fn(request)
+		}
+	}
+
+	// Server answers DNS queries on one address over UDP and TCP, a task
+	// per query.
+	//
+	// ```
+	// let zone = new dns.Zone("example.test")
+	// try zone.add(dns.addressRecord("www.example.test", "192.0.2.1"))
+	// let server = new dns.Server("127.0.0.1:5353", zone)
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		// The address to bind, `host:port`; port 0 picks a free port that
+		// UDP and TCP share.
+		addr         string
+		handler      Handler
+		listenUDP    bool         = true
+		listenTCP    bool         = true
+		// The largest UDP response sent, whatever the client advertises.
+		udpSize      int          = defaultUDPSize
+		// How long a TCP connection may stay silent between queries.
+		idleTimeout  duration     = 10s
+		// How long one TCP read or write inside a message may take.
+		writeTimeout duration     = 5s
+		// Pad the response to a query that carries the Padding option to a
+		// multiple of this many bytes (RFC 8467 advises 468); 0 never pads.
+		// For servers behind an encrypted transport.
+		padding      int          = 0
+		// The TSIG keys clients may sign with (RFC 8945). A signed query is
+		// verified before the handler sees it, `Request.key` names its key,
+		// and the response is signed with it. A query signed with a key not
+		// listed, a signature that does not verify, a MAC shorter than the
+		// key's `macSize` and a time outside the fudge are answered NotAuth;
+		// a MAC whose length could never be a valid truncation is answered
+		// FormatError instead.
+		keys         TSIGKey[]    = []
+		// Called with every failure that is not sent to a client as such:
+		// a handler's error, an accept or a send that failed.
+		onError      ?def (error) = none
+
+		internal datagrams ?udp.Server      = none
+		internal streams   ?tcp.Server      = none
+		internal conns     net.Connection[] = []
+		internal running   bool             = false
+
+		def new(addr string, handler Handler) {
+			self.addr = addr
+			self.handler = handler
+		}
+
+		// start binds the address and serves in the background.
+		// Fails with PolicyDenied when the policy denies listening on
+		// `dns://addr`, and when the address cannot be bound.
+		def start() !none {
+			return none when running
+			try bind()
+			let sock = datagrams
+			if !(sock is none) {
+				let task = async serveDatagrams(sock)
+				task.keepAlive()
+			}
+			let listener = streams
+			if !(listener is none) {
+				let task = async serveStreams(listener)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// listenAndServe binds the address and serves until `close`.
+		// Fails as `start` does.
+		def listenAndServe() !none {
+			fail errorOf(ErrorKind.Closed, "server is already serving") when running
+			try bind()
+			let sock = datagrams
+			let listener = streams
+			if listener is none {
+				serveDatagrams(sock) unless sock is none
+				return none
+			}
+			if !(sock is none) {
+				let task = async serveDatagrams(sock)
+				task.keepAlive()
+			}
+			serveStreams(listener)
+			return none
+		}
+
+		// close stops serving and closes every TCP connection; a second
+		// call does nothing. Does not fail today.
+		atomic def close() !none {
+			return none unless running
+			running = false
+			let sock = datagrams
+			if !(sock is none) {
+				sock.close() onerror recover none
+			}
+			let listener = streams
+			if !(listener is none) {
+				listener.close() onerror recover none
+			}
+			for let (_, conn) in conns {
+				conn.close() onerror recover none
+			}
+			conns = []
+			datagrams = none
+			streams = none
+			return none
+		}
+
+		// address is the address the server is bound to, the chosen port
+		// included; the configured one before `start`.
+		def address() net.Address {
+			let sock = datagrams
+			return sock.address() unless sock is none
+			let listener = streams
+			return listener.address() unless listener is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// isRunning reports whether the server is bound and serving.
+		def isRunning() bool {
+			return running
+		}
+
+		// respond is the response the server sends for a query: the
+		// handler's, or the refusal the protocol asks for. Exposed so a
+		// handler can be exercised without sockets.
+		def respond(request Request) Message {
+			let query = request.message
+			let sig = query.tsig
+			return answerTo(request) when sig is none
+			let signer ?TSIGKey = none
+			for let (_, held) in keys {
+				signer = held when held.name == sig.keyName && held.algorithm.value == sig.algorithm
+			}
+			let fault = signer is none ?? (tsigBadKey, tsigFault(signer, query, [], [], false, none))
+			// A MAC whose length could never be a valid truncation is a
+			// format error, not a signature one (RFC 8945 §5.2.2.1): the
+			// query is answered as any other malformed message, without a
+			// TSIG record.
+			return query.reply(RCode.FormatError) when fault == tsigFormatError
+			if fault != 0 {
+				let refusal = query.reply(RCode.NotAuth)
+				refusal.tsig = TSIG{keyName: sig.keyName, algorithm: sig.algorithm, timeSigned: sig.timeSigned, fudge: sig.fudge, originalID: query.id, error: fault}
+				// A refusal over the time or over a MAC too short for this
+				// server's policy is signed (RFC 8945 §5.2, §5.3.2).
+				if fault == tsigBadTime || fault == tsigBadTruncation {
+					refusal.key = signer
+					refusal.requestMAC = sig.mac
+				}
+				return refusal
+			}
+			request.key = sig.keyName
+			let response = answerTo(request)
+			response.key = signer
+			response.requestMAC = sig.mac
+			return response
+		}
+
+		internal def answerTo(request Request) Message {
+			let query = request.message
+			let e = query.edns
+			return query.reply(RCode.BadVersion) when !(e is none) && e.version > 0
+			// A NOTIFY and a dynamic update go to the handler too: a
+			// `Secondary` takes the one, a `Zone` the other, every other
+			// handler of the module says NotImplemented itself.
+			return query.reply(RCode.NotImplemented) unless query.opcode := Opcode.Query || Opcode.Notify || Opcode.Update
+			return query.reply(RCode.FormatError) when query.questions.len() != 1
+			let failure ?error = none
+			let response ?Message = none
+			response = tryServe(request) onerror (err error) {
+				failure = err
+				recover none
+			}
+			report(failure) unless failure is none
+			return query.reply(RCode.ServerFailure) when response is none
+			response.id = query.id
+			response.response = true
+			response.edns = EDNS{} when response.edns is none && !(e is none)
+			response.edns = none when e is none
+			let own = response.edns
+			own.udpSize = udpSize unless own is none
+			if padding > 1 && query.isPadded() {
+				response.pad(padding) onerror recover none
+			}
+			return response
+		}
+
+		// `handler.serve` as an optional, so a failure can recover to none.
+		internal def tryServe(request Request) !?Message {
+			return try handler.serve(request)
+		}
+
+		internal def report(failure ?error) {
+			let hook = onError
+			return when hook is none
+			return when failure is none
+			hook(failure)
+		}
+
+		internal def bind() !none {
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "dns://" + addr)
+			let wanted = try net.parseAddress(addr)
+			for let attempt = 0; attempt < 8; attempt++ {
+				let bound = addr
+				if listenUDP {
+					let sock = new udp.Server(addr)
+					try sock.start()
+					datagrams = sock
+					bound = sock.address().str()
+				}
+				if listenTCP {
+					let listener = new tcp.Server(bound)
+					let failure ?error = none
+					listener.start() onerror (err error) {
+						failure = err
+						recover none
+					}
+					if !(failure is none) {
+						let sock = datagrams
+						if !(sock is none) {
+							sock.close() onerror recover none
+						}
+						datagrams = none
+						// The free UDP port is taken on TCP: pick another.
+						continue when wanted.port == 0 && listenUDP && failure is net.NetError && failure.kind == net.ErrorCode.AddrInUse
+						fail failure
+					}
+					streams = listener
+				}
+				running = true
+				return none
+			}
+			fail net.errorOf(net.ErrorCode.AddrInUse, "bind", addr, "no port is free on both UDP and TCP")
+		}
+
+		internal def serveDatagrams(sock udp.Server) {
+			let buf byte[] = []
+			buf.len(65535)
+			for running {
+				let failure ?error = none
+				let (n, from) = sock.recv(buf, 1s) onerror (err error) {
+					failure = err
+					recover (0, new net.Address())
+				}
+				if !(failure is none) {
+					break unless running
+					continue when failure is net.NetError && failure.kind == net.ErrorCode.TimedOut
+					break when failure is net.NetError && failure.kind == net.ErrorCode.Closed
+					report(failure)
+					time.sleep(5ms)
+					continue
+				}
+				continue when n < 12
+				let task = async answerDatagram(sock, buf[:n].clone(), from)
+				task.keepAlive()
+			}
+		}
+
+		internal def answerDatagram(sock udp.Server, data byte[], from net.Address) {
+			let outcome = answer(data, from, false)
+			return when outcome is none
+			let (response, limit) = outcome
+			let failure ?error = none
+			let wire = response.encode(limit) onerror (err error) {
+				failure = err
+				recover []
+			}
+			if failure is none {
+				sock.send(wire, from, writeTimeout) onerror (err error) {
+					failure = err
+					recover 0
+				}
+			}
+			report(failure) unless failure is none || !running
+		}
+
+		// answer decodes a query and is the response to send with the size
+		// it may have on the wire, none for bytes that deserve no response:
+		// a response, or a header that cannot be read. A query that does not
+		// decode past its header is answered with FormatError.
+		internal def answer(data byte[], from net.Address, overTCP bool) ?(Message, int) {
+			return none when data.len() < 12
+			return none when (int(data[2]) & 0x80) != 0
+			let query ?Message = none
+			query = tryDecode(data) onerror recover none
+			if query is none {
+				let refusal = new Message()
+				refusal.id = int(data[0]) << 8 | int(data[1])
+				refusal.response = true
+				refusal.rcode = RCode.FormatError
+				return (refusal, overTCP ?? (65535, minUDPSize))
+			}
+			let response = respond(Request{message: query, remote: from, tcp: overTCP})
+			return (response, 65535) when overTCP
+			return (response, query.udpSize() < udpSize ?? (query.udpSize(), udpSize))
+		}
+
+		internal def serveStreams(listener tcp.Server) {
+			for running {
+				let failure ?error = none
+				let accepted ?net.Connection = none
+				accepted = tryAccept(listener) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					break unless running
+					break when failure is net.NetError && failure.kind == net.ErrorCode.Closed
+					report(failure)
+					time.sleep(5ms)
+					continue
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					break
+				}
+				track(accepted)
+				let task = async serveConnection(accepted)
+				task.keepAlive()
+			}
+		}
+
+		// `accept` as an optional, so a failure can recover to none.
+		internal def tryAccept(listener tcp.Server) !?net.Connection {
+			return try listener.accept()
+		}
+
+		internal def serveConnection(conn net.Connection) {
+			serveStream(conn, conn.remoteAddr())
+			untrack(conn)
+		}
+
+		// serveStream answers the queries that arrive on the stream, framed
+		// as over TCP, until the peer closes it, it stays silent for
+		// `idleTimeout` or a send fails, then closes it. The server need not
+		// be started: a transport of its own, such as DNS over TLS, hands
+		// each connection it accepted here.
+		def serveStream(stream net.Stream, remote net.Address) {
+			for stream.isOpen() {
+				let frame ?byte[] = none
+				let failed = false
+				frame = readFrame(stream, idleTimeout, writeTimeout) onerror (err error) {
+					failed = true
+					recover none
+				}
+				break when failed
+				break when frame is none
+				let outcome = answer(frame, remote, true)
+				break when outcome is none
+				let (response, _) = outcome
+				let failure ?error = none
+				let frames = transferFrames(response) onerror (err error) {
+					failure = err
+					recover []
+				}
+				for let (_, wire) in frames {
+					break unless failure is none
+					writeFrame(stream, wire, writeTimeout) onerror (err error) {
+						failure = err
+						recover none
+					}
+				}
+				if !(failure is none) {
+					report(failure)
+					break
+				}
+			}
+			stream.close() onerror recover none
+		}
+
+		internal atomic def track(conn net.Connection) {
+			conns.push(conn)
+		}
+
+		internal atomic def untrack(conn net.Connection) {
+			let at = conns.indexOf(conn)
+			conns = conns.remove(at) when at >= 0
+		}
+
+		// Closes the server when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+
+	// transferFrames is the response as the messages TCP carries it in: one,
+	// but for the answer to a zone transfer, whose records go into as many
+	// messages as they need (RFC 5936 §2.2), each repeating the question.
+	// Fails as `Message.encode` does, and with Malformed on a record that
+	// fills a message on its own.
+	internal def transferFrames(response Message) !byte[][] {
+		let question = response.question()
+		let whole = question is none || !(question.kind := RecordType.AXFR || RecordType.IXFR) || response.rcode != RCode.Success
+		return [try response.encode()] when whole
+		let frames byte[][]
+		let records = response.answers
+		// Every message of a signed transfer is signed, each over the MAC
+		// of the one before (RFC 8945 §5.3.1).
+		let signer = response.key
+		let prior = response.requestMAC
+		let limit = signer is none ?? (65535, 65535 - signer.name.len() - signer.algorithm.value.len() - 96)
+		let part = response.reply()
+		part.authoritative = response.authoritative
+		part.edns = none
+		let sent = 0
+		for sent < records.len() {
+			part.answers = records[sent:]
+			let wire = try part.encode(limit)
+			let taken = int(wire[6]) << 8 | int(wire[7])
+			fail errorOf(ErrorKind.Malformed, "a record of the transfer does not fit in a message", records[sent].name) when taken == 0
+			// `encode` marks what it cut as truncated, which a part of a transfer is not.
+			wire[2] = byte(int(wire[2]) & 0xfd)
+			if !(signer is none) {
+				let (signedWire, made) = try sealed(signer, wire, prior, frames.len() > 0, none, 0)
+				wire = signedWire
+				prior = made.mac
+			}
+			frames.push(wire)
+			sent += taken
+		}
+		return frames
+	}
+
+	// Mux routes a query to the handler of the longest suffix of its name:
+	// zones a server is an authority for beside a forwarder for the rest.
+	//
+	// ```
+	// let mux = new dns.Mux()
+	// mux.handle("example.test", zone)
+	// mux.handle(".", new dns.Forwarder(new dns.Client(["1.1.1.1"])))
+	// ```
+	type Mux {
+		internal routes map<string, Handler> = map<string, Handler>{}
+
+		// handle sends the names at and below `suffix` to the handler;
+		// "." takes every name no longer suffix claims.
+		atomic def handle(suffix string, handler Handler) {
+			routes[canonicalName(suffix)] = handler
+		}
+
+		// handlerFor is the handler of the longest registered suffix of the
+		// name, none when there is none.
+		atomic def handlerFor(name string) ?Handler {
+			let rest = canonicalName(name)
+			for {
+				let found = routes.get(rest)
+				return found unless found is none
+				break when rest == "."
+				let dot = rest.indexOf(".")
+				rest = dot < 0 ?? (".", rest[dot + 1:])
+			}
+			return none
+		}
+
+		// Implements Handler: a name no suffix claims is Refused. A NOTIFY
+		// and a dynamic update are routed by their zone like a query.
+		// Fails as the chosen handler does.
+		def serve(request Request) !Message {
+			let question = request.message.question()
+			return request.message.reply(RCode.FormatError) when question is none
+			let chosen = handlerFor(question.name)
+			// The DS of a zone is data of its parent (RFC 4035 §3.1.4.1).
+			if question.kind == RecordType.DS && question.name != "." {
+				let labels = nameLabels(question.name)
+				let above = handlerFor(labels.len() > 1 ?? (labels[1:].join("."), "."))
+				chosen = above unless above is none
+			}
+			return request.message.reply(RCode.Refused) when chosen is none
+			return try chosen.serve(request)
+		}
+	}
 }

@@ -1,0 +1,603 @@
+partial module std.net.http {
+	use (
+		std.bytes
+		std.crypto
+		std.data.compress.gzip
+		std.data.encoding
+		std.net
+		std.time
+	)
+
+	// Handlers that answer by themselves.
+
+	// redirectHandler answers every request with a redirect to `target`,
+	// a URL or a path, and `status` (301, 302, 303, 307, 308).
+	def redirectHandler(target string, status int = 302) Handler {
+		return new HandlerFunc(def (ctx Context) !none {
+			return ctx.redirect(target, status)
+		})
+	}
+
+	// errorHandler answers every request with the status and message,
+	// `text/plain`.
+	def errorHandler(status int, message string = "") Handler {
+		return new HandlerFunc(def (ctx Context) !none {
+			return ctx.error(status, message)
+		})
+	}
+
+	// notFoundHandler answers 404.
+	def notFoundHandler() Handler {
+		return errorHandler(404)
+	}
+
+	// Handlers that wrap another handler.
+
+	// stripPrefix serves `h` with `prefix` removed from the request path
+	// (and raw path); 404 when the path does not start with it.
+	def stripPrefix(prefix string, h Handler) Handler {
+		return h when prefix == ""
+		return new HandlerFunc(def (ctx Context) !none {
+			let u = ctx.request.url
+			return ctx.notFound() unless u.path.startsWith(prefix)
+			let rest = u.path[prefix.len():]
+			rest = "/" + rest unless rest.startsWith("/")
+			u.path = rest
+			if u.rawPath != "" && u.rawPath.startsWith(prefix) {
+				let raw = u.rawPath[prefix.len():]
+				u.rawPath = raw.startsWith("/") ?? (raw, "/" + raw)
+			}
+			return h.serve(ctx)
+		})
+	}
+
+	// timeoutHandler runs `h` with `limit` on the whole request: past
+	// it, the client gets 503 with `message` (or a default page) and the
+	// handler's writer swallows what it writes later. The request's
+	// `deadline` is set so the handler can stop early.
+	def timeoutHandler(h Handler, limit duration, message string = "") Handler {
+		return new HandlerFunc(def (ctx Context) !none {
+			let req = ctx.request
+			let started = time.now()
+			let until = started + limit
+			let current = req.deadline
+			req.deadline = until when current is none || until.before(current)
+			let capture = new bytes.Buffer()
+			let inner = new Context(req, new ResponseWriter(req, capture))
+			inner.route = ctx.route
+			inner.server = ctx.server
+			inner.values = ctx.values
+			inner.authenticated = ctx.authenticated
+			inner.user = ctx.user
+			inner.session = ctx.session
+			let job = async h.serve(inner)
+			for {
+				break when job.done()
+				if time.now().after(until) {
+					req.cancel()
+					let text = message == "" ?? ("Timeout", message)
+					return ctx.error(503, text)
+				}
+				time.sleep(1ms)
+			}
+			try await job
+			try inner.response.end()
+			return try replay(ctx.response, capture.bytes())
+		})
+	}
+
+	// maxBytesHandler serves `h` with the request body capped at `n`
+	// bytes: a read past it fails with HttpError (op "body") and the
+	// server answers 413.
+	def maxBytesHandler(h Handler, n int) Handler {
+		return new HandlerFunc(def (ctx Context) !none {
+			ctx.request.limitBody(n)
+			return h.serve(ctx)
+		})
+	}
+
+	// allowQuerySemicolons serves `h` with `;` in the query rewritten to
+	// `&`, for clients that still separate parameters with semicolons.
+	def allowQuerySemicolons(h Handler) Handler {
+		return new HandlerFunc(def (ctx Context) !none {
+			let u = ctx.request.url
+			u.rawQuery = u.rawQuery.replace(";", "&") when u.rawQuery.contains(";")
+			return h.serve(ctx)
+		})
+	}
+
+	// replay copies a captured response (the wire form a `ResponseWriter`
+	// wrote into a buffer) onto the real writer: status, headers and
+	// body, reframed for the connection.
+	internal def replay(target ResponseWriter, recorded byte[]) !none {
+		return none when recorded.len() == 0
+		let res = try readResponse(new bytes.Reader(recorded), target.request)
+		for let key in res.headers.keys() {
+			continue when key := "Content-Length" || "Transfer-Encoding" || "Date" || "Connection"
+			for let value in res.headers.values(key) {
+				target.headers.add(key, value)
+			}
+		}
+		target.status = res.status
+		let body = try res.bytes()
+		try target.write(body)
+		return try target.end()
+	}
+
+	// Middleware for a mux or a group, each for `apply`.
+
+	// recoverer turns a handler failure into the `HttpError` status or a
+	// 500 (or leaves the response as it is when already committed) and
+	// reports it to the server's `onError`. The server does this for the
+	// top-level handler; use it inside a group to keep a failing route
+	// from taking a chain of middleware down with it.
+	def recoverer() Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			next.serve(ctx) onerror (err error) {
+				let srv = ctx.server
+				srv.report(err, ctx) unless srv is none
+				let (status, message) = failureStatus(err)
+				answerPlain(ctx, status, message)
+				recover none
+			}
+			return none
+		})
+	}
+
+	// errorJSON renders a handler failure as `{"error": message,
+	// "status": n}` with the `HttpError` status or 500, for a JSON API
+	// that never wants the plain-text error page.
+	def errorJSON() Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			next.serve(ctx) onerror (err error) {
+				let srv = ctx.server
+				srv.report(err, ctx) unless srv is none
+				let (status, message) = failureStatus(err)
+				answerJSON(ctx, status, message)
+				recover none
+			}
+			return none
+		})
+	}
+
+	// answerPlain sends the error page for a failure unless the response
+	// already went out.
+	internal def answerPlain(ctx Context, status int, message string) {
+		return when ctx.committed()
+		ctx.error(status, message) onerror recover none
+	}
+
+	// answerJSON sends `{"error": message, "status": n}` for a failure
+	// unless the response already went out.
+	internal def answerJSON(ctx Context, status int, message string) {
+		return when ctx.committed()
+		let text = message == "" ?? (statusText(status), message)
+		let body = ErrorReply{error: text, status: status}
+		ctx.json(status, body) onerror recover none
+	}
+
+	// ErrorReply is the JSON body `errorJSON` sends for a failure.
+	struct ErrorReply {
+		error  string
+		status int
+	}
+
+	// failureStatus is the status and message a handler failure maps to:
+	// the `HttpError` status and message from `abort`, 413 for a body
+	// past its limit, 500 with no message otherwise.
+	internal def failureStatus(err error) (int, string) {
+		if err is HttpError {
+			return (413, "") when err.code == "too-large"
+			return (err.status, err.message) when err.status > 0
+		}
+		return (500, "")
+	}
+
+	// requestID sets `request.id` from the incoming `X-Request-Id` (or
+	// `header`) when the client sent one, else a new random one, and
+	// echoes it in the response.
+	def requestID(header string = "X-Request-Id") Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let id = ctx.header(header).trim()
+			if id == "" || id.len() > 200 {
+				let fresh = new crypto.UUID()
+				id = fresh.str()
+			}
+			ctx.request.id = id
+			ctx.setHeader(header, id)
+			return next.serve(ctx)
+		})
+	}
+
+	// logger calls fn once the response is finished, with the context,
+	// the status, the body size and the elapsed time; the default fn
+	// writes one line per request to standard output in the common log
+	// format.
+	def logger(fn ?def(Context, int, int, duration) = none) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let started = time.now()
+			ctx.onFinish(def () {
+				let elapsed = time.since(started)
+				let status = ctx.response.status
+				let size = ctx.response.size()
+				if fn is none {
+					logLine(ctx, status, size, elapsed)
+				} else {
+					fn(ctx, status, size, elapsed)
+				}
+			})
+			return next.serve(ctx)
+		})
+	}
+
+	// logLine prints one common-log-format line.
+	internal def logLine(ctx Context, status int, size int, elapsed duration) {
+		let req = ctx.request
+		let user = "-"
+		let auth = req.basicAuth()
+		if !(auth is none) {
+			let (name, _) = auth
+			user = name
+		}
+		let stamp = time.now().str()
+		let client = ctx.clientAddr()
+		let method = requestMethodText(req)
+		let target = req.requestURI()
+		let millis = int(elapsed) / 1000000
+		println("{client} - {user} [{stamp}] \"{method} {target} {req.proto}\" {status} {size} {millis}ms")
+	}
+
+	// realIP sets `request.remote` from `X-Forwarded-For` or `X-Real-Ip`
+	// when the direct peer is one of `trusted` (addresses or CIDR
+	// blocks), so `clientAddr` and rate limits see the client, not the
+	// proxy.
+	def realIP(trusted ...string) Middleware {
+		let list = trusted
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let req = ctx.request
+			let peer = req.remote
+			return next.serve(ctx) when peer is none
+			return next.serve(ctx) unless addressTrusted(peer.host, list)
+			let forwarded = req.forwardedFor()
+			let client = ""
+			client = forwarded[0] when forwarded.len() > 0
+			client = req.header("X-Real-Ip").trim() when client == ""
+			return next.serve(ctx) when client == ""
+			let replaced = net.parseAddress(client.contains(":") && !client.startsWith("[") ?? ("[" + client + "]:0", client + ":0")) onerror recover peer
+			req.remote = replaced
+			return next.serve(ctx)
+		})
+	}
+
+	// addressTrusted reports whether host is one of the entries: an
+	// address, or an IPv4 CIDR block.
+	internal def addressTrusted(host string, trusted string[]) bool {
+		for let entry in trusted {
+			let want = entry.trim()
+			return true when want == host
+			continue unless want.contains("/")
+			return true when cidrContains(want, host)
+		}
+		return false
+	}
+
+	// cidrContains reports whether the IPv4 block (`10.0.0.0/8`) holds
+	// the address.
+	internal def cidrContains(block string, host string) bool {
+		let slash = block.indexOf("/")
+		return false when slash < 0
+		let bitsText = block[slash + 1:]
+		return false unless bitsText.isNumeric()
+		let bits = bitsText.toInt<int>()
+		return false when bits < 0 || bits > 32
+		let base = ipv4Value(block[:slash])
+		let addr = ipv4Value(host)
+		return false when base < 0 || addr < 0
+		return true when bits == 0
+		let shift = 32 - bits
+		return (base >> shift) == (addr >> shift)
+	}
+
+	// ipv4Value is the address as one integer, -1 when it is not dotted
+	// IPv4.
+	internal def ipv4Value(text string) int {
+		let parts = text.split(".")
+		return -1 when parts.len() != 4
+		let value = 0
+		for let part in parts {
+			return -1 unless part.isNumeric()
+			let n = part.toInt<int>()
+			return -1 when n < 0 || n > 255
+			value = value * 256 + n
+		}
+		return value
+	}
+
+	// CorsOptions configures `cors`.
+	struct CorsOptions {
+		// Origins allowed; "*" for any, or exact origins, or patterns
+		// with one `*` (`https://*.example.com`). Empty allows none.
+		origins        string[] = ["*"]
+		methods        string[] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+		// Request headers allowed in preflight; "*" for any.
+		headers        string[] = ["*"]
+		// Response headers the browser may read.
+		exposedHeaders string[] = []
+		// Send `Access-Control-Allow-Credentials`; then `origins` may
+		// not be "*".
+		credentials    bool     = false
+		// Preflight cache, `Access-Control-Max-Age`; 0s sends none.
+		maxAge         duration = 0s
+	}
+
+	// cors answers preflight `OPTIONS` requests and adds the
+	// `Access-Control-*` headers to the rest, per the options.
+	def cors(opts CorsOptions = CorsOptions{}) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let origin = ctx.header("Origin")
+			return next.serve(ctx) when origin == ""
+			ctx.addHeader("Vary", "Origin")
+			let allowed = originAllowed(origin, opts.origins)
+			return next.serve(ctx) unless allowed
+			// A wildcard with credentials is refused by browsers: echo the
+			// origin instead.
+			let echo = opts.credentials || !opts.origins.includes("*") ?? (origin, "*")
+			ctx.setHeader("Access-Control-Allow-Origin", echo)
+			ctx.setHeader("Access-Control-Allow-Credentials", "true") when opts.credentials
+			ctx.setHeader("Access-Control-Expose-Headers", opts.exposedHeaders.join(", ")) when opts.exposedHeaders.len() > 0
+			let preflight = ctx.method() == Method.OPTIONS && ctx.header("Access-Control-Request-Method") != ""
+			return next.serve(ctx) unless preflight
+			ctx.setHeader("Access-Control-Allow-Methods", opts.methods.join(", "))
+			let asked = ctx.header("Access-Control-Request-Headers")
+			if opts.headers.includes("*") {
+				ctx.setHeader("Access-Control-Allow-Headers", asked) when asked != ""
+			} else if opts.headers.len() > 0 {
+				ctx.setHeader("Access-Control-Allow-Headers", opts.headers.join(", "))
+			}
+			let maxAge = wholeSeconds(opts.maxAge)
+			ctx.setHeader("Access-Control-Max-Age", maxAge.str()) when maxAge > 0
+			return ctx.noContent(204)
+		})
+	}
+
+	// originAllowed matches an origin against the allowed list: "*",
+	// exact, or one wildcard in the host.
+	internal def originAllowed(origin string, allowed string[]) bool {
+		for let pattern in allowed {
+			return true when pattern == "*" || pattern == origin
+			let star = pattern.indexOf("*")
+			continue when star < 0
+			let head = pattern[:star]
+			let tail = pattern[star + 1:]
+			return true when origin.startsWith(head) && origin.endsWith(tail) && origin.len() >= head.len() + tail.len()
+		}
+		return false
+	}
+
+	// compress encodes the response body with gzip or deflate when the
+	// client accepts it, the content type is compressible (text, JSON,
+	// SVG, …) and the body is at least `minSize` bytes; adds `Vary:
+	// Accept-Encoding`. `level` is the deflate level, 1 to 9.
+	def compress(level int = 5, minSize int = 1024) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let req = ctx.request
+			// Only a client that asked for gzip gets it: with no
+			// `Accept-Encoding` at all the body goes out as it is.
+			return next.serve(ctx) when req.header("Accept-Encoding").trim() == ""
+			let encoding = req.acceptsEncoding("gzip")
+			return next.serve(ctx) when encoding is none
+			ctx.response.vary("Accept-Encoding")
+			let capture = new bytes.Buffer()
+			let inner = new Context(req, new ResponseWriter(req, capture))
+			inner.route = ctx.route
+			inner.server = ctx.server
+			inner.values = ctx.values
+			inner.authenticated = ctx.authenticated
+			inner.user = ctx.user
+			inner.session = ctx.session
+			try next.serve(inner)
+			try inner.response.end()
+			let recorded = capture.bytes()
+			return none when recorded.len() == 0
+			let res = try readResponse(new bytes.Reader(recorded), req)
+			let body = try res.bytes()
+			let mediaType = res.headers.get("Content-Type")
+			let eligible = body.len() >= minSize && !res.headers.has("Content-Encoding") && compressible(mediaType) && statusHasBody(res.status)
+			return try replay(ctx.response, recorded) unless eligible
+			let out = new bytes.Buffer()
+			let writer = new gzip.Writer(out, gzipLevel(level))
+			try writer.write(body)
+			try writer.close()
+			let target = ctx.response
+			for let key in res.headers.keys() {
+				continue when key := "Content-Length" || "Transfer-Encoding" || "Date" || "Connection"
+				for let value in res.headers.values(key) {
+					target.headers.add(key, value)
+				}
+			}
+			target.headers.set("Content-Encoding", "gzip")
+			target.headers.del("ETag")
+			target.status = res.status
+			try target.write(out.bytes())
+			return try target.end()
+		})
+	}
+
+	// gzipLevel maps a 1 to 9 level onto the gzip writer's enum.
+	internal def gzipLevel(level int) gzip.Level {
+		return gzip.Level.BestSpeed when level <= 1
+		return gzip.Level.BestCompression when level >= 9
+		return gzip.Level.DefaultCompression
+	}
+
+	// compressible reports whether a content type is worth encoding:
+	// text, JSON, XML, JavaScript, SVG and the like.
+	internal def compressible(contentType string) bool {
+		let essence = contentType.lower()
+		let semi = essence.indexOf(";")
+		essence = essence[:semi].trim() when semi >= 0
+		return true when essence.startsWith("text/")
+		return true when essence.endsWith("+json") || essence.endsWith("+xml")
+		return true when essence := "application/json" || "application/xml" || "application/javascript" || "application/x-javascript" || "application/ecmascript" || "image/svg+xml" || "application/wasm" || "application/x-www-form-urlencoded"
+		return false
+	}
+
+	// basicAuth challenges with `realm` and lets the request through when
+	// `verify(user, password)` returns a principal: it becomes `ctx.user`
+	// and `ctx.authenticated` is set. 401 otherwise.
+	def basicAuth(realm string, verify def(string, string) ?any) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let credentials = ctx.request.basicAuth()
+			if !(credentials is none) {
+				let (user, password) = credentials
+				let principal = verify(user, password)
+				if !(principal is none) {
+					ctx.user = principal
+					ctx.authenticated = true
+					return next.serve(ctx)
+				}
+			}
+			ctx.setHeader("WWW-Authenticate", "Basic realm=\"" + realm.replace("\"", "") + "\", charset=\"UTF-8\"")
+			return ctx.error(401)
+		})
+	}
+
+	// bearerAuth lets the request through when `verify(token)` returns a
+	// principal, which becomes `ctx.user` with `ctx.authenticated` set;
+	// 401 with `WWW-Authenticate: Bearer` otherwise.
+	def bearerAuth(verify def(string) ?any) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let token = ctx.request.bearerToken()
+			if !(token is none) {
+				let principal = verify(token)
+				if !(principal is none) {
+					ctx.user = principal
+					ctx.authenticated = true
+					return next.serve(ctx)
+				}
+			}
+			ctx.setHeader("WWW-Authenticate", "Bearer")
+			return ctx.error(401)
+		})
+	}
+
+	// sessions loads the session `load(ctx)` finds (from a cookie, a
+	// header) into `ctx.session` and marks the context authenticated
+	// when it returns one. The application owns the session type and
+	// the store; this middleware only plugs it in.
+	def sessions(load def(Context) !?Session) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let found = try load(ctx)
+			if !(found is none) {
+				ctx.session = found
+				ctx.authenticated = true
+			}
+			return next.serve(ctx)
+		})
+	}
+
+	// requireAuth answers 401 unless `ctx.authenticated` is set: put it
+	// on a group after `basicAuth`, `bearerAuth` or `sessions`.
+	def requireAuth() Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			return ctx.error(401) unless ctx.authenticated
+			return next.serve(ctx)
+		})
+	}
+
+	// rateLimit allows `limit` requests per `window` per key (the client
+	// address by default) with a sliding window; 429 with `Retry-After`
+	// past it.
+	def rateLimit(limit int, window duration, keyFn ?def(Context) string = none) Middleware {
+		let limiter = new RateLimiter(limit, window)
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let key = ""
+			if keyFn is none {
+				key = ctx.clientAddr()
+			} else {
+				key = keyFn(ctx)
+			}
+			let wait = limiter.take(key)
+			return next.serve(ctx) when wait <= 0s
+			let seconds = wholeSeconds(wait)
+			seconds = 1 when seconds < 1
+			ctx.setHeader("Retry-After", seconds.str())
+			return ctx.error(429)
+		})
+	}
+
+	// wholeSeconds is a duration in whole seconds, rounded down.
+	internal def wholeSeconds(d duration) int {
+		return int(d) / 1000000000
+	}
+
+	// RateLimiter counts requests per key inside a sliding window.
+	internal type RateLimiter {
+		limit  int
+		window duration
+		hits   map<string, time.Time[]>
+
+		def new(limit int, window duration) {
+			self.limit = limit
+			self.window = window
+			self.hits = {}
+		}
+
+		// Records a request under key and returns how long the caller
+		// must wait, 0s when it is allowed now.
+		atomic def take(key string) duration {
+			let now = time.now()
+			let start = now - window
+			let kept time.Time[] = []
+			let previous = hits.get(key)
+			if !(previous is none) {
+				for let t in previous {
+					kept.push(t) when t.after(start)
+				}
+			}
+			if kept.len() >= limit {
+				hits[key] = kept
+				return kept[0] + window - now
+			}
+			kept.push(now)
+			hits[key] = kept
+			// Keys that went quiet are dropped now and then.
+			if hits.len() > 10000 {
+				for let k in hits.keys() {
+					let entries = hits.get(k)
+					continue when entries is none
+					hits.delete(k) when entries.len() == 0 || !entries[entries.len() - 1].after(start)
+				}
+			}
+			return 0s
+		}
+	}
+
+	// timeout is `timeoutHandler` as middleware.
+	def timeout(limit duration, message string = "") Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			return timeoutHandler(next, limit, message).serve(ctx)
+		})
+	}
+
+	// maxBytes is `maxBytesHandler` as middleware.
+	def maxBytes(n int) Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			return maxBytesHandler(next, n).serve(ctx)
+		})
+	}
+
+	// secureHeaders adds the usual hardening headers when the response
+	// has none: `X-Content-Type-Options: nosniff`, `X-Frame-Options`,
+	// `Referrer-Policy`, and `Strict-Transport-Security` on TLS.
+	def secureHeaders() Middleware {
+		return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+			let headers = ctx.response.headers
+			headers.set("X-Content-Type-Options", "nosniff") unless headers.has("X-Content-Type-Options")
+			headers.set("X-Frame-Options", "SAMEORIGIN") unless headers.has("X-Frame-Options")
+			headers.set("Referrer-Policy", "strict-origin-when-cross-origin") unless headers.has("Referrer-Policy")
+			headers.set("Strict-Transport-Security", "max-age=63072000; includeSubDomains") when ctx.request.isSecure() && !headers.has("Strict-Transport-Security")
+			return next.serve(ctx)
+		})
+	}
+}

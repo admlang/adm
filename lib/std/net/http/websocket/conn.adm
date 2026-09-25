@@ -1,0 +1,661 @@
+partial module std.net.http.websocket {
+	use (
+		std.bytes
+		std.crypto::(rand)
+		std.data.compress.flate
+		std.data.encoding
+		std.io
+		std.net
+		std.time
+	)
+
+	// Message is one message as `messages` yields it.
+	struct Message {
+		kind MessageType
+		data byte[]
+	}
+
+	// Conn is one WebSocket connection over a stream, the socket or the
+	// TLS connection an HTTP upgrade handed over. Reads hand out whole
+	// messages, reassembled from fragments, with control frames answered
+	// on the way: a ping gets its pong, a close frame is echoed and then
+	// reported as a WebSocketError of kind Closed. Writes send one message
+	// per call; a client masks its frames. One task reads and one writes
+	// at a time; `close` may come from either.
+	type Conn {
+		stream                 net.Stream
+		isClient               bool
+		// Longest wait for a frame or a write; 0s is no limit.
+		readTimeout            duration   = 0s
+		writeTimeout           duration   = 10s
+		// Largest message accepted, fragments summed; a bigger one closes
+		// the connection with MessageTooBig.
+		maxMessageSize         int        = 32 * 1024 * 1024
+		// The subprotocol agreed on, "" for none.
+		subprotocol            string     = ""
+		// True when the handshake agreed on permessage-deflate: messages of
+		// 64 bytes and more go out compressed, each on its own, and the
+		// peer's compressed messages are accepted.
+		compression            bool       = false
+		// Context takeover, as the handshake agreed: this side's compressor
+		// keeps its history from message to message (small similar
+		// messages shrink to a few bytes), and the peer's does, so the
+		// last 32 KiB received stay at hand to decode the next message.
+		sendContextTakeover    bool       = false
+		receiveContextTakeover bool       = false
+		// The window this side compresses within, as the handshake agreed
+		// (`server_max_window_bits` on a server, `client_max_window_bits`
+		// on a client): no match reaches back more than 2^bits bytes.
+		sendWindowBits         int        = 15
+		// The payload of the last pong received, for a caller that pings.
+		lastPong               byte[]
+		// The peer's close frame, once received.
+		closeCode              int        = 0
+		closeReason            string     = ""
+
+		internal frames        FrameReader
+		internal closeSent     bool          = false
+		internal closed        bool          = false
+		internal peerClosed    bool          = false
+		// True while a read is blocked on the stream, so a close from
+		// another task does not start a second reader.
+		internal reading       bool          = false
+		// True when `close` ran while a read was blocked: that read is the
+		// one the peer's close frame reaches, so it closes the stream.
+		internal closePending  bool          = false
+		// The type of the message whose frames are arriving, none between
+		// its last frame and the next message's first.
+		internal pending       ?MessageType  = none
+		// The message being handed out: its type, whether it is not over
+		// yet, the payload of its current frame and how much of that was
+		// taken, whether that frame is its last, the bytes handed out so
+		// far, and the start of a UTF-8 sequence a text piece ended in.
+		internal inKind        MessageType   = MessageType.Binary
+		internal receiving     bool          = false
+		internal chunk         byte[]
+		internal chunkOffset   int           = 0
+		internal lastFrame     bool          = true
+		internal received      int           = 0
+		internal carry         byte[]
+		// True while the message handed out comes from `inflater`.
+		internal inflating     bool          = false
+		internal inflater      ?flate.Reader = none
+		// The end of what the peer's compressed messages decoded to, under
+		// `receiveContextTakeover`.
+		internal window        byte[]
+		// The compressor, reused across messages, what it produced and has
+		// not gone out yet, and whether the outgoing message is compressed
+		// and has its first frame on the wire.
+		internal deflater      ?flate.Writer = none
+		internal deflated      DeflateSink
+		internal outCompressed bool          = false
+		internal outStarted    bool          = false
+
+		// Over a stream, with the bytes the HTTP layer had already read
+		// past the upgrade response ahead of it.
+		def new(stream net.Stream, buffered io.Reader, isClient bool) {
+			self.stream = stream
+			self.isClient = isClient
+			frames = new FrameReader(new PrefixedStream(buffered, stream, self))
+			deflated = new DeflateSink()
+		}
+
+		// readMessage returns the next text or binary message. Fails with
+		// WebSocketError: Closed once the peer sent a close frame (after
+		// echoing it), Protocol when the peer broke the framing (after
+		// sending a ProtocolError close), TooLarge past `maxMessageSize`,
+		// NotOpen after `close`; NetError from the stream.
+		def readMessage() !(MessageType, byte[]) {
+			let message = try reader()
+			let data byte[]
+			let scratch byte[]
+			scratch.len(32 * 1024) when inflating
+			for {
+				if inflating {
+					let n = try readPart(scratch)
+					break when n == 0
+					data = data + scratch[0:n]
+					continue
+				}
+				if chunkOffset < chunk.len() {
+					let piece = chunkOffset == 0 ?? (chunk, chunk[chunkOffset:])
+					chunkOffset = chunk.len()
+					try account(piece)
+					data = data.len() == 0 ?? (piece, data + piece)
+					continue
+				}
+				if lastFrame {
+					try endMessage()
+					break
+				}
+				try nextData()
+			}
+			return (message.kind, data)
+		}
+
+		// reader waits for the next text or binary message and returns it as
+		// a reader, for a message too large to hold: frames are read as the
+		// reader is, except that a compressed message is received whole (its
+		// compressed form at most `maxMessageSize`) before its first byte is
+		// handed out. What an earlier reader left unread is skipped. Fails
+		// as readMessage does.
+		def reader() !MessageReader {
+			fail wsError(ErrorKind.NotOpen, "connection is closed") when closed
+			fail closedError(closeCode, closeReason) when peerClosed
+			let scratch byte[]
+			scratch.len(32 * 1024) when receiving
+			for receiving {
+				try readPart(scratch)
+			}
+			let first = try nextData()
+			inKind = first.opcode == opcodeText ?? (MessageType.Text, MessageType.Binary)
+			receiving = true
+			received = 0
+			carry = []
+			inflating = false
+			try inflate() when first.compressed
+			return new MessageReader(self, inKind)
+		}
+
+		// readPart reads more of the message `reader` returned into buf and
+		// returns how much, 0 at the end of the message. `MessageReader`
+		// wraps this. Fails as readMessage does.
+		def readPart(buf byte[]) !int {
+			return 0 when !receiving || buf.len() == 0
+			let n = try nextBytes(buf)
+			if n == 0 {
+				try endMessage()
+				return 0
+			}
+			try account(buf[0:n])
+			return n
+		}
+
+		// nextBytes copies what comes next in the message into buf, from
+		// the decompressor or from the frames, reading one when the current
+		// is used up. Returns 0 at the end of the message.
+		internal def nextBytes(buf byte[]) !int {
+			if inflating {
+				let source = inflater
+				fail wsError(ErrorKind.NotOpen, "no message in progress") when source is none
+				let n = source.read(buf) onerror recover -1
+				try failWith(wsError(ErrorKind.Protocol, "message is not valid DEFLATE data"), CloseCode.InvalidPayload) when n < 0
+				return n
+			}
+			for chunkOffset >= chunk.len() {
+				return 0 when lastFrame
+				try nextData()
+			}
+			let n = (chunk[chunkOffset:]).copy(buf)
+			chunkOffset += n
+			return n
+		}
+
+		// inflate receives the rest of a compressed message and points the
+		// decompressor at it. Fails with TooLarge when the compressed form
+		// alone passes the limit.
+		internal def inflate() !none {
+			let raw = chunk
+			for !lastFrame {
+				try nextData()
+				raw = raw + chunk
+				try failWith(wsError(ErrorKind.TooLarge, "message exceeds {maxMessageSize} bytes"), CloseCode.MessageTooBig) when raw.len() > maxMessageSize
+			}
+			chunk = []
+			chunkOffset = 0
+			let source = new bytes.Reader(raw + deflateTail)
+			let existing = inflater
+			let history byte[] = receiveContextTakeover ?? (window, [])
+			if existing is none {
+				inflater = new flate.Reader(source, history)
+			} else {
+				existing.reset(source, history)
+			}
+			inflating = true
+			return none
+		}
+
+		// account counts a piece of the message against the limit and, for
+		// text, validates it as UTF-8 up to its last whole character. Fails
+		// with TooLarge or Protocol after sending the close frame for it.
+		internal def account(piece byte[]) !none {
+			received += piece.len()
+			remember(piece) when inflating && receiveContextTakeover
+			try failWith(wsError(ErrorKind.TooLarge, "message exceeds {maxMessageSize} bytes"), CloseCode.MessageTooBig) when received > maxMessageSize
+			return none when inKind != MessageType.Text
+			let text = carry.len() == 0 ?? (piece, carry + piece)
+			let tail = incompleteTail(text)
+			let whole = tail == 0 ?? (text, text[0:text.len() - tail])
+			try failWith(wsError(ErrorKind.Protocol, "text message is not UTF-8"), CloseCode.InvalidPayload) unless string(whole).isUTF8()
+			carry = text[text.len() - tail:].clone()
+			return none
+		}
+
+		// remember keeps the last `deflateWindow` bytes decoded, which the
+		// peer's next message may refer back to.
+		internal def remember(piece byte[]) {
+			let joined = window + piece
+			window = joined.len() > deflateWindow ?? (joined[joined.len() - deflateWindow:].clone(), joined)
+		}
+
+		// endMessage closes the message handed out. Fails with Protocol
+		// when text ended inside a UTF-8 sequence.
+		internal def endMessage() !none {
+			receiving = false
+			inflating = false
+			try failWith(wsError(ErrorKind.Protocol, "text message is not UTF-8"), CloseCode.InvalidPayload) when carry.len() > 0
+			return none
+		}
+
+		// nextData reads frames up to the next data frame, which becomes the
+		// current one, answering control frames on the way. Fails as
+		// readMessage does.
+		internal def nextData() !Frame {
+			fail wsError(ErrorKind.NotOpen, "connection is closed") when closed
+			reading = true
+			let frame = readData() onerror (err error) {
+				reading = false
+				finishPendingClose()
+				fail err
+			}
+			reading = false
+			finishPendingClose()
+			chunk = frame.payload
+			chunkOffset = 0
+			lastFrame = frame.fin
+			return frame
+		}
+
+		// finishPendingClose closes the stream on behalf of a `close` that
+		// ran while this task was reading.
+		internal def finishPendingClose() {
+			return unless closePending
+			closePending = false
+			closed = true
+			stream.close() onerror recover none
+		}
+
+		// readData reads frames until a data frame, checked against the
+		// message in progress. Fails with Protocol for a frame masked the
+		// wrong way, a continuation without a start or a start inside a
+		// message.
+		internal def readData() !Frame {
+			frames.allowCompressed = compression
+			for {
+				let frame = frames.next() onerror (err error) {
+					try failProtocol(err)
+					fail err
+				}
+				if isControl(frame.opcode) {
+					try handleControl(frame)
+					continue
+				}
+				try failWith(wsError(ErrorKind.Protocol, "client frame is not masked"), CloseCode.ProtocolError) when !isClient && !frame.masked
+				try failWith(wsError(ErrorKind.Protocol, "server frame is masked"), CloseCode.ProtocolError) when isClient && frame.masked
+				let current = pending
+				if frame.opcode == opcodeContinuation {
+					try failWith(wsError(ErrorKind.Protocol, "continuation frame without a message"), CloseCode.ProtocolError) when current is none
+				} else {
+					try failWith(wsError(ErrorKind.Protocol, "new message inside a fragmented one"), CloseCode.ProtocolError) unless current is none
+					pending = frame.opcode == opcodeText ?? (MessageType.Text, MessageType.Binary)
+				}
+				pending = none when frame.fin
+				return frame
+			}
+			fail wsError(ErrorKind.NotOpen, "unreachable")
+		}
+
+		// readText is `readMessage` for a text message. Fails as it does,
+		// and with Protocol when the message is binary.
+		def readText() !string {
+			let (kind, data) = try readMessage()
+			fail wsError(ErrorKind.Protocol, "expected a text message, got binary") when kind != MessageType.Text
+			return string(data)
+		}
+
+		// readJSON reads a text message and decodes it into target. Fails
+		// as readMessage does, and when the text is not JSON for target.
+		def readJSON(target any) !none {
+			let text = try readText()
+			let codec = new encoding.JSON()
+			return try codec.decode(text, target)
+		}
+
+		// messages iterates over the messages until the peer closes or the
+		// connection fails; `lastError` then says which, none for a clean
+		// close.
+		//
+		//     for let msg in conn.messages() {
+		//         try conn.writeMessage(msg.kind, msg.data)
+		//     }
+		def messages() Messages {
+			return new Messages(self)
+		}
+
+		// writeJSON sends a value as a text message. Fails as writeMessage
+		// does.
+		def writeJSON(value any) !none {
+			let codec = new encoding.JSON()
+			return try writeMessage(MessageType.Text, codec.encode(value))
+		}
+
+		// writeMessage sends one message of the type in a single frame.
+		// Fails with WebSocketError NotOpen after `close`, NetError from the
+		// stream.
+		def writeMessage(kind MessageType, data byte[]) !none {
+			let first = true
+			let fin = true
+			return try writeFragment(kind, first, fin, data)
+		}
+
+		// writeText sends a text message. Fails as writeMessage does.
+		def writeText(text string) !none {
+			return try writeMessage(MessageType.Text, text.bytes())
+		}
+
+		// writeBinary sends a binary message. Fails as writeMessage does.
+		def writeBinary(data byte[]) !none {
+			return try writeMessage(MessageType.Binary, data)
+		}
+
+		// writer starts a message sent in fragments: every `write` goes
+		// out as a frame, `close` ends the message. Nothing else may be
+		// written until then.
+		def writer(kind MessageType) MessageWriter {
+			return new MessageWriter(self, kind)
+		}
+
+		// writeFragment sends one frame of a fragmented message: the first
+		// carries the type, later ones are continuations, the last has
+		// `fin` set. `writer` wraps this. Fails as writeMessage does.
+		def writeFragment(kind MessageType, first bool, fin bool, data byte[]) !none {
+			fail wsError(ErrorKind.NotOpen, "connection is closed") when closed || closeSent
+			// With the context kept a short message shrinks too; an empty one
+			// has nothing to gain either way.
+			let least = sendContextTakeover ?? (1, compressMin)
+			outCompressed = compression && !(fin && data.len() < least) when first
+			return try sendDeflated(first, fin, int(kind), data) when outCompressed
+			return try sendFrame(fin, first ?? (int(kind), opcodeContinuation), data)
+		}
+
+		// ping sends a ping with up to 125 bytes of payload; the pong lands
+		// in `lastPong` when a later read meets it. Fails as writeMessage
+		// does.
+		def ping(data byte[] = []) !none {
+			fail wsError(ErrorKind.NotOpen, "connection is closed") when closed || closeSent
+			return try send(opcodePing, data[0:maxControlPayload]) when data.len() > maxControlPayload
+			return try send(opcodePing, data)
+		}
+
+		// close performs the closing handshake: sends a close frame with
+		// the code and reason, waits up to five seconds for the peer's
+		// close frame unless it came already, then closes the stream. When
+		// another task is blocked in a read, that read meets the peer's
+		// close frame and closes the stream instead. A second call does
+		// nothing. Fails only when
+		// the stream refuses to close; a peer that never answers is not a
+		// failure.
+		def close(code CloseCode = CloseCode.Normal, reason string = "") !none {
+			return try closeWith(int(code), reason)
+		}
+
+		// closeWith is `close` with any code, for the application codes
+		// 3000 to 4999. Fails as close does.
+		def closeWith(code int, reason string = "") !none {
+			return none when closed
+			if !closeSent {
+				closeSent = true
+				send(opcodeClose, encodeClose(code, reason)) onerror recover none
+			}
+			if reading {
+				closePending = true
+				return none
+			}
+			awaitPeerClose() unless peerClosed
+			closed = true
+			return try stream.close()
+		}
+
+		// isOpen reports whether close was not called yet and the peer has
+		// not closed.
+		def isOpen() bool {
+			return !closed && !closePending && !peerClosed
+		}
+
+		// Closes the stream when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// awaitPeerClose reads frames for up to five seconds until the
+		// peer's close frame, dropping data on the floor.
+		internal def awaitPeerClose() {
+			let saved = readTimeout
+			readTimeout = 5s
+			for !peerClosed {
+				let frame = frames.next() onerror (err error) {
+					peerClosed = true
+					recover Frame{fin: true, opcode: opcodePong, masked: false, payload: []}
+				}
+				if frame.opcode == opcodeClose {
+					peerClosed = true
+					let (code, reason) = decodeClose(frame.payload) onerror recover (int(CloseCode.ProtocolError), "")
+					closeCode = code
+					closeReason = reason
+				}
+			}
+			readTimeout = saved
+		}
+
+		// handleControl answers a control frame: pong for ping, records a
+		// pong, echoes a close and reports it.
+		internal def handleControl(frame Frame) !none {
+			switch {
+				case frame.opcode == opcodePing:
+					send(opcodePong, frame.payload) onerror recover none
+				case frame.opcode == opcodePong:
+					lastPong = frame.payload
+				case frame.opcode == opcodeClose:
+					let (code, reason) = decodeClose(frame.payload) onerror (err error) {
+						try failProtocol(err)
+						fail err
+					}
+					peerClosed = true
+					closeCode = code
+					closeReason = reason
+					if !closeSent {
+						closeSent = true
+						let echo = code == int(CloseCode.NoStatus) ?? ([], encodeClose(code, ""))
+						send(opcodeClose, echo) onerror recover none
+					}
+					fail closedError(code, reason)
+			}
+			return none
+		}
+
+		// failProtocol sends the close frame a frame reader's failure
+		// deserves and marks the peer gone; a stream failure passes as is.
+		internal def failProtocol(err error) !none {
+			return none unless err is WebSocketError
+			let code = err.kind == ErrorKind.TooLarge ?? (CloseCode.MessageTooBig, CloseCode.ProtocolError)
+			return try failWith(err, code) when err.kind := ErrorKind.Protocol || ErrorKind.TooLarge
+			return none
+		}
+
+		// failWith sends a close frame with the code and fails with err.
+		internal def failWith(err WebSocketError, code CloseCode) !none {
+			if !closeSent {
+				closeSent = true
+				send(opcodeClose, encodeClose(int(code), err.message)) onerror recover none
+			}
+			fail err
+		}
+
+		// send writes one final frame, masked on a client.
+		internal def send(opcode int, payload byte[]) !none {
+			return try sendFrame(true, opcode, payload)
+		}
+
+		// sendFrame writes one frame, masked on a client, whole: writes
+		// from several tasks (a message and a pong, a ping from
+		// `keepAlive`) never interleave. Fails when the random source for
+		// the mask is unavailable or the stream fails.
+		internal atomic def sendFrame(fin bool, opcode int, payload byte[]) !none {
+			return try emit(fin, opcode, payload, false)
+		}
+
+		// sendDeflated compresses one fragment of a message and sends what
+		// the compressor has ready: nothing for a fragment it buffered
+		// whole, and on the last the flushed rest without the four bytes
+		// RFC 7692 leaves out. The first frame on the wire carries RSV1.
+		// Whole like sendFrame. Fails as it does.
+		internal atomic def sendDeflated(first bool, fin bool, opcode int, data byte[]) !none {
+			let existing = deflater
+			if existing is none {
+				// BestSpeed forgets its history on a short input, which is what
+				// context takeover is for.
+				let level = sendContextTakeover ?? (flate.Level.DefaultCompression, flate.Level.BestSpeed)
+				deflater = new flate.Writer(deflated, int(level), none, sendWindowBits)
+			} else if first && !sendContextTakeover {
+				existing.reset(deflated)
+			}
+			if first {
+				deflated.data = []
+				outStarted = false
+			}
+			let packer = deflater
+			fail wsError(ErrorKind.NotOpen, "no compressor") when packer is none
+			try packer.write(data) when data.len() > 0
+			try packer.flush() when fin
+			let ready = deflated.data
+			deflated.data = []
+			return none when !fin && ready.len() == 0
+			ready = ready[0:ready.len() - 4] when fin && ready.len() >= 4
+			try emit(fin, outStarted ?? (opcodeContinuation, opcode), ready,!outStarted)
+			outStarted = true
+			return none
+		}
+
+		// emit encodes and writes one frame, masked on a client.
+		internal def emit(fin bool, opcode int, payload byte[], compressed bool) !none {
+			let key byte[]
+			key = try rand(4) when isClient
+			let encoded = encodeFrame(fin, opcode, payload, key, compressed)
+			let written = 0
+			for written < encoded.len() {
+				let n = try stream.write(encoded[written:], waitFor(writeTimeout))
+				fail wsError(ErrorKind.NotOpen, "stream wrote nothing") when n <= 0
+				written += n
+			}
+			return none
+		}
+	}
+
+	// Messages iterates a connection's messages for `for`, ending at the
+	// peer's close or a failure, which `lastError` keeps (none after a
+	// clean close).
+	type Messages {
+		conn      Conn
+		lastError ?error = none
+
+		def new(conn Conn) {
+			self.conn = conn
+		}
+
+		// Implements Iterator<Message>.
+		def iterate() ?Message {
+			let failure ?error = none
+			let (kind, data) = conn.readMessage() onerror (err error) {
+				failure = err
+				recover (MessageType.Binary, [])
+			}
+			return Message{kind: kind, data: data} when failure is none
+			lastError = failure
+			if failure is WebSocketError && failure.kind == ErrorKind.Closed {
+				let clean = failure.closeCode := int(CloseCode.Normal) || int(CloseCode.NoStatus) || int(CloseCode.GoingAway)
+				lastError = none when clean
+			}
+			return none
+		}
+	}
+
+	// MessageReader hands out one incoming message piece by piece, as
+	// `Conn.reader` returned it; `kind` says whether it is text, which is
+	// validated as UTF-8 on the way. It is good until the connection's
+	// next `reader` or `readMessage`. Implements std.io.Reader. Fails as
+	// Conn.readMessage does.
+	type MessageReader {
+		conn Conn
+		kind MessageType
+
+		def new(conn Conn, kind MessageType) {
+			self.conn = conn
+			self.kind = kind
+		}
+
+		// read copies more of the message into buf and returns how much, 0
+		// at the end of the message. Fails as Conn.readMessage does.
+		def read(buf byte[]) !int {
+			return try conn.readPart(buf)
+		}
+	}
+
+	// MessageWriter sends one message as a sequence of frames: the first
+	// carries the message type, the rest are continuations, and `close`
+	// sends the final one (empty when nothing is pending). Implements
+	// std.io.Writer. Fails as Conn.writeMessage does.
+	type MessageWriter {
+		conn    Conn
+		kind    MessageType
+		started bool        = false
+		ended   bool        = false
+
+		def new(conn Conn, kind MessageType) {
+			self.conn = conn
+			self.kind = kind
+		}
+
+		// write sends the bytes as one non-final frame and returns their
+		// count. Fails after close, or as the connection's writes do.
+		def write(data byte[]) !int {
+			fail wsError(ErrorKind.NotOpen, "message writer is closed") when ended
+			try conn.writeFragment(kind,!started, false, data)
+			started = true
+			return data.len()
+		}
+
+		// close sends the final frame of the message. Fails as write does.
+		def close() !none {
+			return none when ended
+			ended = true
+			return try conn.writeFragment(kind,!started, true, [])
+		}
+	}
+
+	// PrefixedStream reads the bytes the HTTP layer had buffered before
+	// the stream itself, with the connection's read timeout. Implements
+	// std.io.Reader.
+	internal type PrefixedStream {
+		prefix     io.Reader
+		stream     net.Stream
+		weak owner ?Conn
+		drained    bool       = false
+
+		def new(prefix io.Reader, stream net.Stream, owner Conn) {
+			self.prefix = prefix
+			self.stream = stream
+			self.owner = owner
+		}
+
+		def read(buf byte[]) !int {
+			if !drained {
+				let n = try prefix.read(buf)
+				return n when n > 0
+				drained = true
+			}
+			let conn = owner
+			let timeout = conn is none ?? (0s, conn.readTimeout)
+			return try stream.read(buf, waitFor(timeout))
+		}
+	}
+}

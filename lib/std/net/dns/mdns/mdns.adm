@@ -1,0 +1,227 @@
+// Multicast DNS (RFC 6762) and DNS service discovery over it (RFC 6763):
+// the names under `.local` and the services of the local link, asked of
+// every host at once instead of a server. `std.net.dns` already resolves
+// a `.local` host name; this module asks for any record, browses for
+// services and, with a `Responder`, answers for the host's own.
+//
+// ```
+// for let (_, printer) in try mdns.browse("_ipp._tcp") {
+//     println("{printer.name} at {printer.host}:{printer.port}")
+// }
+//
+// let responder = new mdns.Responder("kitchen-display")
+// responder.add(mdns.Service{name: "Kitchen display", kind: "_http._tcp", port: 8080})
+// try responder.start()
+// ```
+//
+// IPv4 only: the group is 224.0.0.251, port 5353.
+
+partial module std.net.dns.mdns {
+	use (
+		std.net
+		std.net.dns
+		std.services::(Network)
+		std.time
+	)
+
+	// The name every browsable service type is listed under (RFC 6763 §9).
+	const serviceTypes = "_services._dns-sd._udp.local"
+
+	// Service is one instance of a service on the link (RFC 6763): a
+	// printer, a web page, a share.
+	struct Service {
+		// What a person calls it: "Office printer". Any text, dots included.
+		name      string
+		// The service type with its protocol: `_ipp._tcp`, `_http._tcp`.
+		kind      string
+		port      int
+		// The host that offers it, as `name.local`; a `Responder` fills in
+		// its own for a service it announces.
+		host      string   = ""
+		// The `key=value` strings of the TXT record.
+		text      string[] = []
+		// The addresses of `host`, filled in by `browse`.
+		addresses string[] = []
+	}
+
+	// instanceName is the DNS name of a service instance: the instance as
+	// one label, dots and backslashes escaped, under the type and `local`.
+	def instanceName(entry Service) string {
+		let label = entry.name.replace("\\", "\\\\").replace(".", "\\.")
+		return "{label}.{typeName(entry.kind)}"
+	}
+
+	// typeName is the DNS name of a service type: `_ipp._tcp.local`.
+	internal def typeName(kind string) string {
+		let bare = dns.canonicalName(kind)
+		return dns.isLocalName(bare) ?? (bare, bare + ".local")
+	}
+
+	// query asks the link for the records of a name and collects what every
+	// host answers within `wait`; a record several hosts send comes once.
+	// The name is taken as it is, so a host name needs its `.local`.
+	// An empty list means nobody answered.
+	// Fails with BadName when the name is not a domain name, with
+	// PolicyDenied when the policy denies the name as a host, and as the
+	// `Network` service does when the question cannot be sent.
+	def query(name string, kind dns.RecordType = dns.RecordType.A, wait duration = 1s) !dns.Record[] {
+		let found dns.Record[]
+		for let (_, message) in try ask(name, kind, wait) {
+			for let (_, r) in message.answers {
+				collect(found, r) when r.kind == kind || kind == dns.RecordType.ANY
+			}
+		}
+		return found
+	}
+
+	// browse lists the instances of a service type on the link, each with
+	// its host, port, TXT strings and addresses, as far as the hosts told
+	// within `wait`. Hosts send those along with the instance; what is
+	// missing after that is asked for once more.
+	// Fails as `query` does.
+	def browse(kind string, wait duration = 2s) !Service[] {
+		let seen dns.Record[]
+		for let (_, message) in try ask(typeName(kind), dns.RecordType.PTR, wait) {
+			for let (_, r) in message.answers {
+				collect(seen, r)
+			}
+			for let (_, r) in message.additionals {
+				collect(seen, r)
+			}
+		}
+		let out Service[]
+		let under = typeName(kind)
+		for let (_, pointer) in seen {
+			continue unless pointer.kind == dns.RecordType.PTR && dns.canonicalName(pointer.name) == under
+			let instance = pointer.target
+			if !holds(seen, instance, dns.RecordType.SRV) {
+				for let (_, r) in try query(instance, dns.RecordType.ANY, duration(int(wait) / 2)) {
+					collect(seen, r)
+				}
+			}
+			let entry = Service{name: instanceLabel(instance, under), kind: kind, port: 0}
+			for let (_, r) in seen {
+				continue unless sameName(r.name, instance)
+				if r.kind == dns.RecordType.SRV {
+					entry.host = r.target
+					entry.port = r.port
+				}
+				entry.text = r.text when r.kind == dns.RecordType.TXT
+			}
+			continue when entry.host == ""
+			if !holds(seen, entry.host, dns.RecordType.A) {
+				for let (_, r) in try query(entry.host, dns.RecordType.A, duration(int(wait) / 2)) {
+					collect(seen, r)
+				}
+			}
+			for let (_, r) in seen {
+				entry.addresses.push(r.address) when sameName(r.name, entry.host) && (r.kind := dns.RecordType.A || dns.RecordType.AAAA)
+			}
+			out.push(entry)
+		}
+		return out
+	}
+
+	// kinds lists the service types somebody on the link offers, as
+	// `_ipp._tcp`.
+	// Fails as `query` does.
+	def kinds(wait duration = 2s) !string[] {
+		let out string[]
+		for let (_, r) in try query(serviceTypes, dns.RecordType.PTR, wait) {
+			let kind = dns.canonicalName(r.target)
+			kind = kind[:kind.len() - 6] when kind.endsWith(".local")
+			out.push(kind) unless out.includes(kind)
+		}
+		return out
+	}
+
+	// ask sends one question with the unicast-response bit from a port of
+	// its own, again after a third of the wait, and returns every response
+	// that came until the wait was over.
+	internal def ask(name string, kind dns.RecordType, wait duration) !dns.Message[] {
+		let question = try dns.newQuery(name, kind)
+		question.id = 0
+		question.recursionDesired = false
+		question.questions[0].unicastResponse = true
+		let wire = try question.encode()
+		let fd = try Network.socketFd(net.SocketDomain.IPv4, net.SocketType.Datagram)
+		let out dns.Message[]
+		let failure ?error = none
+		let started = time.now()
+		let again = duration(int(wait) / 3)
+		let sent = 0
+		let buf byte[] = []
+		buf.len(9000)
+		for failure is none {
+			let spent = time.since(started)
+			break when spent >= wait
+			if sent == 0 || (sent == 1 && spent >= again) {
+				Network.sendToNameServer(fd, wire, dns.multicastServer, wait) onerror (err error) {
+					failure = err
+					recover 0
+				}
+				sent++
+				continue
+			}
+			let left = sent == 1 ?? (again - spent, wait - spent)
+			let quiet = false
+			let (n, _) = Network.recvFrom(fd, buf, left) onerror (err error) {
+				quiet = err.code == net.ErrorCode.TimedOut.value
+				failure = err unless quiet
+				recover (0, "")
+			}
+			continue when quiet || n == 0
+			let message = dns.decode(buf[:n]) onerror recover new dns.Message()
+			out.push(message) when message.response
+		}
+		Network.close(fd) onerror recover none
+		fail failure unless failure is none
+		return out
+	}
+
+	// collect adds a record unless the list has it already.
+	internal def collect(found dns.Record[], r dns.Record) {
+		for let (_, have) in found {
+			return when have.kind == r.kind && sameName(have.name, r.name) && have.rdata() == r.rdata()
+		}
+		found.push(r)
+	}
+
+	internal def holds(found dns.Record[], name string, kind dns.RecordType) bool {
+		for let (_, r) in found {
+			return true when r.kind == kind && sameName(r.name, name)
+		}
+		return false
+	}
+
+	internal def sameName(a string, b string) bool {
+		return dns.canonicalName(a) == dns.canonicalName(b)
+	}
+
+	// instanceLabel is what a person calls the instance: the first label of
+	// its name without the escapes.
+	internal def instanceLabel(instance string, under string) string {
+		let full = instance
+		full = full[:full.len() - 1] when full.endsWith(".") && !full.endsWith("\\.")
+		let label = full.len() > under.len() + 1 ?? (full[:full.len() - under.len() - 1], full)
+		// The text form of a name writes a dot and a backslash with a
+		// backslash before them, and other bytes as three decimal digits.
+		let raw = byte[](label)
+		let out byte[]
+		for let i = 0; i < raw.len(); i++ {
+			if int(raw[i]) != 92 || i + 1 >= raw.len() {
+				out.push(raw[i])
+				continue
+			}
+			let numbered = i + 3 < raw.len() && string(raw[i + 1:i + 4]).isNumeric()
+			if numbered {
+				out.push(byte(string(raw[i + 1:i + 4]).toInt<int>() & 0xff))
+				i += 3
+			} else {
+				out.push(raw[i + 1])
+				i++
+			}
+		}
+		return string(out)
+	}
+}

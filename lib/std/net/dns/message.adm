@@ -1,0 +1,491 @@
+partial module std.net.dns {
+	use std.crypto::(rand)
+
+	// The largest message a UDP datagram carries without EDNS(0).
+	const minUDPSize = 512
+
+	// The EDNS(0) payload size this module advertises, which stays under
+	// the path MTU nearly everywhere.
+	const defaultUDPSize = 1232
+
+	// Question is one entry of a message's question section.
+	struct Question {
+		name            string
+		kind            RecordType  = RecordType.A
+		// The wire value of the type when `kind` is `Unknown`.
+		code            int         = 0
+		class           RecordClass = RecordClass.IN
+		// The top bit of the class, which in multicast DNS asks for the
+		// answer by unicast (the QU bit, RFC 6762 §5.4).
+		unicastResponse bool        = false
+	}
+
+	// The code of the EDNS(0) Padding option (RFC 7830).
+	const paddingOption = 12
+
+	// EDNSOption is one option of the OPT record, such as a cookie.
+	struct EDNSOption {
+		code int
+		data byte[]
+	}
+
+	// EDNS is what the OPT pseudo record of EDNS(0) says about its sender.
+	struct EDNS {
+		// The largest UDP message the sender takes.
+		udpSize  int          = defaultUDPSize
+		version  int          = 0
+		// The sender wants DNSSEC records (the DO bit).
+		dnssecOK bool         = false
+		options  EDNSOption[] = []
+	}
+
+	// Message is a DNS query or response.
+	type Message {
+		// Pairs a response with its query; 0 to 65535.
+		id                 int        = 0
+		// False for a query, true for a response.
+		response           bool       = false
+		opcode             Opcode     = Opcode.Query
+		// The responding server is an authority for the name.
+		authoritative      bool       = false
+		// The message was cut to fit; ask again over TCP.
+		truncated          bool       = false
+		recursionDesired   bool       = false
+		recursionAvailable bool       = false
+		// The resolver verified the data with DNSSEC.
+		authenticData      bool       = false
+		// The resolver should not verify with DNSSEC.
+		checkingDisabled   bool       = false
+		rcode              RCode      = RCode.Success
+		questions          Question[] = []
+		answers            Record[]   = []
+		authorities        Record[]   = []
+		// The additional section, without the OPT record `edns` stands for.
+		additionals        Record[]   = []
+		// none when the sender does not speak EDNS(0).
+		edns               ?EDNS      = none
+		// The TSIG record a decoded message ended with, or the one `encode`
+		// signed it with; none for an unsigned message. It is not part of
+		// `additionals`.
+		tsig               ?TSIG      = none
+		// Set to have `encode` sign the message (RFC 8945).
+		key                ?TSIGKey   = none
+		// The MAC of the request, when this is the response to a signed one.
+		requestMAC         byte[]     = []
+		// What the TSIG record of a decoded message covers; empty for an
+		// unsigned one.
+		signedData         byte[]     = []
+
+		// question is the first question, none when there is none.
+		def question() ?Question {
+			return none when questions.len() == 0
+			return questions[0]
+		}
+
+		// reply starts the response to this query: the same id, opcode and
+		// questions, the recursion wish copied, and EDNS(0) when the query
+		// had it.
+		def reply(rcode RCode = RCode.Success) Message {
+			let out = new Message()
+			out.id = id
+			out.response = true
+			out.opcode = opcode
+			out.recursionDesired = recursionDesired
+			out.checkingDisabled = checkingDisabled
+			out.rcode = rcode
+			for let (_, q) in questions {
+				out.questions.push(q)
+			}
+			// The DO bit comes back as it was sent (RFC 3225 §3).
+			let asked = edns
+			out.edns = EDNS{dnssecOK: asked.dnssecOK} unless asked is none
+			return out
+		}
+
+		// pad sets the EDNS(0) Padding option (RFC 7830) so that the encoded
+		// message is a multiple of `block` bytes, which hides its length on
+		// an encrypted transport; RFC 8467 advises 128 for a query and 468
+		// for a response. EDNS is added when the message has none, and
+		// padding set before is replaced. A block under 2 removes it.
+		// Fails as `encode` does.
+		def pad(block int) !none {
+			let own = EDNS{}
+			let e = edns
+			own = e unless e is none
+			let kept EDNSOption[]
+			for let (_, option) in own.options {
+				kept.push(option) unless option.code == paddingOption
+			}
+			own.options = kept
+			return none when block < 2 && e is none
+			edns = own
+			return none when block < 2
+			let bare = (try encode()).len() + 4
+			let fill byte[] = []
+			fill.len((block - bare % block) % block)
+			own.options.push(EDNSOption{code: paddingOption, data: fill})
+			return none
+		}
+
+		// isPadded reports whether the message carries the Padding option.
+		def isPadded() bool {
+			let e = edns
+			return false when e is none
+			for let (_, option) in e.options {
+				return true when option.code == paddingOption
+			}
+			return false
+		}
+
+		// udpSize is the largest UDP message the sender takes: 512 without
+		// EDNS(0), else what it advertises, never under 512.
+		def udpSize() int {
+			let e = edns
+			return minUDPSize when e is none
+			return minUDPSize when e.udpSize < minUDPSize
+			return e.udpSize
+		}
+
+		// encode renders the message in wire form with name compression.
+		// Records that would take it over `limit` bytes are left out, and
+		// `truncated` is set on the wire when an answer or authority record
+		// was.
+		//
+		// A message with a `key` is signed: the TSIG record goes last and
+		// `tsig` holds it afterwards. A response whose `tsig` names an error
+		// and has no key carries that record unsigned, which is how a server
+		// refuses a signature.
+		//
+		// Fails with BadName on a name that is not one, with Malformed on
+		// record data its type cannot carry, on an id or count over 65535,
+		// on a response code over 15 without EDNS(0), and when the
+		// questions alone pass the limit.
+		def encode(limit int = 65535) !byte[] {
+			fail errorOf(ErrorKind.Malformed, "message id {id} is not 0 to 65535") when id < 0 || id > 0xffff
+			let e = edns
+			fail errorOf(ErrorKind.Malformed, "response code {rcode.name} needs EDNS") when rcode.value > 15 && e is none
+			let b = new Builder()
+			for let i = 0; i < 12; i++ {
+				b.u8(0)
+			}
+			for let (_, q) in questions {
+				try b.name(q.name, true)
+				b.u16(q.kind == RecordType.Unknown ?? (q.code, q.kind.value))
+				b.u16(q.unicastResponse ?? (q.class.value | 0x8000, q.class.value))
+			}
+			let reserve = 0
+			if !(e is none) {
+				reserve = 11
+				for let (_, option) in e.options {
+					reserve += 4 + option.data.len()
+				}
+			}
+			let signer = key
+			let said = tsig
+			// Room for the TSIG record: two names, the fixed fields, a MAC.
+			let room = signer is none ?? (0, signer.name.len() + signer.algorithm.value.len() + 96)
+			reserve += room
+			fail errorOf(ErrorKind.Malformed, "questions do not fit in {limit} bytes") when b.buf.len() + reserve > limit
+
+			let sections Record[][] = [answers, authorities, additionals]
+			let counts int[] = [0, 0, 0]
+			let cut = false
+			for let s = 0; s < 3; s++ {
+				for let (_, r) in sections[s] {
+					continue when r.kind == RecordType.OPT
+					let mark = b.buf.len()
+					try writeRecord(b, r)
+					if b.buf.len() + reserve > limit {
+						b.buf.len(mark)
+						cut = cut || s < 2
+						break
+					}
+					counts[s] = counts[s] + 1
+				}
+				break when cut
+			}
+			let extra = 0
+			if !(e is none) {
+				b.u8(0)
+				b.u16(RecordType.OPT.value)
+				b.u16(e.udpSize)
+				b.u8(rcode.value >> 4)
+				b.u8(e.version)
+				b.u16(e.dnssecOK ?? (0x8000, 0))
+				b.u16(reserve - room - 11)
+				for let (_, option) in e.options {
+					b.u16(option.code)
+					b.u16(option.data.len())
+					b.bytes(option.data)
+				}
+				extra = 1
+			}
+
+			let flags = (opcode.value & 0xf) << 11 | rcode.value & 0xf
+			flags |= 0x8000 when response
+			flags |= 0x0400 when authoritative
+			flags |= 0x0200 when truncated || cut
+			flags |= 0x0100 when recursionDesired
+			flags |= 0x0080 when recursionAvailable
+			flags |= 0x0020 when authenticData
+			flags |= 0x0010 when checkingDisabled
+			let header int[] = [id, flags, questions.len(), counts[0], counts[1], counts[2] + extra]
+			for let (i, v) in header {
+				fail errorOf(ErrorKind.Malformed, "a section has over 65535 entries") when v > 0xffff
+				b.buf[i * 2] = byte(v >> 8)
+				b.buf[i * 2 + 1] = byte(v & 0xff)
+			}
+			if !(signer is none) {
+				let fault = said is none ?? (0, said.error)
+				let (wire, made) = try sealed(signer, b.buf, requestMAC, false, none, fault)
+				tsig = made
+				return wire
+			}
+			return try withTSIG(b.buf, said) when response && !(said is none) && said.error != 0
+			return b.buf
+		}
+
+		// str renders the message the way `dig` prints one.
+		def str() string {
+			let out = ";; {opcode.name} {rcode.name} id {id}"
+			out += " qr" when response
+			out += " aa" when authoritative
+			out += " tc" when truncated
+			out += " rd" when recursionDesired
+			out += " ra" when recursionAvailable
+			for let (_, q) in questions {
+				out += "\n;{q.name}. {q.class.name} {q.kind.name}"
+			}
+			let sections Record[][] = [answers, authorities, additionals]
+			for let (_, section) in sections {
+				for let (_, r) in section {
+					out += "\n" + r.str()
+				}
+			}
+			return out
+		}
+	}
+
+	// newQuery is a recursive query for the name with a random id.
+	// Fails when the system's random source is unavailable.
+	def newQuery(name string, kind RecordType = RecordType.A, class RecordClass = RecordClass.IN) !Message {
+		let seed = try rand(2)
+		let m = new Message()
+		m.id = int(seed[0]) << 8 | int(seed[1])
+		m.recursionDesired = true
+		m.questions.push(Question{name: canonicalName(name), kind: kind, code: kind.value, class: class})
+		return m
+	}
+
+	// decode reads a message from wire form; names come out without the
+	// trailing dot, the root as ".". Bytes after the last record are
+	// ignored.
+	//
+	// Fails with Malformed when the message ends early, a compression
+	// pointer does not point backwards, a name passes 255 bytes or record
+	// data does not fill its declared length.
+	def decode(data byte[]) !Message {
+		let p = new Parser(data)
+		let m = new Message()
+		m.id = try p.u16()
+		let flags = try p.u16()
+		m.response = flags & 0x8000 != 0
+		m.opcode = opcodeOf((flags >> 11) & 0xf)
+		m.authoritative = flags & 0x0400 != 0
+		m.truncated = flags & 0x0200 != 0
+		m.recursionDesired = flags & 0x0100 != 0
+		m.recursionAvailable = flags & 0x0080 != 0
+		m.authenticData = flags & 0x0020 != 0
+		m.checkingDisabled = flags & 0x0010 != 0
+		let code = flags & 0xf
+		let questions = try p.u16()
+		let counts int[] = [try p.u16(), try p.u16(), try p.u16()]
+		for let i = 0; i < questions; i++ {
+			let name = try p.name()
+			let kind = try p.u16()
+			let class = try p.u16()
+			m.questions.push(Question{name: name, kind: recordTypeOf(kind), code: kind, class: recordClassOf(class & 0x7fff), unicastResponse: class & 0x8000 != 0})
+		}
+		for let s = 0; s < 3; s++ {
+			for let i = 0; i < counts[s]; i++ {
+				let mark = p.pos
+				let r = try readRecord(p)
+				if r.kind == RecordType.TSIG {
+					fail errorOf(ErrorKind.Malformed, "the TSIG record is not the last of the message", r.name) unless s == 2 && i == counts[2] - 1
+					let sig = try tsigOf(r)
+					m.tsig = sig
+					m.signedData = signedPart(data, mark, sig.originalID)
+					continue
+				}
+				if r.kind == RecordType.OPT {
+					m.edns = ednsOf(r)
+					code |= (r.weight >> 24 & 0xff) << 4
+					continue
+				}
+				match s {
+					case 0:
+						m.answers.push(r)
+					case 1:
+						m.authorities.push(r)
+					default:
+						m.additionals.push(r)
+				}
+			}
+		}
+		m.rcode = rcodeOf(code)
+		return m
+	}
+
+	// ednsOf reads the EDNS fields out of a decoded OPT record, which
+	// holds its class in `priority` and its TTL in `weight`. A broken
+	// option list gives the options read so far.
+	internal def ednsOf(r Record) EDNS {
+		let out = EDNS{udpSize: r.priority, version: r.weight >> 16 & 0xff, dnssecOK: r.weight & 0x8000 != 0}
+		let at = 0
+		for at + 4 <= r.data.len() {
+			let code = int(r.data[at]) << 8 | int(r.data[at + 1])
+			let size = int(r.data[at + 2]) << 8 | int(r.data[at + 3])
+			break when at + 4 + size > r.data.len()
+			out.options.push(EDNSOption{code: code, data: r.data[at + 4:at + 4 + size].clone()})
+			at += 4 + size
+		}
+		return out
+	}
+
+	// Builder assembles a message, remembering where each name suffix went
+	// for compression.
+	internal type Builder {
+		buf       byte[]           = []
+		offsets   map<string, int> = map<string, int>{}
+		// Write the canonical form DNSSEC signs (RFC 4034 §6.2): no name is
+		// compressed, and names are lower case unless `name` is told to keep
+		// their case.
+		canonical bool             = false
+
+		def u8(v int) {
+			buf.push(byte(v & 0xff))
+		}
+
+		def u16(v int) {
+			buf.push(byte(v >> 8 & 0xff))
+			buf.push(byte(v & 0xff))
+		}
+
+		def u32(v int) {
+			u16(v >> 16 & 0xffff)
+			u16(v & 0xffff)
+		}
+
+		def bytes(data byte[]) {
+			for let i = 0; i < data.len(); i++ {
+				buf.push(data[i])
+			}
+		}
+
+		// name appends the name, ending in a pointer to an earlier copy of
+		// its suffix when `compress` allows. `keepCase` spares the name the
+		// lower case of the canonical form. Fails as splitLabels does.
+		def name(text string, compress bool, keepCase bool = false) !none {
+			let labels = try splitLabels(text)
+			if canonical {
+				for let (_, label) in labels {
+					for let i = 0; i < label.len() && !keepCase; i++ {
+						label[i] = byte(int(label[i]) + 0x20) when label[i] >= byte(0x41) && label[i] <= byte(0x5a)
+					}
+					u8(label.len())
+					bytes(label)
+				}
+				u8(0)
+				return none
+			}
+			let keys string[]
+			for let (_, label) in labels {
+				keys.push(labelText(label).lower())
+			}
+			for let i = 0; i < labels.len(); i++ {
+				let key = keys[i:].join(".")
+				let seen = offsets.get(key)
+				if !(seen is none) && compress {
+					u16(0xc000 | seen)
+					return none
+				}
+				offsets[key] = buf.len() when seen is none && buf.len() < 0x4000
+				u8(labels[i].len())
+				bytes(labels[i])
+			}
+			u8(0)
+			return none
+		}
+	}
+
+	// Parser reads a message front to back.
+	internal type Parser {
+		data byte[]
+		pos  int    = 0
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		// bytes takes the next count bytes as a view of the message.
+		// Fails with Malformed when fewer are left; so do the readers below.
+		def bytes(count int) !byte[] {
+			fail errorOf(ErrorKind.Malformed, "message is truncated") when count < 0 || pos + count > data.len()
+			let out = data[pos:pos + count]
+			pos += count
+			return out
+		}
+
+		def u8() !int {
+			let b = try bytes(1)
+			return int(b[0])
+		}
+
+		def u16() !int {
+			let b = try bytes(2)
+			return int(b[0]) << 8 | int(b[1])
+		}
+
+		def u32() !int {
+			let b = try bytes(4)
+			return int(b[0]) << 24 | int(b[1]) << 16 | int(b[2]) << 8 | int(b[3])
+		}
+
+		// name reads a possibly compressed name into text form. Fails with
+		// Malformed on a pointer that does not point backwards, a reserved
+		// label type, or a name over 255 bytes.
+		def name() !string {
+			let out = ""
+			let at = pos
+			let jumped = false
+			let size = 1
+			for {
+				fail errorOf(ErrorKind.Malformed, "name runs past the message") when at >= data.len()
+				let c = int(data[at])
+				if c == 0 {
+					at++
+					break
+				}
+				if (c & 0xc0) == 0xc0 {
+					fail errorOf(ErrorKind.Malformed, "name runs past the message") when at + 1 >= data.len()
+					let target = (c & 0x3f) << 8 | int(data[at + 1])
+					fail errorOf(ErrorKind.Malformed, "compression pointer does not point backwards") when target >= at
+					pos = at + 2 unless jumped
+					jumped = true
+					at = target
+					continue
+				}
+				fail errorOf(ErrorKind.Malformed, "reserved label type") when (c & 0xc0) != 0
+				fail errorOf(ErrorKind.Malformed, "name runs past the message") when at + 1 + c > data.len()
+				size += c + 1
+				fail errorOf(ErrorKind.Malformed, "name is over 255 bytes") when size > 255
+				out += "." when out != ""
+				out += labelText(data[at + 1:at + 1 + c])
+				at += 1 + c
+			}
+			pos = at unless jumped
+			return "." when out == ""
+			return out
+		}
+	}
+}

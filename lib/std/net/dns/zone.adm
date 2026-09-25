@@ -1,0 +1,1055 @@
+partial module std.net.dns {
+	use (
+		std.crypto.x509::(parseIPText)
+		std.net
+	)
+
+	// Zone is an in-memory zone a server is the authority for. It answers
+	// from its records with aliases followed inside the zone, a wildcard
+	// (`*.example.test`) standing in for names that do not exist, the SOA
+	// record in the authority section of a negative answer, and the
+	// addresses of NS, MX and SRV targets in the additional section.
+	// Names outside the origin are Refused.
+	//
+	// A zone transfer (AXFR, RFC 5936) is answered over TCP to the clients
+	// `allowTransfer` lists; `parseZone` and `readZone` read a zone file,
+	// `str` writes one.
+	//
+	// A dynamic update (RFC 2136, `Update`) is taken over TCP from the
+	// clients `allowUpdate` lists: its prerequisites are checked and its
+	// changes made as one step, then the zone is published. The SOA record
+	// and the last NS record of the origin cannot be deleted, a name holds
+	// a CNAME record or other records, never both, and a SOA record in an
+	// update only replaces one with an older serial.
+	//
+	// The zone remembers what each of its last `history` moves of the
+	// serial changed, and answers an incremental transfer (IXFR, RFC 1995)
+	// with the changes since the client's serial, with the whole zone when
+	// it does not remember that far.
+	type Zone {
+		// The name at the top of the zone, in canonical form.
+		origin        string
+		// Who may transfer the zone: addresses and prefixes (`192.0.2.7`,
+		// `10.0.0.0/8`, `::1`), `key:` and the name of a TSIG key the
+		// server holds (`key:transfer.example.test`), `*` for anyone.
+		// Nobody when empty.
+		allowTransfer string[]     = []
+		// Who may change the zone with a dynamic update, in the same forms.
+		// Only TCP vouches for an address, so an update over UDP is Refused
+		// unless a listed key signed it.
+		allowUpdate   string[]     = []
+		// How many moves of the serial are remembered for incremental
+		// transfers; 0 remembers none.
+		history       int          = 16
+		// The servers `publish` sends a NOTIFY, as `host` or `host:port`.
+		secondaries   string[]     = []
+		// Signs those NOTIFY messages (TSIG, RFC 8945); unsigned when none.
+		notifyKey     ?TSIGKey     = none
+		// Called in the background with every NOTIFY that went unacknowledged.
+		onError       ?def (error) = none
+
+		internal records    map<string, Record[]> = map<string, Record[]>{}
+		internal journal    ZoneChange[]          = []
+		// What changed since the serial last moved.
+		internal removedNow Record[]              = []
+		internal addedNow   Record[]              = []
+
+		def new(origin string) {
+			self.origin = canonicalName(origin)
+		}
+
+		// add puts the record in the zone.
+		// Fails with BadName when its name lies outside the origin.
+		atomic def add(record Record) !none {
+			let owner = canonicalName(record.name)
+			fail errorOf(ErrorKind.BadName, "{owner} is outside the zone {origin}", owner) unless isSubdomain(owner, origin)
+			let held = at(owner)
+			held.push(record)
+			records[owner] = held
+			noteAdded(record)
+			return none
+		}
+
+		// apply checks the prerequisites of a dynamic update and makes its
+		// changes, all or none (RFC 2136 section 3), without asking who sent
+		// it. A change moves the SOA serial on unless the update brought a
+		// newer SOA record itself. It returns the response code, `Success`
+		// when the changes were made, and whether the zone is another now;
+		// `publish` is not called.
+		atomic def apply(update Message) (RCode, bool) {
+			let code = unmet(update.answers)
+			return (code, false) when code != RCode.Success
+			code = unfit(update.authorities)
+			return (code, false) when code != RCode.Success
+			let before = soaHeld()
+			let changed = false
+			for let (_, r) in update.authorities {
+				changed = true when change(r)
+			}
+			return (RCode.Success, false) unless changed
+			let after = soaHeld()
+			return (RCode.Success, true) when before is none || after is none
+			if serialIn(after) == serialIn(before) {
+				moveSerial() onerror recover 0
+			} else {
+				closeStep(before, after)
+			}
+			return (RCode.Success, true)
+		}
+
+		// replace makes the records the whole zone, as a transfer brought
+		// them; what the zone remembered of its changes is forgotten.
+		// Fails with BadName on a record outside the origin, and keeps the
+		// zone as it was.
+		atomic def replace(all Record[]) !none {
+			let fresh = map<string, Record[]>{}
+			for let (_, r) in all {
+				let owner = canonicalName(r.name)
+				fail errorOf(ErrorKind.BadName, "{owner} is outside the zone {origin}", owner) unless isSubdomain(owner, origin)
+				let held = fresh.get(owner)
+				if held is none {
+					fresh[owner] = [r]
+				} else {
+					held.push(r)
+					fresh[owner] = held
+				}
+			}
+			records = fresh
+			journal = []
+			removedNow = []
+			addedNow = []
+			return none
+		}
+
+		// patch makes the changes of an incremental transfer, step by step,
+		// and remembers them as its own.
+		// Fails with Malformed at a step that does not start at the serial
+		// the zone has, and with BadName on a record outside the origin; the
+		// steps before it stay made.
+		atomic def patch(changes ZoneChange[]) !none {
+			for let (_, step) in changes {
+				let from = serialIn(step.before)
+				fail errorOf(ErrorKind.Malformed, "a change from serial {from} does not fit {origin} at {serialHeld()}", origin) when from != serialHeld()
+				for let (_, r) in step.removed {
+					let owner = canonicalName(r.name)
+					let kept Record[]
+					for let (_, h) in at(owner) {
+						kept.push(h) unless sameData(h, r)
+					}
+					store(owner, kept)
+				}
+				for let (_, r) in step.added {
+					let owner = canonicalName(r.name)
+					fail errorOf(ErrorKind.BadName, "{owner} is outside the zone {origin}", owner) unless isSubdomain(owner, origin)
+					let held = at(owner)
+					let found = -1
+					for let (i, h) in held {
+						found = i when sameData(h, r)
+					}
+					if found < 0 {
+						held.push(r)
+					} else {
+						held[found] = r
+					}
+					records[owner] = held
+				}
+				let top Record[] = [step.after]
+				for let (_, h) in at(origin) {
+					top.push(h) unless h.kind == RecordType.SOA
+				}
+				records[origin] = top
+				remember(step)
+			}
+			removedNow = []
+			addedNow = []
+			return none
+		}
+
+		// changesSince is what the zone changed since it had the serial,
+		// oldest step first: empty at that serial, none when the zone does
+		// not remember that far back.
+		atomic def changesSince(serial int) ?ZoneChange[] {
+			return stepsSince(serial)
+		}
+
+		// remove takes every record of the type off the name, all of its
+		// records for `ANY`, and returns how many went.
+		atomic def remove(name string, kind RecordType = RecordType.ANY) int {
+			let owner = canonicalName(name)
+			let held = at(owner)
+			let kept Record[]
+			for let (_, r) in held {
+				if kind == RecordType.ANY || r.kind == kind {
+					noteRemoved(r)
+				} else {
+					kept.push(r)
+				}
+			}
+			store(owner, kept)
+			return held.len() - kept.len()
+		}
+
+		// publish closes a round of changes: it moves the SOA serial on by
+		// one (RFC 1982) and sends every server in `secondaries` a NOTIFY
+		// (RFC 1996) in the background, so that a `Secondary` transfers the
+		// zone now instead of at its next refresh. A NOTIFY that times out is
+		// sent up to three times. It returns the new serial.
+		// Fails with NoData when the zone has no SOA record.
+		def publish() !int {
+			let serial = try advance()
+			announce()
+			return serial
+		}
+
+		// allowsUpdate reports whether `allowUpdate` lists the client, by
+		// its address or by the TSIG key that signed its message.
+		def allowsUpdate(remote net.Address, key string = "") bool {
+			return listed(remote, allowUpdate) || keyListed(key, allowUpdate)
+		}
+
+		internal def announce() {
+			for let (_, server) in secondaries {
+				let task = async tell(server)
+				task.keepAlive()
+			}
+		}
+
+		internal atomic def advance() !int {
+			return try moveSerial()
+		}
+
+		// moveSerial replaces the SOA record with one a serial further;
+		// records already handed out keep theirs.
+		internal def moveSerial() !int {
+			let held = at(origin)
+			for let (i, r) in held {
+				let soa = r.soa
+				continue when soa is none
+				let next = r.withTTL(r.ttl)
+				next.soa = SOA{mname: soa.mname, rname: soa.rname, serial: (soa.serial + 1) & 0xffffffff, refresh: soa.refresh, retry: soa.retry, expire: soa.expire, minimum: soa.minimum}
+				held[i] = next
+				records[origin] = held
+				closeStep(r, next)
+				return (soa.serial + 1) & 0xffffffff
+			}
+			fail errorOf(ErrorKind.NoData, "{origin} has no SOA record", origin)
+		}
+
+		internal def tell(server string) {
+			let client = new Client([server])
+			client.useHosts = false
+			client.key = notifyKey
+			let failure ?error = none
+			for let attempt = 0; attempt < 3; attempt++ {
+				failure = none
+				client.notify(origin, server) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break when failure is none
+				// An answer with a failure code stays the same when asked again.
+				let refused = false
+				refused = failure.kind == ErrorKind.ServerFailed when failure is DNSError
+				break when refused
+			}
+			let hook = onError
+			return when failure is none || hook is none
+			hook(failure)
+		}
+
+		// find returns the records of the type at the name, all of them for
+		// `ANY`; wildcards and aliases are not applied.
+		atomic def find(name string, kind RecordType = RecordType.ANY) Record[] {
+			let out Record[]
+			for let (_, r) in at(canonicalName(name)) {
+				out.push(r) when kind == RecordType.ANY || r.kind == kind
+			}
+			return out
+		}
+
+		// len is the number of records in the zone.
+		atomic def len() int {
+			return count()
+		}
+
+		// all is every record of the zone in the order of a transfer: the
+		// SOA record first, then name by name from the origin.
+		atomic def all() Record[] {
+			return everything()
+		}
+
+		internal def count() int {
+			let total = 0
+			for let (_, owner) in records.keys() {
+				total += at(owner).len()
+			}
+			return total
+		}
+
+		internal def everything() Record[] {
+			let out Record[]
+			for let (_, r) in at(origin) {
+				out.push(r) when r.kind == RecordType.SOA
+			}
+			for let (_, r) in at(origin) {
+				out.push(r) unless r.kind == RecordType.SOA
+			}
+			let owners = records.keys().sort((a string, b string) => a < b)
+			for let (_, owner) in owners {
+				continue when owner == origin
+				for let (_, r) in at(owner) {
+					out.push(r)
+				}
+			}
+			return out
+		}
+
+		// str renders the zone as a zone file that `parseZone` reads back.
+		def str() string {
+			let out = "$ORIGIN " + dotted(origin) + "\n"
+			for let (_, r) in all() {
+				out += r.str() + "\n"
+			}
+			return out
+		}
+
+		// allowsTransfer reports whether `allowTransfer` lists the client, by
+		// its address or by the TSIG key that signed its message.
+		def allowsTransfer(remote net.Address, key string = "") bool {
+			return listed(remote, allowTransfer) || keyListed(key, allowTransfer)
+		}
+
+		// Implements Handler. Does not fail today.
+		def serve(request Request) !Message {
+			let query = request.message
+			return update(request) when query.opcode == Opcode.Update
+			return query.reply(RCode.NotImplemented) when query.opcode != Opcode.Query
+			let question = query.question()
+			return query.reply(RCode.FormatError) when question is none
+			let name = canonicalName(question.name)
+			return query.reply(RCode.Refused) unless isSubdomain(name, origin)
+			return transfer(request, name) when question.kind == RecordType.AXFR
+			return incremental(request, name) when question.kind == RecordType.IXFR
+			let response = query.reply()
+			response.authoritative = true
+			// A query with the DO bit gets the signatures of a signed zone
+			// with its answer, and the NSEC records that prove a denial.
+			let options = query.edns
+			let signed = !(options is none) && options.dnssecOK
+			let owner = name
+			for let hop = 0; hop < 8; hop++ {
+				let dname = dnameAbove(owner)
+				if !(dname is none) {
+					response.answers.push(dname)
+					if signed {
+						for let (_, r) in find(dname.name, RecordType.RRSIG) {
+							response.answers.push(r) when covers(r, RecordType.DNAME)
+						}
+					}
+					let target = dnameSubstitute(owner, dname)
+					response.answers.push(cnameRecord(owner, target, dname.ttl))
+					owner = canonicalName(target)
+					break unless isSubdomain(owner, origin)
+					continue
+				}
+				let held = resolve(owner)
+				if held is none {
+					response.rcode = RCode.NameError
+					break
+				}
+				let alias = ""
+				for let (_, r) in held {
+					if question.kind == RecordType.ANY || r.kind == question.kind {
+						response.answers.push(owned(r, owner))
+					} else if r.kind == RecordType.CNAME {
+						alias = r.target
+					}
+				}
+				let followed = alias != "" && !hasAnswerFor(response, question.kind)
+				if signed && question.kind != RecordType.ANY {
+					let covered = followed ?? (RecordType.CNAME, question.kind)
+					for let (_, r) in held {
+						response.answers.push(owned(r, owner)) when covers(r, covered)
+					}
+					// An answer made from a wildcard comes with the proof
+					// that the name itself does not exist.
+					pushProof(response, expansionProof(owner)) when held.len() > 0 && canonicalName(held[0].name) != owner
+				}
+				break when alias == ""
+				for let (_, r) in held {
+					response.answers.push(owned(r, owner)) when r.kind == RecordType.CNAME
+				}
+				owner = canonicalName(alias)
+				break unless isSubdomain(owner, origin)
+			}
+			if !hasAnswerFor(response, question.kind) {
+				for let (_, soa) in find(origin, RecordType.SOA) {
+					let data = soa.soa
+					let ttl = soa.ttl
+					ttl = data.minimum unless data is none || data.minimum >= ttl
+					response.authorities.push(soa.withTTL(ttl))
+				}
+				deny(response, owner) when signed
+				return response
+			}
+			for let (_, r) in response.answers {
+				continue unless r.kind := RecordType.NS || RecordType.MX || RecordType.SRV
+				for let (_, glue) in find(r.target) {
+					response.additionals.push(glue) when glue.kind := RecordType.A || RecordType.AAAA
+				}
+			}
+			return response
+		}
+
+		// deny adds what proves a negative answer about `name` (RFC 4035
+		// §3.1.3): the signature of the SOA record, the NSEC record of the
+		// name when it exists, else the ones that cover it and the
+		// wildcard that could have answered for it. A zone with an
+		// NSEC3PARAM record proves with its NSEC3 records instead (RFC 5155
+		// §7.2): the closest name above that exists, the span over the
+		// next name below it, and the wildcard's record or span.
+		internal def deny(response Message, name string) {
+			for let (_, r) in find(origin, RecordType.RRSIG) {
+				response.authorities.push(r) when covers(r, RecordType.SOA)
+			}
+			let chain = hashing()
+			if !(chain is none) {
+				let own = hashedLink(chain, name)
+				if own.len() > 0 {
+					pushProof(response, own)
+					return
+				}
+				let above = name
+				let below = name
+				for above != origin {
+					let dot = above.indexOf(".")
+					below = above
+					above = dot < 0 ?? (origin, above[dot + 1:])
+					break when hashedLink(chain, above).len() > 0
+				}
+				pushProof(response, hashedLink(chain, above))
+				pushProof(response, hashedCover(hashedLabel(chain, below)))
+				let star = above == "." ?? ("*", "*." + above)
+				let answer = hashedLink(chain, star)
+				pushProof(response, answer.len() > 0 ?? (answer, hashedCover(hashedLabel(chain, star))))
+				return
+			}
+			let exact = find(name, RecordType.NSEC)
+			if exact.len() > 0 {
+				pushProof(response, exact)
+				return
+			}
+			pushProof(response, cover(name))
+			// The closest encloser is the longest name above that exists.
+			let encloser = name
+			for encloser != origin {
+				let dot = encloser.indexOf(".")
+				break when dot < 0
+				encloser = encloser[dot + 1:]
+				break unless resolve(encloser) is none
+			}
+			let wild = find("*." + encloser, RecordType.NSEC)
+			pushProof(response, wild.len() > 0 ?? (wild, cover("*." + encloser)))
+		}
+
+		// expansionProof is what proves that a name a wildcard answered for
+		// has no records of its own: the NSEC record that covers it, or the
+		// NSEC3 record that covers the first name below the closest one
+		// that exists.
+		internal def expansionProof(name string) Record[] {
+			let chain = hashing()
+			return cover(name) when chain is none
+			let above = name
+			let below = name
+			for above != origin {
+				let dot = above.indexOf(".")
+				below = above
+				above = dot < 0 ?? (origin, above[dot + 1:])
+				break when hashedLink(chain, above).len() > 0
+			}
+			return hashedCover(hashedLabel(chain, below))
+		}
+
+		// hashing is the NSEC3PARAM data of a zone signed with NSEC3, none
+		// for another.
+		internal def hashing() ?NSEC3 {
+			for let (_, r) in find(origin, RecordType.NSEC3PARAM) {
+				return r.nsec3
+			}
+			return none
+		}
+
+		// hashedLabel is the owner label of the name's NSEC3 record, "" for
+		// a text that is not a domain name.
+		internal def hashedLabel(chain NSEC3, name string) string {
+			let nothing byte[]
+			let sum = chain.hash(name) onerror recover nothing
+			return sum.len() == 0 ?? ("", hashLabel(sum))
+		}
+
+		// hashedLink is the NSEC3 record of the name, empty when it has none.
+		internal def hashedLink(chain NSEC3, name string) Record[] {
+			let label = hashedLabel(chain, name)
+			return [] when label == ""
+			return find(origin == "." ?? (label, "{label}.{origin}"), RecordType.NSEC3)
+		}
+
+		// hashedCover is the NSEC3 record whose span holds the label: the
+		// one of the last label before it, and of the last of all for a
+		// label before the first.
+		internal atomic def hashedCover(label string) Record[] {
+			let best = ""
+			let last = ""
+			for let (_, owner) in records.keys() {
+				let linked = false
+				for let (_, r) in at(owner) {
+					linked = true when r.kind == RecordType.NSEC3
+				}
+				continue unless linked
+				let dot = owner.indexOf(".")
+				let own = dot < 0 ?? (owner, owner[:dot])
+				last = own when own > last
+				best = own when own < label && own > best
+			}
+			best = last when best == ""
+			return [] when best == "" || label == ""
+			return setOf(origin == "." ?? (best, "{best}.{origin}"), RecordType.NSEC3.value)
+		}
+
+		// cover is the NSEC record whose span holds the name: the one of the
+		// last owner before it in canonical order. Empty in an unsigned zone.
+		internal atomic def cover(name string) Record[] {
+			let best = ""
+			for let (_, owner) in records.keys() {
+				continue when compareNames(owner, name) >= 0 || (best != "" && compareNames(owner, best) <= 0)
+				for let (_, r) in at(owner) {
+					if r.kind == RecordType.NSEC {
+						best = owner
+						break
+					}
+				}
+			}
+			return [] when best == ""
+			return setOf(best, RecordType.NSEC.value)
+		}
+
+		// pushProof adds NSEC or NSEC3 records and their signatures to the
+		// authority section, once each.
+		internal def pushProof(response Message, links Record[]) {
+			for let (_, link) in links {
+				let seen = false
+				for let (_, r) in response.authorities {
+					seen = true when r.kind == link.kind && canonicalName(r.name) == canonicalName(link.name)
+				}
+				continue when seen
+				response.authorities.push(link)
+				for let (_, r) in find(link.name, RecordType.RRSIG) {
+					response.authorities.push(r) when covers(r, link.kind)
+				}
+			}
+		}
+
+		// transfer answers an AXFR question with the whole zone between two
+		// copies of its SOA record; the server spreads it over as many
+		// messages as it takes. NotAuth for a name that is not the origin,
+		// Refused over UDP and to a client `allowTransfer` does not list,
+		// ServerFailure for a zone without a SOA record.
+		internal def transfer(request Request, name string) Message {
+			let query = request.message
+			return query.reply(RCode.NotAuth) when name != origin
+			return query.reply(RCode.Refused) unless request.tcp && allowsTransfer(request.remote, request.key)
+			let held = all()
+			return query.reply(RCode.ServerFailure) when held.len() == 0 || held[0].kind != RecordType.SOA
+			let response = query.reply()
+			response.authoritative = true
+			response.answers = held
+			response.answers.push(held[0])
+			return response
+		}
+
+		// incremental answers an IXFR question, whose authority section
+		// holds the SOA record the client has: that record alone when the
+		// client is not behind, and over UDP, which sends the client to TCP;
+		// else the steps since its serial between two copies of the SOA
+		// record, each step as the SOA record it started from, the records
+		// it removed, the SOA record it ended at and the records it added;
+		// the whole zone as `transfer` gives it when the zone does not
+		// remember that far. Refusals as for `transfer`, UDP aside, and
+		// FormatError without the client's SOA record.
+		internal def incremental(request Request, name string) Message {
+			let query = request.message
+			return query.reply(RCode.NotAuth) when name != origin
+			return query.reply(RCode.Refused) unless allowsTransfer(request.remote, request.key)
+			let theirs = -1
+			for let (_, r) in query.authorities {
+				theirs = serialIn(r) when r.kind == RecordType.SOA
+			}
+			return query.reply(RCode.FormatError) when theirs < 0
+			let answers = answerSince(theirs, request.tcp)
+			return query.reply(RCode.ServerFailure) when answers.len() == 0
+			let response = query.reply()
+			response.authoritative = true
+			response.answers = answers
+			return response
+		}
+
+		// answerSince is the answer section of an incremental transfer,
+		// empty for a zone without a SOA record.
+		internal atomic def answerSince(theirs int, tcp bool) Record[] {
+			let soa = soaHeld()
+			return [] when soa is none
+			return [soa] unless tcp && serialAhead(serialIn(soa), theirs)
+			let steps = stepsSince(theirs)
+			let out Record[]
+			if steps is none {
+				out = everything()
+				out.push(soa)
+				return out
+			}
+			out.push(soa)
+			for let (_, step) in steps {
+				out.push(step.before)
+				for let (_, r) in step.removed {
+					out.push(r)
+				}
+				out.push(step.after)
+				for let (_, r) in step.added {
+					out.push(r)
+				}
+			}
+			out.push(soa)
+			return out
+		}
+
+		internal def stepsSince(serial int) ?ZoneChange[] {
+			return [] when serial == serialHeld()
+			for let (i, step) in journal {
+				return journal[i:].clone() when serialIn(step.before) == serial
+			}
+			return none
+		}
+
+		// closeStep files what changed since the serial last moved under the
+		// move from `before` to `after`. A step that takes as many records
+		// to tell as the zone has is not kept, the whole zone travels as
+		// well; the steps before it are of no use then, as they are when the
+		// serial moved behind the zone's back in between.
+		internal def closeStep(before Record, after Record) {
+			let step = ZoneChange{before: before, after: after, removed: removedNow, added: addedNow}
+			removedNow = []
+			addedNow = []
+			if history <= 0 || step.removed.len() + step.added.len() + 1 >= count() {
+				journal = []
+				return
+			}
+			remember(step)
+		}
+
+		internal def remember(step ZoneChange) {
+			return when history <= 0
+			let last = journal.len() - 1
+			journal = [] when last >= 0 && serialIn(journal[last].after) != serialIn(step.before)
+			journal.push(step)
+			for journal.len() > history {
+				journal.remove(0)
+			}
+		}
+
+		// noteAdded and noteRemoved keep the net change since the serial
+		// last moved: a record that came and went in between is in neither
+		// list. The SOA record is the step's own business.
+		internal def noteAdded(r Record) {
+			return when history <= 0 || r.kind == RecordType.SOA
+			for let (i, h) in removedNow {
+				continue unless h.ttl == r.ttl && sameRecord(h, r)
+				removedNow.remove(i)
+				return
+			}
+			addedNow.push(r)
+		}
+
+		internal def noteRemoved(r Record) {
+			return when history <= 0 || r.kind == RecordType.SOA
+			for let (i, h) in addedNow {
+				continue unless h == r
+				addedNow.remove(i)
+				return
+			}
+			removedNow.push(r)
+		}
+
+		// update answers a dynamic update: FormatError unless the zone
+		// section asks for a SOA record, NotAuth for another zone, Refused
+		// over UDP and to a client `allowUpdate` does not list, else the code
+		// of `apply`. A zone that changed is announced to `secondaries`.
+		internal def update(request Request) Message {
+			let query = request.message
+			let section = query.question()
+			return query.reply(RCode.FormatError) when section is none
+			return query.reply(RCode.FormatError) when section.kind != RecordType.SOA
+			return query.reply(RCode.NotAuth) when canonicalName(section.name) != origin
+			return query.reply(RCode.Refused) unless allowsUpdate(request.remote, request.key)
+			return query.reply(RCode.Refused) unless request.tcp || keyListed(request.key, allowUpdate)
+			let (code, changed) = apply(query)
+			announce() when changed
+			return query.reply(code)
+		}
+
+		// unmet is the code of the first prerequisite the zone does not
+		// meet, Success when it meets them all.
+		internal def unmet(prerequisites Record[]) RCode {
+			let exact Record[]
+			for let (_, r) in prerequisites {
+				return RCode.FormatError when r.ttl != 0
+				let owner = canonicalName(r.name)
+				return RCode.NotZone unless isSubdomain(owner, origin)
+				let whole = r.kind == RecordType.ANY
+				let found = whole ?? (at(owner).len(), setOf(owner, r.wireType()).len())
+				if r.class == RecordClass.ANY {
+					return RCode.FormatError unless r.dataless
+					return (whole ?? (RCode.NameError, RCode.NXRRSet)) when found == 0
+				} else if r.class == RecordClass.NoClass {
+					return RCode.FormatError unless r.dataless
+					return (whole ?? (RCode.YXDomain, RCode.YXRRSet)) when found > 0
+				} else if r.class == RecordClass.IN {
+					return RCode.FormatError when r.dataless || whole
+					exact.push(r)
+				} else {
+					return RCode.FormatError
+				}
+			}
+			// A record with data asks for its whole set, as given, no more.
+			for let (_, r) in exact {
+				let owner = canonicalName(r.name)
+				let wanted = 0
+				for let (_, other) in exact {
+					wanted++ when other.wireType() == r.wireType() && canonicalName(other.name) == owner
+				}
+				let held = setOf(owner, r.wireType())
+				return RCode.NXRRSet when held.len() != wanted || !holds(held, r)
+			}
+			return RCode.Success
+		}
+
+		// unfit is FormatError or NotZone for a change section that cannot
+		// be applied, which is found out before any of it is.
+		internal def unfit(changes Record[]) RCode {
+			for let (_, r) in changes {
+				return RCode.NotZone unless isSubdomain(canonicalName(r.name), origin)
+				let question = (r.kind := RecordType.AXFR || RecordType.OPT)
+				let whole = r.kind == RecordType.ANY
+				if r.class == RecordClass.IN {
+					return RCode.FormatError when question || whole || r.dataless
+				} else if r.class == RecordClass.ANY {
+					return RCode.FormatError when question || r.ttl != 0 || !r.dataless
+				} else if r.class == RecordClass.NoClass {
+					return RCode.FormatError when question || whole || r.ttl != 0 || r.dataless
+				} else {
+					return RCode.FormatError
+				}
+			}
+			return RCode.Success
+		}
+
+		// change makes one change of an update and reports whether the zone
+		// is another for it.
+		internal def change(r Record) bool {
+			let owner = canonicalName(r.name)
+			let held = at(owner)
+			let apex = owner == origin
+			return put(owner, held, r) when r.class == RecordClass.IN
+			let kept Record[]
+			if r.class == RecordClass.ANY {
+				for let (_, h) in held {
+					let guarded = apex && (h.kind := RecordType.SOA || RecordType.NS)
+					let named = r.kind == RecordType.ANY || h.wireType() == r.wireType()
+					kept.push(h) when guarded || !named
+				}
+			} else {
+				return false when apex && r.kind == RecordType.SOA
+				return false when apex && r.kind == RecordType.NS && setOf(owner, r.wireType()).len() < 2
+				for let (_, h) in held {
+					kept.push(h) unless sameData(h, r)
+				}
+			}
+			return false when kept.len() == held.len()
+			for let (_, h) in held {
+				noteRemoved(h) unless kept.includes(h)
+			}
+			store(owner, kept)
+			return true
+		}
+
+		// put adds the record of an update to the ones the owner holds.
+		internal def put(owner string, held Record[], r Record) bool {
+			let aliases = 0
+			for let (_, h) in held {
+				aliases++ when h.kind == RecordType.CNAME
+			}
+			if r.kind == RecordType.CNAME {
+				return false when held.len() > aliases
+			} else {
+				return false when aliases > 0
+			}
+			if r.kind == RecordType.SOA {
+				let soa = r.soa
+				return false when soa is none
+				let ours = serialHeld()
+				return false unless owner == origin && ours >= 0 && serialAhead(soa.serial, ours)
+			}
+			for let (i, h) in held {
+				// One SOA and one CNAME record at most; any other record
+				// again only brings its TTL.
+				let single = h.kind == r.kind && (r.kind := RecordType.SOA || RecordType.CNAME)
+				continue unless single || sameData(h, r)
+				return false when h.ttl == r.ttl && sameData(h, r)
+				held[i] = r
+				records[owner] = held
+				noteRemoved(h)
+				noteAdded(r)
+				return true
+			}
+			held.push(r)
+			records[owner] = held
+			noteAdded(r)
+			return true
+		}
+
+		internal def store(owner string, held Record[]) {
+			if held.len() == 0 {
+				records = records.delete(owner)
+			} else {
+				records[owner] = held
+			}
+		}
+
+		// setOf is the records of the owner with the wire type.
+		internal def setOf(owner string, wire int) Record[] {
+			let out Record[]
+			for let (_, r) in at(owner) {
+				out.push(r) when r.wireType() == wire
+			}
+			return out
+		}
+
+		// soaHeld is the SOA record of the zone.
+		internal def soaHeld() ?Record {
+			for let (_, r) in at(origin) {
+				return r unless r.soa is none
+			}
+			return none
+		}
+
+		// serialHeld is the SOA serial, -1 without a SOA record.
+		internal def serialHeld() int {
+			let soa = soaHeld()
+			return -1 when soa is none
+			return serialIn(soa)
+		}
+
+		// at is the record list of the owner, empty when it has none.
+		internal def at(owner string) Record[] {
+			let held = records.get(owner)
+			return [] when held is none
+			return held
+		}
+
+		// resolve is what the zone holds for the name: its records, those of
+		// the closest wildcard when the name does not exist, an empty list
+		// for a name that only has names below it, none for no such name.
+		internal atomic def resolve(name string) ?Record[] {
+			let exact = records.get(name)
+			return exact unless exact is none
+			for let (_, owner) in records.keys() {
+				return [] when owner.endsWith("." + name)
+			}
+			let rest = name
+			for rest != origin {
+				let dot = rest.indexOf(".")
+				break when dot < 0
+				rest = rest[dot + 1:]
+				let wild = records.get("*." + rest)
+				return wild unless wild is none
+				// A name that exists between the two ends the search (RFC 4592).
+				break unless records.get(rest) is none
+			}
+			return none
+		}
+
+		// dnameAbove is the DNAME record whose owner is an ancestor of
+		// `name`, none when there is none; a DNAME does not affect its own
+		// owner name, so `name` itself is not checked.
+		internal atomic def dnameAbove(name string) ?Record {
+			let owner = name
+			for owner != origin {
+				let dot = owner.indexOf(".")
+				break when dot < 0
+				owner = owner[dot + 1:]
+				for let (_, r) in at(owner) {
+					return r when r.kind == RecordType.DNAME
+				}
+			}
+			return none
+		}
+	}
+
+	// dnameSubstitute is the name below a DNAME rewritten to its target: the
+	// owner suffix replaced (RFC 6672 §2.2).
+	internal def dnameSubstitute(name string, dname Record) string {
+		let owner = canonicalName(dname.name)
+		return "{name}.{dname.target}" when owner == "."
+		return name[:name.len() - owner.len()] + dname.target
+	}
+
+	// ZoneChange is what one move of a zone's serial changed: the unit of
+	// an incremental transfer (IXFR, RFC 1995).
+	struct ZoneChange {
+		// The SOA record the zone had before, and the one it has after.
+		before  Record
+		after   Record
+		removed Record[] = []
+		added   Record[] = []
+	}
+
+	// serialIn is the serial of a SOA record, -1 for any other record.
+	internal def serialIn(r Record) int {
+		let soa = r.soa
+		return -1 when soa is none
+		return soa.serial
+	}
+
+	// covers reports whether the record is an RRSIG over the type.
+	internal def covers(r Record, kind RecordType) bool {
+		let sig = r.rrsig
+		return !(sig is none) && r.kind == RecordType.RRSIG && sig.covered == kind && kind != RecordType.Unknown
+	}
+
+	// owned is the record under the name that was asked for, which differs
+	// from its own for a wildcard.
+	internal def owned(r Record, owner string) Record {
+		return r when canonicalName(r.name) == owner
+		let out = r.withTTL(r.ttl)
+		out.name = owner
+		return out
+	}
+
+	// listed reports whether the list names the client, by address or by
+	// prefix, or holds `*`.
+	internal def listed(remote net.Address, list string[]) bool {
+		let ip = parseIPText(remote.host)
+		return false when ip is none
+		let client = unmapped(ip)
+		for let (_, entry) in list {
+			return true when entry == "*" || inPrefix(client, entry)
+		}
+		return false
+	}
+
+	// keyListed reports whether the list names the TSIG key, as `key:name`.
+	internal def keyListed(key string, list string[]) bool {
+		return false when key == ""
+		for let (_, entry) in list {
+			return true when entry.startsWith("key:") && canonicalName(entry[4:]) == key
+		}
+		return false
+	}
+
+	// holds reports whether one of the records has the data of `r`.
+	internal def holds(held Record[], r Record) bool {
+		for let (_, h) in held {
+			return true when sameData(h, r)
+		}
+		return false
+	}
+
+	// sameData reports whether two records have the same type and data;
+	// domain names in the data compare without case.
+	internal def sameData(a Record, b Record) bool {
+		return false when a.wireType() != b.wireType()
+		let named = a.target != "" || !(a.soa is none)
+		return named ?? (a.rdata().lower() == b.rdata().lower(), a.rdata() == b.rdata())
+	}
+
+	// sameRecord reports whether two records have the same owner, type and
+	// data.
+	internal def sameRecord(a Record, b Record) bool {
+		return canonicalName(a.name) == canonicalName(b.name) && sameData(a, b)
+	}
+
+	// unmapped is the IPv4 address inside an IPv4-mapped IPv6 one
+	// (`::ffff:192.0.2.1`), any other address as it is.
+	internal def unmapped(ip byte[]) byte[] {
+		return ip when ip.len() != 16
+		for let i = 0; i < 10; i++ {
+			return ip when int(ip[i]) != 0
+		}
+		return ip when int(ip[10]) != 0xff || int(ip[11]) != 0xff
+		return ip[12:]
+	}
+
+	// inPrefix reports whether the address is the one the text names, or
+	// lies in its `address/bits` prefix.
+	internal def inPrefix(ip byte[], prefix string) bool {
+		let slash = prefix.indexOf("/")
+		let base = parseIPText(slash < 0 ?? (prefix, prefix[:slash]))
+		return false when base is none
+		let network = unmapped(base)
+		return false when network.len() != ip.len()
+		let bits = ip.len() * 8
+		if slash >= 0 {
+			let width = prefix[slash + 1:]
+			return false when width == "" || width.len() > 3 || !width.isNumeric()
+			let given = width.toInt<int>()
+			return false when given > bits
+			bits = given
+		}
+		for let i = 0; i < ip.len() && bits > 0; i++ {
+			let mask = bits >= 8 ?? (0xff, 0xff << (8 - bits) & 0xff)
+			return false when (int(ip[i]) & mask) != (int(network[i]) & mask)
+			bits -= 8
+		}
+		return true
+	}
+
+	// hasAnswerFor reports whether the answer section holds more than the
+	// aliases that led nowhere.
+	internal def hasAnswerFor(response Message, kind RecordType) bool {
+		for let (_, r) in response.answers {
+			return true when kind == RecordType.ANY || r.kind == kind
+		}
+		return false
+	}
+
+	// Forwarder answers a query by asking the servers of a `Client`, which
+	// makes a server a forwarding resolver; give the client a `Cache` to
+	// make it a caching one.
+	type Forwarder {
+		client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Implements Handler.
+		// Fails as `Client.exchange` does when no server answers.
+		def serve(request Request) !Message {
+			let query = request.message
+			return query.reply(RCode.NotImplemented) when query.opcode != Opcode.Query
+			let question = query.question()
+			return query.reply(RCode.FormatError) when question is none
+			let upstream = try newQuery(question.name)
+			upstream.questions = [question]
+			upstream.recursionDesired = query.recursionDesired
+			upstream.checkingDisabled = query.checkingDisabled
+			upstream.edns = EDNS{udpSize: client.udpSize} when client.udpSize > 0
+			let answer = try client.exchange(upstream)
+			let response = query.reply(answer.rcode)
+			response.recursionAvailable = true
+			response.authenticData = answer.authenticData
+			response.answers = answer.answers
+			response.authorities = answer.authorities
+			response.additionals = answer.additionals
+			return response
+		}
+	}
+}

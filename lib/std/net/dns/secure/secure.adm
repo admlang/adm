@@ -1,0 +1,186 @@
+// Encrypted transports for `std.net.dns`: DNS over TLS (RFC 7858) and DNS
+// over HTTPS (RFC 8484), both ways. They live above `std.net.dns` because
+// the `Network` service resolves through it, and so cannot import TLS.
+//
+// ```
+// let client = new dns.Client(["1.1.1.1", "9.9.9.9"])
+// client.transport = new secure.TLSTransport()
+// let addresses = try client.lookupHost("example.com")
+//
+// let web = new dns.Client(["https://cloudflare-dns.com/dns-query"])
+// web.transport = new secure.HTTPSTransport()
+//
+// let server = new secure.TLSServer("0.0.0.0:853", zone, config)
+// try server.listenAndServe()
+// ```
+
+partial module std.net.dns.secure {
+	use (
+		std.crypto.x509::(parseIPText)
+		std.net.dns
+		std.net.tls
+		std.services::(Policy)
+		std.time
+	)
+
+	// The port of DNS over TLS.
+	const tlsPort = 853
+
+	// TLSTransport carries the queries of a `dns.Client` over TLS (RFC
+	// 7858). A server is `host`, `host:port` or `tls://host[:port]`, port 853
+	// when it names none. A connection stays open after its query and
+	// serves the next one to the same server.
+	type TLSTransport {
+		// TLS settings. With an empty `serverName` the certificate is
+		// checked against the server's host, so a server listed by address
+		// needs one that names the address, or the name set here.
+		config      tls.Config = tls.Config{}
+		// How long an unused connection is kept.
+		idleTimeout duration   = 30s
+		// Pad each query to a multiple of this many bytes, so its length
+		// says less about the name (RFC 8467); 0 sends it as it is.
+		padding     int        = 128
+
+		internal idle map<string, IdleConn[]> = map<string, IdleConn[]>{}
+
+		// Implements dns.Transport. The policy is asked about
+		// `dns://host:port` under `adm.network.connect`.
+		//
+		// Fails with PolicyDenied when the policy denies, with Timeout when
+		// no response comes in time, with Malformed when the server closes
+		// the connection instead of answering, as `tls.dial` does when the
+		// connection or the handshake fails, and as `Message.encode` and
+		// `dns.decode` do.
+		def exchange(query dns.Message, server string, timeout duration) !dns.Message {
+			let addr = tlsAddress(server)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr)
+			try query.pad(padding) when padding > 1
+			let wire = try query.encode()
+			// A kept connection may have been closed by the server: one that
+			// fails is dropped and the query goes out again on the next.
+			for {
+				let kept = take(addr)
+				break when kept is none
+				let answer ?dns.Message = none
+				answer = roundTrip(kept, wire, timeout) onerror recover none
+				if answer is none {
+					kept.close() onerror recover none
+					continue
+				}
+				put(addr, kept)
+				return answer
+			}
+			let conn = try tls.dial(addr, config, timeout)
+			let failure ?error = none
+			let answer ?dns.Message = none
+			answer = roundTrip(conn, wire, timeout) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if answer is none {
+				conn.close() onerror recover none
+				let silent = dns.errorOf(dns.ErrorKind.Malformed, "{addr} closed the connection without answering")
+				silent.server = addr
+				fail silent when failure is none
+				let late = dns.errorOf(dns.ErrorKind.Timeout, "{addr} did not answer within {int(timeout) / 1000000}ms")
+				late.server = addr
+				fail late when failure.code == "ETIMEDOUT"
+				fail failure
+			}
+			put(addr, conn)
+			return answer
+		}
+
+		// dial opens a connection to the server for a caller that speaks
+		// on it itself, such as `dns.Client.transfer` for a zone transfer
+		// over TLS (RFC 9103). The policy is asked as `exchange` asks it.
+		// Fails with PolicyDenied when the policy denies, and as `tls.dial`
+		// does.
+		def dial(server string, timeout duration = 30s) !tls.Conn {
+			let addr = tlsAddress(server)
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "dns://" + addr)
+			return try tls.dial(addr, config, timeout)
+		}
+
+		// close closes the connections that are kept. Does not fail today.
+		atomic def close() !none {
+			for let (_, held) in idle {
+				for let (_, entry) in held {
+					entry.conn.close() onerror recover none
+				}
+			}
+			idle = map<string, IdleConn[]>{}
+			return none
+		}
+
+		internal def roundTrip(conn tls.Conn, wire byte[], timeout duration) !?dns.Message {
+			let started = time.now()
+			try dns.writeFrame(conn, wire, timeout)
+			let frame = try dns.readFrame(conn, timeout - time.since(started), timeout)
+			return none when frame is none
+			return try dns.decode(frame)
+		}
+
+		// take is a kept connection to the server that is still fresh, none
+		// when there is none; stale ones are closed on the way.
+		internal atomic def take(addr string) ?tls.Conn {
+			let held = idle.get(addr)
+			return none when held is none
+			let found ?tls.Conn = none
+			let rest IdleConn[]
+			for let (_, entry) in held {
+				if !(found is none) {
+					rest.push(entry)
+					continue
+				}
+				if time.since(entry.since) < idleTimeout && entry.conn.isOpen() {
+					found = entry.conn
+					continue
+				}
+				entry.conn.close() onerror recover none
+			}
+			idle[addr] = rest
+			return found
+		}
+
+		internal atomic def put(addr string, conn tls.Conn) {
+			let held = idle.get(addr)
+			let list IdleConn[] = []
+			list = held unless held is none
+			if list.len() >= 4 {
+				conn.close() onerror recover none
+				return
+			}
+			list.push(IdleConn{conn: conn, since: time.now()})
+			idle[addr] = list
+		}
+
+		// Closes the kept connections when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+
+	// IdleConn is a connection a TLSTransport keeps for the next query.
+	internal struct IdleConn {
+		conn  tls.Conn
+		since time.Time
+	}
+
+	// tlsAddress is a server of a TLSTransport as `host:port`: a `tls://`
+	// prefix goes, port 853 is added to a bare host, and an IPv6 host gets
+	// its brackets.
+	def tlsAddress(server string) string {
+		let host = server
+		host = host["tls://".len():] when host.startsWith("tls://")
+		return host when host.startsWith("[") && host.contains("]:")
+		return "{host}:{tlsPort}" when host.startsWith("[")
+		let ip = parseIPText(host)
+		if !(ip is none) {
+			return "[{host}]:{tlsPort}" when ip.len() == 16
+			return "{host}:{tlsPort}"
+		}
+		return host when host.contains(":")
+		return "{host}:{tlsPort}"
+	}
+}

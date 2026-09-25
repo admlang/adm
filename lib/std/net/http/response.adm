@@ -1,0 +1,858 @@
+partial module std.net.http {
+	use (
+		std.bytes
+		std.data.encoding
+		std.formats
+		std.io
+		std.net
+		std.net.url
+		std.net.url::(URL)
+		std.os
+		std.time
+	)
+
+	// Response is what a client got back: status, headers and the body,
+	// with the request that produced it. The body is a stream from the
+	// connection; `bytes`, `text` and `json` read it to the end and keep it,
+	// and `close` gives the connection back to the pool. A response must be
+	// closed, or its connection stays out of the pool until the body is
+	// read to the end.
+	//
+	// ```adm
+	// let res = try client.get("https://example.com/items")
+	// fail "unexpected {res.status}" unless res.ok()
+	// let items = Item[]{}
+	// try res.json(items)
+	// try res.close()
+	// ```
+	type Response {
+		status           int            = 200
+		// The reason phrase as the server sent it (`OK`), which may differ
+		// from `statusText(status)`.
+		reason           string         = ""
+		// The protocol version as written: "HTTP/1.1".
+		proto            string         = "HTTP/1.1"
+		headers          Header
+		// The body, none for a response that has none (HEAD, 204, 304,
+		// 1xx). Reading it to the end frees the connection for reuse.
+		body             ?io.Reader     = none
+		// Length of the body when known, -1 when not (chunked, or read to
+		// the connection's close).
+		contentLength    int            = -1
+		// The transfer codings applied to the body, outermost first.
+		transferEncoding string[]       = []
+		// True when the server closes the connection after this response.
+		connectionClose  bool           = false
+		// True when the client decoded a `Content-Encoding` transparently;
+		// the header is removed and `contentLength` is -1 then.
+		uncompressed     bool           = false
+		// Trailer fields, filled once the body has been read to the end.
+		trailer          Header
+		// The request that produced the response; after redirects, the
+		// last one. None for a response built by hand.
+		request          ?Request       = none
+		// When the status line arrived.
+		received         time.Time
+		// The chunked reader behind `body` when the wire framed it so, for
+		// the trailers it collects. Set by `readResponse`.
+		chunkedBody      ?ChunkedReader = none
+
+		internal bodyBytes ?byte[]     = none
+		internal closed    bool        = false
+		internal closeHook ?CancelHook = none
+
+		def new() {
+			self.headers = new Header()
+			self.trailer = new Header()
+			self.received = time.now()
+		}
+
+		// Reports whether the status is a success (2xx).
+		def ok() bool {
+			return status >= 200 && status < 300
+		}
+
+		// Reports whether this is an interim (1xx) head another response
+		// follows on the same connection; `101 Switching Protocols` is
+		// final, the connection changes protocol after it.
+		def isInterim() bool {
+			return status >= 100 && status < 200 && status != 101
+		}
+
+		// The class of the status: informational, success, redirection,
+		// client error, server error.
+		def statusClass() StatusClass {
+			return classOfStatus(status)
+		}
+
+		// The value of one header, "" when absent. Shorthand for
+		// `headers.get(name)`.
+		def header(name string) string {
+			return headers.get(name)
+		}
+
+		// The body's media type from `Content-Type`, none when the header is
+		// absent. Fails when the header does not parse.
+		def contentType() !?formats.MediaType {
+			return try headers.contentType()
+		}
+
+		// The `ETag` header, "" when absent.
+		def etag() string {
+			return headers.get("ETag")
+		}
+
+		// The `Last-Modified` header as a time, none when absent or
+		// malformed.
+		def lastModified() ?time.Time {
+			let value = headers.get("Last-Modified")
+			return none when value == ""
+			return parseDateHeader(value)
+		}
+
+		// The cookies the server set, from every `Set-Cookie` header;
+		// malformed ones are skipped.
+		def cookies() Cookie[] {
+			return readSetCookies(headers)
+		}
+
+		// The `Location` header resolved against the request URL, none when
+		// absent. Fails when it does not parse.
+		def location() !?URL {
+			let value = headers.get("Location").trim()
+			return none when value == ""
+			let ref = url.parse(value) onerror (err error) {
+				fail HttpError{message: "invalid Location: {value}", op: "response", text: value, cause: err}
+			}
+			let req = request
+			return ref when req is none
+			return req.url.resolve(ref)
+		}
+
+		// Reads the body to the end and keeps it, so a later `bytes`,
+		// `text` or `json` sees the same bytes. Empty when there is no body.
+		// Fails when the read does.
+		def bytes() !byte[] {
+			let kept = bodyBytes
+			return kept unless kept is none
+			let source = body
+			if source is none {
+				bodyBytes = []
+				return []
+			}
+			let data = try readAll(source)
+			bodyBytes = data
+			let chunked = chunkedBody
+			trailer = chunked.trailer() unless chunked is none
+			return data
+		}
+
+		// The body as text, decoded as the `Content-Type` charset: UTF-8
+		// when it names none, ISO-8859-1 converted; other charsets are
+		// returned as they are. Fails as `bytes` does.
+		def text() !string {
+			let data = try bytes()
+			let parsed = contentType() onerror recover none
+			return decodeCharset(data, parsed)
+		}
+
+		// Decodes the body as JSON onto target through
+		// `std.data.encoding.JSON`. Fails as `bytes` does, or when the body
+		// is not JSON.
+		def json(target any) !none {
+			let codec = new encoding.JSON()
+			try codec.decode(try bytes(), target)
+			return none
+		}
+
+		// Streams the body into the writer without keeping it, and returns
+		// the number of bytes copied; a body already read by `bytes` is
+		// written from the kept copy. Fails when a read or write does.
+		def copyTo(w io.Writer) !int {
+			let kept = bodyBytes
+			if !(kept is none) {
+				try writeFully(w, kept)
+				return kept.len()
+			}
+			let source = body
+			return 0 when source is none
+			let n = try copyBody(source, w)
+			bodyBytes = []
+			let chunked = chunkedBody
+			trailer = chunked.trailer() unless chunked is none
+			return n
+		}
+
+		// Writes the body to a file at path through `Storage`, creating or
+		// truncating it. Fails when the read or the file does.
+		def save(path string) !none {
+			try os.writeFile(path, try bytes())
+			return none
+		}
+
+		// Drains what is left of the body and releases the connection to
+		// the pool, or closes it when the server asked. Safe to call more
+		// than once. Fails when the drain does.
+		def close() !none {
+			return none when closed
+			closed = true
+			try bytes() when bodyBytes is none
+			let hook = closeHook
+			hook.run() unless hook is none
+			return none
+		}
+
+		// Registers fn to run once when the response is closed: the client
+		// returns the connection to its pool this way.
+		def onClose(fn def ()) {
+			closeHook = new CancelHook(fn)
+		}
+
+		// Writes the response in wire form: status line, headers, blank
+		// line and body, framed by `contentLength` or chunked when it is
+		// unknown. Fails when the writer or the body read does.
+		def write(w io.Writer) !none {
+			let out = new bytes.Buffer()
+			try out.writeString(str() + "\r\n")
+			let fields = headers.clone()
+			let kept = bodyBytes
+			let hasReader = !(body is none)
+			let chunked = false
+			if !(kept is none) {
+				let size = kept.len()
+				fields.set("Content-Length", size.str())
+				fields.del("Transfer-Encoding")
+			} else if hasReader && contentLength >= 0 {
+				fields.set("Content-Length", contentLength.str())
+				fields.del("Transfer-Encoding")
+			} else if hasReader {
+				fields.set("Transfer-Encoding", "chunked")
+				fields.del("Content-Length")
+				chunked = true
+			}
+			try fields.write(out)
+			try out.writeString("\r\n")
+			try writeFully(w, out.bytes())
+			if !(kept is none) {
+				try writeFully(w, kept)
+				return none
+			}
+			let source = body
+			return none when source is none
+			if chunked {
+				let writer = new ChunkedWriter(w)
+				let chunk byte[] = []
+				chunk.len(32 * 1024)
+				for {
+					let n = try source.read(chunk)
+					break when n <= 0
+					try writer.write(chunk.slice(0, n))
+				}
+				try writer.close()
+				return none
+			}
+			try copyBody(source, w)
+			return none
+		}
+
+		// The status line: `HTTP/1.1 200 OK`.
+		def str() string {
+			let phrase = reason != "" ?? (reason, statusText(status))
+			return proto + " " + status.str() + " " + phrase
+		}
+	}
+
+	// classOfStatus is `statusClass` by its hundreds digit; `Unknown` outside
+	// 100 to 599.
+	internal def classOfStatus(status int) StatusClass {
+		return StatusClass.Informational when status >= 100 && status < 200
+		return StatusClass.Success when status >= 200 && status < 300
+		return StatusClass.Redirection when status >= 300 && status < 400
+		return StatusClass.ClientError when status >= 400 && status < 500
+		return StatusClass.ServerError when status >= 500 && status < 600
+		return StatusClass.Unknown
+	}
+
+	// ResponseWriter is what a server handler writes its response into.
+	// Set the status and headers, then write the body; the first write
+	// past the buffer, a flush, or `end` commits the status and headers
+	// to the wire, and later changes to them are lost. The methods after
+	// `write` answer the common cases in one call: text, HTML, JSON, a
+	// file, a redirect, an error.
+	//
+	// A body that fits the buffer goes out with a `Content-Length` at
+	// `end`, a longer one chunked. `Content-Type` is sniffed from the
+	// first bytes when the handler set none, `Date` is added, and for a
+	// HEAD request the body is counted but not sent.
+	//
+	// ```adm
+	// def serve(res ResponseWriter, req Request) !none {
+	//     let user = try users.find(req.param("id"))
+	//     return try res.json(user)
+	// }
+	// ```
+	type ResponseWriter {
+		// The status to send; 200 unless set before the first write.
+		status     int     = 200
+		headers    Header
+		// The request being answered, for HEAD handling, conditionals and
+		// negotiation.
+		request    Request
+		// Trailer fields to send after a chunked body; announce them in the
+		// `Trailer` header before the first write.
+		trailer    Header
+		// How many body bytes are held back before the response commits
+		// with a `Content-Length`; a longer body is sent chunked.
+		bufferSize int     = 32 * 1024
+
+		internal sink      ?ResponseSink = none
+		internal conn      ?net.Stream   = none
+		internal buffered  ?io.Reader    = none
+		internal pending   byte[]        = []
+		internal committed bool          = false
+		internal finished  bool          = false
+		internal takenOver bool          = false
+		internal bodied    bool          = true
+		internal count     int           = 0
+		internal hooks     CancelHook[]  = []
+
+		def new(request Request) {
+			self.request = request
+			self.headers = new Header()
+			self.trailer = new Header()
+		}
+
+		// Over the writer the response goes to; with the connection and the
+		// bytes already buffered from it when a handler may hijack.
+		def new(request Request, sink io.Writer, conn ?net.Stream = none, buffered ?io.Reader = none) {
+			self.request = request
+			self.headers = new Header()
+			self.trailer = new Header()
+			self.sink = new WireSink(sink, request)
+			self.conn = conn
+			self.buffered = buffered
+		}
+
+		// Over the sink that frames the response, for a transport other
+		// than the HTTP/1.1 wire.
+		def new(request Request, sink ResponseSink, conn ?net.Stream = none, buffered ?io.Reader = none) {
+			self.request = request
+			self.headers = new Header()
+			self.trailer = new Header()
+			self.sink = sink
+			self.conn = conn
+			self.buffered = buffered
+		}
+
+		// Commits the status and headers without a body. Only the first
+		// call counts; a write commits them too. Fails when the connection
+		// write does.
+		def writeHeader(status int) !none {
+			return none when committed
+			self.status = status
+			try commit(false)
+			return none
+		}
+
+		// Reports whether the status and headers have gone out.
+		def written() bool {
+			return committed
+		}
+
+		// True once a handler took the connection over with `hijack`.
+		def hijacked() bool {
+			return takenOver
+		}
+
+		// Bytes of body written so far, counting a HEAD response's body
+		// that was not sent.
+		def size() int {
+			return count
+		}
+
+		// Writes body bytes: held back while they fit the buffer, so a
+		// short response gets a `Content-Length`, then committed and sent
+		// chunked. Implements std.io.Writer. Fails when the connection
+		// write does.
+		def write(buf byte[]) !int {
+			fail HttpError{message: "response already finished", op: "response"} when finished
+			fail HttpError{message: "connection hijacked", op: "response"} when takenOver
+			count += buf.len()
+			if !committed && pending.len() + buf.len() <= bufferSize {
+				pending = pending.concat(buf)
+				return buf.len()
+			}
+			try commit(true) unless committed
+			try send(buf)
+			return buf.len()
+		}
+
+		// Writes text as body bytes. Fails as `write` does.
+		def writeString(text string) !int {
+			return try write(text.bytes())
+		}
+
+		// Sends what is buffered to the client now, for a streamed
+		// response. Commits the headers first if needed. Fails when the
+		// connection write does.
+		def flush() !none {
+			return none when finished || takenOver
+			try commit(true) unless committed
+			return none
+		}
+
+		// Ends the response: commits it with a `Content-Length` when the
+		// body was held back, or writes the last chunk and the trailers,
+		// then runs the `onFinish` hooks. The server calls it after the
+		// handler; a handler may too. Safe to call more than once. Fails
+		// when the connection write does.
+		def end() !none {
+			return none when finished || takenOver
+			try commit(false) unless committed
+			let out = try sinkOrFail()
+			try out.end(trailer.len() > 0 && bodied ?? (trailer, none))
+			finished = true
+			let list = hooks
+			hooks = []
+			for let hook in list {
+				hook.run()
+			}
+			return none
+		}
+
+		// Hands the status and headers to the sink. With streaming the
+		// body length is unknown; otherwise what is pending is the whole
+		// body.
+		internal def commit(streaming bool) !none {
+			return none when committed
+			committed = true
+			let fields = headers
+			fields.set("Date", time.formatHTTPDate(time.now())) unless fields.has("Date")
+			let sniffable = !fields.has("Content-Type") && pending.len() > 0 && statusHasBody(status)
+			fields.set("Content-Type", formats.detectContentType(pending.len() > 512 ?? (pending.slice(0, 512), pending))) when sniffable
+			if !statusHasBody(status) {
+				fields.del("Content-Length")
+				fields.del("Transfer-Encoding")
+			}
+			bodied = statusHasBody(status) && request.method != Method.HEAD
+			let out = try sinkOrFail()
+			let length = streaming ?? (-1, pending.len())
+			let declared = fields.get("Content-Length").trim()
+			length = parseInt<int>(declared) when declared != "" && isDigits(declared)
+			try out.writeHead(status, fields, length, bodied)
+			// What was held back goes out first; for HEAD nothing does.
+			let held = pending
+			pending = []
+			try send(held) when held.len() > 0
+			return none
+		}
+
+		// Sends body bytes past the commit; nothing for HEAD or a status
+		// without a body.
+		internal def send(buf byte[]) !none {
+			return none when buf.len() == 0 || !bodied
+			let out = try sinkOrFail()
+			return try out.writeBody(buf)
+		}
+
+		internal def sinkOrFail() !ResponseSink {
+			let w = sink
+			fail HttpError{message: "response writer has no connection", op: "response"} when w is none
+			return w
+		}
+
+		// Sets `Content-Type`. A bare subtype or extension is expanded
+		// through the media type table (`json`, `html`, `png`), and a text
+		// type gets `charset=utf-8`.
+		def contentType(value string) {
+			headers.set("Content-Type", expandContentType(value))
+		}
+
+		// Sets `ETag`, quoted when it is not already; a weak tag gets `W/`.
+		def etag(tag string, weakTag bool = false) {
+			let quoted = normalizeETag(tag)
+			return when quoted == ""
+			headers.set("ETag", weakTag && !isWeakETag(quoted) ?? ("W/" + quoted, quoted))
+		}
+
+		// Sets `Last-Modified` from the time, in HTTP date form.
+		def lastModified(t time.Time) {
+			headers.set("Last-Modified", time.formatHTTPDate(t))
+		}
+
+		// Adds a name to `Vary`, once.
+		def vary(name string) {
+			return when headers.hasToken("Vary", name)
+			headers.add("Vary", name)
+		}
+
+		// Adds a `Set-Cookie` header for the cookie. Fails when the cookie
+		// is not valid (`Cookie.valid`).
+		def cookie(c Cookie) !none {
+			try c.valid()
+			headers.add("Set-Cookie", c.str())
+			return none
+		}
+
+		// Adds a `Set-Cookie` that expires the cookie of that name in the
+		// client, for the same path and domain it was set with.
+		def deleteCookie(name string, path string = "/", domain string = "") {
+			let c = new Cookie(name, "")
+			c.path = path
+			c.domain = domain
+			c.maxAge = -1
+			headers.add("Set-Cookie", c.str())
+		}
+
+		// Sends a plain text body under the given status. Fails when the
+		// write does.
+		def text(status int, text string) !none {
+			self.status = status
+			return try text(text)
+		}
+
+		// Sends a plain text body under the current status. Fails when the
+		// write does.
+		def text(text string) !none {
+			headers.set("Content-Type", "text/plain; charset=utf-8") unless headers.has("Content-Type")
+			try write(text.bytes())
+			return try end()
+		}
+
+		// Sends an HTML body under the given status. Fails when the write
+		// does.
+		def html(status int, text string) !none {
+			self.status = status
+			return try html(text)
+		}
+
+		// Sends an HTML body under the current status. Fails when the
+		// write does.
+		def html(text string) !none {
+			headers.set("Content-Type", "text/html; charset=utf-8") unless headers.has("Content-Type")
+			try write(text.bytes())
+			return try end()
+		}
+
+		// Encodes value as JSON through `std.data.encoding.JSON` and sends
+		// it under the given status, indented when asked. Fails when the
+		// write does.
+		def json(status int, value any, indent bool = false) !none {
+			self.status = status
+			return try json(value, indent)
+		}
+
+		// Encodes value as JSON and sends it under the current status.
+		// Fails when the write does.
+		def json(value any, indent bool = false) !none {
+			let codec = new encoding.JSON()
+			codec.indent = indent
+			codec.indentString = "  "
+			headers.set("Content-Type", "application/json") unless headers.has("Content-Type")
+			try write(codec.encode(value))
+			return try end()
+		}
+
+		// Sends bytes under the given status and content type. Fails when
+		// the write does.
+		def blob(status int, contentType string, data byte[]) !none {
+			self.status = status
+			headers.set("Content-Type", expandContentType(contentType))
+			try write(data)
+			return try end()
+		}
+
+		// Streams the reader to the client under the given status and
+		// content type, chunked, flushing as it goes. Fails when a read or
+		// write does.
+		def stream(status int, contentType string, r io.Reader) !none {
+			self.status = status
+			headers.set("Content-Type", expandContentType(contentType))
+			try commit(true)
+			let chunk byte[] = []
+			chunk.len(32 * 1024)
+			for {
+				let n = try r.read(chunk)
+				break when n <= 0
+				count += n
+				try send(chunk.slice(0, n))
+			}
+			return try end()
+		}
+
+		// Sends one server-sent event on a `text/event-stream` response,
+		// and flushes: `event:` when name is given, `id:` when id is, then
+		// one `data:` line per line of data. The first call sets the
+		// content type. Fails when the write does.
+		def event(data string, name string = "", id string = "") !none {
+			if !committed {
+				headers.set("Content-Type", "text/event-stream") unless headers.has("Content-Type")
+				headers.set("Cache-Control", "no-cache") unless headers.has("Cache-Control")
+				try commit(true)
+			}
+			let out = ""
+			out += "event: " + name + "\n" when name != ""
+			out += "id: " + id + "\n" when id != ""
+			for let line in data.split("\n") {
+				out += "data: " + line + "\n"
+			}
+			out += "\n"
+			count += out.len()
+			try send(out.bytes())
+			return none
+		}
+
+		// Sends the file at path through `Storage`: content type by
+		// extension, `Last-Modified` from the file, 304 when the client's
+		// copy is fresh, a single byte range (206) when asked, and nothing
+		// but the headers for HEAD. A request for several ranges gets the
+		// whole file. Fails when the file cannot be read; a missing file or
+		// a directory is a 404 sent by this call, not an error.
+		def file(path string) !none {
+			let info = statOrNone(path)
+			return try notFound() when info is none
+			return try notFound() when info.isDir
+			let size = int(info.size)
+			headers.set("Accept-Ranges", "bytes")
+			if !headers.has("Content-Type") {
+				let byName = formats.typeByName(info.name)
+				headers.set("Content-Type", byName is none ?? ("application/octet-stream", byName))
+			}
+			lastModified(info.modTime)
+			match evaluateConditions(request, headers.get("ETag"), info.modTime) {
+				case ConditionResult.NotModified:
+					return try noContent(304)
+				case ConditionResult.PreconditionFailed:
+					return try noContent(412)
+				default:
+			}
+			let start = 0
+			let length = size
+			let ranges = request.ranges(size) onerror (err error) {
+				headers.set("Content-Range", "bytes */{size}")
+				recover []
+			}
+			return try self.error(416) when ranges.len() == 0 && headers.has("Content-Range")
+			if ranges.len() == 1 {
+				start = ranges[0].start
+				length = ranges[0].length
+				headers.set("Content-Range", ranges[0].contentRange(size))
+				status = 206
+			}
+			headers.set("Content-Length", length.str())
+			try commit(false)
+			count += length
+			return none when request.method == Method.HEAD
+			let handle = try os.open(path)
+			try handle.seek(int64(start)) when start > 0
+			let left = length
+			let chunk byte[] = []
+			chunk.len(32 * 1024)
+			for left > 0 {
+				let want = left < chunk.len() ?? (left, chunk.len())
+				let n = try handle.read(chunk.slice(0, want))
+				break when n <= 0
+				try send(chunk.slice(0, n))
+				left -= n
+			}
+			try handle.close()
+			return try end()
+		}
+
+		// Sends the file as a download: as `file`, with
+		// `Content-Disposition: attachment` naming it name, or its own
+		// name when name is "". Fails as `file` does.
+		def attachment(path string, name string = "") !none {
+			headers.set("Content-Disposition", disposition("attachment", name != "" ?? (name, baseNameOf(path))))
+			return try file(path)
+		}
+
+		// Sends the file to be shown in the browser: as `file`, with
+		// `Content-Disposition: inline` naming it. Fails as `file` does.
+		def inline(path string, name string = "") !none {
+			headers.set("Content-Disposition", disposition("inline", name != "" ?? (name, baseNameOf(path))))
+			return try file(path)
+		}
+
+		// Sends the bytes as a named download under the content type.
+		// Fails when the write does.
+		def download(name string, contentType string, data byte[]) !none {
+			headers.set("Content-Disposition", disposition("attachment", name))
+			return try blob(status, contentType, data)
+		}
+
+		// Answers a conditional request: sets `ETag` and `Last-Modified`
+		// from the arguments, and when the client's copy is fresh sends 304
+		// and returns true, so the handler returns without a body. Fails
+		// when the write does.
+		//
+		// ```adm
+		// return none when try res.conditional(item.etag(), item.updated)
+		// try res.json(item)
+		// ```
+		def conditional(etag string, lastModified ?time.Time = none) !bool {
+			self.etag(etag) when etag != ""
+			self.lastModified(lastModified) unless lastModified is none
+			match evaluateConditions(request, etag, lastModified) {
+				case ConditionResult.NotModified:
+					try noContent(304)
+					return true
+				case ConditionResult.PreconditionFailed:
+					try noContent(412)
+					return true
+				default:
+					return false
+			}
+		}
+
+		// The offer the client prefers among the given media types
+		// (`Request.accepts`), adding `Accept` to `Vary`; none when it
+		// accepts none, in which case the handler answers 406.
+		def negotiate(offers ...string) ?string {
+			vary("Accept")
+			return request.accepts(...offers)
+		}
+
+		// Sends an empty response under the status (204 by default). Fails
+		// when the write does.
+		def noContent(status int = 204) !none {
+			self.status = status
+			try commit(false)
+			return try end()
+		}
+
+		// Sends a redirect to the URL (302 by default): sets `Location`,
+		// resolved against the request URL when relative, and a short HTML
+		// body for GET. 301, 303, 307 and 308 are the other statuses; 303
+		// after a POST, 307 or 308 to keep the method. Fails when the write
+		// does.
+		def redirect(target string, status int = 302) !none {
+			let location = target
+			let ref = parseURLText(target)
+			location = request.url.resolve(ref).str() when !(ref is none) && !ref.isAbs() && !target.startsWith("/")
+			headers.set("Location", location)
+			self.status = status
+			if request.method == Method.GET {
+				let escaped = encoding.htmlEncode(location)
+				headers.set("Content-Type", "text/html; charset=utf-8")
+				try write(("<a href=\"" + escaped + "\">" + statusText(status) + "</a>.\n").bytes())
+			}
+			return try end()
+		}
+
+		// Sends the `Referer` the request came with as a redirect, or the
+		// fallback when it has none. Fails when the write does.
+		def redirectBack(fallback string = "/", status int = 302) !none {
+			let back = request.referer()
+			return try redirect(back != "" ?? (back, fallback), status)
+		}
+
+		// Sends a plain text error body under the status, with
+		// `X-Content-Type-Options: nosniff` and no caching. The message is
+		// the status text when "". Fails when the write does.
+		def error(status int, message string = "") !none {
+			headers.del("Content-Length")
+			headers.set("Content-Type", "text/plain; charset=utf-8")
+			headers.set("X-Content-Type-Options", "nosniff")
+			headers.set("Cache-Control", "no-store")
+			return try text(status, (message != "" ?? (message, statusText(status))) + "\n")
+		}
+
+		// Sends 404 with the standard body. Fails when the write does.
+		def notFound() !none {
+			return try self.error(404)
+		}
+
+		// Registers fn to run once the response has been sent, or the
+		// connection has failed: for logging, metrics, cleanup. Runs at
+		// once when the response is already finished.
+		def onFinish(fn def ()) {
+			if finished {
+				fn()
+				return
+			}
+			hooks.push(new CancelHook(fn))
+		}
+
+		// Takes over the connection for a protocol upgrade (WebSocket):
+		// after it, the server sends nothing more on it, and the caller
+		// owns the stream and closes it: the socket, or the TLS connection
+		// over it when the server serves https. Bytes the server had
+		// already buffered from the client come back in the reader. Fails
+		// when the response was already committed or the writer has no
+		// connection.
+		def hijack() !(net.Stream, io.Reader) {
+			fail HttpError{message: "response already committed", op: "response"} when committed
+			let c = conn
+			fail HttpError{message: "response writer has no connection to hand over", op: "response"} when c is none
+			takenOver = true
+			let rest = buffered
+			let reader io.Reader = rest is none ?? (new EmptyBody(), rest)
+			return (c, reader)
+		}
+	}
+
+	// expandContentType turns a short content type into a full one: a
+	// bare subtype or extension through the media type table, a text
+	// type with `charset=utf-8` when it names none.
+	internal def expandContentType(value string) string {
+		let text = value.trim()
+		let full = text
+		if !text.contains("/") {
+			let byExt = formats.typeByExtension(text)
+			full = byExt is none ?? ("application/" + text, byExt)
+		}
+		let parsed = parseMediaTypeOrNone(full)
+		return full when parsed is none
+		return full when !(parsed.charset() is none)
+		return full + "; charset=utf-8" when parsed.isText() || parsed.subtype == "json" || parsed.subtype.endsWith("+json") || parsed.subtype == "xml"
+		return full
+	}
+
+	// disposition renders a `Content-Disposition` value, quoting the name
+	// and adding the RFC 5987 form when it is not ASCII.
+	internal def disposition(kind string, name string) string {
+		return kind when name == ""
+		let ascii = true
+		for let ch in name {
+			if int(ch) > 126 || int(ch) < 32 {
+				ascii = false
+				break
+			}
+		}
+		let quoted = "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+		return kind + "; filename=" + quoted when ascii
+		return kind + "; filename=" + quoted + "; filename*=UTF-8''" + url.urlEncode(name)
+	}
+
+	internal def baseNameOf(path string) string {
+		let slash = -1
+		for let i = 0; i < path.len(); i++ {
+			slash = i when path[i] == '/'
+		}
+		return path when slash < 0
+		return path[slash + 1:]
+	}
+
+	// statOrNone is `os.stat`, none when the path cannot be read.
+	internal def statOrNone(path string) ?os.FileInfo {
+		let ok = true
+		let info = os.stat(path) onerror (err error) {
+			ok = false
+			recover os.FileInfo{}
+		}
+		return none unless ok
+		return info
+	}
+
+	// parseMediaTypeOrNone parses a media type, none when it does not parse.
+	internal def parseMediaTypeOrNone(text string) ?formats.MediaType {
+		let ok = true
+		let parsed = formats.parseMediaType(text) onerror (err error) {
+			ok = false
+			recover new formats.MediaType("application", "octet-stream")
+		}
+		return none unless ok
+		return parsed
+	}
+}

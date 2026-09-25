@@ -1,0 +1,205 @@
+// Capturing from the machine's cameras.
+//
+// The devices themselves are listed by the `Devices` service; this module drives
+// the ones a program can read from. Today that is cameras, over the kernel's
+// video interface on Linux: `cameras()` names them, `openCamera(id)` starts one
+// streaming, and `Camera.frame()` waits for the next picture.
+//
+// Example: a snapshot from the first camera
+// ```example
+// use std.devices
+//
+// let cam = try devices.openCamera(try devices.cameras()[0].id, 1280, 720)
+// defer cam.close()
+// let shot = try cam.frame()
+// println("{shot.width}x{shot.height}, {shot.data.len()} bytes")
+// ```
+
+partial module std.devices {
+	use (
+		std.services::(Device, DeviceKind, Devices, Storage)
+	)
+
+	// How a camera hands frames over.
+	enum PixelFormat {
+		// Each frame is a complete JPEG.
+		Mjpeg,
+		// Raw 4:2:2, two bytes a pixel.
+		Yuyv,
+	}
+
+	// One captured frame.
+	struct Frame {
+		width    int
+		height   int
+		format   PixelFormat
+		// The frame's bytes: a whole JPEG file for Mjpeg, the raw plane for Yuyv.
+		data     byte[]
+		// Frames captured so far on this camera, 1 for the first.
+		sequence int
+	}
+
+	// An open camera. openCamera returns one; close it when done, or let it go —
+	// dispose closes it.
+	type Camera {
+		// The device the frames come from.
+		device Device
+		width  int
+		height int
+		format PixelFormat
+
+		// The device's descriptor, -1 once closed.
+		internal fd        int   = -1
+		// One mapping handle per buffer the driver granted, in buffer order.
+		internal buffers   int[]
+		// Whether the device is still filling those buffers.
+		internal streaming bool  = false
+		// Frames handed out so far, which is what a frame's sequence reports.
+		internal delivered int   = 0
+
+		// Cameras come from `openCamera`, which negotiates the frame layout and
+		// maps the buffers before there is anything to construct.
+		internal def new(device Device, fd int, layout Format, buffers int[]) {
+			self.device = device
+			self.fd = fd
+			self.buffers = buffers
+			width = layout.width
+			height = layout.height
+			format = layout.pixelFormat == PIX_FMT_YUYV ?? (PixelFormat.Yuyv, PixelFormat.Mjpeg)
+			streaming = true
+		}
+
+		// Waits for the next frame and returns it. Fails when the camera is closed
+		// or the driver errors.
+		def frame() !Frame {
+			fail "devices: camera {device.id} is closed" when fd < 0
+			let ready = try Storage.wait(fd, FRAME_TIMEOUT)
+			fail "devices: camera {device.id} delivered no frame in time" unless ready
+			let info = try dequeueBuffer(fd)
+			let data = bufferBytes(info) onerror recover []
+			// The buffer goes back to the driver whatever the read above did:
+			// dropping it would starve the queue one frame at a time.
+			try queueBuffer(fd, info.index)
+			fail "devices: camera {device.id} delivered an empty frame" when data.len() == 0
+			delivered += 1
+			return Frame{
+				width:    width,
+				height:   height,
+				format:   format,
+				data:     data,
+				sequence: delivered,
+			}
+		}
+
+		// Stops streaming and releases the device. Safe to call twice.
+		def close() {
+			return when fd < 0
+			if streaming {
+				streamOff(fd) onerror recover none
+				streaming = false
+			}
+			releaseMappings(buffers)
+			buffers = []
+			Devices.close(fd) onerror recover none
+			fd = -1
+		}
+
+		// Whether the camera is still open.
+		def isOpen() bool {
+			return fd >= 0
+		}
+
+		// Closing on dispose, so a camera nobody holds any more frees the device.
+		def dispose() {
+			close()
+		}
+
+		// The frame in a buffer the driver has filled, copied out of the mapping.
+		//
+		// Fails when the buffer is not one of this camera's or its mapping cannot
+		// be read.
+		internal def bufferBytes(info BufferInfo) !byte[] {
+			expects {
+				assert info.index >= 0 && info.index < buffers.len() onerror fail "devices: camera {device.id} named buffer {info.index}, which is not mapped"
+			}
+			let handle = buffers[info.index]
+			// A frame never fills more than the buffer holds, whatever the driver
+			// reports.
+			let mapped = Storage.mmapLength(handle)
+			let length = (mapped > 0 && info.bytesUsed > mapped) ?? (mapped, info.bytesUsed)
+			return Storage.mmapRead(handle, 0, length)
+		}
+	}
+
+	// The cameras the machine has.
+	//
+	// Fails when the policy denies listing the devices.
+	def cameras() !Device[] {
+		return Devices.list(DeviceKind.Camera)
+	}
+
+	// Opens the camera behind the device id for capture; width/height 0 keep the
+	// driver's default.
+	//
+	// Fails when there is no such camera, it cannot be opened, or it supports
+	// neither MJPEG nor YUYV.
+	def openCamera(id string, width int = 0, height int = 0) !Camera {
+		let found = try Devices.get(id)
+		fail "devices: no device with the id {id}" when found is none
+		let device Device = found
+		fail "devices: {id} is not a camera" when device.kind != DeviceKind.Camera
+		let fd = try Devices.open(id)
+		let camera = startCapture(device, fd, width, height) onerror (err error) {
+			// Nothing was handed back, so the descriptor is this call's to close.
+			Devices.close(fd) onerror recover none
+			fail err
+		}
+		return camera
+	}
+
+	// Negotiates the frame layout on an open device, maps its buffers and starts
+	// it streaming.
+	//
+	// Fails when the device does not capture video, supports neither MJPEG nor
+	// YUYV, or refuses to stream.
+	internal def startCapture(device Device, fd int, width int, height int) !Camera {
+		let capability = try queryCapabilities(fd)
+		let caps = nodeCapabilities(capability)
+		fail "devices: {device.id} does not capture video" when (caps & CAP_VIDEO_CAPTURE) == 0
+		fail "devices: {device.id} cannot stream" when (caps & CAP_STREAMING) == 0
+
+		let layout = try negotiate(fd, width, height)
+		let granted = try requestBuffers(fd, CAPTURE_BUFFERS)
+		fail "devices: {device.id} granted {granted} capture buffers, too few to stream" when granted < 2
+		let buffers = try mapBuffers(fd, granted)
+		streamOn(fd) onerror (err error) {
+			releaseMappings(buffers)
+			fail err
+		}
+		return new Camera(device, fd, layout, buffers)
+	}
+
+	// Asks the device for MJPEG at that size, then for YUYV, and returns the
+	// layout it settled on. A device substitutes a layout it supports rather than
+	// refusing, so what came back is compared with what was asked for.
+	//
+	// Fails when the device supports neither format or refuses the request,
+	// as it does while another program holds it.
+	internal def negotiate(fd int, width int, height int) !Format {
+		// A size of 0 means "whatever the device is set to", which only its
+		// current layout can say.
+		let current = try currentFormat(fd)
+		let wantWidth = width > 0 ?? (width, current.width)
+		let wantHeight = height > 0 ?? (height, current.height)
+		// MJPEG first: it is what a camera delivers at full rate, and one frame
+		// is a whole JPEG file. YUYV is the uncompressed fallback.
+		for let (_, wanted) in [PIX_FMT_MJPEG, PIX_FMT_YUYV] {
+			let asked = Format{width: wantWidth, height: wantHeight, pixelFormat: wanted}
+			// A refusal is never about the format (the device substitutes one);
+			// it is the device being busy, held by another program.
+			let got = try setFormat(fd, asked)
+			return got when got.pixelFormat == wanted
+		}
+		fail "devices: the camera supports neither MJPEG nor YUYV"
+	}
+}
