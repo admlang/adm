@@ -1,0 +1,695 @@
+internal partial module std.formats.audio.vorbis {
+	use (
+		std.math
+		std.formats.audio.m4a::*
+		std.units::quantity
+	)
+
+	// Samples per block the encoder uses; every block is long, so the short
+	// block size is declared but never used.
+	const vorbisEncodeBlock = 2048
+
+	// Positions of the encoder's floor points past the two ends, in the
+	// order they are coded: each one halves an interval the earlier ones
+	// left, so its predicted height comes from close neighbours.
+	const vorbisEncodePoints = int[
+		64, 16, 256, 6, 32, 128, 512, 3,
+		10, 24, 48, 96, 192, 384, 768, 2,
+		4, 8, 12, 20, 28, 40, 56, 80,
+		112, 160, 224, 320, 448, 640, 896, 1
+	]
+
+	// Largest residue magnitude the encoder codes; 31 times the coarse
+	// book's reach plus the fine book's.
+	const vorbisEncodeLimit = 64 * 31 + 15
+
+	// Encodes interleaved float frames into Vorbis I packets with a fixed
+	// setup: long blocks only, one floor 1 of 34 points, residue 2 with six
+	// classes over five vector books, and square polar coupling for stereo.
+	// Each block's floor follows the spectral envelope and doubles as the
+	// quantization step, so quality sets how far below the signal the
+	// quantization noise lies.
+	type VorbisEncoder {
+		channels   int
+		sampleRate int
+		// Frames handed to `encode` so far.
+		frames     int64
+		books      VorbisCodebook[]
+		// Bit-reversed codewords per book, the order the bit writer emits.
+		reversed   int[][]
+		floor      VorbisFloor1
+		residue    VorbisResidue
+		transform  VorbisMdct
+		slope      float[]
+		// Signal-to-noise ratio each band aims for, as the ratio of band
+		// amplitude to quantization step.
+		ratio      float
+		// Smallest quantization step, which keeps silence free.
+		minStep    float
+		// Spectral lines coded; those above are left silent.
+		bandwidth  int
+		// The last half block per channel, and the half block arriving.
+		history    float[][]
+		fill       int
+		blocks     int
+		windowed   float[]
+		spectrum   float[]
+		curve      float[]
+		quantized  int[][]
+		interleave int[]
+		targets    int[]
+		heights    int[]
+		finals     int[]
+		coded      int[]
+		used       bool[]
+		writer     VorbisBitWriter
+		order      int[]
+
+		// An encoder for the rate and channel count at quality 0 to 100.
+		def new(sampleRate int, channels int, quality int) {
+			self.sampleRate = sampleRate
+			self.channels = channels
+			let q = quality.clamp(0, 100)
+			// 6 dB at quality 0 to 30 dB at 100.
+			ratio = quantity(6.0 + 0.24 * float(q), dB)
+			minStep = 1e-5
+			// Nothing above 14 kHz is kept at quality 0, above 20 kHz at 100.
+			let cutoff = 14000 + 60 * q
+			bandwidth = vorbisEncodeBlock / 2
+			bandwidth = int(int64(cutoff) * int64(vorbisEncodeBlock) / int64(sampleRate)) when 2 * cutoff < sampleRate
+			let n = vorbisEncodeBlock
+			transform = new VorbisMdct(n)
+			slope = vorbisSlope(n / 2)
+			windowed.len(n)
+			spectrum.len(n / 2)
+			curve.len(n / 2)
+			interleave.len(n / 2 * channels)
+			for let c = 0; c < channels; c++ {
+				let h float[]
+				h.len(n)
+				history.push(h)
+				let qv int[]
+				qv.len(n / 2)
+				quantized.push(qv)
+			}
+			order.len(channels)
+			for let c = 0; c < channels; c++ {
+				order[c] = channels <= 8 ?? (vorbisChannelOrder[(channels - 1) * 8 + c], c)
+			}
+			writer = new VorbisBitWriter()
+			buildBooks()
+			buildFloor()
+			buildResidue()
+		}
+
+		// The codebooks: floor heights, residue classes, then the residue
+		// vector books A to E.
+		def buildBooks() {
+			// 0: floor heights, small steps likelier.
+			let heightWeights float[]
+			for let v = 0; v < 128; v++ {
+				heightWeights.push(1.0 / float((v + 1) * (v + 1)) + 1e-4)
+			}
+			addBook(1, vorbisHuffmanLengths(heightWeights), 0, 0)
+			// 1: two residue partitions' classes per codeword.
+			let classWeights = float[40.0, 12.0, 8.0, 4.0, 2.0, 1.0]
+			let pairWeights float[]
+			for let a = 0; a < 6; a++ {
+				for let b = 0; b < 6; b++ {
+					pairWeights.push(classWeights[a] * classWeights[b])
+				}
+			}
+			addBook(2, vorbisHuffmanLengths(pairWeights), 0, 0)
+			// 2 to 5: vectors of -1..1 by 4, -3..3 by 2, -7..7 by 2, -15..15.
+			addVectorBook(4, 1, 0.25)
+			addVectorBook(2, 3, 0.4)
+			addVectorBook(2, 7, 0.7)
+			addVectorBook(1, 15, 0.85)
+			// 6: the coarse book, multiples of 31.
+			addVectorBook(1, 64, 0.9)
+		}
+
+		// Adds a lookup type 1 book of `dims` values from -reach to reach
+		// each, whose likelihood falls by `falloff` per unit of magnitude.
+		def addVectorBook(dims int, reach int, falloff float) {
+			let span = 2 * reach + 1
+			let entries = 1
+			for let i = 0; i < dims; i++ {
+				entries *= span
+			}
+			let weights float[]
+			for let e = 0; e < entries; e++ {
+				let w = 1.0
+				let rest = e
+				for let i = 0; i < dims; i++ {
+					let v = (rest % span - reach).abs()
+					rest /= span
+					for let k = 0; k < v; k++ {
+						w *= falloff
+					}
+				}
+				weights.push(w + 1e-9)
+			}
+			addBook(dims, vorbisHuffmanLengths(weights), span, reach)
+		}
+
+		// Adds a book with the lengths; `span` values from -reach (times 31
+		// for the coarse book) when it has vectors, none when `span` is 0.
+		def addBook(dims int, lengths int[], span int, reach int) {
+			let book = new VorbisCodebook(dims, lengths)
+			book.build() onerror recover none
+			if span > 0 {
+				book.lookupType = 1
+				let scale = reach == 64 ?? (31, 1)
+				let multiplicands int[]
+				for let i = 0; i < span; i++ {
+					multiplicands.push(i)
+				}
+				book.unpackVectors(multiplicands, float(-reach * scale), float(scale), false)
+			}
+			books.push(book)
+			let rev int[]
+			rev.len(book.entries)
+			for let e = 0; e < book.entries; e++ {
+				let code = book.codes[e]
+				let r = 0
+				for let b = 0; b < book.lengths[e]; b++ {
+					r = (r << 1) | ((code >> b) & 1)
+				}
+				rev[e] = r
+			}
+			reversed.push(rev)
+		}
+
+		// The floor: 8 partitions of one class of 4 points coded with book 0.
+		def buildFloor() {
+			floor = new VorbisFloor1()
+			floor.partitionClass.len(8)
+			floor.classDimensions.push(4)
+			floor.classSubclasses.push(0)
+			floor.classMasterbook.push(0)
+			for let j = 0; j < 8; j++ {
+				floor.subclassBooks.push(j == 0 ?? (0, -1))
+			}
+			floor.multiplier = 2
+			floor.range = 128
+			floor.xList.push(0)
+			floor.xList.push(vorbisEncodeBlock / 2)
+			for let (_, x) in vorbisEncodePoints {
+				floor.xList.push(x)
+			}
+			floor.prepare()
+			let count = floor.xList.len()
+			targets.len(count)
+			heights.len(count)
+			finals.len(count)
+			coded.len(count)
+			used.len(count)
+		}
+
+		// The residue: type 2 over all channels in partitions of 16, class 0
+		// silent, classes 1 to 4 one book each, class 5 the coarse book then
+		// the fine one.
+		def buildResidue() {
+			residue = new VorbisResidue()
+			residue.kind = 2
+			residue.start = 0
+			residue.stop = vorbisEncodeBlock / 2 * channels
+			residue.partitionSize = 16
+			residue.classifications = 6
+			residue.classbook = 1
+			let plan = int[
+				-1, -1,
+				2, -1,
+				3, -1,
+				4, -1,
+				5, -1,
+				6, 5
+			]
+			for let c = 0; c < 6; c++ {
+				for let j = 0; j < 8; j++ {
+					residue.books.push(j < 2 ?? (plan[c * 2 + j], -1))
+				}
+			}
+		}
+
+		// The identification, comment and setup header packets.
+		def headers(vendor string, comments string[]) byte[][] {
+			let out byte[][]
+			let w = writer
+			w.reset()
+			w.write(1, 8)
+			w.text("vorbis")
+			w.write(0, 32)
+			w.write(channels, 8)
+			w.write(sampleRate, 32)
+			w.write(0, 32)
+			w.write(0, 32)
+			w.write(0, 32)
+			w.write(8, 4)
+			w.write(11, 4)
+			w.write(1, 1)
+			out.push(w.bytes())
+
+			w.reset()
+			w.write(3, 8)
+			w.text("vorbis")
+			let v = byte[](vendor)
+			w.write(v.len(), 32)
+			w.text(vendor)
+			w.write(comments.len(), 32)
+			for let (_, c) in comments {
+				w.write(byte[](c).len(), 32)
+				w.text(c)
+			}
+			w.write(1, 1)
+			out.push(w.bytes())
+
+			w.reset()
+			w.write(5, 8)
+			w.text("vorbis")
+			w.write(books.len() - 1, 8)
+			for let (_, book) in books {
+				writeBook(book)
+			}
+			w.write(0, 6)
+			w.write(0, 16)
+			// Floors.
+			w.write(0, 6)
+			w.write(1, 16)
+			w.write(8, 5)
+			for let i = 0; i < 8; i++ {
+				w.write(0, 4)
+			}
+			w.write(3, 3)
+			w.write(0, 2)
+			w.write(1, 8)
+			w.write(1, 2)
+			w.write(10, 4)
+			for let (_, x) in vorbisEncodePoints {
+				w.write(x, 10)
+			}
+			// Residues.
+			w.write(0, 6)
+			w.write(2, 16)
+			w.write(residue.start, 24)
+			w.write(residue.stop, 24)
+			w.write(residue.partitionSize - 1, 24)
+			w.write(residue.classifications - 1, 6)
+			w.write(residue.classbook, 8)
+			for let c = 0; c < residue.classifications; c++ {
+				let cascade = 0
+				for let j = 0; j < 8; j++ {
+					cascade |= 1 << j when residue.books[c * 8 + j] >= 0
+				}
+				w.write(cascade & 7, 3)
+				w.flag(cascade > 7)
+				w.write(cascade >> 3, 5) when cascade > 7
+			}
+			for let c = 0; c < residue.classifications; c++ {
+				for let j = 0; j < 8; j++ {
+					let book = residue.books[c * 8 + j]
+					w.write(book, 8) when book >= 0
+				}
+			}
+			// Mappings.
+			w.write(0, 6)
+			w.write(0, 16)
+			w.write(0, 1)
+			if channels == 2 {
+				w.write(1, 1)
+				w.write(0, 8)
+				w.write(0, 1)
+				w.write(1, 1)
+			} else {
+				w.write(0, 1)
+			}
+			w.write(0, 2)
+			w.write(0, 8)
+			w.write(0, 8)
+			w.write(0, 8)
+			// Modes.
+			w.write(0, 6)
+			w.write(1, 1)
+			w.write(0, 16)
+			w.write(0, 16)
+			w.write(0, 8)
+			w.write(1, 1)
+			out.push(w.bytes())
+			return out
+		}
+
+		// Writes a codebook's setup (Vorbis I §3.2.1).
+		def writeBook(book VorbisCodebook) {
+			let w = writer
+			w.write(0x564342, 24)
+			w.write(book.dimensions, 16)
+			w.write(book.entries, 24)
+			w.write(0, 1)
+			w.write(0, 1)
+			for let e = 0; e < book.entries; e++ {
+				w.write(book.lengths[e] - 1, 5)
+			}
+			if book.lookupType == 0 {
+				w.write(0, 4)
+				return
+			}
+			w.write(1, 4)
+			let span = vorbisLookup1Values(book.entries, book.dimensions)
+			let reach = span / 2
+			let scale = reach == 64 ?? (31, 1)
+			w.write(vorbisPackFloat(-reach * scale), 32)
+			w.write(vorbisPackFloat(scale), 32)
+			let bits = vorbisIlog(span - 1)
+			w.write(bits - 1, 4)
+			w.write(0, 1)
+			for let i = 0; i < span; i++ {
+				w.write(i, bits)
+			}
+		}
+
+		// Takes interleaved frames and returns the packets they complete,
+		// each with its granule position.
+		def encode(samples float32[], count int, packets byte[][], granules int64[]) {
+			let half = vorbisEncodeBlock / 2
+			let at = 0
+			for at < count {
+				let take = count - at
+				take = half - fill when take > half - fill
+				for let c = 0; c < channels; c++ {
+					let h = history[c]
+					let from = order[c]
+					for let i = 0; i < take; i++ {
+						h[half + fill + i] = float(samples[(at + i) * channels + from])
+					}
+				}
+				fill += take
+				at += take
+				frames += int64(take)
+				if fill == half {
+					packets.push(block())
+					granules.push(int64(blocks - 1) * int64(half))
+					for let (_, h) in history {
+						for let i = 0; i < half; i++ {
+							h[i] = h[half + i]
+						}
+					}
+					fill = 0
+				}
+			}
+		}
+
+		// The packets that finish the stream: the partial half block padded
+		// with silence, and one more block so the last frames are overlapped.
+		def end(packets byte[][], granules int64[]) {
+			let half = vorbisEncodeBlock / 2
+			let rounds = fill > 0 ?? (2, 1)
+			for let r = 0; r < rounds; r++ {
+				for let (_, h) in history {
+					for let i = half + fill; i < 2 * half; i++ {
+						h[i] = 0.0
+					}
+				}
+				packets.push(block())
+				granules.push(frames)
+				for let (_, h) in history {
+					for let i = 0; i < half; i++ {
+						h[i] = h[half + i]
+					}
+				}
+				fill = 0
+			}
+			granules[granules.len() - 1] = frames when granules.len() > 0
+			for let i = 0; i < granules.len(); i++ {
+				granules[i] = frames when granules[i] > frames
+			}
+		}
+
+		// Encodes the block held in `history` as one audio packet.
+		def block() byte[] {
+			let n = vorbisEncodeBlock
+			let half = n / 2
+			let w = writer
+			w.reset()
+			w.write(0, 1)
+			w.write(1, 1)
+			w.write(1, 1)
+			let scale = 4.0 / float(n)
+			for let c = 0; c < channels; c++ {
+				let h = history[c]
+				for let i = 0; i < half; i++ {
+					windowed[i] = h[i] * slope[i] * scale
+					windowed[half + i] = h[half + i] * slope[half - 1 - i] * scale
+				}
+				transform.forward(windowed, spectrum)
+				chooseFloor()
+				writeFloor()
+				for let i = 0; i < half; i++ {
+					curve[i] = 1.0
+				}
+				floor.apply(coded, half, curve, used, heights)
+				let qv = quantized[c]
+				for let i = bandwidth; i < half; i++ {
+					spectrum[i] = 0.0
+				}
+				for let i = 0; i < half; i++ {
+					let v = spectrum[i] / curve[i]
+					let r = int(v >= 0.0 ?? (v + 0.5, v - 0.5))
+					qv[i] = r.clamp(-vorbisEncodeLimit, vorbisEncodeLimit)
+				}
+			}
+			couple(quantized[0], quantized[1], half) when channels == 2
+			for let c = 0; c < channels; c++ {
+				let qv = quantized[c]
+				for let i = 0; i < half; i++ {
+					interleave[i * channels + c] = qv[i]
+				}
+			}
+			writeResidue()
+			blocks++
+			return w.bytes()
+		}
+
+		// Picks each floor point's height: the quantization step that puts
+		// the noise `ratio` below the band around the point.
+		def chooseFloor() {
+			let count = floor.xList.len()
+			let half = vorbisEncodeBlock / 2
+			for let k = 0; k < count; k++ {
+				let i = floor.sorted[k]
+				let x = floor.xList[i]
+				let lo = k == 0 ?? (0, (floor.xList[floor.sorted[k - 1]] + x) / 2)
+				let hi = k == count - 1 ?? (half, (floor.xList[floor.sorted[k + 1]] + x + 1) / 2)
+				hi = lo + 1 when hi <= lo
+				hi = half when hi > half
+				let sum = 0.0
+				for let j = lo; j < hi; j++ {
+					sum += spectrum[j] * spectrum[j]
+				}
+				let rms = math.sqrt(sum / float(hi - lo))
+				let step = rms / ratio
+				step = minStep when step < minStep
+				// Table index: 0 is 1.0649863e-7, each step up is a factor of
+				// 1.0649863 (0.0629588 in natural log).
+				let index = math.ln(step / 1.0649863e-7) / 0.0629588
+				let y = int(index / 2.0 + 0.5)
+				targets[i] = y.clamp(0, 127)
+			}
+		}
+
+		// Codes the floor heights of one channel, leaving the values written
+		// in `coded` and the heights the decoder rebuilds from them in
+		// `finals`.
+		def writeFloor() {
+			let w = writer
+			let count = floor.xList.len()
+			let range = floor.range
+			w.write(1, 1)
+			w.write(targets[0], 7)
+			w.write(targets[1], 7)
+			finals[0] = targets[0]
+			finals[1] = targets[1]
+			coded[0] = targets[0]
+			coded[1] = targets[1]
+			let codes = reversed[0]
+			let lengths = books[0].lengths
+			for let i = 2; i < count; i++ {
+				let lo = floor.low[i]
+				let hi = floor.high[i]
+				let predicted = vorbisRenderPoint(floor.xList[lo], finals[lo], floor.xList[hi], finals[hi], floor.xList[i])
+				let highroom = range - predicted
+				let lowroom = predicted
+				let room = highroom < lowroom ?? (highroom * 2, lowroom * 2)
+				let want = targets[i]
+				let val = 0
+				let delta = want - predicted
+				if delta > 0 {
+					val = delta * 2 < room ?? (delta * 2, delta + lowroom)
+				} else if delta < 0 {
+					let d = -delta
+					val = 2 * d - 1 < room ?? (2 * d - 1, d + highroom - 1)
+				}
+				val = val.clamp(0, 127)
+				coded[i] = val
+				if val == 0 {
+					finals[i] = predicted
+				} else if val >= room {
+					finals[i] = highroom > lowroom ?? (val - lowroom + predicted, predicted - val + highroom - 1)
+				} else if (val & 1) != 0 {
+					finals[i] = predicted - (val + 1) / 2
+				} else {
+					finals[i] = predicted + val / 2
+				}
+				w.write(codes[val], lengths[val])
+			}
+		}
+
+		// Square polar coupling (Vorbis I §1.3.3), in place: the left vector
+		// becomes the magnitude, the right the angle.
+		def couple(left int[], right int[], size int) {
+			for let i = 0; i < size; i++ {
+				let l = left[i]
+				let r = right[i]
+				if l.abs() > r.abs() {
+					left[i] = l
+					right[i] = l > 0 ?? (l - r, r - l)
+				} else {
+					left[i] = r
+					right[i] = r > 0 ?? (l - r, r - l)
+				}
+			}
+		}
+
+		// Codes the interleaved residue as residue 2.
+		def writeResidue() {
+			let w = writer
+			let size = residue.partitionSize
+			let partitions = residue.stop / size
+			let classes int[]
+			classes.len(partitions)
+			for let p = 0; p < partitions; p++ {
+				let peak = 0
+				for let i = 0; i < size; i++ {
+					let v = interleave[p * size + i].abs()
+					peak = v when v > peak
+				}
+				let cls = 5
+				if peak == 0 {
+					cls = 0
+				} else if peak <= 1 {
+					cls = 1
+				} else if peak <= 3 {
+					cls = 2
+				} else if peak <= 7 {
+					cls = 3
+				} else if peak <= 15 {
+					cls = 4
+				}
+				classes[p] = cls
+			}
+			for let pass = 0; pass < 2; pass++ {
+				for let p = 0; p < partitions; p++ {
+					if pass == 0 && p % 2 == 0 {
+						let entry = classes[p] * 6 + classes[p + 1]
+						w.write(reversed[1][entry], books[1].lengths[entry])
+					}
+					let book = residue.books[classes[p] * 8 + pass]
+					continue when book < 0
+					writePartition(p * size, book, classes[p] == 5 && pass == 1)
+				}
+			}
+		}
+
+		// Codes one partition with the book; `remainder` codes what the
+		// coarse book left of each value.
+		def writePartition(offset int, book int, remainder bool) {
+			let w = writer
+			let b = books[book]
+			let dims = b.dimensions
+			let span = vorbisLookup1Values(b.entries, dims)
+			let reach = span / 2
+			let codes = reversed[book]
+			for let i = 0; i < residue.partitionSize; i += dims {
+				let entry = 0
+				let place = 1
+				for let d = 0; d < dims; d++ {
+					let v = interleave[offset + i + d]
+					if book == 6 {
+						v = vorbisCoarse(v)
+					} else if remainder {
+						v = v - 31 * vorbisCoarse(v)
+					}
+					entry += (v.clamp(-reach, reach) + reach) * place
+					place *= span
+				}
+				w.write(codes[entry], b.lengths[entry])
+			}
+		}
+	}
+
+	// The coarse book's share of a residue value: the nearest multiple of
+	// 31, as a count of 31s.
+	def vorbisCoarse(v int) int {
+		return (v + 15) / 31 when v >= 0
+		return -((15 - v) / 31)
+	}
+
+	// An integer as a packed Vorbis float (Vorbis I §9.2.2).
+	def vorbisPackFloat(v int) int {
+		let sign = v < 0 ?? (0x80000000, 0)
+		return sign | (788 << 21) | v.abs()
+	}
+
+	// Huffman code lengths for entries of the weights, all at most 32 bits,
+	// forming a complete prefix code.
+	def vorbisHuffmanLengths(weights float[]) int[] {
+		let count = weights.len()
+		let lengths int[]
+		lengths.len(count)
+		return lengths when count == 0
+		if count == 1 {
+			lengths[0] = 1
+			return lengths
+		}
+		// Nodes: the leaves, then one per merge.
+		let weight float[]
+		let parent int[]
+		let alive bool[]
+		for let i = 0; i < count; i++ {
+			weight.push(weights[i])
+			parent.push(-1)
+			alive.push(true)
+		}
+		for let merges = 0; merges < count - 1; merges++ {
+			let a = -1
+			let b = -1
+			for let i = 0; i < weight.len(); i++ {
+				continue unless alive[i]
+				if a < 0 || weight[i] < weight[a] {
+					b = a
+					a = i
+				} else if b < 0 || weight[i] < weight[b] {
+					b = i
+				}
+			}
+			let node = weight.len()
+			weight.push(weight[a] + weight[b])
+			parent.push(-1)
+			alive.push(true)
+			alive[a] = false
+			alive[b] = false
+			parent[a] = node
+			parent[b] = node
+		}
+		for let i = 0; i < count; i++ {
+			let depth = 0
+			let at = i
+			for parent[at] >= 0 {
+				depth++
+				at = parent[at]
+			}
+			lengths[i] = depth
+		}
+		return lengths
+	}
+}

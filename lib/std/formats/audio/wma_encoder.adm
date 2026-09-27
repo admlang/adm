@@ -1,0 +1,402 @@
+internal partial module std.formats.audio.wma {
+	use std.formats.audio.loader::*
+
+	// Encodes interleaved float frames into WMA v2 superframes: one frame of
+	// one full-length block per superframe, Huffman coded exponents, and
+	// mid/side stereo.
+	//
+	// Each band's exponent follows the band's own level, so quantization
+	// noise sits a fixed distance below the signal in every band; the
+	// frame's gain is the finest that fits the superframe.
+	//
+	// The stream starts one frame early, so a decoder that drops its two
+	// warm-up frames returns the input from its first sample. `flush` pads
+	// the end with silence until the last input sample is fully decoded.
+	type WMAEncoder {
+		layout WMALayout
+
+		transform  WMATransform
+		expCodes   int[]
+		expBits    int[]
+		expScales  float[]
+		coefCodes  int[][]
+		coefBits   int[][]
+		coefLevels int[][]
+		// Per table: the first code of each level.
+		firstCode  int[][]
+		// Per channel: the previous frame's samples, then the current one.
+		window     float[][]
+		pending    float[]
+		frames     int
+		input      float[]
+		coefs      float[][]
+		levels     int[][]
+		exps       int[][]
+		bandScale  float[][]
+
+		// An encoder at the rate, channel count (1 or 2) and bit rate in bits
+		// per second.
+		def new(sampleRate int, channels int, bitrate int) {
+			let frameLen = sampleRate <= 16000 ?? (512, sampleRate <= 22050 ?? (1024, 2048))
+			let blockAlign = (bitrate * frameLen / (sampleRate * 8)).min(32768)
+			let bytesPerSec = bitrate / 8
+			layout = new WMALayout(2, channels, sampleRate, bytesPerSec * 8, blockAlign, wmaFlagExpVlc)
+			transform = new WMATransform(layout.frameLen)
+			expCodes = wmaExponentCodes()
+			expBits = wmaExponentBits()
+			expScales = wmaExponentScales()
+			for let t = 0; t < 2; t++ {
+				let table = layout.coefTable * 2 + t
+				coefCodes.push(wmaCoefCodes(table))
+				coefBits.push(wmaCoefBits(table))
+				let lv = wmaCoefLevels(table)
+				coefLevels.push(lv)
+				let first int[]
+				let code = 2
+				for let (_, count) in lv {
+					first.push(code)
+					code += count
+				}
+				firstCode.push(first)
+			}
+			let n = layout.frameLen
+			for let ch = 0; ch < channels; ch++ {
+				window.push(wmaZeros(2 * n))
+				coefs.push(wmaZeros(n))
+				let lv int[]
+				lv.len(n)
+				levels.push(lv)
+				let ex int[]
+				ex.len(32)
+				exps.push(ex)
+				bandScale.push(wmaZeros(32))
+			}
+			input = wmaZeros(2 * n)
+			// The frame of silence the stream starts with.
+			for let i = 0; i < n * channels; i++ {
+				pending.push(0.0)
+			}
+		}
+
+		// Takes interleaved frames and returns every superframe now complete.
+		//
+		// Fails when the samples are not whole frames.
+		def encode(samples float32[]) !byte[][] {
+			let channels = layout.channels
+			fail "wma: {samples.len()} samples are not whole frames" when samples.len() % channels != 0
+			for let (_, v) in samples {
+				pending.push(float(v))
+			}
+			frames += samples.len() / channels
+			return drain()
+		}
+
+		// Pads the input with silence until its last sample is fully coded
+		// and returns the remaining superframes.
+		//
+		// Does not fail today.
+		def flush() !byte[][] {
+			let n = layout.frameLen
+			let channels = layout.channels
+			// Silence to a whole frame, and one frame more to complete the
+			// overlap of the last one: the frame a decoder returns once the
+			// stream ends is then silence.
+			let rest = pending.len() / channels
+			let pad = (n - rest % n) % n + n
+			for let i = 0; i < pad * channels; i++ {
+				pending.push(0.0)
+			}
+			return drain()
+		}
+
+		// Frames of input taken so far.
+		def count() int {
+			return frames
+		}
+
+		// Encodes every whole frame waiting in `pending`.
+		def drain() byte[][] {
+			let out byte[][]
+			let n = layout.frameLen
+			let channels = layout.channels
+			let used = 0
+			for pending.len() - used >= n * channels {
+				out.push(encodeFrame(used))
+				used += n * channels
+			}
+			let rest float[]
+			for let i = used; i < pending.len(); i++ {
+				rest.push(pending[i])
+			}
+			pending = rest
+			return out
+		}
+
+		// Encodes the frame starting at sample `at` of `pending`.
+		def encodeFrame(at int) byte[] {
+			let n = layout.frameLen
+			let channels = layout.channels
+			for let ch = 0; ch < channels; ch++ {
+				let w = window[ch]
+				for let i = 0; i < n; i++ {
+					w[i] = w[n + i]
+					w[n + i] = pending[at + i * channels + ch]
+				}
+				let win = transform.window
+				for let i = 0; i < n; i++ {
+					input[i] = w[i] * win[i]
+					input[n + i] = w[n + i] * win[n - 1 - i]
+				}
+				transform.forward(input, coefs[ch])
+				// The decoder's inverse transform is scaled by -1/32768, and
+				// the overlap-add of a transform of `n` coefficients returns
+				// the input times n/2.
+				let c = coefs[ch]
+				for let k = 0; k < n; k++ {
+					c[k] *= -65536.0 / float(n)
+				}
+			}
+			let ms = channels == 2
+			if ms {
+				let a = coefs[0]
+				let b = coefs[1]
+				for let k = 0; k < n; k++ {
+					let m = (a[k] + b[k]) * 0.5
+					let s = (a[k] - b[k]) * 0.5
+					a[k] = m
+					b[k] = s
+				}
+			}
+
+			let coded bool[]
+			coded.len(channels)
+			for let ch = 0; ch < channels; ch++ {
+				coded[ch] = chooseExponents(ch)
+			}
+
+			// The finest gain whose frame fits: bits shrink as the gain grows.
+			let low = 1
+			let high = 1
+			let best byte[]
+			for high < 2000 {
+				let trial = writeFrame(high, ms, coded)
+				if trial.len() > 0 {
+					best = trial
+					break
+				}
+				low = high
+				high *= 2
+			}
+			for low + 1 < high {
+				let mid = (low + high) / 2
+				let trial = writeFrame(mid, ms, coded)
+				if trial.len() > 0 {
+					best = trial
+					high = mid
+				} else {
+					low = mid
+				}
+			}
+			if best.len() == 0 {
+				for let ch = 0; ch < channels; ch++ {
+					coded[ch] = false
+				}
+				best = writeFrame(1, ms, coded)
+			}
+			let frame byte[]
+			frame.len(layout.blockAlign)
+			for let i = 0; i < best.len() && i < frame.len(); i++ {
+				frame[i] = best[i]
+			}
+			return frame
+		}
+
+		// Sets the band exponents of a channel from the level of each band;
+		// false when the channel is silent. The exponents follow the band
+		// levels at `wmaNoiseShaping` of their spread in decibels, so louder
+		// bands get coarser steps without starving the quiet ones.
+		def chooseExponents(ch int) bool {
+			let bands = layout.exponentBands[0]
+			let c = coefs[ch]
+			let ex = exps[ch]
+			let raw int[]
+			let pos = 0
+			let loud = false
+			let top = -60
+			for let (_, width) in bands {
+				let sum = 0.0
+				for let i = pos; i < pos + width; i++ {
+					sum += c[i] * c[i]
+				}
+				pos += width
+				let rms = wmaSqrt(sum / float(width))
+				loud = true when rms > 1.0e-3
+				let e = nearestExponent(rms)
+				raw.push(e)
+				top = top.max(e)
+			}
+			let last = 36
+			for let (b, e) in raw {
+				let shaped = top - int(float(top - e) * wmaNoiseShaping + 0.5)
+				shaped = shaped.max(last - 60).min(last + 60)
+				ex[b] = shaped
+				bandScale[ch][b] = expScales[shaped + 60]
+				last = shaped
+			}
+			return loud
+		}
+
+		// The exponent -60 to 95 whose scale is nearest `v` in ratio.
+		def nearestExponent(v float) int {
+			return -60 when v <= expScales[0]
+			let top = expScales.len() - 1
+			return top - 60 when v >= expScales[top]
+			let lo = 0
+			let hi = top
+			for lo + 1 < hi {
+				let mid = (lo + hi) / 2
+				if expScales[mid] <= v {
+					lo = mid
+				} else {
+					hi = mid
+				}
+			}
+			// Geometric midpoint of the two neighbours.
+			let pick = v * v > expScales[lo] * expScales[hi] ?? (hi, lo)
+			return pick - 60
+		}
+
+		// Writes the frame at `gain`; empty when it does not fit the
+		// superframe or a level does not fit its escape.
+		def writeFrame(gain int, ms bool, coded bool[]) byte[] {
+			let channels = layout.channels
+			let n = layout.frameLen
+			let w = new WMABitWriter()
+			w.write(1, ms ?? (1, 0)) when channels == 2
+			let any = false
+			for let ch = 0; ch < channels; ch++ {
+				w.write(1, coded[ch] ?? (1, 0))
+				any = any || coded[ch]
+			}
+			if any {
+				let v = gain - 1
+				for v >= 127 {
+					w.write(7, 127)
+					v -= 127
+				}
+				w.write(7, v)
+				let coefBitsLimit = wmaGainBits(gain)
+				if layout.useNoiseCoding {
+					for let ch = 0; ch < channels; ch++ {
+						continue unless coded[ch]
+						for let i = 0; i < layout.highBands[0].len(); i++ {
+							w.write(1, 0)
+						}
+					}
+				}
+				for let ch = 0; ch < channels; ch++ {
+					continue unless coded[ch]
+					let last = 36
+					let ex = exps[ch]
+					for let b = 0; b < layout.exponentBands[0].len(); b++ {
+						let code = ex[b] - last + 60
+						w.write(expBits[code], expCodes[code])
+						last = ex[b]
+					}
+				}
+				let norm = 2.0 / float(n)
+				for let ch = 0; ch < channels; ch++ {
+					continue unless coded[ch]
+					let fits = quantize(ch, gain, norm)
+					return byte[] unless fits
+					let t = (ch == 1 && ms) ?? (1, 0)
+					let ok = writeRunLevels(w, t, levels[ch], layout.coefsEnd[0] - layout.coefsStart, coefBitsLimit)
+					return byte[] unless ok
+					return byte[] when w.count() > layout.blockAlign * 8
+				}
+			}
+			w.align()
+			return byte[] when w.count() > layout.blockAlign * 8
+			return w.bytes()
+		}
+
+		// Quantizes a channel's coefficients at `gain`; false when a level is
+		// out of range.
+		def quantize(ch int, gain int, norm float) bool {
+			let bands = layout.exponentBands[0]
+			let maxScale = 0.0
+			for let b = 0; b < bands.len(); b++ {
+				maxScale = maxScale.max(bandScale[ch][b])
+			}
+			let mult = wmaDecibels(gain) / maxScale * norm
+			let c = coefs[ch]
+			let out = levels[ch]
+			let count = layout.coefsEnd[0] - layout.coefsStart
+			let b = 0
+			let bandEnd = bands[0]
+			for let i = 0; i < count; i++ {
+				let k = layout.coefsStart + i
+				for k >= bandEnd && b + 1 < bands.len() {
+					b++
+					bandEnd += bands[b]
+				}
+				let t = c[k] / (bandScale[ch][b] * mult)
+				return false when t < -32768.0 || t > 32767.0
+				let q = t >= 0.0 ?? (int(t + 0.5), -int(-t + 0.5))
+				out[i] = q
+			}
+			return true
+		}
+
+		// Writes `count` levels as run-level codes of table `t`; false when
+		// an escaped level does not fit `escapeBits`.
+		def writeRunLevels(w WMABitWriter, t int, values int[], count int, escapeBits int) bool {
+			let codes = coefCodes[t]
+			let bits = coefBits[t]
+			let lv = coefLevels[t]
+			let first = firstCode[t]
+			let run = 0
+			for let i = 0; i < count; i++ {
+				let level = values[i]
+				if level == 0 {
+					run++
+					continue
+				}
+				let mag = level < 0 ?? (-level, level)
+				let code = 0
+				code = first[mag - 1] + run when mag <= lv.len() && run < lv[mag - 1]
+				w.write(bits[code], codes[code])
+				if code == 0 {
+					return false when mag >= 1 << escapeBits
+					w.write(escapeBits, mag)
+					w.write(layout.frameBits, run)
+				}
+				w.write(1, level > 0 ?? (1, 0))
+				run = 0
+			}
+			w.write(bits[1], codes[1]) when run > 0
+			return true
+		}
+	}
+
+	// How closely the encoder's quantization steps follow the band levels:
+	// 0 gives every band the same step (the best signal to noise ratio), 1
+	// the same signal to noise ratio in every band.
+	const wmaNoiseShaping = 0.25
+
+	// The square root of a non-negative `v`, by Newton's method from a
+	// power-of-two start.
+	def wmaSqrt(v float) float {
+		return 0.0 when v <= 0.0
+		let x = 1.0
+		for x * x < v {
+			x *= 2.0
+		}
+		for let i = 0; i < 60; i++ {
+			let next = 0.5 * (x + v / x)
+			break when next >= x
+			x = next
+		}
+		return x
+	}
+}

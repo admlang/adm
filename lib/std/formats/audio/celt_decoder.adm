@@ -1,0 +1,689 @@
+internal partial module std.formats.audio.celt {
+	use std.formats.audio.opus::*
+
+	// Samples of history each channel keeps, for the post-filter and the
+	// concealment.
+	const celtBufferSize = 2048
+
+	// The longest post-filter period and concealment pitch.
+	const celtMaxPeriod = 1024
+
+	// The pre-emphasis coefficient.
+	const celtPreemph float32 = 0.85000610
+
+	// Decodes CELT frames (RFC 6716 section 4.3) to float samples in
+	// -1..1.
+	type CeltDecoder {
+		// Output channels.
+		channels       int
+		// Channels coded in the frames, set before each frame.
+		streamChannels int
+		// First band coded: 0, or 17 in a hybrid frame.
+		start          int
+		// The band above the last one coded, from the bandwidth.
+		end            int
+		// The final range of the last frame, which also seeds the noise.
+		rng            int
+		// The transforms, whose window the Opus layer's crossfades share.
+		mdct           CeltMdct
+		bands          CeltBands
+		alloc          CeltAllocation
+		pfPeriod       int
+		pfPeriodOld    int
+		pfGain         float32
+		pfGainOld      float32
+		pfTapset       int
+		pfTapsetOld    int
+		preemph        float32[]
+		// History of each channel, celtBufferSize + 120 samples apart.
+		mem            float32[]
+		oldBandE       float32[]
+		oldLogE        float32[]
+		oldLogE2       float32[]
+		background     float32[]
+		lossCount      int
+		lastPitch      int
+		lpc            float32[]
+		freq           float32[]
+		x              float32[]
+		bandE          float32[]
+		tfRes          int[]
+		cap            int[]
+		offsets        int[]
+		collapse       int[]
+		imdct          float32[]
+		exc            float32[]
+		e              float32[]
+		pitch          CeltPitch
+		lpcMem         float32[]
+
+		// A decoder for `channels` output channels.
+		def new(channels int) {
+			self.channels = channels
+			streamChannels = channels
+			start = 0
+			end = 21
+			mdct = new CeltMdct()
+			bands = new CeltBands()
+			alloc = new CeltAllocation()
+			preemph.len(2)
+			mem.len(2 * (celtBufferSize + 120))
+			oldBandE.len(42)
+			oldLogE.len(42)
+			oldLogE2.len(42)
+			background.len(42)
+			lpc.len(2 * 24)
+			freq.len(2 * 960)
+			x.len(2 * 960)
+			bandE.len(42)
+			tfRes.len(21)
+			cap.len(21)
+			offsets.len(21)
+			collapse.len(42)
+			imdct.len(960 + 120)
+			exc.len(celtMaxPeriod)
+			e.len(celtMaxPeriod + 2 * 120)
+			pitch = new CeltPitch(mdct.window)
+			lpcMem.len(24)
+			reset()
+		}
+
+		// Forgets every earlier frame.
+		def reset() {
+			rng = 0
+			pfPeriod = 0
+			pfPeriodOld = 0
+			pfGain = 0.0
+			pfGainOld = 0.0
+			pfTapset = 0
+			pfTapsetOld = 0
+			preemph[0] = 0.0
+			preemph[1] = 0.0
+			for let i = 0; i < mem.len(); i++ {
+				mem[i] = 0.0
+			}
+			for let i = 0; i < 42; i++ {
+				oldBandE[i] = 0.0
+				oldLogE[i] = -28.0
+				oldLogE2[i] = -28.0
+				background[i] = 0.0
+			}
+			for let i = 0; i < lpc.len(); i++ {
+				lpc[i] = 0.0
+			}
+			lossCount = 0
+			lastPitch = 0
+		}
+
+		// Decodes a frame of `n` samples per channel (120, 240, 480 or 960)
+		// from `len` bytes of `dec` into `pcm` from `at`, interleaved; a
+		// frame of at most one byte is concealed instead. Fails when the
+		// frame size is not a CELT one or the frame is damaged.
+		def decode(dec OpusRangeDecoder, len int, pcm float32[], at int, n int) !none {
+			let lm = 0
+			for lm <= 3 && (120 << lm) != n {
+				lm++
+			}
+			fail "celt: bad frame size {n}" when lm > 3
+			let m = 1 << lm
+			let c = streamChannels
+			let cc = channels
+			let effEnd = end.min(21)
+			for let ch = 0; ch < c; ch++ {
+				for let i = 0; i < m * celtEBands[start]; i++ {
+					x[ch * n + i] = 0.0
+				}
+				for let i = m * celtEBands[effEnd]; i < n; i++ {
+					x[ch * n + i] = 0.0
+				}
+			}
+			if len <= 1 {
+				conceal(pcm, at, n, lm)
+				return none
+			}
+			if c == 1 {
+				for let i = 0; i < 21; i++ {
+					oldBandE[i] = oldBandE[i].max(oldBandE[21 + i])
+				}
+			}
+			let totalBits = len * 8
+			let tell = dec.tell()
+			let silence = false
+			if tell >= totalBits {
+				silence = true
+			} else if tell == 1 {
+				silence = dec.bitLogp(15)
+			}
+			if silence {
+				tell = len * 8
+				dec.markRead(tell)
+			}
+			let pfGainNew float32 = 0.0
+			let pfPitchNew = 0
+			let pfTapsetNew = 0
+			if start == 0 && tell + 16 <= totalBits {
+				if dec.bitLogp(1) {
+					let octave = dec.uint(6)
+					pfPitchNew = (16 << octave) + dec.bits(4 + octave) - 1
+					let qg = dec.bits(3)
+					pfTapsetNew = dec.icdf(celtTapsetIcdf, 2) when dec.tell() + 2 <= totalBits
+					pfGainNew = 0.09375 * float32(qg + 1)
+				}
+				tell = dec.tell()
+			}
+			let transient = false
+			if lm > 0 && tell + 3 <= totalBits {
+				transient = dec.bitLogp(3)
+				tell = dec.tell()
+			}
+			let shortBlocks = transient
+			let intra = tell + 3 <= totalBits ?? (dec.bitLogp(3), false)
+			decodeCoarseEnergy(dec, intra, c, lm)
+			decodeTf(dec, transient, lm)
+			tell = dec.tell()
+			let spread = celtSpreadNormal
+			spread = dec.icdf(celtSpreadIcdf, 5) when tell + 4 <= totalBits
+
+			for let i = 0; i < 21; i++ {
+				let w = (celtEBands[i + 1] - celtEBands[i]) << lm
+				cap[i] = ((celtCacheCaps[21 * (2 * lm + c - 1) + i] + 64) * c * w) >> 2
+			}
+			let dynallocLogp = 6
+			let total = totalBits << 3
+			tell = dec.tellFrac()
+			for let i = start; i < end; i++ {
+				let width = (c * (celtEBands[i + 1] - celtEBands[i])) << lm
+				let quanta = (width << 3).min((6 << 3).max(width))
+				let loopLogp = dynallocLogp
+				let boost = 0
+				for tell + (loopLogp << 3) < total && boost < cap[i] {
+					let flag = dec.bitLogp(loopLogp)
+					tell = dec.tellFrac()
+					break unless flag
+					boost += quanta
+					total -= quanta
+					loopLogp = 1
+				}
+				offsets[i] = boost
+				dynallocLogp = (dynallocLogp - 1).max(2) when boost > 0
+			}
+			let allocTrim = tell + (6 << 3) <= total ?? (dec.icdf(celtTrimIcdf, 7), 5)
+			let bits = ((len * 8) << 3) - dec.tellFrac() - 1
+			let antiCollapseRsv = transient && lm >= 2 && bits >= ((lm + 2) << 3) ?? (8, 0)
+			bits -= antiCollapseRsv
+			alloc.compute(start, end, offsets, cap, allocTrim, bits, c, lm, false, dec, bands.enc, 0)
+			decodeFineEnergy(dec, c)
+
+			bands.encode = false
+			bands.dec = dec
+			bands.seed = rng
+			bands.spread = spread
+			bands.intensity = alloc.intensity
+			bands.quantAll(start, end, x, c == 2, n, collapse, alloc.pulses, shortBlocks, alloc.dualStereo, tfRes, len * 64 - antiCollapseRsv, alloc.balance, lm, alloc.codedBands)
+			rng = bands.seed
+			let antiCollapseOn = false
+			antiCollapseOn = dec.bits(1) == 1 when antiCollapseRsv > 0
+			decodeFinalEnergy(dec, len * 8 - dec.tell(), c)
+			antiCollapse(c, lm, n) when antiCollapseOn
+
+			amplitudes(c, oldBandE)
+			if silence {
+				for let i = 0; i < 42; i++ {
+					bandE[i] = 0.0
+					oldBandE[i] = -28.0
+				}
+			}
+			for let ch = 0; ch < c; ch++ {
+				let base = ch * n
+				for let i = 0; i < effEnd; i++ {
+					let g = bandE[ch * 21 + i]
+					for let j = m * celtEBands[i]; j < m * celtEBands[i + 1]; j++ {
+						freq[base + j] = x[base + j] * g
+					}
+				}
+				for let j = m * celtEBands[effEnd]; j < n; j++ {
+					freq[base + j] = 0.0
+				}
+				for let j = 0; j < m * celtEBands[start]; j++ {
+					freq[base + j] = 0.0
+				}
+			}
+			if cc == 2 && c == 1 {
+				for let i = 0; i < n; i++ {
+					freq[n + i] = freq[i]
+				}
+			}
+			if cc == 1 && c == 2 {
+				for let i = 0; i < n; i++ {
+					freq[i] = 0.5 * (freq[i] + freq[n + i])
+				}
+			}
+			for let ch = 0; ch < cc; ch++ {
+				let base = ch * (celtBufferSize + 120)
+				for let i = 0; i < celtBufferSize - n; i++ {
+					mem[base + i] = mem[base + i + n]
+				}
+			}
+			synthesize(shortBlocks, n, lm)
+
+			for let ch = 0; ch < cc; ch++ {
+				let syn = ch * (celtBufferSize + 120) + celtBufferSize - n
+				pfPeriod = pfPeriod.max(15)
+				pfPeriodOld = pfPeriodOld.max(15)
+				celtCombFilter(mdct.window, mem, syn, mem, syn, pfPeriodOld, pfPeriod, 120, pfGainOld, pfGain, pfTapsetOld, pfTapset, true)
+				celtCombFilter(mdct.window, mem, syn + 120, mem, syn + 120, pfPeriod, pfPitchNew, n - 120, pfGain, pfGainNew, pfTapset, pfTapsetNew, true) when lm != 0
+			}
+			pfPeriodOld = pfPeriod
+			pfGainOld = pfGain
+			pfTapsetOld = pfTapset
+			pfPeriod = pfPitchNew
+			pfGain = pfGainNew
+			pfTapset = pfTapsetNew
+			if lm != 0 {
+				pfPeriodOld = pfPeriod
+				pfGainOld = pfGain
+				pfTapsetOld = pfTapset
+			}
+			if c == 1 {
+				for let i = 0; i < 21; i++ {
+					oldBandE[21 + i] = oldBandE[i]
+				}
+			}
+			if !transient {
+				for let i = 0; i < 42; i++ {
+					oldLogE2[i] = oldLogE[i]
+					oldLogE[i] = oldBandE[i]
+					background[i] = (background[i] + float32(m) * 0.001).min(oldBandE[i])
+				}
+			} else {
+				for let i = 0; i < 42; i++ {
+					oldLogE[i] = oldLogE[i].min(oldBandE[i])
+				}
+			}
+			for let ch = 0; ch < 2; ch++ {
+				for let i = 0; i < start; i++ {
+					oldBandE[ch * 21 + i] = 0.0
+					oldLogE[ch * 21 + i] = -28.0
+					oldLogE2[ch * 21 + i] = -28.0
+				}
+				for let i = end; i < 21; i++ {
+					oldBandE[ch * 21 + i] = 0.0
+					oldLogE[ch * 21 + i] = -28.0
+					oldLogE2[ch * 21 + i] = -28.0
+				}
+			}
+			rng = dec.range()
+			deemphasis(pcm, at, n)
+			lossCount = 0
+			fail "celt: the frame is damaged" when dec.tell() > 8 * len
+		}
+
+		// Inverse MDCTs of `freq` into each channel's history, overlap-added
+		// with the previous frame.
+		def synthesize(shortBlocks bool, n int, lm int) {
+			let blocks = shortBlocks ?? (1 << lm, 1)
+			let n2 = shortBlocks ?? (120, n)
+			let shift = shortBlocks ?? (3, 3 - lm)
+			for let ch = 0; ch < channels; ch++ {
+				for let i = 0; i < 120; i++ {
+					imdct[i] = 0.0
+				}
+				for let b = 0; b < blocks; b++ {
+					mdct.backward(freq, b + ch * n, blocks, imdct, n2 * b, shift)
+				}
+				let base = ch * (celtBufferSize + 120)
+				let syn = base + celtBufferSize - n
+				let ov = base + celtBufferSize
+				for let j = 0; j < 120; j++ {
+					mem[syn + j] = imdct[j] + mem[ov + j]
+				}
+				for let j = 120; j < n; j++ {
+					mem[syn + j] = imdct[j]
+				}
+				for let j = 0; j < 120; j++ {
+					mem[ov + j] = imdct[n + j]
+				}
+			}
+		}
+
+		// Undoes the pre-emphasis of the last `n` synthesized samples of each
+		// channel and writes them to `pcm` from `at`, interleaved.
+		def deemphasis(pcm float32[], at int, n int) {
+			for let ch = 0; ch < channels; ch++ {
+				let syn = ch * (celtBufferSize + 120) + celtBufferSize - n
+				let m = preemph[ch]
+				let o = at + ch
+				for let j = 0; j < n; j++ {
+					let t = mem[syn + j] + m
+					m = celtPreemph * t
+					pcm[o] = t * 0.000030517578125
+					o += channels
+				}
+				preemph[ch] = m
+			}
+		}
+
+		// Decodes the coarse band energies, predicted across time (unless
+		// `intra`) and bands (RFC 6716 section 4.3.2.1).
+		def decodeCoarseEnergy(dec OpusRangeDecoder, intra bool, c int, lm int) {
+			let model = (lm * 2 + (intra ?? (1, 0))) * 42
+			let prev0 float32 = 0.0
+			let prev1 float32 = 0.0
+			let coef = intra ?? (float32(0.0), celtPredCoef[lm])
+			let beta = intra ?? (celtBetaIntra, celtBetaCoef[lm])
+			let budget = dec.size() * 8
+			for let i = start; i < end; i++ {
+				for let ch = 0; ch < c; ch++ {
+					let tell = dec.tell()
+					let qi = 0
+					if budget - tell >= 15 {
+						let pi = 2 * i.min(20)
+						qi = dec.laplace(celtEProbModel[model + pi] << 7, celtEProbModel[model + pi + 1] << 6)
+					} else if budget - tell >= 2 {
+						qi = dec.icdf(celtSmallEnergyIcdf, 2)
+						qi = (qi >> 1) ^ -(qi & 1)
+					} else if budget - tell >= 1 {
+						qi = dec.bitLogp(1) ?? (-1, 0)
+					} else {
+						qi = -1
+					}
+					let q = float32(qi)
+					let at = ch * 21 + i
+					oldBandE[at] = oldBandE[at].max(float32(-9.0))
+					let prev = ch == 0 ?? (prev0, prev1)
+					oldBandE[at] = coef * oldBandE[at] + prev + q
+					if ch == 0 {
+						prev0 = prev0 + q - beta * q
+					} else {
+						prev1 = prev1 + q - beta * q
+					}
+				}
+			}
+		}
+
+		// Decodes the time-frequency resolution change of each band.
+		def decodeTf(dec OpusRangeDecoder, transient bool, lm int) {
+			let budget = dec.size() * 8
+			let tell = dec.tell()
+			let logp = transient ?? (2, 4)
+			let rsv = lm > 0 && tell + logp + 1 <= budget
+			budget -= rsv ?? (1, 0)
+			let changed = 0
+			let curr = 0
+			for let i = start; i < end; i++ {
+				if tell + logp <= budget {
+					curr ^= dec.bitLogp(logp) ?? (1, 0)
+					tell = dec.tell()
+					changed |= curr
+				}
+				tfRes[i] = curr
+				logp = transient ?? (4, 5)
+			}
+			let sel = 0
+			let base = lm * 8 + (transient ?? (4, 0))
+			sel = dec.bitLogp(1) ?? (1, 0) when rsv && celtTfSelectTable[base + changed] != celtTfSelectTable[base + 2 + changed]
+			for let i = start; i < end; i++ {
+				tfRes[i] = celtTfSelectTable[base + 2 * sel + tfRes[i]]
+			}
+		}
+
+		// Adds the fine energy bits to the coarse energies.
+		def decodeFineEnergy(dec OpusRangeDecoder, c int) {
+			for let i = start; i < end; i++ {
+				let fq = alloc.fineQuant[i]
+				continue when fq <= 0
+				for let ch = 0; ch < c; ch++ {
+					let q2 = dec.bits(fq)
+					let offset = (float32(q2) + 0.5) * float32(1 << (14 - fq)) * float32(0.00006103515625) - 0.5
+					oldBandE[ch * 21 + i] += offset
+				}
+			}
+		}
+
+		// Spends the bits left at the end of the frame on one more fine energy
+		// bit per band, by priority.
+		def decodeFinalEnergy(dec OpusRangeDecoder, bitsLeftIn int, c int) {
+			let bitsLeft = bitsLeftIn
+			for let prio = 0; prio < 2; prio++ {
+				for let i = start; i < end && bitsLeft >= c; i++ {
+					continue when alloc.fineQuant[i] >= 8 || alloc.finePriority[i] != prio
+					for let ch = 0; ch < c; ch++ {
+						let q2 = dec.bits(1)
+						let offset = (float32(q2) - 0.5) * float32(1 << (14 - alloc.fineQuant[i] - 1)) * float32(0.00006103515625)
+						oldBandE[ch * 21 + i] += offset
+						bitsLeft--
+					}
+				}
+			}
+		}
+
+		// The linear amplitude of each band from the log energies in `logE`.
+		def amplitudes(c int, logE float32[]) {
+			for let ch = 0; ch < c; ch++ {
+				for let i = 0; i < 21; i++ {
+					let at = ch * 21 + i
+					if i < start || i >= end {
+						bandE[at] = 0.0
+					} else {
+						let lg = (logE[at] + celtEMeans[i]).min(float32(32.0))
+						bandE[at] = float32(celtExp2(float(lg)))
+					}
+				}
+			}
+		}
+
+		// Fills the short blocks a transient left empty with noise
+		// (RFC 6716 section 4.3.5).
+		def antiCollapse(c int, lm int, n int) {
+			let seed = rng
+			for let i = start; i < end; i++ {
+				let n0 = celtEBands[i + 1] - celtEBands[i]
+				let depth = (1 + alloc.pulses[i]) / (n0 << lm)
+				let thresh = float32(0.5 * celtExp2(-0.125 * float(depth)))
+				let sqrt1 = float32(1.0) / float32(celtSqrt(float(n0 << lm)))
+				for let ch = 0; ch < c; ch++ {
+					let prev1 = oldLogE[ch * 21 + i]
+					let prev2 = oldLogE2[ch * 21 + i]
+					if c == 1 {
+						prev1 = prev1.max(oldLogE[21 + i])
+						prev2 = prev2.max(oldLogE2[21 + i])
+					}
+					let ediff = (oldBandE[ch * 21 + i] - prev1.min(prev2)).max(float32(0.0))
+					let r = float32(2.0 * celtExp2(-float(ediff)))
+					r *= 1.41421356 when lm == 3
+					r = thresh.min(r)
+					r = r * sqrt1
+					let xo = ch * n + (celtEBands[i] << lm)
+					let renorm = false
+					for let k = 0; k < (1 << lm); k++ {
+						if (collapse[i * c + ch] & (1 << k)) == 0 {
+							for let j = 0; j < n0; j++ {
+								seed = celtLcgRand(seed)
+								x[xo + (j << lm) + k] = (seed & 0x8000) != 0 ?? (r, -r)
+							}
+							renorm = true
+						}
+					}
+					bands.renormalise(x, xo, n0 << lm, float32(1.0)) when renorm
+				}
+			}
+		}
+
+		// Conceals a lost frame of `n` samples: the first losses repeat the
+		// last pitch period through the signal's LPC model, longer ones (and
+		// hybrid frames) fill the bands with noise at the last energies,
+		// fading out (RFC 6716 section 4.4).
+		def conceal(pcm float32[], at int, n int, lm int) {
+			if lossCount < 5 && start == 0 {
+				concealPitch(n)
+				deemphasis(pcm, at, n)
+				lossCount++
+				return
+			}
+			let c = channels
+			let effEnd = end.min(21)
+			if lossCount >= 5 {
+				amplitudes(c, background)
+			} else {
+				let decay float32 = lossCount == 0 ?? (1.5, 0.5)
+				for let ch = 0; ch < c; ch++ {
+					for let i = start; i < end; i++ {
+						oldBandE[ch * 21 + i] -= decay
+					}
+				}
+				amplitudes(c, oldBandE)
+			}
+			let seed = rng
+			for let ch = 0; ch < c; ch++ {
+				for let i = 0; i < (celtEBands[start] << lm); i++ {
+					x[ch * n + i] = 0.0
+				}
+				for let i = start; i < 21; i++ {
+					let boffs = n * ch + (celtEBands[i] << lm)
+					let blen = (celtEBands[i + 1] - celtEBands[i]) << lm
+					for let j = 0; j < blen; j++ {
+						seed = celtLcgRand(seed)
+						let s = seed >= 0x80000000 ?? (seed - 0x100000000, seed)
+						x[boffs + j] = float32(s >> 20)
+					}
+					bands.renormalise(x, boffs, blen, float32(1.0))
+				}
+			}
+			rng = seed
+			let m = 1 << lm
+			for let ch = 0; ch < c; ch++ {
+				let base = ch * n
+				for let i = 0; i < 21; i++ {
+					let g = bandE[ch * 21 + i]
+					for let j = m * celtEBands[i]; j < m * celtEBands[i + 1]; j++ {
+						freq[base + j] = x[base + j] * g
+					}
+				}
+				for let j = 0; j < m * celtEBands[start]; j++ {
+					freq[base + j] = 0.0
+				}
+				for let j = m * celtEBands[effEnd]; j < n; j++ {
+					freq[base + j] = 0.0
+				}
+				let hist = ch * (celtBufferSize + 120)
+				for let i = 0; i < celtBufferSize - n; i++ {
+					mem[hist + i] = mem[hist + i + n]
+				}
+			}
+			synthesize(false, n, lm)
+			deemphasis(pcm, at, n)
+			lossCount++
+		}
+
+		// Pitch-based concealment of `n` samples into each channel's history.
+		def concealPitch(n int) {
+			let c = channels
+			let overlap = 120
+			let len = n + overlap
+			let fade float32 = 1.0
+			let pitchIndex = 0
+			if lossCount == 0 {
+				pitch.downsample(mem, 0, celtBufferSize + 120, celtBufferSize, c)
+				pitchIndex = 720 - pitch.search(360, 0, celtBufferSize - 720, 720 - 100)
+				lastPitch = pitchIndex
+			} else {
+				pitchIndex = lastPitch
+				fade = 0.8
+			}
+			let w = mdct.window
+			for let ch = 0; ch < c; ch++ {
+				let outMem = ch * (celtBufferSize + 120) + celtBufferSize - celtMaxPeriod
+				for let i = 0; i < celtMaxPeriod; i++ {
+					exc[i] = mem[outMem + i]
+				}
+				let lpcAt = ch * 24
+				pitch.lpc(exc, celtMaxPeriod, 24, true, lpc, lpcAt) when lossCount == 0
+				for let i = 0; i < 24; i++ {
+					lpcMem[i] = mem[outMem + celtMaxPeriod - 1 - i]
+				}
+				for let i = 0; i < celtMaxPeriod; i++ {
+					let x0 = exc[i]
+					let sum = x0
+					for let j = 0; j < 24; j++ {
+						sum += lpc[lpcAt + j] * lpcMem[j]
+					}
+					for let j = 23; j >= 1; j-- {
+						lpcMem[j] = lpcMem[j - 1]
+					}
+					lpcMem[0] = x0
+					exc[i] = sum
+				}
+				let e1 float32 = 1.0
+				let e2 float32 = 1.0
+				let period = pitchIndex <= celtMaxPeriod / 2 ?? (pitchIndex, celtMaxPeriod / 2)
+				for let i = 0; i < period; i++ {
+					let a = exc[celtMaxPeriod - period + i]
+					let b = exc[celtMaxPeriod - 2 * period + i]
+					e1 += a * a
+					e2 += b * b
+				}
+				e1 = e2 when e1 > e2
+				let decay = float32(celtSqrt(float(e1 / e2)))
+				let offset = celtMaxPeriod - pitchIndex
+				let s1 float32 = 0.0
+				for let i = 0; i < len + overlap; i++ {
+					if offset + i >= celtMaxPeriod {
+						offset -= pitchIndex
+						decay = decay * decay
+					}
+					e[i] = decay * exc[offset + i]
+					let t = mem[outMem + offset + i]
+					s1 += t * t
+				}
+				for let i = 0; i < 24; i++ {
+					lpcMem[i] = mem[outMem + celtMaxPeriod - 1 - i]
+				}
+				for let i = 0; i < len + overlap; i++ {
+					e[i] = fade * e[i]
+				}
+				for let i = 0; i < len + overlap; i++ {
+					let sum = e[i]
+					for let j = 0; j < 24; j++ {
+						sum -= lpc[lpcAt + j] * lpcMem[j]
+					}
+					for let j = 23; j >= 1; j-- {
+						lpcMem[j] = lpcMem[j - 1]
+					}
+					lpcMem[0] = sum
+					e[i] = sum
+				}
+				let s2 float32 = 0.0
+				for let i = 0; i < len + overlap; i++ {
+					s2 += e[i] * e[i]
+				}
+				if !(s1 > 0.2 * s2) {
+					for let i = 0; i < len + overlap; i++ {
+						e[i] = 0.0
+					}
+				} else if s1 < s2 {
+					let ratio = float32(celtSqrt(float((s1 + 1.0) / (s2 + 1.0))))
+					for let i = 0; i < len + overlap; i++ {
+						e[i] = ratio * e[i]
+					}
+				}
+				let tail = outMem + celtMaxPeriod
+				celtCombFilter(mdct.window, mem, tail, mem, tail, pfPeriod.max(15), pfPeriod.max(15), overlap, pfGain, pfGain, pfTapset, pfTapset, false)
+				for let i = 0; i < celtMaxPeriod + overlap - n; i++ {
+					mem[outMem + i] = mem[outMem + n + i]
+				}
+				for let i = 0; i < overlap / 2; i++ {
+					let t = w[i] * e[n + overlap - 1 - i] + w[overlap - i - 1] * e[n + i]
+					mem[tail + i] = w[overlap - i - 1] * t
+					mem[tail + overlap - i - 1] = w[i] * t
+				}
+				for let i = 0; i < n; i++ {
+					mem[outMem + celtMaxPeriod - n + i] = e[i]
+				}
+				celtCombFilter(mdct.window, e, 0, mem, tail, pfPeriod.max(15), pfPeriod.max(15), overlap, -pfGain, -pfGain, pfTapset, pfTapset, false)
+				for let i = 0; i < overlap; i++ {
+					mem[tail + i] = e[i]
+				}
+			}
+		}
+	}
+}

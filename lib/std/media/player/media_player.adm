@@ -1,0 +1,698 @@
+partial module std.media.player {
+	use (
+		std.gfx
+		std.formats.audio
+		std.formats.image
+		std.media.dsp
+		std.media.player.engine::*
+	)
+
+	// Plays a playlist of audio and video, one track after another, with
+	// crossfades, shuffle, repeat and a play-next queue. Sound goes to a sink;
+	// pictures (video frames, a visualizer, cover art) go to `display` when one
+	// is set. Playback runs on its own task; the controls can be called from
+	// any task.
+	//
+	// The player keeps its own place: the playlist stays in the order it was
+	// arranged while shuffle jumps around it, and a track taken out of the
+	// playlist (or the whole playlist cleared) plays to its end before the
+	// player moves on, or stops when nothing is left.
+	//
+	// ```adm
+	// let player = new MediaPlayer()
+	// try player.playlist.addFolder("~/Music/Album")
+	// player.crossfade = 3s
+	// try player.play()
+	// ```
+	type MediaPlayer {
+		playlist      Playlist          = new Playlist()
+		// 0 is silent, 1 as recorded; above 1 amplifies.
+		volume        float             = 1.0
+		muted         bool
+		repeat        RepeatMode        = RepeatMode.NoRepeat
+		// Whether the next track is picked from a shuffled order of the
+		// playlist rather than the playlist's own order. `shuffle` turns it on
+		// with a new order; setting it false goes back to the playlist's order
+		// after the current track.
+		shuffled      bool
+		// Overlap from one track to the next, whether the track ends or a call
+		// changes it (`next`, `previous`, `playAt`); 0s plays gapless.
+		crossfade     duration          = 0s
+		// Overlap within a track when `seek` or `skip` jumps to another
+		// position: the old position fades out as the new one fades in. 0s
+		// jumps at once.
+		skipCrossfade duration          = 0s
+		// Applied in order to everything played, before the volume; one whose
+		// `enabled` is false is skipped.
+		effects       dsp.AudioEffect[]
+		// How ReplayGain tags level the tracks.
+		replayGain    ReplayGainMode    = ReplayGainMode.Auto
+		// Decibels added to the ReplayGain of tracks that have one: the
+		// reference level is quiet next to most modern masters, and +6 dB
+		// matches them. Never louder than the track's peak allows without
+		// clipping.
+		preamp        float             = 0.0
+
+		// Where pictures go: a video's frames, else the visualizer for audio,
+		// else its cover art. Set or cleared at any time, also while playing;
+		// with none, video is not decoded and only its sound plays.
+		display    ?gfx.Raster = none
+		// Draws audio tracks into `display`; with none, their cover art shows.
+		visualizer ?Visualizer = none
+		// How a frame fits a `display` of another size. The display itself is
+		// never resized.
+		fit        ScaleMode   = ScaleMode.Contain
+
+		// Called on the player's task when the current track changes, with its
+		// playlist index (-1 when playback ran out, or the track is no longer
+		// in the playlist).
+		onTrackChange ?def(int)         = none
+		// Called on the player's task when the current track's title or
+		// artist changes while it plays, with its playlist index: a radio
+		// station announcing the next song, or tags read after the track
+		// started.
+		onTitleChange ?def(int)         = none
+		// Called on the player's task when the state changes.
+		onStateChange ?def(PlayerState) = none
+		// Called on the player's task when a track fails to open or decode; the
+		// player moves on to the next track.
+		onError       ?def(int, error)  = none
+		// Called on the player's task after a frame is complete in `display`,
+		// for the UI to repaint. The display never shows half a frame.
+		onFrame       ?def()            = none
+
+		internal sink       AudioSink
+		// The default speaker `new()` plays through, opened by the first
+		// `play` and closed on dispose.
+		internal speaker    ?SpeakerSink   = none
+		internal status     PlayerState    = PlayerState.Stopped
+		// The track playing, or paused, or to play from its start.
+		internal track      ?Track         = none
+		// The last track taken from the play order rather than the queue: the
+		// order continues from it.
+		internal anchor     ?Track         = none
+		// Where `anchor` last stood in the playlist, for when it is taken out.
+		internal anchorAt   int
+		internal deck       ?Deck          = none
+		// The deck fading out under `deck`.
+		internal outgoing   ?Deck          = none
+		internal queue      Track[]
+		internal history    Track[]
+		// The shuffled play order and whether it follows `shuffled` yet.
+		internal order      Track[]
+		internal ordered    bool
+		internal random     ShuffleRandom  = new ShuffleRandom(uint64(0))
+		// Whether the playback task is running, and how it is woken from a
+		// pause.
+		internal running    bool
+		internal wake       channel<bool>  = new channel<bool>(size = 1)
+		// What the events last reported, so each change is reported once.
+		internal toldState  PlayerState    = PlayerState.Stopped
+		internal toldTrack  ?Track         = none
+		internal toldTitle  string
+		internal failures   (int, error)[]
+		// The player's own frame, the size of `display`, drawn whole and then
+		// copied, so the display never shows half a frame; and what the cover
+		// frame last drawn showed, so it is drawn again only when that changes.
+		internal canvas     ?image.Image   = none
+		internal painted    ?Track         = none
+		internal paintedFit ScaleMode      = ScaleMode.Contain
+		internal paintedTag bool
+		internal paintedOk  bool
+
+		// Plays through the default speaker, which opens when playback first
+		// starts.
+		def new() {
+			let lazy = new SpeakerSink()
+			speaker = lazy
+			sink = lazy
+		}
+
+		def new(sink AudioSink) {
+			self.sink = sink
+		}
+
+		// play starts or resumes playback.
+		// Fails when the playlist is empty, or there is no speaker to play
+		// through.
+		atomic def play() !none {
+			try speaker.open() unless speaker is none
+			if track is none {
+				let first = pickNext(false)
+				fail "player: the playlist is empty" when first is none
+				take(first,!queueHas(first))
+			}
+			return none when status == PlayerState.Playing
+			status = PlayerState.Playing
+			start()
+		}
+
+		// playAt plays the track at playlist `index` now.
+		// Fails when `index` is out of range, or there is no speaker to play
+		// through.
+		atomic def playAt(index int) !none {
+			expects {
+				assert index >= 0 && index < playlist.len() onerror fail "player: track {index} is out of range (0 to {playlist.len() - 1})"
+			}
+			try speaker.open() unless speaker is none
+			change(playlist.tracks[index], true)
+			status = PlayerState.Playing
+			start()
+		}
+
+		// pause holds playback where it is; `play` resumes it.
+		atomic def pause() {
+			return unless status == PlayerState.Playing
+			status = PlayerState.Paused
+		}
+
+		// stop ends playback and goes back to the start of the current track.
+		// The queue is kept.
+		atomic def stop() {
+			closeDecks()
+			status = PlayerState.Stopped
+			signal()
+		}
+
+		// next plays the queued track, else the next in play order.
+		// Fails when there is none and repeat is `NoRepeat`.
+		atomic def next() !none {
+			let following = pickNext(false)
+			fail "player: there is no next track" when following is none
+			change(following,!queueHas(following))
+		}
+
+		// previous restarts the current track when it is more than 3 s in, else
+		// plays the one before it in play order.
+		// Fails when there is none and repeat is `NoRepeat`.
+		atomic def previous() !none {
+			if !(deck is none) && deck.position() > RESTART_AFTER {
+				try restart()
+				return none
+			}
+			let before = pickPrevious()
+			fail "player: there is no previous track" when before is none
+			change(before, fromOrder = true, remember = false)
+		}
+
+		// playNext queues the track at playlist `index` to play after the
+		// current one, whatever the play order. Queued tracks play in the order
+		// queued; a track queued twice plays twice.
+		atomic def playNext(index int) {
+			return when index < 0 || index >= playlist.len()
+			queue.push(playlist.tracks[index])
+		}
+
+		// clearQueue forgets the tracks `playNext` queued.
+		atomic def clearQueue() {
+			queue = Track[]
+		}
+
+		// shuffle turns shuffle on with a new order; `seed` makes it
+		// repeatable. The current track keeps playing.
+		atomic def shuffle(seed uint64 = 0) {
+			random = new ShuffleRandom(seed)
+			shuffled = true
+			reshuffle()
+		}
+
+		// seek moves within the current track.
+		// Fails when the track cannot seek (a radio stream).
+		atomic def seek(time duration) !none {
+			fail "player: nothing is playing" when deck is none
+			let target = time < 0s ?? (0s, time)
+			let length = deck.length()
+			target = length when length > 0s && target > length
+			return jump(target)
+		}
+
+		// skip moves by `offset` within the current track, negative is back.
+		// Fails when the track cannot seek.
+		atomic def skip(offset duration) !none {
+			fail "player: nothing is playing" when deck is none
+			return seek(deck.position() + offset)
+		}
+
+		// What the player is doing.
+		atomic def state() PlayerState {
+			return status
+		}
+
+		// The playlist index of the current track; none when nothing is
+		// current or it is no longer in the playlist.
+		atomic def current() ?int {
+			return none when track is none
+			let at = playlist.tracks.indexOf(track)
+			return none when at < 0
+			return at
+		}
+
+		// How far into the current track playback is.
+		atomic def position() duration {
+			return 0s when deck is none
+			return deck.position()
+		}
+
+		// The current track's length; 0s when unknown.
+		atomic def length() duration {
+			return deck.length() unless deck is none
+			return 0s when track is none
+			return track.length
+		}
+
+		// Stops playback and closes the default speaker when it was opened.
+		def dispose() {
+			stop()
+			speaker.close() unless speaker is none
+		}
+
+		// Starts the playback task unless it runs, or wakes it from a pause.
+		internal def start() {
+			if running {
+				signal()
+				return
+			}
+			running = true
+			async run()
+		}
+
+		// Wakes the playback task when it waits.
+		internal def signal() {
+			wake <- true when wake.len() == 0
+		}
+
+		// The playback task: mixes a block, reports what changed, and writes
+		// the block to the sink outside the lock, until playback stops.
+		internal def run() {
+			for {
+				let block = step()
+				report()
+				if block.len() == 0 {
+					break unless waiting()
+					<-wake
+					continue
+				}
+				deliver(block)
+				paint(block)
+			}
+		}
+
+		// Whether the task should wait for a wake rather than end: it ends
+		// once stopped.
+		internal atomic def waiting() bool {
+			if status == PlayerState.Stopped {
+				running = false
+				return false
+			}
+			return true
+		}
+
+		// Writes the block to the sink; a failing sink stops playback.
+		internal def deliver(block float32[]) {
+			let width = sink.channels()
+			let at = 0
+			for at < block.len() {
+				let taken = sink.write(block[at:]) onerror (err error) {
+					failed(err)
+					return
+				}
+				break when taken <= 0
+				at += taken * width
+			}
+		}
+
+		// Draws the frame for the block just played into `display`: the
+		// visualizer's picture of it, else the current track's cover art
+		// (drawn again only when the track, its tags, the size or `fit`
+		// change), else black. Calls `onFrame` after each frame.
+		internal def paint(block float32[]) {
+			let (shown, drawer, scale, playing) = frameState()
+			return when shown is none
+			let target gfx.Raster = shown
+			let w = int(target.size().width)
+			let h = int(target.size().height)
+			return when w <= 0 || h <= 0
+			if canvas is none || int(canvas.size().width) != w || int(canvas.size().height) != h {
+				canvas = new image.Image(w, h)
+				paintedOk = false
+			}
+			let current = canvas
+			return when current is none
+			let buffer image.Image = current
+			if !(drawer is none) {
+				clearRaster(buffer)
+				drawer.draw(block, blockInfo(), buffer)
+				blit(buffer, target, 0, 0)
+				notify(onFrame)
+				paintedOk = false
+				return
+			}
+			let found = tagsOf(playing)
+			let tagged = !(found is none)
+			return when paintedOk && sameTrack(painted, playing) && paintedFit == scale && paintedTag == tagged
+			clearRaster(buffer)
+			drawCover(found, buffer, scale)
+			blit(buffer, target, 0, 0)
+			notify(onFrame)
+			painted = playing
+			paintedFit = scale
+			paintedTag = tagged
+			paintedOk = true
+		}
+
+		// What a frame is drawn from, taken under the lock.
+		internal atomic def frameState() (?gfx.Raster, ?Visualizer, ScaleMode, ?Track) {
+			return (display, visualizer, fit, track)
+		}
+
+		// Records a sink failure and stops.
+		internal atomic def failed(err error) {
+			failures.push((currentIndex(), err))
+			closeDecks()
+			status = PlayerState.Stopped
+		}
+
+		// The next block to write; empty when paused or stopped.
+		internal atomic def step() float32[] {
+			let block float32[]
+			return block unless status == PlayerState.Playing
+			let channels = sink.channels()
+			block.len(BLOCK_FRAMES * channels)
+			let filled = 0
+			let attempts = 0
+			for filled < BLOCK_FRAMES && status == PlayerState.Playing {
+				if deck is none && !openDeck() {
+					// Every track failed; nothing more to try.
+					attempts++
+					break when attempts > playlist.len() + queue.len()
+					continue
+				}
+				continue when deck is none
+				// Starting a crossfade makes the next track's deck current.
+				startCrossfade(deck)
+				continue when deck is none
+				let playing Deck = deck
+				playing.level = float32(replayLevel(playing.track.tags, replayGain, albumGain(), preamp))
+				let got = playing.mixInto(block, filled, BLOCK_FRAMES - filled) onerror (err error) {
+					failures.push((currentIndex(), err))
+					recover 0
+				}
+				mixOutgoing(block, filled, got)
+				filled += got
+				advance() when playing.finished() || got == 0
+			}
+			if filled < BLOCK_FRAMES {
+				// Playback ended within the block: no trailing silence.
+				block = block[:filled * channels]
+				return block when filled == 0
+			}
+			for let (_, effect) in effects {
+				effect.process(block, blockInfo()) when effect.enabled
+			}
+			let gain = muted ?? (float32(0.0), float32(volume))
+			if gain != float32(1.0) {
+				for let i = 0; i < block.len(); i++ {
+					block[i] = block[i] * gain
+				}
+			}
+			return block
+		}
+
+		// Mixes the fading-out deck under `frames` frames from `at`.
+		internal def mixOutgoing(block float32[], at int, frames int) {
+			return when outgoing is none || frames <= 0
+			let fading Deck = outgoing
+			fading.mixInto(block, at, frames) onerror recover 0
+			if fading.silent() || fading.finished() {
+				fading.close()
+				outgoing = none
+			}
+		}
+
+		// Starts the crossfade into the next track once the playing one is
+		// within `crossfade` of its end.
+		internal def startCrossfade(playing Deck) {
+			return when crossfade <= 0s || !(outgoing is none) || repeat == RepeatMode.RepeatSong
+			let length = playing.length()
+			return when length <= 0s
+			let left = length - playing.position()
+			return when left > crossfade || left <= 0s
+			let following = pickNext(true)
+			return when following is none
+			change(following,!queueHas(following))
+		}
+
+		// The track after the current one ended: the next, or the end.
+		internal def advance() {
+			let following = pickNext(true)
+			if following is none {
+				closeDecks()
+				status = PlayerState.Stopped
+				track = none
+				return
+			}
+			let fading = deck
+			deck = none
+			fading.close() unless fading is none
+			take(following,!queueHas(following))
+		}
+
+		// Opens the current track into `deck`; on failure records it and moves
+		// the current track on. Returns whether a deck is open.
+		internal def openDeck() bool {
+			return false when track is none
+			let playing Track = track
+			let stream = playing.open() onerror (err error) {
+				failures.push((currentIndex(), err))
+				advance()
+				return false
+			}
+			deck = new Deck(playing, stream, sink.sampleRate(), sink.channels())
+			return true
+		}
+
+		// Makes `next` current. With a deck playing and a crossfade set, the
+		// deck fades out as the new track fades in; otherwise it stops.
+		internal def change(next Track, fromOrder bool, remember bool = true) {
+			let old = deck
+			if !(old is none) && status == PlayerState.Playing && crossfade > 0s {
+				let fading Deck = old
+				outgoing.close() unless outgoing is none
+				let frames = framesIn(crossfade, sink.sampleRate())
+				let length = fading.length()
+				frames = frames.min(framesIn(length - fading.position(), sink.sampleRate()).max(1)) when length > 0s
+				fading.fade(0.0, frames)
+				outgoing = fading
+				deck = none
+				take(next, fromOrder, remember)
+				openDeck()
+				deck.fadeUp(frames) unless (deck is none)
+				return
+			}
+			closeDecks()
+			take(next, fromOrder, remember)
+		}
+
+		// Makes `next` the current track without opening it.
+		internal def take(next Track, fromOrder bool, remember bool = true) {
+			if remember && !(track is none) {
+				history.push(track)
+				history.remove(0) when history.len() > HISTORY_LIMIT
+			}
+			if fromOrder {
+				anchor = next
+				anchorAt = playlist.tracks.indexOf(next).max(0)
+			} else {
+				let at = queue.indexOf(next)
+				queue.remove(at) when at >= 0
+			}
+			track = next
+		}
+
+		// Whether `next` would come from the queue.
+		internal def queueHas(next Track) bool {
+			return queue.len() > 0 && queue[0] == next
+		}
+
+		// The track to play after the current one: the queue's first, else the
+		// next in play order. When the current track ended by itself (`ended`),
+		// `RepeatSong` plays it again.
+		internal def pickNext(ended bool) ?Track {
+			return track when ended && repeat == RepeatMode.RepeatSong && !(track is none)
+			return queue[0] when queue.len() > 0
+			return nextShuffled() when shuffled
+			let count = playlist.len()
+			return none when count == 0
+			return playlist.tracks[0] when anchor is none
+			let at = playlist.tracks.indexOf(anchor)
+			// Taken out of the playlist: the track that moved into its place.
+			let following = at < 0 ?? (anchorAt, at + 1)
+			if following >= count {
+				return none unless repeat == RepeatMode.RepeatPlaylist
+				following = 0
+			}
+			return playlist.tracks[following]
+		}
+
+		// The next track of the shuffled order, after the anchor.
+		internal def nextShuffled() ?Track {
+			syncOrder()
+			return none when order.len() == 0
+			let at = anchor is none ?? (-1, order.indexOf(anchor))
+			return order[at + 1] when at + 1 < order.len()
+			return none unless repeat == RepeatMode.RepeatPlaylist
+			let last = order[order.len() - 1]
+			reshuffle()
+			// A new round does not start with the track that ended the last.
+			if order.len() > 1 && order[0] == last {
+				order[0], order[1] = order[1], order[0]
+			}
+			return order[0]
+		}
+
+		// The track before the current one: back through what played when
+		// shuffled, else the playlist's order.
+		internal def pickPrevious() ?Track {
+			if shuffled {
+				for history.len() > 0 {
+					let before = history.pop()
+					return before when playlist.tracks.indexOf(before) >= 0
+				}
+				return none
+			}
+			let count = playlist.len()
+			return none when count == 0 || anchor is none
+			let at = playlist.tracks.indexOf(anchor)
+			let before = at < 0 ?? (anchorAt - 1, at - 1)
+			if before < 0 {
+				return none unless repeat == RepeatMode.RepeatPlaylist
+				before = count - 1
+			}
+			return playlist.tracks[before.min(count - 1)]
+		}
+
+		// A new shuffled order of the playlist, with the current track first so
+		// every other track plays before it comes round again.
+		internal def reshuffle() {
+			order = playlist.tracks.clone()
+			for let i = order.len() - 1; i > 0; i-- {
+				let j = random.below(i + 1)
+				order[i], order[j] = order[j], order[i]
+			}
+			if !(anchor is none) {
+				let at = order.indexOf(anchor)
+				if at > 0 {
+					order[0], order[at] = order[at], order[0]
+				}
+			}
+			ordered = true
+		}
+
+		// Brings the shuffled order in line with the playlist: tracks taken out
+		// leave it, tracks added go in at random places after the anchor.
+		internal def syncOrder() {
+			if !ordered {
+				reshuffle()
+				return
+			}
+			let kept Track[]
+			for let (_, t) in order {
+				kept.push(t) when playlist.tracks.indexOf(t) >= 0
+			}
+			order = kept
+			for let (_, t) in playlist.tracks {
+				continue when order.indexOf(t) >= 0
+				let after = anchor is none ?? (-1, order.indexOf(anchor))
+				let span = order.len() - after
+				order = insertTrack(order, after + 1 + random.below(span.max(1)), t)
+			}
+		}
+
+		// Moves to `time` in the current track, crossfading within it when
+		// `skipCrossfade` is set and the track can be opened a second time.
+		// Fails when the track cannot seek.
+		internal def jump(time duration) !none {
+			fail "player: nothing is playing" when deck is none
+			let playing Deck = deck
+			fail "player: this track cannot seek" unless playing.info.seekable
+			// A stream the caller added cannot be opened twice.
+			if skipCrossfade > 0s && status == PlayerState.Playing && !(playing.stream is BorrowedStream) {
+				let second = playing.track.open() onerror (err error) {
+					return playing.seek(time)
+				}
+				let fresh = new Deck(playing.track, second, sink.sampleRate(), sink.channels())
+				fresh.seek(time) onerror (err error) {
+					fresh.close()
+					fail err
+				}
+				let frames = framesIn(skipCrossfade, sink.sampleRate())
+				outgoing.close() unless outgoing is none
+				playing.fade(0.0, frames)
+				outgoing = playing
+				fresh.fadeUp(frames)
+				deck = fresh
+				return none
+			}
+			return playing.seek(time)
+		}
+
+		// Plays the current track from its start again.
+		// Fails when the track cannot seek.
+		internal def restart() !none {
+			return jump(0s)
+		}
+
+		// Closes both decks.
+		internal def closeDecks() {
+			deck.close() unless deck is none
+			outgoing.close() unless outgoing is none
+			deck = none
+			outgoing = none
+		}
+
+		// The playlist index of the current track, -1 when it has none.
+		internal def currentIndex() int {
+			return -1 when track is none
+			return playlist.tracks.indexOf(track)
+		}
+
+		// What the effects are told about the samples.
+		internal def blockInfo() audio.AudioInfo {
+			return audio.AudioInfo{sampleRate: uint32(sink.sampleRate()), channels: uint16(sink.channels()), bitDepth: uint16(32), format: audio.SampleFormat.Float32, codec: "pcm"}
+		}
+
+		// Calls the event closures for what changed since the last report,
+		// outside the lock.
+		internal def report() {
+			let (errors, changed, retitled, index, newState, stateChanged) = changes()
+			for let (_, failure) in errors {
+				let (at, err) = failure
+				notify(onError, at, err)
+			}
+			notify(onTrackChange, index) when changed
+			notify(onTitleChange, index) when retitled
+			notify(onStateChange, newState) when stateChanged
+		}
+
+		// The failures, track, title and state to report, taken under the
+		// lock.
+		internal atomic def changes() ((int, error)[], bool, bool, int, PlayerState, bool) {
+			let errors = failures
+			let cleared (int, error)[]
+			failures = cleared
+			let changed = !sameTrack(toldTrack, track)
+			toldTrack = track
+			let title = titleLine(track)
+			let retitled = !changed && title != toldTitle
+			toldTitle = title
+			let stateChanged = toldState != status
+			toldState = status
+			return (errors, changed, retitled, currentIndex(), status, stateChanged)
+		}
+
+		// Whether ReplayGain takes album gains now.
+		internal def albumGain() bool {
+			return replayGain == ReplayGainMode.Album || (replayGain == ReplayGainMode.Auto && !shuffled)
+		}
+	}
+}

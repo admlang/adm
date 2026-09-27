@@ -1,0 +1,551 @@
+internal partial module std.media.player.radio {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.time
+		std.net.http
+		std.formats.audio
+		std.formats.playlist
+		std.media.player::*
+		std.media.player.engine::*
+	)
+
+	// The layout a radio stream hands out, whatever the station sends: a
+	// station can change it between connections.
+	const RADIO_RATE = 48000
+	const RADIO_CHANNELS = 2
+	// Sound buffered before playing starts, and again after the buffer ran
+	// dry.
+	const RADIO_PREBUFFER = 1s
+	// Sound decoded ahead at most.
+	const RADIO_AHEAD = 10s
+	// Connections in a row that may fail before the stream gives up, and the
+	// wait before each new one: one step for each failure so far.
+	const RADIO_RETRIES = 5
+	const RADIO_RETRY_STEP = 1s
+	// A connection that played this long counts as a success: the next
+	// failure starts the count again.
+	const RADIO_STABLE = 30s
+	// Playlist files linking to a station are read up to this size, and
+	// followed this deep.
+	const RADIO_PLAYLIST_BYTES = 64 * 1024
+	const RADIO_PLAYLIST_DEPTH = 3
+	// Frames decoded per read.
+	const RADIO_READ_FRAMES = 2048
+
+	// Whether `location` is an internet address the player streams from.
+	def isStreamURL(location string) bool {
+		let lower = location.lower()
+		return lower.startsWith("http://") || lower.startsWith("https://")
+	}
+
+	// The audio bytes of an ICY stream (SHOUTcast, Icecast): the metadata
+	// block the server puts after every `interval` audio bytes is taken out,
+	// and the stream titles it carries wait in `titles`.
+	type IcyReader {
+		source   io.Reader
+		interval int
+		// Audio bytes until the next metadata block.
+		left     int
+		titles   string[]
+
+		def new(source io.Reader, interval int) {
+			self.source = source
+			self.interval = interval
+			left = interval
+		}
+
+		// Reads audio bytes, never more than reach the next metadata block.
+		// Fails when the source does, or ends inside a metadata block.
+		def read(buf byte[]) !int {
+			if left == 0 {
+				try readMetadata()
+				left = interval
+			}
+			let n = try source.read(buf[:buf.len().min(left)])
+			left -= n
+			return n
+		}
+
+		// Reads one metadata block: a length byte counting 16-byte units, then
+		// `StreamTitle='…';StreamUrl='…';` padded with zeros.
+		// Fails when the source does, or ends inside the block.
+		def readMetadata() !none {
+			let size byte[]
+			size.len(1)
+			let got = try source.read(size)
+			return none when got == 0
+			let length = int(size[0]) * 16
+			return none when length == 0
+			let block byte[]
+			block.len(length)
+			try io.readFull(source, block)
+			let title = streamTitle(block)
+			titles.push(title) unless title is none
+		}
+
+		// The titles read since the last call.
+		def takeTitles() string[] {
+			let taken = titles
+			titles = string[]
+			return taken
+		}
+	}
+
+	// The `StreamTitle` of an ICY metadata block; none when it has none.
+	def streamTitle(block byte[]) ?string {
+		let end = block.indexOf(byte(0))
+		let text = decodeText(end < 0 ?? (block, block[:end]))
+		let key = "StreamTitle='"
+		let at = text.indexOf(key)
+		return none when at < 0
+		let rest = text[at + key.len():]
+		// Ends at `';`, or a title cut short at its last quote.
+		let close = rest.indexOf("';")
+		for let i = rest.len() - 1; close < 0 && i >= 0; i-- {
+			close = i when rest[i:i + 1] == "'"
+		}
+		return close < 0 ?? (rest.trim(), rest[:close].trim())
+	}
+
+	// Metadata text: UTF-8 when it is valid UTF-8, else Latin-1, which older
+	// servers send.
+	def decodeText(raw byte[]) string {
+		return string(raw) when validUtf8(raw)
+		let out byte[]
+		for let (_, b) in raw {
+			if b < 0x80 {
+				out.push(b)
+			} else {
+				out.push(byte(0xC0 | (int(b) >> 6)))
+				out.push(byte(0x80 | (int(b) & 0x3F)))
+			}
+		}
+		return string(out)
+	}
+
+	// Whether `raw` is well-formed UTF-8.
+	def validUtf8(raw byte[]) bool {
+		let i = 0
+		for i < raw.len() {
+			let b = int(raw[i])
+			let follow = 0
+			if b >= 0xF0 && b < 0xF5 {
+				follow = 3
+			} else if b >= 0xE0 && b < 0xF0 {
+				follow = 2
+			} else if b >= 0xC2 && b < 0xE0 {
+				follow = 1
+			} else if b >= 0x80 {
+				return false
+			}
+			return false when i + follow >= raw.len() && follow > 0
+			for let k = 1; k <= follow; k++ {
+				return false unless int(raw[i + k]) & 0xC0 == 0x80
+			}
+			i += follow + 1
+		}
+		return true
+	}
+
+	// The media type of a `Content-Type` value without its parameters, in
+	// lower case.
+	def essenceOf(contentType string) string {
+		let semi = contentType.indexOf(";")
+		return (semi < 0 ?? (contentType, contentType[:semi])).trim().lower()
+	}
+
+	// Whether a response of `contentType` from `location` is a playlist
+	// linking to the stream rather than the stream: by its media type, or by
+	// the extension of a file served without an audio type.
+	def isPlaylistResponse(location string, contentType string) bool {
+		let essence = essenceOf(contentType)
+		return true when playlistTypes().indexOf(essence) >= 0
+		return false when essence.startsWith("audio/") || essence == "application/ogg"
+		let path = location
+		let query = path.indexOf("?")
+		path = path[:query] when query >= 0
+		let ext = os.extension(path).lower()
+		return ext := "m3u" || "m3u8" || "pls"
+	}
+
+	// What changes a track's title when the audio after it plays: the
+	// station's name when a connection starts, or a stream title.
+	struct RadioMark {
+		// The frame, counted in audio handed out, from which it applies.
+		frame   int64
+		station bool
+		text    string
+	}
+
+	// The sound of an internet stream: a radio station, or an audio file
+	// served over HTTP. A task of its own connects, reads and decodes ahead
+	// into a buffer, so a slow network never holds up the player: while the
+	// buffer is empty the stream plays silence. A station that drops the
+	// connection is dialled again. Station names and stream titles become the
+	// track's title, artist and album as the audio they arrived with plays.
+	// The stream cannot seek.
+	type RadioStream {
+		track         Track
+		location      string
+		// Decoded frames at RADIO_RATE, RADIO_CHANNELS: `count` of them from
+		// frame `head` of the ring.
+		ring          float32[]
+		head          int
+		count         int
+		// Playing silence until RADIO_PREBUFFER is buffered.
+		buffering     bool            = true
+		// The fetch task has ended: the file ended, or the stream failed.
+		ended         bool
+		failure       ?error          = none
+		closed        bool
+		// Frames of audio put in, and handed out.
+		written       int64
+		taken         int64
+		marks         RadioMark[]
+		// The connection being read, closed by `close` to wake the task.
+		response      ?http.Response  = none
+		// Whether any audio was decoded, and whether the last connection is
+		// a file with a length rather than a stream.
+		reached       bool
+		finite        bool
+		described     audio.AudioInfo
+		framePosition uint64
+
+		def new(track Track) {
+			self.track = track
+			location = track.location
+			ring.len(framesAt(RADIO_AHEAD + RADIO_PREBUFFER) * RADIO_CHANNELS)
+			described = audio.AudioInfo{sampleRate: uint32(RADIO_RATE), channels: uint16(RADIO_CHANNELS), bitDepth: 32, format: audio.SampleFormat.Float32, codec: "", seekable: false}
+		}
+
+		// Starts the task that connects and decodes.
+		def start() {
+			let task = async fetch()
+			task.keepAlive()
+		}
+
+		def info() audio.AudioInfo {
+			return described
+		}
+
+		// Hands out buffered frames, silence while buffering; 0 at the end.
+		// Fails when the stream failed for good and the buffer is played out,
+		// or the stream is closed.
+		atomic def read(buf float32[]) !int {
+			fail "radio: the stream is closed" when closed
+			let frames = buf.len() / RADIO_CHANNELS
+			if count == 0 && ended {
+				let failed = failure
+				fail failed unless failed is none
+				return 0
+			}
+			buffering = false when buffering && (count >= framesAt(RADIO_PREBUFFER) || ended)
+			let n = buffering ?? (0, count.min(frames))
+			let capacity = ring.len() / RADIO_CHANNELS
+			for let f = 0; f < n; f++ {
+				let from = ((head + f) % capacity) * RADIO_CHANNELS
+				buf[f * RADIO_CHANNELS] = ring[from]
+				buf[f * RADIO_CHANNELS + 1] = ring[from + 1]
+			}
+			head = (head + n) % capacity
+			count -= n
+			taken += int64(n)
+			applyMarks()
+			if n < frames && !ended {
+				// Ran dry: silence until the buffer fills again.
+				buffering = true
+				for let i = n * RADIO_CHANNELS; i < frames * RADIO_CHANNELS; i++ {
+					buf[i] = 0.0
+				}
+				n = frames
+			}
+			framePosition += uint64(n)
+			return n
+		}
+
+		// Fails: a stream cannot seek.
+		def seek(frame uint64) !none {
+			fail "radio: \"{location}\" is a stream and cannot seek"
+		}
+
+		// Fails: a stream cannot seek.
+		def seek(time duration) !none {
+			fail "radio: \"{location}\" is a stream and cannot seek"
+		}
+
+		// Fails: a stream cannot seek.
+		def skip(offset duration) !none {
+			fail "radio: \"{location}\" is a stream and cannot seek"
+		}
+
+		def position() uint64 {
+			return framePosition
+		}
+
+		// Stops the task and drops the connection.
+		atomic def close() !none {
+			return none when closed
+			closed = true
+			let open = response
+			response = none
+			return none when open is none
+			open.close() onerror recover none
+		}
+
+		// Frames at RADIO_RATE in `length`.
+		internal def framesAt(length duration) int {
+			return framesIn(length, RADIO_RATE)
+		}
+
+		// Gives the track the station names and titles whose audio has
+		// started playing.
+		internal def applyMarks() {
+			for marks.len() > 0 && marks[0].frame <= taken {
+				let mark = marks.shift()
+				if mark.station {
+					track.album = mark.text
+					track.title = mark.text
+					track.artist = ""
+				} else if mark.text == "" {
+					// Between songs, some stations clear the title.
+					track.title = track.album when track.album != ""
+					track.artist = ""
+				} else {
+					let dash = mark.text.indexOf(" - ")
+					track.artist = dash < 0 ?? ("", mark.text[:dash].trim())
+					track.title = dash < 0 ?? (mark.text, mark.text[dash + 3:].trim())
+				}
+			}
+		}
+
+		internal atomic def isClosed() bool {
+			return closed
+		}
+
+		// Frames the ring has room for.
+		internal atomic def room() int {
+			return ring.len() / RADIO_CHANNELS - count
+		}
+
+		// Appends decoded frames; the caller waited for room.
+		internal atomic def put(samples float32[]) {
+			let frames = samples.len() / RADIO_CHANNELS
+			let capacity = ring.len() / RADIO_CHANNELS
+			for let f = 0; f < frames; f++ {
+				let to = ((head + count + f) % capacity) * RADIO_CHANNELS
+				ring[to] = samples[f * RADIO_CHANNELS]
+				ring[to + 1] = samples[f * RADIO_CHANNELS + 1]
+			}
+			count += frames
+			written += int64(frames)
+			reached = true when frames > 0
+		}
+
+		// Records a station name or title for the audio from here on.
+		internal atomic def mark(text string, station bool) {
+			marks.push(RadioMark{frame: written, station: station, text: text})
+		}
+
+		// Keeps the connection so `close` can drop it; false when the stream
+		// is closed already.
+		internal atomic def connected(res http.Response) bool {
+			return false when closed
+			response = res
+			return true
+		}
+
+		// Ends the stream after the buffer plays out, failing with `err`.
+		internal atomic def stopWith(err ?error) {
+			ended = true
+			failure = err
+			let open = response
+			response = none
+			return when open is none
+			open.close() onerror recover none
+		}
+
+		// The task: connects, decodes into the ring, and dials again when a
+		// station drops the connection, until the stream is closed, the file
+		// ends, or connecting keeps failing.
+		internal def fetch() {
+			let failures = 0
+			for !isClosed() {
+				let started = time.now()
+				let failed = attempt()
+				return when isClosed()
+				if failed is none && finite {
+					stopWith(none)
+					return
+				}
+				if !reached {
+					let reason ?error = failed
+					reason = Error{message: "radio: \"{location}\" sent no audio"} when reason is none
+					stopWith(reason)
+					return
+				}
+				failures = time.now() - started >= RADIO_STABLE ?? (1, failures + 1)
+				if failures > RADIO_RETRIES {
+					let reason ?error = failed
+					reason = Error{message: "radio: \"{location}\" stopped sending"} when reason is none
+					stopWith(reason)
+					return
+				}
+				time.sleep(duration(int64(RADIO_RETRY_STEP) * int64(failures)))
+			}
+		}
+
+		// One connection, played until it ends; its error, none when it
+		// ended cleanly.
+		internal def attempt() ?error {
+			session() onerror (err error) {
+				return err
+			}
+			return none
+		}
+
+		// Connects and decodes until the connection ends. An Ogg stream that
+		// ends a logical stream (a chained stream's next song) is decoded on.
+		// Fails when connecting, the codec or the connection does.
+		internal def session() !none {
+			let res = try connect(location, 0)
+			if !connected(res) {
+				res.close() onerror recover none
+				return none
+			}
+			defer hangUp(res)
+			let interval = parseInt<int>(res.headers.get("icy-metaint").trim())
+			finite = res.contentLength >= 0 && interval <= 0
+			let station = res.headers.get("icy-name").trim()
+			mark(station, true) when station != ""
+			let received = res.body
+			fail "radio: \"{location}\" sent no body" when received is none
+			let body io.Reader = received
+			let icy ?IcyReader = none
+			let source = body
+			if interval > 0 {
+				let reader = new IcyReader(body, interval)
+				icy = reader
+				source = reader
+			}
+			for !isClosed() {
+				let decoded = try audio.open(source, live = true)
+				let info = decoded.info()
+				let codec = info.codec
+				drain(decoded, icy) onerror (err error) {
+					decoded.close() onerror recover none
+					fail err
+				}
+				decoded.close() onerror recover none
+				return none when finite || !(codec := "vorbis" || "opus")
+			}
+		}
+
+		// Decodes `decoded` to its end into the ring, converted to the ring's
+		// layout, marking the titles `icy` reads as their audio goes in.
+		// Fails when decoding does.
+		internal def drain(decoded audio.AudioStream, icy ?IcyReader) !none {
+			let info = decoded.info()
+			let width = int(info.channels)
+			fail "radio: \"{location}\" has no channels" when width <= 0
+			let converter = new audio.Converter(int(info.sampleRate), width, RADIO_RATE, RADIO_CHANNELS)
+			let scratch float32[]
+			scratch.len(RADIO_READ_FRAMES * width)
+			for !isClosed() {
+				let got = try decoded.read(scratch)
+				let converted = got == 0 ?? (converter.flush(), converter.convert(scratch[:got * width]))
+				if !(icy is none) {
+					for let (_, title) in icy.takeTitles() {
+						mark(title, false)
+					}
+				}
+				waitForRoom(converted.len() / RADIO_CHANNELS)
+				put(converted)
+				break when got == 0
+			}
+		}
+
+		// Waits until the ring has room for `frames`, or the stream is
+		// closed.
+		internal def waitForRoom(frames int) {
+			for !isClosed() && room() < frames {
+				time.sleep(50ms)
+			}
+		}
+
+		// Closes a connection the task opened, unless `close` took it.
+		internal def hangUp(res http.Response) {
+			let kept = takeResponse(res)
+			if !(kept is none) {
+				kept.close() onerror recover none
+			}
+		}
+
+		// `res` when it is still the stream's connection, forgetting it.
+		internal atomic def takeResponse(res http.Response) ?http.Response {
+			let open = response
+			return none when open is none
+			return none unless open == res
+			response = none
+			return res
+		}
+
+		// A response carrying the stream at `location`: a playlist file the
+		// server sends instead is read and its entries tried in turn, as
+		// stations list mirrors.
+		// Fails when the server cannot be reached or answers with an error,
+		// the stream is HLS, or no entry of a playlist plays.
+		internal def connect(location string, depth int) !http.Response {
+			let client = new http.Client()
+			client.decompress = false
+			let req = try client.request(http.Method.GET, location)
+			req.headers.set("Icy-MetaData", "1")
+			let res = try client.do(req)
+			if !res.ok() {
+				res.close() onerror recover none
+				fail "radio: \"{location}\" answered {res.status} {res.reason}"
+			}
+			return res unless isPlaylistResponse(location, res.headers.get("Content-Type"))
+			fail "radio: \"{location}\" links to playlists too deep" when depth >= RADIO_PLAYLIST_DEPTH
+			let text = try readPlaylist(res)
+			fail "radio: \"{location}\" is an HLS stream, which is not supported" when string(text).contains("#EXT-X-")
+			let entries = try playlist.load(new bytes.Reader(text))
+			let last ?error = none
+			for let (_, entry) in entries {
+				continue unless isStreamURL(entry.location)
+				let (found, err) = tryConnect(entry.location, depth + 1)
+				return found unless found is none
+				last = err
+			}
+			fail last unless last is none
+			fail "radio: the playlist at \"{location}\" lists no stream"
+		}
+
+		// `connect`, with its failure as a value.
+		internal def tryConnect(location string, depth int) (?http.Response, ?error) {
+			let res = connect(location, depth) onerror (err error) {
+				return (none, err)
+			}
+			return (res, none)
+		}
+
+		// The body of a playlist response, up to RADIO_PLAYLIST_BYTES.
+		// Fails when reading does.
+		internal def readPlaylist(res http.Response) !byte[] {
+			let data byte[]
+			let chunk byte[]
+			chunk.len(4096)
+			let body = res.body
+			if !(body is none) {
+				for data.len() < RADIO_PLAYLIST_BYTES {
+					let n = try body.read(chunk)
+					break when n == 0
+					data = data + chunk[:n]
+				}
+			}
+			res.close() onerror recover none
+			return data
+		}
+	}
+}

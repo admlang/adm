@@ -1,1 +1,459 @@
-partial module std.formats.audio {}
+partial module std.formats.audio {
+	use (
+		std.io
+		std.bytes
+		std.os
+		std.formats.audio.wav::*
+	)
+
+	// WAVCue is a cue point of a WAV file: a marked frame with an optional label.
+	struct WAVCue {
+		// Identifier linking the point to its label.
+		id    uint32
+		// Frame the point marks.
+		frame uint64
+		// Text of the point's `labl` entry, empty when it has none.
+		label string
+	}
+
+	// WAV is the RIFF WAVE codec.
+	//
+	// It decodes RIFF (little-endian), RIFX (big-endian) and RF64/BW64 files
+	// holding integer PCM of 8 to 32 bits, IEEE float of 32 or 64 bits, A-law or
+	// µ-law, in plain or WAVE_FORMAT_EXTENSIBLE `fmt ` chunks. Unknown chunks are
+	// skipped; a `data` chunk that comes before `fmt ` is held in memory. A data
+	// chunk shorter than its header claims ends the stream early rather than
+	// failing.
+	//
+	// It encodes integer PCM or IEEE float as `format` says, with the `tags`
+	// and `cues` it holds. The header is patched in place when the writer is an
+	// `os.File`; otherwise the audio is held in
+	// memory until its length is known.
+	//
+	// `open` and `info` fill `format`, `tags` and `cues` from the file, so the
+	// same instance encodes back what it read. Only the chunks before the audio
+	// data are read by them; tags placed after the data are not seen.
+	@codec("WAV")
+	type WAV {
+		// Sample layout `encode` writes: `Uint8`, `Int16` (the default), `Int24`,
+		// `Int32`, `Float32` or `Float64`. After `open` or `info` it is the
+		// layout the file stores, `Int16` for A-law and µ-law.
+		format SampleFormat        = SampleFormat.Int16
+		// INFO list entries by four-character id: "INAM" title, "IART" artist,
+		// "IPRD" album, "ICMT" comment, "ICRD" date, "IGNR" genre, "ITRK" track,
+		// "ISFT" software. Ids longer than four characters are cut when encoding.
+		tags   map<string, string>
+		// Cue points with their labels.
+		cues   WAVCue[]
+
+		def new() {
+			tags = new map<string, string>()
+		}
+
+		mimeType string[] {
+			def get() string[] {
+				return string["audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"]
+			}
+		}
+
+		extension string[] {
+			def get() string[] {
+				return string[".wav", ".wave"]
+			}
+		}
+
+		// matchSignature reports whether the reader starts with a RIFF, RIFX,
+		// RF64 or BW64 header of form WAVE.
+		def matchSignature(r io.Reader) bool {
+			let b byte[]
+			b.len(12)
+			let n = io.readFull(r, b) onerror recover 0
+			return false when n != 12
+			let id = string(b[0:4])
+			return false unless id := "RIFF" || "RIFX" || "RF64" || "BW64"
+			return string(b[8:12]) == "WAVE"
+		}
+
+		// open reads the headers up to the audio data and returns a stream that
+		// decodes the rest as it is read. The stream seeks when the reader can
+		// (`bytes.Reader`, `bytes.Buffer`, `os.File`) or the data came before
+		// `fmt ` and is held in memory. Closing the stream closes the reader
+		// when it is an `io.Closer`.
+		// Fails when the reader does not hold a WAV file, the file uses an
+		// encoding this codec lacks, or the headers are cut short.
+		// Fails too when `live` is set: the codec needs the whole file.
+		def open(reader io.Reader, live bool = false) !AudioStream {
+			fail "wav: a live stream cannot be decoded" when live
+			let header = new WAVHeader()
+			try header.read(reader)
+			adopt(header)
+			return new WAVStream(reader, header)
+		}
+
+		// open decodes the WAV file held in the bytes as a stream.
+		// Fails when the bytes are not a WAV file this codec decodes.
+		def open(data byte[]) !AudioStream {
+			return open(new bytes.Reader(data))
+		}
+
+		// info reads what the headers say without decoding any audio.
+		// Fails when the reader does not hold a WAV file, the file uses an
+		// encoding this codec lacks, or the headers are cut short.
+		def info(reader io.Reader) !AudioInfo {
+			let header = new WAVHeader()
+			try header.read(reader)
+			adopt(header)
+			return header.info
+		}
+
+		// info reads the headers of the WAV file held in the bytes.
+		// Fails when the bytes are not a WAV file this codec decodes.
+		def info(data byte[]) !AudioInfo {
+			return info(new bytes.Reader(data))
+		}
+
+		// Takes the layout, tags and cues the header read.
+		internal def adopt(header WAVHeader) {
+			format = header.info.format
+			tags = header.tags
+			cues = header.cues
+		}
+
+		// encode writes the stream, from where it stands to its end, as a WAV
+		// file in `format` with `tags` and `cues`. More than 4 GiB of audio is
+		// written as RF64. Samples outside -1..1 are clipped for integer layouts.
+		// Fails when the stream has no channels, or the stream or the writer
+		// fails.
+		def encode(stream AudioStream, writer io.Writer) !none {
+			let src = stream.info()
+			fail "wav: the stream has no channels" when src.channels == 0
+			let layout = new WAVLayout(format, int(src.channels), int(src.sampleRate))
+
+			let w any = writer
+			if w is os.File {
+				let file os.File = w
+				return encodePatched(stream, file, layout)
+			}
+
+			let data = new bytes.Buffer()
+			let size = try layout.encodeFrames(stream, data)
+			try wavWriteAll(writer, header(layout, size, false))
+			try wavWriteAll(writer, data.bytes())
+			if size % 2 == 1 {
+				try wavWriteAll(writer, byte[0])
+			}
+			return none
+		}
+
+		// encode returns the stream as the bytes of a WAV file.
+		// Fails when the stream has no channels or fails.
+		def encode(stream AudioStream) !byte[] {
+			let out = new bytes.Buffer()
+			try encode(stream, out)
+			return out.bytes()
+		}
+
+		// Writes a placeholder header, streams the audio, then rewrites the
+		// header over the placeholder with the real sizes.
+		internal def encodePatched(stream AudioStream, writer os.File, layout WAVLayout) !none {
+			let start = try writer.seek(0, bytes.Whence.Current)
+			let placeholder = header(layout, 0, true)
+			try wavWriteAll(writer, placeholder)
+			let size = try layout.encodeFrames(stream, writer)
+			if size % 2 == 1 {
+				try wavWriteAll(writer, byte[0])
+			}
+			let patched = header(layout, size, true)
+			fail "wav: header size changed while encoding" when patched.len() != placeholder.len()
+			try writer.writeAt(patched, int(start))
+			return none
+		}
+
+		// The bytes before the audio: RIFF (or RF64) header, `fmt `, the tags,
+		// the cues and the `data` chunk header for `size` bytes of audio. With
+		// `reserve` a `JUNK` chunk holds room for the `ds64` chunk, so a header
+		// written before the size is known keeps its length when patched.
+		internal def header(layout WAVLayout, size int64, reserve bool) byte[] {
+			let body = new bytes.Buffer()
+			body.writeString("WAVE") onerror recover 0
+			let chunks = new bytes.Buffer()
+			layout.writeFmt(chunks)
+			writeTags(chunks)
+			writeCues(chunks)
+
+			let padded = size + size % 2
+			let riffSize = int64(4 + chunks.len() + 8) + padded
+			let large = riffSize + 36 > int64(wavMaxRiffSize)
+			riffSize += 36 when large || reserve
+			if large {
+				wavChunkHeader(body, "ds64", 28)
+				wavPut(body, riffSize, 8)
+				wavPut(body, size, 8)
+				wavPut(body, int64(size / int64(layout.blockAlign)), 8)
+				wavPut(body, 0, 4)
+			} else if reserve {
+				wavChunkHeader(body, "JUNK", 28)
+				wavPut(body, 0, 8)
+				wavPut(body, 0, 8)
+				wavPut(body, 0, 8)
+				wavPut(body, 0, 4)
+			}
+			chunks.writeTo(body) onerror recover 0
+			wavChunkHeader(body, "data", large ?? (wavMaxRiffSize, int(size)))
+
+			let out = new bytes.Buffer()
+			out.writeString(large ?? ("RF64", "RIFF")) onerror recover 0
+			wavPut(out, large ?? (int64(wavMaxRiffSize), riffSize), 4)
+			body.writeTo(out) onerror recover 0
+			return out.bytes()
+		}
+
+		// Writes `tags` as a LIST INFO chunk, in id order.
+		internal def writeTags(out bytes.Buffer) {
+			return when tags.len() == 0
+			let ids = tags.keys()
+			ids.sort((a, b string) => a < b)
+			let list = new bytes.Buffer()
+			list.writeString("INFO") onerror recover 0
+			for let (_, id) in ids {
+				let text = tags.get(id)
+				continue when text is none
+				wavTextChunk(list, wavFourCC(id), text.bytes())
+			}
+			wavChunkHeader(out, "LIST", list.len())
+			list.writeTo(out) onerror recover 0
+		}
+
+		// Writes `cues` as a `cue ` chunk and their labels as a LIST adtl chunk.
+		internal def writeCues(out bytes.Buffer) {
+			return when cues.len() == 0
+			wavChunkHeader(out, "cue ", 4 + cues.len() * 24)
+			wavPut(out, cues.len(), 4)
+			for let (_, cue) in cues {
+				let position = int64(cue.frame.min(uint64(wavMaxRiffSize)))
+				wavPut(out, int64(cue.id), 4)
+				wavPut(out, position, 4)
+				out.writeString("data") onerror recover 0
+				wavPut(out, 0, 4)
+				wavPut(out, 0, 4)
+				wavPut(out, position, 4)
+			}
+
+			let labels = new bytes.Buffer()
+			labels.writeString("adtl") onerror recover 0
+			for let (_, cue) in cues {
+				continue when cue.label.len() == 0
+				let text = new bytes.Buffer()
+				wavPut(text, int64(cue.id), 4)
+				text.writeString(cue.label) onerror recover 0
+				wavTextChunk(labels, "labl", text.bytes())
+			}
+			return when labels.len() == 4
+			wavChunkHeader(out, "LIST", labels.len())
+			labels.writeTo(out) onerror recover 0
+		}
+	}
+}
+
+internal partial module std.formats.audio.wav {
+	use (
+		std.io
+		std.bytes
+		std.formats.audio::*
+	)
+
+	const (
+		wavTagPCM        = 0x0001
+		wavTagFloat      = 0x0003
+		wavTagALaw       = 0x0006
+		wavTagMuLaw      = 0x0007
+		wavTagExtensible = 0xFFFE
+	)
+
+	// Frames converted per pass while encoding.
+	const wavEncodeChunkFrames = 4096
+
+	// Largest size a 32-bit RIFF field holds; bigger files are written as RF64.
+	const wavMaxRiffSize = 0xFFFFFFFF
+
+	// How samples are packed for encoding, from the codec's `format`.
+	type WAVLayout {
+		format     SampleFormat
+		channels   int
+		sampleRate int
+		bytesPer   int
+		blockAlign int
+		float      bool
+
+		def new(format SampleFormat, channels int, sampleRate int) {
+			self.format = format
+			self.channels = channels
+			self.sampleRate = sampleRate
+			match format {
+				case SampleFormat.Uint8:
+					bytesPer = 1
+				case SampleFormat.Int16:
+					bytesPer = 2
+				case SampleFormat.Int24:
+					bytesPer = 3
+				case SampleFormat.Int32:
+					bytesPer = 4
+				case SampleFormat.Float32:
+					bytesPer = 4
+					float = true
+				case SampleFormat.Float64:
+					bytesPer = 8
+					float = true
+			}
+			blockAlign = bytesPer * channels
+		}
+
+		// Writes the `fmt ` chunk: WAVE_FORMAT_EXTENSIBLE when there are more
+		// than two channels or more than 16 bits, the plain form otherwise.
+		def writeFmt(out bytes.Buffer) {
+			let tag = float ?? (wavTagFloat, wavTagPCM)
+			let bits = bytesPer * 8
+			let extensible = channels > 2 || bits > 16
+			wavChunkHeader(out, "fmt ", extensible ?? (40, 16))
+			wavPut(out, extensible ?? (wavTagExtensible, tag), 2)
+			wavPut(out, channels, 2)
+			wavPut(out, sampleRate, 4)
+			wavPut(out, int64(sampleRate) * int64(blockAlign), 4)
+			wavPut(out, blockAlign, 2)
+			wavPut(out, bits, 2)
+			return unless extensible
+			wavPut(out, 22, 2)
+			wavPut(out, bits, 2)
+			wavPut(out, wavChannelMask(channels), 4)
+			// KSDATAFORMAT_SUBTYPE GUID: the format tag, then the fixed tail.
+			wavPut(out, tag, 4)
+			out.write(byte[0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]) onerror recover 0
+		}
+
+		// Converts every frame left in the stream and writes it, returning the
+		// byte count. Fails when the stream or the writer does.
+		def encodeFrames(stream AudioStream, writer io.Writer) !int64 {
+			let buf float32[]
+			buf.len(wavEncodeChunkFrames * channels)
+			let raw byte[]
+			raw.len(wavEncodeChunkFrames * blockAlign)
+			let total int64 = 0
+			for {
+				let frames = try stream.read(buf)
+				break when frames == 0
+				let count = frames * channels
+				pack(buf, count, raw)
+				try wavWriteAll(writer, raw[:frames * blockAlign])
+				total += int64(frames * blockAlign)
+			}
+			return total
+		}
+
+		// Packs `count` samples into `raw`, little-endian.
+		def pack(buf float32[], count int, raw byte[]) {
+			match format {
+				case SampleFormat.Uint8:
+					for let i = 0; i < count; i++ {
+						let v = int(wavRound(float64(buf[i]) * 128.0)).max(-128).min(127)
+						raw[i] = byte(v + 128)
+					}
+				case SampleFormat.Int16:
+					for let i = 0; i < count; i++ {
+						let v = int(wavRound(float64(buf[i]) * 32768.0)).max(-32768).min(32767)
+						let o = i * 2
+						raw[o], raw[o + 1] = byte(v & 0xFF), byte((v >> 8) & 0xFF)
+					}
+				case SampleFormat.Int24:
+					for let i = 0; i < count; i++ {
+						let v = int(wavRound(float64(buf[i]) * 8388608.0)).max(-8388608).min(8388607)
+						let o = i * 3
+						raw[o], raw[o + 1], raw[o + 2] = byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF)
+					}
+				case SampleFormat.Int32:
+					for let i = 0; i < count; i++ {
+						let v = int(wavRound(float64(buf[i]) * 2147483648.0)).max(-2147483648).min(2147483647)
+						let o = i * 4
+						raw[o], raw[o + 1], raw[o + 2], raw[o + 3] = byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 24) & 0xFF)
+					}
+				case SampleFormat.Float32:
+					for let i = 0; i < count; i++ {
+						let v = __bitcast_u32_from_f32(buf[i])
+						let o = i * 4
+						raw[o], raw[o + 1], raw[o + 2], raw[o + 3] = byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 24) & 0xFF)
+					}
+				case SampleFormat.Float64:
+					for let i = 0; i < count; i++ {
+						let v = __bitcast_u64_from_f64(float64(buf[i]))
+						let o = i * 8
+						for let k = 0; k < 8; k++ {
+							raw[o + k] = byte((v >> uint64(k * 8)) & 0xFF)
+						}
+					}
+			}
+		}
+	}
+
+	// Rounds half away from zero, in float64 so 32-bit samples keep their
+	// precision.
+	def wavRound(v float64) float64 {
+		return v >= 0.0 ?? (v + 0.5, v - 0.5)
+	}
+
+	// The speaker mask of the usual layout for the channel count, 0 when there
+	// is none.
+	def wavChannelMask(channels int) int {
+		let masks = int[0x4, 0x3, 0x7, 0x33, 0x37, 0x3F, 0x13F, 0x63F]
+		return 0 when channels < 1 || channels > masks.len()
+		return masks[channels - 1]
+	}
+
+	// Writes a chunk id and a little-endian 32-bit size.
+	def wavChunkHeader(out bytes.Buffer, id string, size int) {
+		out.writeString(id) onerror recover 0
+		wavPut(out, int64(size), 4)
+	}
+
+	// Writes a text sub-chunk: its bytes, a terminating NUL and the pad byte
+	// that keeps the next chunk on an even offset.
+	def wavTextChunk(out bytes.Buffer, id string, text byte[]) {
+		wavChunkHeader(out, id, text.len() + 1)
+		out.write(text) onerror recover 0
+		out.write(byte[0]) onerror recover 0
+		if (text.len() + 1) % 2 == 1 {
+			out.write(byte[0]) onerror recover 0
+		}
+	}
+
+	// Pads or cuts an id to four characters.
+	def wavFourCC(id string) string {
+		let b = id.bytes()
+		let out byte[]
+		out.len(4)
+		for let i = 0; i < 4; i++ {
+			out[i] = i < b.len() ?? (b[i], byte(' '))
+		}
+		return string(out)
+	}
+
+	// Writes the low `size` bytes of `v`, little-endian.
+	def wavPut(out bytes.Buffer, v int64, size int) {
+		let b byte[]
+		b.len(size)
+		for let i = 0; i < size; i++ {
+			b[i] = byte((v >> int64(i * 8)) & 0xFF)
+		}
+		out.write(b) onerror recover 0
+	}
+
+	// Writes every byte, looping over short writes.
+	// Fails when the writer does or stops accepting bytes.
+	def wavWriteAll(writer io.Writer, data byte[]) !none {
+		let n = 0
+		for n < data.len() {
+			let wrote = try writer.write(data[n:])
+			fail "wav: the writer accepted no bytes" when wrote <= 0
+			n += wrote
+		}
+		return none
+	}
+}

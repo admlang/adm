@@ -1,0 +1,712 @@
+internal partial module std.formats.audio.wma {
+	use std.math
+
+	// Decodes WMA v1 and v2 superframes into planar float samples.
+	//
+	// Each superframe is `layout.blockAlign` bytes and yields whole frames of
+	// `layout.frameLen` samples per channel. The output runs two frames behind
+	// the input: the first two frames decoded are the transform's warm-up,
+	// and `flush` returns the last frame still held once the input ends.
+	type WMADecoder {
+		layout WMALayout
+
+		transforms  WMATransform[]
+		expVlc      WMAVlc
+		gainVlc     WMAVlc
+		coefVlc     WMAVlc[]
+		// Per table: the run and level of each code.
+		runs        int[][]
+		levels      int[][]
+		expScales   float[]
+		noise       float[]
+		noiseIndex  int
+		lspCodebook float[][]
+		lspCos      float32[]
+		lspPowE     float32[]
+		lspPowM1    float32[]
+		lspPowM2    float32[]
+
+		// Block state.
+		resetBlockLens bool
+		blockLenBits   int
+		nextBlockBits  int
+		prevBlockBits  int
+		blockLen       int
+		blockPos       int
+		msStereo       bool
+		channelCoded   bool[]
+		exponentsBsize int[]
+		exponentsReady bool[]
+		exponents      float[][]
+		maxExponent    float[]
+		coefs1         float[][]
+		coefs          float[][]
+		output         float[]
+		frameOut       float[][]
+		highBandCoded  bool[][]
+		highBandValues int[][]
+
+		// Bit reservoir: the tail of the previous superframe that starts the
+		// next frame.
+		lastSuperframe byte[]
+		lastBitOffset  int
+
+		// Frames decoded but not yet returned, interleaved.
+		pending float32[]
+
+		// A decoder for the stream the layout describes.
+		def new(layout WMALayout) {
+			self.layout = layout
+			let channels = layout.channels
+			for let k = 0; k < layout.blockSizes; k++ {
+				transforms.push(new WMATransform(layout.frameLen >> k))
+			}
+			let gainSyms = wmaGainSymbols()
+			gainVlc = new WMAVlc(wmaGainCodes(), wmaGainBits(), gainSyms, 9)
+			let expCodes = wmaExponentCodes()
+			let expSyms int[]
+			for let i = 0; i < expCodes.len(); i++ {
+				expSyms.push(i)
+			}
+			expVlc = new WMAVlc(expCodes, wmaExponentBits(), expSyms, 8)
+			for let t = 0; t < 2; t++ {
+				let table = layout.coefTable * 2 + t
+				let codes = wmaCoefCodes(table)
+				let syms int[]
+				for let i = 0; i < codes.len(); i++ {
+					syms.push(i)
+				}
+				coefVlc.push(new WMAVlc(codes, wmaCoefBits(table), syms, 9))
+				let run int[]
+				let level int[]
+				run.len(codes.len())
+				level.len(codes.len())
+				let lv = wmaCoefLevels(table)
+				let i = 2
+				for let (k, count) in lv {
+					for let j = 0; j < count; j++ {
+						run[i] = j
+						level[i] = k + 1
+						i++
+					}
+				}
+				runs.push(run)
+				levels.push(level)
+			}
+			expScales = wmaExponentScales()
+			noise = layout.noiseTable() when layout.useNoiseCoding
+			if !layout.useExpVlc {
+				lspCodebook = wmaLspCodebook()
+				initLsp()
+			}
+
+			channelCoded.len(channels)
+			exponentsBsize.len(channels)
+			exponentsReady.len(channels)
+			exponents.len(channels)
+			maxExponent.len(channels)
+			coefs1.len(channels)
+			coefs.len(channels)
+			frameOut.len(channels)
+			highBandCoded.len(channels)
+			highBandValues.len(channels)
+			for let ch = 0; ch < channels; ch++ {
+				exponents[ch] = wmaZeros(layout.frameLen)
+				maxExponent[ch] = 1.0
+				coefs1[ch] = wmaZeros(layout.frameLen)
+				coefs[ch] = wmaZeros(layout.frameLen)
+				frameOut[ch] = wmaZeros(layout.frameLen * 2)
+				let coded bool[]
+				coded.len(16)
+				highBandCoded[ch] = coded
+				let values int[]
+				values.len(16)
+				highBandValues[ch] = values
+			}
+			output.len(layout.frameLen * 2)
+			reset()
+		}
+
+		// Forgets the stream so far, as after a seek: the bit reservoir, the
+		// overlap and the block sizes.
+		def reset() {
+			noiseIndex = 0
+			for let ch = 0; ch < layout.channels; ch++ {
+				exponentsReady[ch] = false
+				maxExponent[ch] = 1.0
+			}
+			lastSuperframe = byte[]
+			lastBitOffset = 0
+			resetBlockLens = true
+			blockLenBits = layout.frameBits
+			nextBlockBits = layout.frameBits
+			prevBlockBits = layout.frameBits
+			for let ch = 0; ch < layout.channels; ch++ {
+				for let i = 0; i < frameOut[ch].len(); i++ {
+					frameOut[ch][i] = 0.0
+				}
+			}
+			pending = float32[]
+		}
+
+		// Decodes one superframe, the first `layout.blockAlign` bytes of
+		// `data`, and returns the frames it completes, interleaved. A damaged
+		// superframe gives no frames and leaves the decoder ready for the
+		// next one.
+		//
+		// Fails when `data` is shorter than a superframe or damaged.
+		def decode(data byte[]) !float32[] {
+			pending = float32[]
+			decodeSuperframe(data) onerror (err error) {
+				pending = float32[]
+				return err
+			}
+			let out = pending
+			pending = float32[]
+			return out
+		}
+
+		// The samples of the last frame still held in the overlap, returned
+		// once the input has ended.
+		def flush() float32[] {
+			let out float32[]
+			let channels = layout.channels
+			out.len(layout.frameLen * channels)
+			for let ch = 0; ch < channels; ch++ {
+				let src = frameOut[ch]
+				for let i = 0; i < layout.frameLen; i++ {
+					out[i * channels + ch] = float32(src[i])
+				}
+			}
+			return out
+		}
+
+		def decodeSuperframe(data byte[]) !none {
+			let size = layout.blockAlign
+			fail "wma: superframe of {data.len()} bytes, expected {size}" when data.len() < size
+			if !layout.useBitReservoir {
+				let r = new WMABitReader(data, size * 8)
+				return decodeFrame(r)
+			}
+
+			let r = new WMABitReader(data, size * 8)
+			r.skip(4)
+			let frames = r.read(4) - (lastSuperframe.len() <= 0 ?? (1, 0))
+			if frames <= 0 {
+				fail "wma: superframe with {frames} frames" when frames < 0 || r.left() <= 8
+				let joined = lastSuperframe.clone()
+				for let i = 1; i < size; i++ {
+					joined.push(data[i])
+				}
+				lastSuperframe = joined
+				return none
+			}
+
+			let headerBits = 4 + 4 + layout.byteOffsetBits + 3
+			let bitOffset = r.read(layout.byteOffsetBits + 3)
+			if bitOffset > r.left() {
+				lastSuperframe = byte[]
+				fail "wma: last frame bit offset {bitOffset} past the superframe"
+			}
+
+			if lastSuperframe.len() > 0 {
+				let joined = lastSuperframe.clone()
+				let rest = bitOffset
+				for rest > 7 {
+					joined.push(byte(r.read(8)))
+					rest -= 8
+				}
+				joined.push(byte(r.read(rest) << (8 - rest))) when rest > 0
+				let carried = new WMABitReader(joined, lastSuperframe.len() * 8 + bitOffset)
+				carried.skip(lastBitOffset) when lastBitOffset > 0
+				decodeFrame(carried) onerror (err error) {
+					lastSuperframe = byte[]
+					return err
+				}
+				frames--
+			}
+
+			let pos = bitOffset + headerBits
+			if pos > size * 8 {
+				lastSuperframe = byte[]
+				fail "wma: superframe frame start past its end"
+			}
+			let body = new WMABitReader(data[pos >> 3:size], (size - (pos >> 3)) * 8)
+			body.skip(pos & 7)
+			resetBlockLens = true
+			for let i = 0; i < frames; i++ {
+				decodeFrame(body) onerror (err error) {
+					lastSuperframe = byte[]
+					return err
+				}
+			}
+
+			let end = body.count() + (pos & ^7)
+			lastBitOffset = end & 7
+			let start = end >> 3
+			if start > size {
+				lastSuperframe = byte[]
+				fail "wma: frame overruns its superframe"
+			}
+			lastSuperframe = data[start:size].clone()
+			return none
+		}
+
+		// Decodes the blocks of one frame and moves its samples to `pending`.
+		def decodeFrame(r WMABitReader) !none {
+			blockPos = 0
+			for {
+				let done = try decodeBlock(r)
+				break when done
+			}
+			let channels = layout.channels
+			let frameLen = layout.frameLen
+			let base = pending.len()
+			pending.len(base + frameLen * channels)
+			for let ch = 0; ch < channels; ch++ {
+				let out = frameOut[ch]
+				for let i = 0; i < frameLen; i++ {
+					pending[base + i * channels + ch] = float32(out[i])
+					out[i] = out[frameLen + i]
+				}
+			}
+			return none
+		}
+
+		// Decodes one block and adds it into the frame; true once the frame
+		// is complete.
+		def decodeBlock(r WMABitReader) !bool {
+			let channels = layout.channels
+			let frameBits = layout.frameBits
+			let frameLen = layout.frameLen
+			if layout.useVariableBlocks {
+				let n = wmaLog2(layout.blockSizes - 1) + 1
+				if resetBlockLens {
+					resetBlockLens = false
+					let v = r.read(n)
+					fail "wma: previous block size {v} out of range" when v >= layout.blockSizes
+					prevBlockBits = frameBits - v
+					let w = r.read(n)
+					fail "wma: block size {w} out of range" when w >= layout.blockSizes
+					blockLenBits = frameBits - w
+				} else {
+					prevBlockBits = blockLenBits
+					blockLenBits = nextBlockBits
+				}
+				let v = r.read(n)
+				fail "wma: next block size {v} out of range" when v >= layout.blockSizes
+				nextBlockBits = frameBits - v
+			} else {
+				nextBlockBits = frameBits
+				prevBlockBits = frameBits
+				blockLenBits = frameBits
+			}
+			let bsize = frameBits - blockLenBits
+			fail "wma: block size out of range" when bsize >= layout.blockSizes
+			blockLen = 1 << blockLenBits
+			fail "wma: blocks overrun the frame" when blockPos + blockLen > frameLen
+
+			msStereo = r.bit() == 1 when channels == 2
+			let anyCoded = false
+			for let ch = 0; ch < channels; ch++ {
+				channelCoded[ch] = r.bit() == 1
+				anyCoded = anyCoded || channelCoded[ch]
+			}
+
+			if anyCoded {
+				try decodeSpectrum(r, bsize)
+			}
+
+			let transform = transforms[bsize]
+			let half = blockLen / 2
+			for let ch = 0; ch < channels; ch++ {
+				if channelCoded[ch] {
+					transform.inverse(coefs[ch], output, -1.0 / 32768.0)
+				} else if !(msStereo && ch == 1) {
+					for let i = 0; i < output.len(); i++ {
+						output[i] = 0.0
+					}
+				}
+				window(frameOut[ch], frameLen / 2 + blockPos - half)
+			}
+
+			blockPos += blockLen
+			return blockPos >= frameLen
+		}
+
+		// Reads the gain, noise bands, exponents and coefficients of a block
+		// with at least one coded channel and turns them into `coefs`.
+		def decodeSpectrum(r WMABitReader, bsize int) !none {
+			let channels = layout.channels
+			let totalGain = 1
+			for {
+				fail "wma: block gain past the end of the frame" when r.left() < 7
+				let a = r.read(7)
+				totalGain += a
+				break when a != 127
+			}
+			let coefBits = wmaGainBits(totalGain)
+
+			let coded = layout.coefsEnd[bsize] - layout.coefsStart
+			let counts int[]
+			counts.len(channels)
+			for let ch = 0; ch < channels; ch++ {
+				counts[ch] = coded
+			}
+
+			let highBands = layout.highBands[bsize]
+			if layout.useNoiseCoding {
+				for let ch = 0; ch < channels; ch++ {
+					continue unless channelCoded[ch]
+					for let i = 0; i < highBands.len(); i++ {
+						let a = r.bit() == 1
+						highBandCoded[ch][i] = a
+						counts[ch] -= highBands[i] when a
+					}
+				}
+				for let ch = 0; ch < channels; ch++ {
+					continue unless channelCoded[ch]
+					let started = false
+					let val = 0
+					for let i = 0; i < highBands.len(); i++ {
+						continue unless highBandCoded[ch][i]
+						if !started {
+							val = r.read(7) - 19
+							started = true
+						} else {
+							val += gainVlc.decode(r)
+						}
+						highBandValues[ch][i] = val
+					}
+				}
+			}
+
+			if blockLenBits == layout.frameBits || r.bit() == 1 {
+				for let ch = 0; ch < channels; ch++ {
+					continue unless channelCoded[ch]
+					if layout.useExpVlc {
+						try decodeExponentsVlc(r, ch)
+					} else {
+						decodeExponentsLsp(r, ch)
+					}
+					exponentsBsize[ch] = bsize
+					exponentsReady[ch] = true
+				}
+			}
+			for let ch = 0; ch < channels; ch++ {
+				fail "wma: block without exponents" when channelCoded[ch] && !exponentsReady[ch]
+			}
+
+			for let ch = 0; ch < channels; ch++ {
+				if channelCoded[ch] {
+					let t = (ch == 1 && msStereo) ?? (1, 0)
+					try decodeRunLevels(r, t, coefs1[ch], counts[ch], coefBits)
+				}
+				r.align() when layout.version == 1 && channels >= 2
+			}
+
+			let n4 = blockLen / 2
+			let norm = 1.0 / float(n4)
+			norm *= wmaSqrt(float(n4)) when layout.version == 1
+
+			for let ch = 0; ch < channels; ch++ {
+				continue unless channelCoded[ch]
+				scaleCoefficients(ch, bsize, totalGain, norm, counts[ch])
+			}
+
+			if msStereo && channelCoded[1] {
+				if !channelCoded[0] {
+					for let i = 0; i < blockLen; i++ {
+						coefs[0][i] = 0.0
+					}
+					channelCoded[0] = true
+				}
+				let a = coefs[0]
+				let b = coefs[1]
+				for let i = 0; i < blockLen; i++ {
+					let t = a[i] - b[i]
+					a[i] += b[i]
+					b[i] = t
+				}
+			}
+			return none
+		}
+
+		// Turns the decoded levels of a channel into spectral coefficients:
+		// levels times exponents and gain, noise where the band is noise
+		// coded or outside the coded range.
+		def scaleCoefficients(ch int, bsize int, totalGain int, norm float, count int) {
+			let exps = exponents[ch]
+			let esize = exponentsBsize[ch]
+			let mult = wmaDecibels(totalGain) / maxExponent[ch] * norm
+			let out = coefs[ch]
+			let quant = coefs1[ch]
+			let o = 0
+			if !layout.useNoiseCoding {
+				for let i = 0; i < layout.coefsStart; i++ {
+					out[o] = 0.0
+					o++
+				}
+				for let i = 0; i < count; i++ {
+					out[o] = quant[i] * exps[(i << bsize) >> esize] * mult
+					o++
+				}
+				for let i = 0; i < blockLen - layout.coefsEnd[bsize]; i++ {
+					out[o] = 0.0
+					o++
+				}
+				return
+			}
+
+			let mask = wmaNoiseTableSize - 1
+			for let i = 0; i < layout.coefsStart; i++ {
+				out[o] = noise[noiseIndex] * exps[(i << bsize) >> esize] * mult
+				o++
+				noiseIndex = (noiseIndex + 1) & mask
+			}
+
+			let highBands = layout.highBands[bsize]
+			let highStart = layout.highBandStart[bsize]
+			let power float[]
+			power.len(highBands.len())
+			let lastHigh = 0
+			let e = (highStart << bsize) >> esize
+			for let j = 0; j < highBands.len(); j++ {
+				let n = highBands[j]
+				if highBandCoded[ch][j] {
+					let sum = 0.0
+					for let i = 0; i < n; i++ {
+						let v = exps[e + ((i << bsize) >> esize)]
+						sum += v * v
+					}
+					power[j] = sum / float(n)
+					lastHigh = j
+				}
+				e += (n << bsize) >> esize
+			}
+
+			e = (layout.coefsStart << bsize) >> esize
+			let li = 0
+			for let j = -1; j < highBands.len(); j++ {
+				let n = j < 0 ?? (highStart - layout.coefsStart, highBands[j >= 0 ?? (j, 0)])
+				if j >= 0 && highBandCoded[ch][j] {
+					let m = wmaSqrt(power[j] / power[lastHigh])
+					m *= wmaDecibels(highBandValues[ch][j])
+					m /= maxExponent[ch] * layout.noiseMult
+					m *= norm
+					for let i = 0; i < n; i++ {
+						out[o] = noise[noiseIndex] * exps[e + ((i << bsize) >> esize)] * m
+						o++
+						noiseIndex = (noiseIndex + 1) & mask
+					}
+				} else {
+					for let i = 0; i < n; i++ {
+						out[o] = (quant[li] + noise[noiseIndex]) * exps[e + ((i << bsize) >> esize)] * mult
+						o++
+						li++
+						noiseIndex = (noiseIndex + 1) & mask
+					}
+				}
+				e += (n << bsize) >> esize
+			}
+
+			let rest = blockLen - layout.coefsEnd[bsize]
+			let back = ((1 << bsize) + (1 << esize) - 1) >> esize
+			let m = mult * exps[e - back]
+			for let i = 0; i < rest; i++ {
+				out[o] = noise[noiseIndex] * m
+				o++
+				noiseIndex = (noiseIndex + 1) & mask
+			}
+		}
+
+		// Reads the run-level coded levels of one channel into `out`.
+		def decodeRunLevels(r WMABitReader, t int, out float[], count int, coefBits int) !none {
+			for let i = 0; i < blockLen; i++ {
+				out[i] = 0.0
+			}
+			let vlc = coefVlc[t]
+			let run = runs[t]
+			let level = levels[t]
+			let mask = blockLen - 1
+			let offset = 0
+			for offset < count {
+				let code = vlc.decode(r)
+				if code > 1 {
+					offset += run[code]
+					let v = float(level[code])
+					out[offset & mask] = r.bit() == 1 ?? (v, -v)
+				} else if code == 1 {
+					break
+				} else {
+					let lv = r.read(coefBits)
+					offset += r.read(layout.frameBits)
+					let v = float(lv)
+					out[offset & mask] = r.bit() == 1 ?? (v, -v)
+				}
+				offset++
+			}
+			fail "wma: spectral run-levels overflow the block" when offset > count
+			return none
+		}
+
+		// Reads Huffman coded exponents of a channel for the current block.
+		def decodeExponentsVlc(r WMABitReader, ch int) !none {
+			let bands = layout.exponentBands[layout.frameBits - blockLenBits]
+			let out = exponents[ch]
+			let q = 0
+			let b = 0
+			let maxScale = 0.0
+			let last = 36
+			if layout.version == 1 {
+				last = r.read(5) + 10
+				let v = expScales[last + 60]
+				maxScale = v
+				for let i = 0; i < bands[0]; i++ {
+					out[q] = v
+					q++
+				}
+				b = 1
+			}
+			for q < blockLen && b < bands.len() {
+				let code = expVlc.decode(r)
+				last += code - 60
+				fail "wma: exponent {last} out of range" when last + 60 < 0 || last + 60 >= expScales.len()
+				let v = expScales[last + 60]
+				maxScale = maxScale.max(v)
+				for let i = 0; i < bands[b]; i++ {
+					out[q] = v
+					q++
+				}
+				b++
+			}
+			maxExponent[ch] = maxScale
+			return none
+		}
+
+		// Reads LSP coded exponents of a channel and expands them into the
+		// spectral envelope of the current block.
+		def decodeExponentsLsp(r WMABitReader, ch int) {
+			let lsp float32[]
+			lsp.len(10)
+			for let i = 0; i < 10; i++ {
+				let val = (i == 0 || i >= 8) ?? (r.read(3), r.read(4))
+				lsp[i] = float32(lspCodebook[i][val])
+			}
+			let out = exponents[ch]
+			let top float32 = float32(0.0)
+			for let i = 0; i < blockLen; i++ {
+				let p = float32(0.5)
+				let q = float32(0.5)
+				let w = lspCos[i]
+				for let j = 1; j < 10; j += 2 {
+					q *= w - lsp[j - 1]
+					p *= w - lsp[j]
+				}
+				p *= p * (float32(2.0) - w)
+				q *= q * (float32(2.0) + w)
+				let v = powQuarter(p + q)
+				top = v when v > top
+				out[i] = float(v)
+			}
+			maxExponent[ch] = float(top)
+		}
+
+		// x to the power -1/4 by table interpolation, as the LSP envelope is
+		// defined.
+		def powQuarter(x float32) float32 {
+			let u = int(__bitcast_u32_from_f32(x))
+			let e = u >> 23
+			let m = (u >> 16) & 127
+			let t = __bitcast_f32_from_u32(uint32(((u << 7) & 0x7FFFFF) | (127 << 23)))
+			return lspPowE[e & 255] * (lspPowM1[m] + lspPowM2[m] * t)
+		}
+
+		def initLsp() {
+			let frameLen = layout.frameLen
+			let wdel = float32(math.π / float(frameLen))
+			lspCos.len(frameLen)
+			for let i = 0; i < frameLen; i++ {
+				lspCos[i] = float32(2.0 * math.cos(float(wdel * float32(i))))
+			}
+			let quarter = float[1.0, 1.189207115002721, 1.4142135623730951, 1.681792830507429]
+			lspPowE.len(256)
+			for let i = 0; i < 256; i++ {
+				// 2^(-(i - 126) / 4) = 2^(126 - i) / 4 split into whole and
+				// quarter powers.
+				let k = 126 - i
+				let whole = k >= 0 ?? (k / 4, -((-k + 3) / 4))
+				let frac = k - whole * 4
+				let v = quarter[frac]
+				for let s = 0; s < whole; s++ {
+					v *= 2.0
+				}
+				for let s = 0; s < -whole; s++ {
+					v /= 2.0
+				}
+				lspPowE[i] = float32(v)
+			}
+			lspPowM1.len(128)
+			lspPowM2.len(128)
+			let b = float32(1.0)
+			for let i = 127; i >= 0; i-- {
+				let m = 128 + i
+				let a = float32(float(m) * (0.5 / 128.0))
+				a = float32(1.0 / wmaSqrt(wmaSqrt(float(a))))
+				lspPowM1[i] = float32(2.0) * a - b
+				lspPowM2[i] = b - a
+				b = a
+			}
+		}
+
+		// Windows the block in `output` and adds it into `out` at `at`,
+		// shaping each edge to the neighbouring block's size.
+		def window(out float[], at int) {
+			let frameBits = layout.frameBits
+			if blockLenBits <= prevBlockBits {
+				let win = transforms[frameBits - blockLenBits].window
+				for let i = 0; i < blockLen; i++ {
+					out[at + i] += output[i] * win[i]
+				}
+			} else {
+				let len = 1 << prevBlockBits
+				let n = (blockLen - len) / 2
+				let win = transforms[frameBits - prevBlockBits].window
+				for let i = 0; i < len; i++ {
+					out[at + n + i] += output[n + i] * win[i]
+				}
+				for let i = 0; i < n; i++ {
+					out[at + n + len + i] = output[n + len + i]
+				}
+			}
+
+			let right = at + blockLen
+			if blockLenBits <= nextBlockBits {
+				let win = transforms[frameBits - blockLenBits].window
+				for let i = 0; i < blockLen; i++ {
+					out[right + i] = output[blockLen + i] * win[blockLen - 1 - i]
+				}
+			} else {
+				let len = 1 << nextBlockBits
+				let n = (blockLen - len) / 2
+				let win = transforms[frameBits - nextBlockBits].window
+				for let i = 0; i < n; i++ {
+					out[right + i] = output[blockLen + i]
+				}
+				for let i = 0; i < len; i++ {
+					out[right + n + i] = output[blockLen + n + i] * win[len - 1 - i]
+				}
+				for let i = 0; i < n; i++ {
+					out[right + n + len + i] = 0.0
+				}
+			}
+		}
+	}
+
+	// A float array of `n` zeros.
+	def wmaZeros(n int) float[] {
+		let out float[]
+		out.len(n)
+		return out
+	}
+}

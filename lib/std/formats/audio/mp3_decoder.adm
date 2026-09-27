@@ -1,0 +1,799 @@
+internal partial module std.formats.audio.mp3 {
+	// Decodes Layer III frames to PCM (ISO/IEC 11172-3 2.4.3.4, ISO/IEC
+	// 13818-3 for the lower sampling frequencies). Frames go in one at a
+	// time, in stream order: the bit reservoir, the overlap of the hybrid
+	// filterbank and the synthesis filter all carry state from one to the next.
+	type Mp3Decoder {
+		t            Mp3Tables
+		bits         Mp3Bits
+		// Main data of the frames so far: the bit reservoir.
+		reservoir    byte[]
+		reservoirLen int
+
+		// Side information of the current frame, indexed [granule*2 + channel].
+		mainDataBegin int
+		scfsi         int[]
+		part23        int[]
+		bigValues     int[]
+		globalGain    int[]
+		sfCompress    int[]
+		windowSwitch  int[]
+		blockType     int[]
+		mixed         int[]
+		region0       int[]
+		region1       int[]
+		preflag       int[]
+		sfScale       int[]
+		count1Table   int[]
+		// [(granule*2 + channel)*3 + region]
+		tableSelect   int[]
+		// [(granule*2 + channel)*3 + window]
+		subblockGain  int[]
+
+		// Scale factors by channel: long bands [channel*22 + band], short
+		// bands [channel*39 + band*3 + window].
+		sfLong      int[]
+		sfShort     int[]
+		// Scale factors of an MPEG-2 granule in bit stream order.
+		sfList      int[]
+		// Huffman-decoded values of one channel's granule.
+		lines       int[]
+		// Spectrum of each channel's granule [channel*576 + line].
+		xr          float[]
+		// Lines past which a channel's spectrum is zero.
+		nonzero     int[]
+		reorderTmp  float[]
+		// IMDCT overlap [channel*576 + subband*18 + i].
+		overlap     float[]
+		imdctOut    float[]
+		// Subband samples of one granule [slot*32 + subband].
+		subbands    float[]
+		// Synthesis V vectors [channel*1024 + i] and their write offset.
+		synthV      float[]
+		synthOffset int[]
+		dctOut      float[]
+
+		def new() {
+			t = new Mp3Tables()
+			bits = new Mp3Bits()
+			reservoir.len(mp3ReservoirSize)
+			reservoirLen = 0
+			scfsi.len(8)
+			part23.len(4)
+			bigValues.len(4)
+			globalGain.len(4)
+			sfCompress.len(4)
+			windowSwitch.len(4)
+			blockType.len(4)
+			mixed.len(4)
+			region0.len(4)
+			region1.len(4)
+			preflag.len(4)
+			sfScale.len(4)
+			count1Table.len(4)
+			tableSelect.len(12)
+			subblockGain.len(12)
+			sfLong.len(44)
+			sfShort.len(78)
+			sfList.len(40)
+			lines.len(576)
+			xr.len(1152)
+			nonzero.len(2)
+			reorderTmp.len(576)
+			overlap.len(1152)
+			imdctOut.len(36)
+			subbands.len(576)
+			synthV.len(2048)
+			synthOffset.len(2)
+			dctOut.len(32)
+		}
+
+		// Forgets the reservoir and the filter state, as at the start of a
+		// stream.
+		def reset() {
+			reservoirLen = 0
+			for let i = 0; i < 1152; i++ {
+				overlap[i] = 0.0
+			}
+			for let i = 0; i < 2048; i++ {
+				synthV[i] = 0.0
+			}
+			synthOffset[0] = 0
+			synthOffset[1] = 0
+		}
+
+		// Decodes the frame at `at` in `data` into `h.samples` interleaved
+		// frames of `out` from `outAt` (the header's channel count wide).
+		// Returns false, with silence written, when the frame's main data
+		// reaches back past the reservoir (the first frames after a seek) or
+		// its side information is invalid.
+		def decode(data byte[], at int, h Mp3FrameHeader, out float32[], outAt int) bool {
+			let nch = h.channels
+			let sideAt = at + 4 + (h.crc ?? (2, 0))
+			bits.reset(data, sideAt)
+			let sideOk = readSideInfo(h)
+
+			// Keep the last 511 bytes of the reservoir, the most main_data_begin
+			// can reach back, then append this frame's main data.
+			let keep = reservoirLen.min(511)
+			if keep < reservoirLen {
+				let from = reservoirLen - keep
+				for let i = 0; i < keep; i++ {
+					reservoir[i] = reservoir[from + i]
+				}
+			}
+			reservoirLen = keep
+			let mainAt = sideAt + h.sideBytes
+			let mainLen = h.mainBytes().min(data.len() - mainAt).max(0)
+			mainLen = mainLen.min(reservoir.len() - 8 - reservoirLen)
+			for let i = 0; i < mainLen; i++ {
+				reservoir[reservoirLen + i] = data[mainAt + i]
+			}
+			let prior = reservoirLen
+			reservoirLen += mainLen
+			for let i = 0; i < 8; i++ {
+				reservoir[reservoirLen + i] = 0
+			}
+
+			let ok = sideOk && mainDataBegin <= prior
+			let granules = h.lsf ?? (1, 2)
+			bits.reset(reservoir, prior - mainDataBegin) when ok
+			for let gr = 0; gr < granules; gr++ {
+				for let ch = 0; ch < nch; ch++ {
+					if ok {
+						decodeChannel(h, gr, ch)
+					} else {
+						silence(ch)
+					}
+				}
+				stereo(h, gr) when ok && h.mode == 1 && nch == 2
+				for let ch = 0; ch < nch; ch++ {
+					hybrid(h, gr, ch)
+					synthesize(ch, out, outAt + gr * 576 * nch + ch, nch)
+				}
+			}
+			return ok
+		}
+
+		// Reads the side information after the header and CRC. Returns false
+		// when it describes something no valid stream holds.
+		def readSideInfo(h Mp3FrameHeader) bool {
+			let nch = h.channels
+			if h.lsf {
+				mainDataBegin = bits.read(8)
+				bits.skip(nch == 1 ?? (1, 2))
+			} else {
+				mainDataBegin = bits.read(9)
+				bits.skip(nch == 1 ?? (5, 3))
+				for let ch = 0; ch < nch; ch++ {
+					for let g = 0; g < 4; g++ {
+						scfsi[ch * 4 + g] = bits.bit()
+					}
+				}
+			}
+			let granules = h.lsf ?? (1, 2)
+			let ok = true
+			for let gr = 0; gr < granules; gr++ {
+				for let ch = 0; ch < nch; ch++ {
+					let i = gr * 2 + ch
+					part23[i] = bits.read(12)
+					bigValues[i] = bits.read(9)
+					globalGain[i] = bits.read(8)
+					sfCompress[i] = bits.read(h.lsf ?? (9, 4))
+					windowSwitch[i] = bits.bit()
+					if windowSwitch[i] == 1 {
+						blockType[i] = bits.read(2)
+						mixed[i] = bits.bit()
+						tableSelect[i * 3] = bits.read(5)
+						tableSelect[i * 3 + 1] = bits.read(5)
+						tableSelect[i * 3 + 2] = 0
+						for let w = 0; w < 3; w++ {
+							subblockGain[i * 3 + w] = bits.read(3)
+						}
+						region0[i] = 0
+						region1[i] = 0
+						ok = false when blockType[i] == 0
+					} else {
+						blockType[i] = 0
+						mixed[i] = 0
+						for let r = 0; r < 3; r++ {
+							tableSelect[i * 3 + r] = bits.read(5)
+						}
+						for let w = 0; w < 3; w++ {
+							subblockGain[i * 3 + w] = 0
+						}
+						region0[i] = bits.read(4)
+						region1[i] = bits.read(3)
+					}
+					preflag[i] = h.lsf ?? (0, bits.bit())
+					sfScale[i] = bits.bit()
+					count1Table[i] = bits.bit()
+					ok = false when bigValues[i] > 288
+				}
+			}
+			return ok
+		}
+
+		// A zero spectrum for a channel whose data is missing.
+		def silence(ch int) {
+			for let i = 0; i < 576; i++ {
+				xr[ch * 576 + i] = 0.0
+			}
+			nonzero[ch] = 0
+		}
+
+		// Reads the scale factors and Huffman data of one channel's granule
+		// and requantizes it into `xr`.
+		def decodeChannel(h Mp3FrameHeader, gr int, ch int) {
+			let i = gr * 2 + ch
+			let start = bits.pos
+			if h.lsf {
+				readLsfScalefactors(h, i, ch)
+			} else {
+				readScalefactors(gr, i, ch)
+			}
+			let count = readHuffman(h, i, start + part23[i])
+			requantize(h, i, ch, count)
+		}
+
+		// MPEG-1 scale factors, reusing granule 0's where scfsi says so.
+		def readScalefactors(gr int, i int, ch int) {
+			let slen1 = mp3Slen1[sfCompress[i]]
+			let slen2 = mp3Slen2[sfCompress[i]]
+			let sl = ch * 22
+			let ss = ch * 39
+			if windowSwitch[i] == 1 && blockType[i] == 2 {
+				let first = 0
+				if mixed[i] == 1 {
+					for let b = 0; b < 8; b++ {
+						sfLong[sl + b] = bits.read(slen1)
+					}
+					first = 3
+				}
+				for let b = first; b < 12; b++ {
+					let n = b < 6 ?? (slen1, slen2)
+					for let w = 0; w < 3; w++ {
+						sfShort[ss + b * 3 + w] = bits.read(n)
+					}
+				}
+				for let w = 0; w < 3; w++ {
+					sfShort[ss + 36 + w] = 0
+				}
+				return
+			}
+			for let g = 0; g < 4; g++ {
+				let from = mp3ScfsiBands[g]
+				let to = mp3ScfsiBands[g + 1]
+				if gr == 0 || scfsi[ch * 4 + g] == 0 {
+					let n = g < 2 ?? (slen1, slen2)
+					for let b = from; b < to; b++ {
+						sfLong[sl + b] = bits.read(n)
+					}
+				}
+			}
+			sfLong[sl + 21] = 0
+		}
+
+		// MPEG-2 scale factors (ISO/IEC 13818-3 2.4.3.2), whose bit widths
+		// and group sizes come from scalefac_compress.
+		def readLsfScalefactors(h Mp3FrameHeader, i int, ch int) {
+			let sfc = sfCompress[i]
+			let s0 = 0
+			let s1 = 0
+			let s2 = 0
+			let s3 = 0
+			let partition = 0
+			if (h.modeExt & 1) == 1 && ch == 1 {
+				let isc = sfc >> 1
+				if isc < 180 {
+					s0 = isc / 36
+					s1 = (isc % 36) / 6
+					s2 = (isc % 36) % 6
+					partition = 3
+				} else if isc < 244 {
+					let v = isc - 180
+					s0 = (v % 64) >> 4
+					s1 = (v % 16) >> 2
+					s2 = v % 4
+					partition = 4
+				} else {
+					let v = isc - 244
+					s0 = v / 3
+					s1 = v % 3
+					partition = 5
+				}
+				preflag[i] = 0
+			} else if sfc < 400 {
+				s0 = (sfc >> 4) / 5
+				s1 = (sfc >> 4) % 5
+				s2 = (sfc & 15) >> 2
+				s3 = sfc & 3
+				preflag[i] = 0
+			} else if sfc < 500 {
+				let v = sfc - 400
+				s0 = (v >> 2) / 5
+				s1 = (v >> 2) % 5
+				s2 = v & 3
+				partition = 1
+				preflag[i] = 0
+			} else {
+				let v = sfc - 500
+				s0 = v / 3
+				s1 = v % 3
+				partition = 2
+				preflag[i] = 1
+			}
+			let shape = 0
+			shape = mixed[i] == 1 ?? (2, 1) when windowSwitch[i] == 1 && blockType[i] == 2
+			let n = 0
+			for let g = 0; g < 4; g++ {
+				let width = g == 0 ?? (s0, (g == 1 ?? (s1, (g == 2 ?? (s2, s3)))))
+				let count = mp3LsfBandCounts[partition * 12 + shape * 4 + g]
+				for let k = 0; k < count; k++ {
+					sfList[n] = bits.read(width)
+					n++
+				}
+			}
+			for n < 40 {
+				sfList[n] = 0
+				n++
+			}
+			let sl = ch * 22
+			let ss = ch * 39
+			if shape == 0 {
+				for let b = 0; b < 22; b++ {
+					sfLong[sl + b] = b < 21 ?? (sfList[b], 0)
+				}
+				return
+			}
+			let first = 0
+			let from = 0
+			if shape == 2 {
+				for let b = 0; b < 6; b++ {
+					sfLong[sl + b] = sfList[b]
+				}
+				first = 3
+				from = 6
+			}
+			for let b = first; b < 13; b++ {
+				for let w = 0; w < 3; w++ {
+					sfShort[ss + b * 3 + w] = b < 12 ?? (sfList[from + (b - first) * 3 + w], 0)
+				}
+			}
+		}
+
+		// Decodes the Huffman-coded values of one channel's granule into
+		// `lines`, stopping at bit `end`. Returns the count of lines that may
+		// be nonzero.
+		def readHuffman(h Mp3FrameHeader, i int, end int) int {
+			let rate = h.rateIndex
+			let big = (bigValues[i] * 2).min(576)
+			let r1 = 0
+			let r2 = 0
+			if windowSwitch[i] == 1 {
+				r1 = blockType[i] == 2 ?? (mp3ShortBands[rate * 14 + 3] * 3, mp3LongBands[rate * 23 + 8])
+				r2 = 576
+			} else {
+				r1 = mp3LongBands[rate * 23 + region0[i] + 1]
+				r2 = mp3LongBands[rate * 23 + (region0[i] + region1[i] + 2).min(22)]
+			}
+			r1 = r1.min(big)
+			r2 = r2.min(big)
+
+			let n = 0
+			for let r = 0; r < 3; r++ {
+				let stop = r == 0 ?? (r1, (r == 1 ?? (r2, big)))
+				let table = tableSelect[i * 3 + r]
+				let source = mp3HuffSource[table]
+				if source < 0 {
+					for n < stop {
+						lines[n] = 0
+						n++
+					}
+					continue
+				}
+				let root = t.huffRoot[source]
+				let linbits = mp3HuffLinbits[table]
+				for n < stop {
+					let sym = huffman(root)
+					let x = sym >> 4
+					let y = sym & 15
+					x += bits.read(linbits) when x == 15 && linbits > 0
+					x = 0 - x when x != 0 && bits.bit() == 1
+					y += bits.read(linbits) when y == 15 && linbits > 0
+					y = 0 - y when y != 0 && bits.bit() == 1
+					lines[n] = x
+					lines[n + 1] = y
+					n += 2
+				}
+			}
+
+			// Quadruples of values -1..1 until the part ends.
+			let root = t.huffRoot[mp3HuffSource[32 + count1Table[i]]]
+			let quadA = count1Table[i] == 0
+			let overran = false
+			for n <= 572 {
+				if bits.pos >= end {
+					overran = bits.pos > end
+					break
+				}
+				let sym = quadA ?? (huffman(root), 15 - bits.read(4))
+				for let k = 0; k < 4; k++ {
+					let v = (sym >> (3 - k)) & 1
+					v = -1 when v != 0 && bits.bit() == 1
+					lines[n + k] = v
+				}
+				n += 4
+			}
+			// A final quadruple that ran past the end belongs to no one.
+			n -= 4 when overran && n > big
+			for let k = n; k < 576; k++ {
+				lines[k] = 0
+			}
+			bits.pos = end
+			return n
+		}
+
+		// One Huffman symbol from the table whose root starts at `root`.
+		def huffman(root int) int {
+			let e = t.huff[root + bits.peek(8)]
+			if e >= 0 {
+				bits.pos += e & 31
+				return e >> 5
+			}
+			bits.pos += 8
+			let d = 0 - e - 1
+			let e2 = t.huff[(d >> 5) + bits.peek(d & 31)]
+			bits.pos += e2 & 31
+			return e2 >> 5
+		}
+
+		// Scales the decoded values by their band gains: xr = sign |v|^(4/3)
+		// 2^(q/4) with q from the global gain, subblock gains and scale factors.
+		def requantize(h Mp3FrameHeader, i int, ch int, count int) {
+			let rate = h.rateIndex
+			let base = ch * 576
+			let shift = sfScale[i] == 1 ?? (4, 2)
+			let gg = globalGain[i] - 210 + mp3GainBias
+			let sl = ch * 22
+			let ss = ch * 39
+			let short = windowSwitch[i] == 1 && blockType[i] == 2
+			let longEnd = 22
+			let shortStart = 13
+			if short {
+				longEnd = mixed[i] == 1 ?? ((h.lsf ?? (6, 8)), 0)
+				shortStart = mixed[i] == 1 ?? (3, 0)
+			}
+			let n = 0
+			for let b = 0; b < longEnd; b++ {
+				let from = mp3LongBands[rate * 23 + b]
+				let to = mp3LongBands[rate * 23 + b + 1]
+				let q = gg - shift * (sfLong[sl + b] + preflag[i] * mp3Pretab[b])
+				let g = t.gain[q.max(0)]
+				for let k = from; k < to; k++ {
+					xr[base + k] = scaled(lines[k], g)
+				}
+				n = to
+			}
+			for let b = shortStart; b < 13; b++ {
+				let width = mp3ShortBands[rate * 14 + b + 1] - mp3ShortBands[rate * 14 + b]
+				for let w = 0; w < 3; w++ {
+					let q = gg - 8 * subblockGain[i * 3 + w] - shift * sfShort[ss + b * 3 + w]
+					let g = t.gain[q.max(0)]
+					for let k = 0; k < width; k++ {
+						xr[base + n + k] = scaled(lines[n + k], g)
+					}
+					n += width
+				}
+			}
+			nonzero[ch] = count
+		}
+
+		// sign(v) |v|^(4/3) g.
+		def scaled(v int, g float) float {
+			return 0.0 when v == 0
+			return 0.0 - t.pow43[(0 - v).min(8206)] * g when v < 0
+			return t.pow43[v.min(8206)] * g
+		}
+
+		// Joint stereo: M/S and intensity stereo on the granule's two spectra
+		// (ISO/IEC 11172-3 2.4.3.4.9.2-3), before short blocks are reordered.
+		def stereo(h Mp3FrameHeader, gr int) {
+			let ms = (h.modeExt & 2) != 0
+			if (h.modeExt & 1) == 0 {
+				return when !ms
+				let n = nonzero[0].max(nonzero[1])
+				for let k = 0; k < n; k++ {
+					let m = xr[k]
+					let s = xr[576 + k]
+					xr[k] = (m + s) * mp3InvSqrt2
+					xr[576 + k] = (m - s) * mp3InvSqrt2
+				}
+				nonzero[0] = n
+				nonzero[1] = n
+				return
+			}
+			intensity(h, gr, ms)
+		}
+
+		// Intensity stereo: from the top down, each band of the right channel
+		// that is all zero takes the left channel's values, split by the
+		// band's intensity position; the bands below the highest nonzero one
+		// get M/S stereo when it is on.
+		def intensity(h Mp3FrameHeader, gr int, ms bool) {
+			let i = gr * 2 + 1
+			let rate = h.rateIndex
+			let short = windowSwitch[i] == 1 && blockType[i] == 2
+			let longEnd = 22
+			let shortStart = 13
+			if short {
+				longEnd = mixed[i] == 1 ?? ((h.lsf ?? (6, 8)), 0)
+				shortStart = mixed[i] == 1 ?? (3, 0)
+			}
+			let lsfBase = (sfCompress[i] & 1) * 32
+			let limit = h.lsf ?? (16, 7)
+			let pos = 576
+			let found0 = false
+			let found1 = false
+			let found2 = false
+			for let b = 12; b >= shortStart; b-- {
+				let width = mp3ShortBands[rate * 14 + b + 1] - mp3ShortBands[rate * 14 + b]
+				// The last band uses the scale factor of the one below it.
+				let sfBand = b == 12 ?? (11, b)
+				for let w = 2; w >= 0; w-- {
+					pos -= width
+					let found = w == 0 ?? (found0, (w == 1 ?? (found1, found2)))
+					if !found {
+						found = !zeroRight(pos, width)
+						if w == 0 {
+							found0 = found
+						} else if w == 1 {
+							found1 = found
+						} else {
+							found2 = found
+						}
+					}
+					let sf = sfShort[39 + sfBand * 3 + w]
+					if !found && sf < limit {
+						applyIntensity(h, pos, width, sf, lsfBase)
+					} else if ms {
+						midSide(pos, width)
+					}
+				}
+			}
+			let found = found0 || found1 || found2
+			for let b = longEnd - 1; b >= 0; b-- {
+				let width = mp3LongBands[rate * 23 + b + 1] - mp3LongBands[rate * 23 + b]
+				pos -= width
+				found = !zeroRight(pos, width) unless found
+				let sf = sfLong[22 + (b == 21 ?? (20, b))]
+				if !found && sf < limit {
+					applyIntensity(h, pos, width, sf, lsfBase)
+				} else if ms {
+					midSide(pos, width)
+				}
+			}
+			nonzero[0] = 576
+			nonzero[1] = 576
+		}
+
+		// Whether the right channel is zero on `width` lines from `pos`.
+		def zeroRight(pos int, width int) bool {
+			for let k = 0; k < width; k++ {
+				return false when xr[576 + pos + k] != 0.0
+			}
+			return true
+		}
+
+		// Splits the left channel's lines into both channels by intensity
+		// position `sf`.
+		def applyIntensity(h Mp3FrameHeader, pos int, width int, sf int, lsfBase int) {
+			let left = 0.0
+			let right = 0.0
+			if h.lsf {
+				left = t.intensityLsf[lsfBase + sf]
+				right = t.intensityLsf[lsfBase + 16 + sf]
+			} else {
+				left = t.intensityLeft[sf]
+				right = t.intensityRight[sf]
+			}
+			for let k = pos; k < pos + width; k++ {
+				let v = xr[k]
+				xr[k] = v * left
+				xr[576 + k] = v * right
+			}
+		}
+
+		// M/S stereo on `width` lines from `pos`.
+		def midSide(pos int, width int) {
+			for let k = pos; k < pos + width; k++ {
+				let m = xr[k]
+				let s = xr[576 + k]
+				xr[k] = (m + s) * mp3InvSqrt2
+				xr[576 + k] = (m - s) * mp3InvSqrt2
+			}
+		}
+
+		// Short-block reordering, alias reduction, IMDCT with overlap-add and
+		// frequency inversion of one channel's granule, into `subbands`.
+		def hybrid(h Mp3FrameHeader, gr int, ch int) {
+			let i = gr * 2 + ch
+			let base = ch * 576
+			let short = windowSwitch[i] == 1 && blockType[i] == 2
+			reorder(h, i, base) when short
+			// Alias reduction between neighbouring subbands.
+			let butterflies = 31
+			butterflies = mixed[i] == 1 ?? (1, 0) when short
+			for let sb = 1; sb <= butterflies; sb++ {
+				let edge = base + sb * 18
+				for let k = 0; k < 8; k++ {
+					let a = xr[edge - 1 - k]
+					let b = xr[edge + k]
+					xr[edge - 1 - k] = a * t.aliasCs[k] - b * t.aliasCa[k]
+					xr[edge + k] = b * t.aliasCs[k] + a * t.aliasCa[k]
+				}
+			}
+			// Subbands above the last nonzero line only release their overlap.
+			let limit = 32
+			for limit > 0 && zeroSubband(base + (limit - 1) * 18) {
+				limit--
+			}
+			let longEnd = 32
+			longEnd = mixed[i] == 1 ?? (2, 0) when short
+			for let sb = 0; sb < 32; sb++ {
+				let ov = base + sb * 18
+				if sb >= limit {
+					for let k = 0; k < 18; k++ {
+						subbands[k * 32 + sb] = overlap[ov + k]
+						overlap[ov + k] = 0.0
+					}
+				} else if sb < longEnd {
+					let bt = (mixed[i] == 1 && sb < 2) ?? (0, blockType[i])
+					imdctLong(base + sb * 18, bt)
+					for let k = 0; k < 18; k++ {
+						subbands[k * 32 + sb] = imdctOut[k] + overlap[ov + k]
+						overlap[ov + k] = imdctOut[18 + k]
+					}
+				} else {
+					imdctShort(base + sb * 18)
+					// Before a short block the previous block's window has ended
+					// by sample 12 (a start or short block precedes it in a valid
+					// stream), so its overlap there is not added.
+					for let k = 0; k < 12; k++ {
+						subbands[k * 32 + sb] = imdctOut[k] + overlap[ov + k]
+						overlap[ov + k] = imdctOut[18 + k]
+					}
+					for let k = 12; k < 18; k++ {
+						subbands[k * 32 + sb] = imdctOut[k]
+						overlap[ov + k] = imdctOut[18 + k]
+					}
+				}
+				// Frequency inversion: odd samples of odd subbands change sign.
+				if (sb & 1) == 1 {
+					for let k = 1; k < 18; k += 2 {
+						subbands[k * 32 + sb] = 0.0 - subbands[k * 32 + sb]
+					}
+				}
+			}
+		}
+
+		// Whether the 18 lines from `at` are all zero.
+		def zeroSubband(at int) bool {
+			for let k = 0; k < 18; k++ {
+				return false when xr[at + k] != 0.0
+			}
+			return true
+		}
+
+		// Reorders the short-window bands of a granule from window-major to
+		// the interleaved order the short IMDCT reads.
+		def reorder(h Mp3FrameHeader, i int, base int) {
+			let rate = h.rateIndex
+			let first = mixed[i] == 1 ?? (3, 0)
+			let pos = base + mp3ShortBands[rate * 14 + first] * 3
+			for let b = first; b < 13; b++ {
+				let width = mp3ShortBands[rate * 14 + b + 1] - mp3ShortBands[rate * 14 + b]
+				for let k = 0; k < width; k++ {
+					reorderTmp[3 * k] = xr[pos + k]
+					reorderTmp[3 * k + 1] = xr[pos + width + k]
+					reorderTmp[3 * k + 2] = xr[pos + 2 * width + k]
+				}
+				for let k = 0; k < 3 * width; k++ {
+					xr[pos + k] = reorderTmp[k]
+				}
+				pos += 3 * width
+			}
+		}
+
+		// The 36-point IMDCT of the 18 lines at `at`, windowed for block type
+		// `bt`, into `imdctOut`.
+		def imdctLong(at int, bt int) {
+			let win = bt * 36
+			for let r = 0; r < 18; r++ {
+				let a = 0.0
+				let row = r * 18
+				for let k = 0; k < 18; k++ {
+					a += xr[at + k] * t.imdctLong[row + k]
+				}
+				if r < 9 {
+					// Outputs i and 17-i are negatives of each other.
+					imdctOut[r] = a * t.windows[win + r]
+					imdctOut[17 - r] = (0.0 - a) * t.windows[win + 17 - r]
+				} else {
+					// Outputs i and 53-i are equal.
+					let o = r + 9
+					imdctOut[o] = a * t.windows[win + o]
+					imdctOut[53 - o] = a * t.windows[win + 53 - o]
+				}
+			}
+		}
+
+		// Three 12-point IMDCTs of the interleaved short windows at `at`,
+		// windowed and overlapped into the 36 outputs of `imdctOut`.
+		def imdctShort(at int) {
+			for let k = 0; k < 36; k++ {
+				imdctOut[k] = 0.0
+			}
+			for let w = 0; w < 3; w++ {
+				for let i = 0; i < 12; i++ {
+					let s = 0.0
+					for let k = 0; k < 6; k++ {
+						s += xr[at + 3 * k + w] * t.imdctShort[i * 6 + k]
+					}
+					imdctOut[6 + 6 * w + i] += s * t.windows[72 + i]
+				}
+			}
+		}
+
+		// Runs the polyphase synthesis filter over the 18 slots of
+		// `subbands` and writes 576 samples to `out` from `at`, `stride`
+		// apart.
+		def synthesize(ch int, out float32[], at int, stride int) {
+			let vBase = ch * 1024
+			let o = at
+			for let slot = 0; slot < 18; slot++ {
+				let sIn = slot * 32
+				// DCT-II of the 32 subband samples.
+				for let i = 0; i < 32; i++ {
+					let s = 0.0
+					let row = i * 32
+					for let k = 0; k < 32; k++ {
+						s += t.dct[row + k] * subbands[sIn + k]
+					}
+					dctOut[i] = s
+				}
+				let off = (synthOffset[ch] - 64) & 1023
+				synthOffset[ch] = off
+				let v = vBase + off
+				for let i = 0; i < 16; i++ {
+					synthV[v + i] = dctOut[16 + i]
+				}
+				synthV[v + 16] = 0.0
+				for let i = 17; i < 49; i++ {
+					synthV[v + i] = 0.0 - dctOut[48 - i]
+				}
+				for let i = 49; i < 64; i++ {
+					synthV[v + i] = 0.0 - dctOut[i - 48]
+				}
+				for let j = 0; j < 32; j++ {
+					let sum = 0.0
+					for let i = 0; i < 8; i++ {
+						sum += synthV[vBase + ((off + 128 * i + j) & 1023)] * t.synth[64 * i + j]
+						sum += synthV[vBase + ((off + 128 * i + 96 + j) & 1023)] * t.synth[64 * i + 32 + j]
+					}
+					out[o] = float32(sum)
+					o += stride
+				}
+			}
+		}
+	}
+
+	// Bytes held for main data: the 511 main_data_begin can reach back plus
+	// the largest frame, with room to spare.
+	const mp3ReservoirSize = 4096
+
+	// First long band of each of the four scfsi groups, and the end.
+	const mp3ScfsiBands = int[0, 6, 11, 16, 21]
+
+	const mp3InvSqrt2 = 0.7071067811865476
+}

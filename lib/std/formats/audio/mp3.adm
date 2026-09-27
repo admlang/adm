@@ -1,1 +1,538 @@
-partial module std.formats.audio {}
+partial module std.formats.audio {
+	use (
+		std.io
+		std.bytes
+		std.formats.audio.mp3::*
+	)
+
+	// MP3 is the MPEG-1/2/2.5 Audio Layer III codec: decodes `.mp3` files
+	// frame by frame and encodes constant bit rate ones.
+	//
+	// Decoding takes the frame count from the Xing/Info or VBRI header and
+	// honours the LAME tag's encoder delay and padding, so a gapless file
+	// yields exactly the samples that were encoded; without such a header
+	// `AudioInfo.frames` is 0 until the stream is read. Seeking is exact to
+	// the sample. Layer I/II, free-format streams and CRC checking are not
+	// supported (the CRC is skipped). Beyond the `AudioFormat` interface it
+	// reads and writes ID3 tags:
+	//
+	// ```
+	// let mp3 = new MP3()
+	// let tags = try mp3.tags(os.readFile("song.mp3")!)
+	// println(tags.title)
+	//
+	// mp3.bitrate = 192
+	// mp3.metadata = ID3Tags{title: "Take two", artist: "Me"}
+	// try mp3.encode(stream, file)
+	// ```
+	@codec("MP3")
+	type MP3 {
+		// Bit rate of encoded files in kbit/s. The nearest rate the encoded
+		// sample rate allows is used: 32 to 320 at 32, 44.1 and 48 kHz, 8 to
+		// 160 at the lower rates.
+		bitrate  int     = 128
+		// Tags written as an ID3v2 tag at the start of encoded files; nothing
+		// is written when they are empty.
+		metadata ID3Tags = ID3Tags{}
+
+		mimeType string[] {
+			def get() string[] {
+				return string["audio/mpeg", "audio/mp3"]
+			}
+		}
+		extension string[] {
+			def get() string[] {
+				return string[".mp3"]
+			}
+		}
+
+		// matchSignature reports whether the reader starts with an ID3v2 tag
+		// or with two consecutive Layer III frame headers.
+		def matchSignature(r io.Reader) bool {
+			let head byte[]
+			head.len(10)
+			let n = io.readFull(r, head) onerror recover 0
+			return false when n < 4
+			return true when n == 10 && id3v2Length(head, 0) > 0
+			let h = mp3ParseHeader(head, 0)
+			return false when h is none
+			// The next frame's header must follow this one.
+			let rest byte[]
+			rest.len(h.frameBytes - 10 + 4)
+			let got = io.readFull(r, rest) onerror recover 0
+			return true when got < rest.len()
+			let next = mp3ParseHeader(rest, rest.len() - 4)
+			return next is Mp3FrameHeader && next.matches(h)
+		}
+
+		// open returns a stream decoding the MP3 data read from the reader.
+		// A live stream keeps only the frames still to decode.
+		// Fails when the data holds no Layer III frames, or the reader fails.
+		def open(reader io.Reader, live bool = false) !AudioStream {
+			let s = new Mp3Stream(reader)
+			s.live = live
+			try s.start()
+			return s
+		}
+
+		// info reads the stream's description from its first frame and its
+		// Xing/Info, VBRI and LAME headers. Without a header giving the frame
+		// count, the rest of the data is read and its frames counted. Fails
+		// when the data holds no Layer III frames, or the reader fails.
+		def info(reader io.Reader) !AudioInfo {
+			let s = new Mp3Stream(reader)
+			defer s.close()
+			try s.start()
+			if s.info().frames == 0 {
+				try s.count()
+			}
+			return s.info()
+		}
+
+		// tags reads the ID3v2 tag at the start of the data and the ID3v1 tag
+		// at its end; a field ID3v2 lacks is taken from ID3v1. Fails when the
+		// reader does.
+		def tags(reader io.Reader) !ID3Tags {
+			let buf = new bytes.Buffer()
+			try buf.readFrom(reader)
+			return tags(buf.bytes())
+		}
+
+		// tags reads the ID3v2 and ID3v1 tags of the MP3 file in the bytes.
+		// Does not fail today: a damaged tag reads as the fields before the
+		// damage.
+		def tags(data byte[]) !ID3Tags {
+			let out = ID3Tags{}
+			id3ReadV2(data, out)
+			id3ReadV1(data, out)
+			return out
+		}
+
+		// encode compresses the stream to a constant bit rate MP3 file:
+		// the tags, an Info header with the frame count and the encoder delay
+		// and padding, then the frames. Rates MP3 cannot hold are resampled to
+		// the nearest one it can (32, 44.1 or 48 kHz); more than two channels
+		// are mixed down to stereo. Fails when the stream or the writer does,
+		// or the stream has no channels.
+		def encode(stream AudioStream, writer io.Writer) !none {
+			let enc = new Mp3Encoder(stream.info(), bitrate)
+			return enc.encode(stream, writer, metadata)
+		}
+	}
+}
+
+internal partial module std.formats.audio.mp3 {
+	use (
+		std.io
+		std.formats.audio.seek::*
+		std.formats.audio::*
+	)
+
+	// A lazy stream over the frames of an MP3 file. The compressed bytes read
+	// so far are kept, so seeking backwards needs no rewindable reader; a live
+	// stream drops them once decoded and cannot seek.
+	type Mp3Stream {
+		// The frame the next read starts at.
+		framePosition uint64
+
+		reader     io.Reader
+		ended      bool
+		closed     bool
+		// Every byte read so far, then zeros.
+		data       byte[]
+		dataLen    int
+		described  AudioInfo
+		first      Mp3FrameHeader
+		// Byte offset of each audio frame found so far, in stream order.
+		offsets    int[]
+		// Where the search for the next frame starts.
+		scanAt     int
+		decoder    Mp3Decoder
+		// One decoded frame and how much of it has been handed out.
+		pcm        float32[]
+		pcmFrames  int
+		pcmUsed    int
+		// Index of the next frame to decode.
+		next       int
+		// Output frames delivered since the start.
+		streamAt   int
+		// Decoded frames still to drop: the encoder delay, or the part of a
+		// frame before a seek target.
+		dropFrames int
+		// Decoded frames the LAME tag says come before the audio.
+		delay      int
+		// Output frames in the stream, -1 when unknown.
+		total      int
+		// Whether the stream ends at `total` frames, dropping the encoder's
+		// padding, rather than with its last frame.
+		trimmed    bool
+		audioBytes int
+		// A stream with no end: decoded frames are dropped, seeking fails.
+		live       bool
+
+		def new(reader io.Reader) {
+			self.reader = reader
+			ended = false
+			closed = false
+			dataLen = 0
+			scanAt = 0
+			pcmFrames = 0
+			pcmUsed = 0
+			next = 0
+			streamAt = 0
+			dropFrames = 0
+			delay = 0
+			total = -1
+			trimmed = false
+			audioBytes = 0
+			decoder = new Mp3Decoder()
+		}
+
+		// Finds the first frame and reads the headers that describe the
+		// stream. Fails when there is no Layer III frame, or the reader fails.
+		def start() !none {
+			// Skip ID3v2 tags; a file may carry more than one.
+			let at = 0
+			for {
+				try fill(at + 10)
+				let tag = id3v2Length(data, at)
+				break when tag == 0
+				at += tag
+			}
+			let found = -1
+			let limit = at + mp3SearchLimit
+			let pos = at
+			for pos < limit {
+				try fill(pos + 4)
+				break when pos + 4 > dataLen
+				let h = mp3ParseHeader(data, pos)
+				if h is Mp3FrameHeader {
+					try fill(pos + h.frameBytes + 4)
+					let n = mp3ParseHeader(data, pos + h.frameBytes)
+					if (n is Mp3FrameHeader && n.matches(h)) || pos + h.frameBytes >= dataLen {
+						found = pos
+						first = h
+						break
+					}
+				}
+				pos++
+			}
+			fail "mp3: no MPEG audio Layer III frames" when found < 0
+			scanAt = found
+			scanAt = found + first.frameBytes when readInfoFrame(found)
+			pcm.len(first.samples * first.channels)
+			let seconds = 0s
+			seconds = duration(int64(total) * 1000000000 / int64(first.sampleRate)) when total > 0
+			let rate = first.bitrate * 1000
+			rate = int(int64(audioBytes) * 8 * int64(first.sampleRate) / int64(total)) when audioBytes > 0 && total > 0
+			described = AudioInfo{
+				sampleRate: uint32(first.sampleRate),
+				channels: uint16(first.channels),
+				bitDepth: 32,
+				format: SampleFormat.Float32,
+				frames: uint64(total.max(0)),
+				length: seconds,
+				codec: "mp3",
+				bitrate: uint32(rate),
+				seekable: !live,
+			}
+			dropFrames = delay
+		}
+
+		// Reads the Xing/Info or VBRI header in the frame at `at`, when there
+		// is one, with the LAME tag after it. Returns whether the frame is such
+		// a header rather than audio.
+		def readInfoFrame(at int) bool {
+			let h = first
+			// Everything read here lies inside the frame.
+			let limit = dataLen.min(at + h.frameBytes)
+			let x = at + 4 + h.sideBytes
+			if x + 8 <= limit && (mp3IsTag(data, x, "Xing") || mp3IsTag(data, x, "Info")) {
+				let flags = id3Int(data, x + 4, 4)
+				let p = x + 8
+				let frames = 0
+				if (flags & 1) != 0 && p + 4 <= limit {
+					frames = id3Int(data, p, 4)
+					p += 4
+				}
+				if (flags & 2) != 0 && p + 4 <= limit {
+					audioBytes = id3Int(data, p, 4)
+					p += 4
+				}
+				// The seek table is not needed: the frames are scanned anyway,
+				// as the reader cannot skip.
+				p += 100 when (flags & 4) != 0
+				p += 4 when (flags & 8) != 0
+				let padding = 0
+				let encoderDelay = 0
+				// LAME tag: encoder string, then the delay and padding at 21.
+				if p + 24 <= limit && mp3KnownEncoder(data, p) {
+					let v = id3Int(data, p + 21, 3)
+					encoderDelay = v >> 12
+					padding = v & 0xFFF
+					delay = encoderDelay + mp3DecoderDelay
+					trimmed = frames > 0
+				}
+				total = (frames * h.samples - encoderDelay - padding).max(0) when frames > 0
+				return true
+			}
+			let v = at + 36
+			if v + 18 <= limit && mp3IsTag(data, v, "VBRI") {
+				audioBytes = id3Int(data, v + 10, 4)
+				let frames = id3Int(data, v + 14, 4)
+				total = frames * h.samples when frames > 0
+				return true
+			}
+			return false
+		}
+
+		// Reads from the reader until `size` bytes are held or it ends.
+		// Fails when the reader does.
+		def fill(size int) !none {
+			for dataLen < size && !ended {
+				data.len((data.len() * 2).max(dataLen + mp3ReadChunk + 8)) when data.len() < dataLen + mp3ReadChunk + 8
+				let n = try reader.read(data[dataLen:dataLen + mp3ReadChunk])
+				if n <= 0 {
+					ended = true
+				} else {
+					dataLen += n
+				}
+			}
+			data.len(dataLen + 8) when data.len() < dataLen + 8
+		}
+
+		// Finds the frame after the last one found. Returns false at the end
+		// of the data. Bytes that are not a frame of this stream (tags,
+		// damage) are passed over.
+		def scan() !bool {
+			let pos = scanAt
+			for {
+				try fill(pos + 4)
+				return false when pos + 4 > dataLen
+				let h = mp3ParseHeader(data, pos)
+				if h is Mp3FrameHeader && h.matches(first) {
+					try fill(pos + h.frameBytes + 4)
+					// A cut-off last frame is not decoded.
+					return false when pos + h.frameBytes > dataLen
+					// After a gap, the frame must be followed by another one,
+					// or end the data.
+					let fits = pos == scanAt || pos + h.frameBytes + 4 > dataLen
+					if !fits {
+						let n = mp3ParseHeader(data, pos + h.frameBytes)
+						fits = n is Mp3FrameHeader && n.matches(first)
+					}
+					if fits {
+						offsets.push(pos)
+						scanAt = pos + h.frameBytes
+						return true
+					}
+				}
+				pos++
+			}
+			return false
+		}
+
+		// Makes sure the offset of frame `index` is known. Returns false when
+		// the stream has fewer frames.
+		def locate(index int) !bool {
+			for offsets.len() <= index {
+				return false unless try scan()
+			}
+			return true
+		}
+
+		// Decodes the next frame into `pcm`. Returns false at the end.
+		def decodeNext() !bool {
+			return false unless try locate(next)
+			let at = offsets[next]
+			let h = mp3ParseHeader(data, at)
+			return false when h is none
+			decoder.decode(data, at, h, pcm, 0)
+			pcmFrames = h.samples
+			pcmUsed = 0
+			next++
+			compact() when live && next >= mp3LiveFrames
+			return true
+		}
+
+		// Drops the bytes and offsets of the frames decoded so far, so a live
+		// stream holds only what is still to decode.
+		def compact() {
+			let cut = next < offsets.len() ?? (offsets[next], scanAt)
+			let kept byte[]
+			kept.len(dataLen - cut + mp3ReadChunk + 8)
+			data[cut:dataLen].copy(kept) when dataLen > cut
+			data = kept
+			dataLen -= cut
+			scanAt -= cut
+			let rest int[]
+			for let i = next; i < offsets.len(); i++ {
+				rest.push(offsets[i] - cut)
+			}
+			offsets = rest
+			next = 0
+		}
+
+		def info() AudioInfo {
+			return described
+		}
+
+		// Fills `buf` with the next frames and returns their count, 0 at the end.
+		//
+		// Fails as decoding does.
+		def read(buf float32[]) !int {
+			let readCount = try readFrames(buf)
+			framePosition += uint64(readCount)
+			return readCount
+		}
+
+		// read fills `buf` with interleaved frames and returns how many were
+		// written, 0 at the end. Fails when the stream is closed, `buf` is not
+		// whole frames, or the reader fails.
+		def readFrames(buf float32[]) !int {
+			fail "mp3: the stream is closed" when closed
+			let nch = first.channels
+			fail "mp3: the buffer is not a whole number of frames" when buf.len() % nch != 0
+			let want = buf.len() / nch
+			let written = 0
+			for written < want {
+				break when trimmed && streamAt >= total
+				if pcmUsed >= pcmFrames {
+					break unless try decodeNext()
+					continue
+				}
+				if dropFrames > 0 {
+					let drop = dropFrames.min(pcmFrames - pcmUsed)
+					pcmUsed += drop
+					dropFrames -= drop
+					continue
+				}
+				let n = (want - written).min(pcmFrames - pcmUsed)
+				n = n.min(total - streamAt) when trimmed
+				let src = pcmUsed * nch
+				let dst = written * nch
+				for let i = 0; i < n * nch; i++ {
+					buf[dst + i] = pcm[src + i]
+				}
+				pcmUsed += n
+				written += n
+				streamAt += n
+			}
+			return written
+		}
+
+		// Positions the stream at `frame`.
+		//
+		// Fails when the stream cannot seek there.
+		def seek(frame uint64) !none {
+			try seekFrame(frame)
+			let knownFrames = info().frames
+			framePosition = knownFrames > uint64(0) && frame > knownFrames ?? (knownFrames, frame)
+			return none
+		}
+
+		// Positions the stream at `time` from its start.
+		//
+		// Fails when the stream cannot seek there.
+		def seek(time duration) !none {
+			return seek(frameAt(time, info()))
+		}
+
+		// Moves the stream by `offset`, back when negative.
+		//
+		// Fails when the stream cannot seek there.
+		def skip(offset duration) !none {
+			return seek(skipTarget(framePosition, offset, info()))
+		}
+
+		// The frame the next read starts at.
+		def position() uint64 {
+			return framePosition
+		}
+
+		// seek positions the stream at output frame `frame`; past the end it
+		// positions at the end. Decoding restarts a few frames earlier so the
+		// bit reservoir and the filters hold what they would have, which makes
+		// the samples after a seek the same as those of reading through.
+		// Fails when the stream is closed or live, or the reader fails.
+		def seekFrame(frame uint64) !none {
+			fail "mp3: the stream is closed" when closed
+			fail "mp3: a live stream cannot seek" when live
+			let target = int(frame)
+			target = target.min(total) when trimmed
+			let spf = first.samples
+			let absolute = target + delay
+			let k = absolute / spf
+			if !try locate(k) {
+				// Past the last frame: the end.
+				next = offsets.len()
+				pcmFrames = 0
+				pcmUsed = 0
+				dropFrames = 0
+				streamAt = trimmed ?? (target, (offsets.len() * spf - delay).max(0))
+				return none
+			}
+			// Frame k-1 must decode as it would have: the frames before it
+			// hold at least the 511 bytes its main data can reach back.
+			let restart = (k - 1).max(0)
+			let held = 0
+			for restart > 0 && held < 511 {
+				restart--
+				let h = mp3ParseHeader(data, offsets[restart])
+				held += h.mainBytes() when h is Mp3FrameHeader
+			}
+			decoder.reset()
+			next = restart
+			pcmFrames = 0
+			pcmUsed = 0
+			dropFrames = (k - restart) * spf + absolute % spf
+			streamAt = target
+		}
+
+		// Counts the frames by scanning the rest of the data, for a stream
+		// without a header giving the count. Fails when the reader does.
+		def count() !none {
+			for try scan() {}
+			total = offsets.len() * first.samples
+			described.frames = uint64(total)
+			described.length = duration(int64(total) * 1000000000 / int64(first.sampleRate))
+		}
+
+		// close releases the stream's buffers; reading after it fails. The
+		// reader stays with its owner. Does not fail.
+		def close() !none {
+			closed = true
+			ended = true
+			data.len(0)
+			dataLen = 0
+			offsets.len(0)
+		}
+	}
+
+	// Whether the LAME-format tag at `at` names an encoder whose delay and
+	// padding fields hold the gapless trim.
+	def mp3KnownEncoder(data byte[], at int) bool {
+		return mp3IsTag(data, at, "LAME") || mp3IsTag(data, at, "Lavf") || mp3IsTag(data, at, "Lavc") || mp3IsTag(data, at, mp3EncoderName)
+	}
+
+	// Whether the four bytes at `at` spell `tag`.
+	def mp3IsTag(data byte[], at int, tag string) bool {
+		return false when at < 0 || at + 4 > data.len()
+		let t = tag.bytes()
+		return data[at] == t[0] && data[at + 1] == t[1] && data[at + 2] == t[2] && data[at + 3] == t[3]
+	}
+
+	// Samples the decoder's filterbanks delay the audio by, which the LAME
+	// tag's encoder delay does not count.
+	const mp3DecoderDelay = 529
+
+	// Bytes searched for the first frame after the tags.
+	const mp3SearchLimit = 1 << 16
+
+	// Bytes read from the reader at a time.
+	const mp3ReadChunk = 1 << 16
+
+	// Frames a live stream decodes between dropping the ones behind it, about
+	// 7 s.
+	const mp3LiveFrames = 256
+}

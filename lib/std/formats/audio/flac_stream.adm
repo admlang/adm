@@ -1,0 +1,701 @@
+internal partial module std.formats.audio.flac {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto.hash
+		std.formats.audio.seek::*
+		std.formats.audio::*
+	)
+
+	// Sample rates by frame header code; 0 marks the codes that defer to
+	// STREAMINFO or carry the rate after the header.
+	const flacRates = int[0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000, 0, 0, 0, 0]
+
+	// Bits per sample by frame header code; 0 defers to STREAMINFO, -1 is
+	// reserved.
+	const flacDepths = int[0, 8, 12, -1, 16, 20, 24, 32]
+
+	// Decodes a FLAC file frame by frame as it is read; what `FLAC.open`
+	// returns.
+	type FlacStream {
+		// The frame the next read starts at.
+		framePosition uint64
+
+		src        io.Reader
+		seekable   bool
+		// Source offset where the FLAC data starts.
+		base       int
+		md         FlacMetadata
+		// (sample, offset from the first frame) pairs from SEEKTABLE.
+		seekTable  int[]
+		// Offset of the first frame from `base`.
+		audioStart int
+		// Length of the source from `base`, 0 when unknown.
+		audioEnd   int
+
+		// Buffered source bytes: `data[head:tail]` is unread, and `data[0]`
+		// sits at `dataOffset` from `base`.
+		data       byte[]
+		head       int
+		tail       int
+		dataOffset int
+		eof        bool
+		// The largest frame a valid stream can hold with verbatim subframes.
+		frameBound int
+
+		bits        FlacBitReader
+		coefs       int[]
+		// Decoded samples of the current block, one array per channel.
+		chans       int[][]
+		blockLen    int
+		blockPos    int
+		// Sample number of the current block's first frame.
+		blockSample int
+		// Offset from `base` of the current block's frame.
+		blockOffset int
+		scale       float64
+
+		verify      bool
+		digest      hash.MD5
+		// Whether every block so far went into `digest`, in order.
+		digesting   bool
+		digestBytes byte[]
+		closed      bool
+
+		// Decodes the FLAC data `src` holds; `verify` checks the stored MD5 at
+		// the end.
+		def new(src io.Reader, verify bool) {
+			self.src = src
+			self.verify = verify
+			bits = new FlacBitReader()
+			digest = new hash.MD5()
+			coefs.len(32)
+		}
+
+		// Reads the metadata and prepares the first frame; returns the stream.
+		// Fails when the data is not FLAC, its metadata is damaged, or the
+		// reader fails.
+		def start() !FlacStream {
+			let r = src
+			if r is os.File {
+				base = int(try r.seek(0, bytes.Whence.Current))
+				audioEnd = int(try r.seek(0, bytes.Whence.End)) - base
+				try r.seek(int64(base))
+				seekable = true
+			} else if r is bytes.Reader {
+				base = try r.seek(0, bytes.Whence.Current)
+				audioEnd = r.size() - base
+				seekable = true
+			}
+			let (found, table, consumed) = try flacReadMetadata(src, true)
+			md = found
+			seekTable = table
+			audioStart = consumed
+			dataOffset = consumed
+
+			let info = md.info
+			let channels = int(info.channels)
+			let bps = int(info.bitDepth)
+			info.seekable = seekable
+			if audioEnd > audioStart && info.frames > 0 {
+				let seconds = float64(info.frames) / float64(info.sampleRate)
+				info.bitrate = uint32(float64(audioEnd - audioStart) * 8.0 / seconds)
+			}
+			md.info = info
+			scale = 1.0 / float64(int64(1) << int64(bps - 1))
+
+			frameBound = md.maxBlockSize * channels * (bps + 1) / 8 + channels * 8 + 32
+			let size = md.maxFrameSize > frameBound ?? (md.maxFrameSize, frameBound)
+			data.len(size * 2 + 65536)
+			for let c = 0; c < channels; c++ {
+				let s int[]
+				s.len(md.maxBlockSize)
+				chans.push(s)
+			}
+			digesting = verify && !flacIsZero(md.md5)
+			return self
+		}
+
+		// metadata returns what the file's metadata blocks say: tags, pictures,
+		// the stored MD5.
+		def metadata() FlacMetadata {
+			return md
+		}
+
+		// info implements AudioStream: the stream as STREAMINFO describes it.
+		def info() AudioInfo {
+			return md.info
+		}
+
+		// Fills `buf` with the next frames and returns their count, 0 at the end.
+		//
+		// Fails as decoding does.
+		def read(buf float32[]) !int {
+			let readCount = try readFrames(buf)
+			framePosition += uint64(readCount)
+			return readCount
+		}
+
+		// read implements AudioStream: fills `buf` with interleaved frames and
+		// returns how many, 0 at the end.
+		// Fails when a frame is damaged, its CRC does not match, the stream is
+		// closed, the reader fails, or, with verification on, the decoded
+		// samples do not match the stored MD5.
+		def readFrames(buf float32[]) !int {
+			fail "flac: the stream is closed" when closed
+			let channels = chans.len()
+			let want = buf.len() / channels
+			let written = 0
+			let sc = scale
+			for written < want {
+				if blockPos >= blockLen {
+					if !(try decodeFrame()) {
+						try checkDigest()
+						break
+					}
+				}
+				let n = blockLen - blockPos
+				n = want - written when n > want - written
+				if channels == 1 {
+					let s = chans[0]
+					let o = written
+					for let i = blockPos; i < blockPos + n; i++ {
+						buf[o] = float32(float64(s[i]) * sc)
+						o++
+					}
+				} else if channels == 2 {
+					let l = chans[0]
+					let r = chans[1]
+					let o = written * 2
+					for let i = blockPos; i < blockPos + n; i++ {
+						buf[o] = float32(float64(l[i]) * sc)
+						buf[o + 1] = float32(float64(r[i]) * sc)
+						o += 2
+					}
+				} else {
+					for let c = 0; c < channels; c++ {
+						let s = chans[c]
+						let o = written * channels + c
+						for let i = blockPos; i < blockPos + n; i++ {
+							buf[o] = float32(float64(s[i]) * sc)
+							o += channels
+						}
+					}
+				}
+				blockPos += n
+				written += n
+			}
+			return written
+		}
+
+		// Positions the stream at `frame`.
+		//
+		// Fails when the stream cannot seek there.
+		def seek(frame uint64) !none {
+			try seekFrame(frame)
+			let knownFrames = info().frames
+			framePosition = knownFrames > uint64(0) && frame > knownFrames ?? (knownFrames, frame)
+			return none
+		}
+
+		// Positions the stream at `time` from its start.
+		//
+		// Fails when the stream cannot seek there.
+		def seek(time duration) !none {
+			return seek(frameAt(time, info()))
+		}
+
+		// Moves the stream by `offset`, back when negative.
+		//
+		// Fails when the stream cannot seek there.
+		def skip(offset duration) !none {
+			return seek(skipTarget(framePosition, offset, info()))
+		}
+
+		// The frame the next read starts at.
+		def position() uint64 {
+			return framePosition
+		}
+
+		// seek implements AudioStream: positions the stream at `frame`. Seeking
+		// uses SEEKTABLE when the file has one, else a search over the frame
+		// headers. A reader that cannot seek only moves forward.
+		// Fails when `frame` is past the end, the stream cannot seek backwards,
+		// or decoding the frames on the way fails.
+		def seekFrame(frame uint64) !none {
+			fail "flac: the stream is closed" when closed
+			let target = int(frame)
+			let total = int(md.info.frames)
+			fail "flac: frame {target} is past the end ({total})" when total > 0 && target > total
+			digesting = false
+			let current = blockSample + blockPos
+			let near = target >= current && (target - current < md.maxBlockSize * 8 || !seekable)
+			if !near {
+				fail "flac: the stream cannot seek backwards" unless seekable
+				try locate(target)
+			}
+			for blockSample + blockLen <= target {
+				if !(try decodeFrame()) {
+					blockPos = blockLen
+					return none
+				}
+			}
+			blockPos = target - blockSample
+			blockPos = 0 when blockPos < 0
+			return none
+		}
+
+		// close implements io.Closer, closing the reader when it is an
+		// `os.File`.
+		// Fails when closing the reader does.
+		def close() !none {
+			return none when closed
+			closed = true
+			let r = src
+			return r.close() when r is os.File
+			return none
+		}
+
+		// Moves to a decoded block at or before `target`, from the seek table
+		// or by bisecting the file over frame headers.
+		// Fails when the source fails.
+		def locate(target int) !none {
+			let bestSample = 0
+			let bestOffset = 0
+			for let i = 0; i + 1 < seekTable.len(); i += 2 {
+				if seekTable[i] <= target && seekTable[i] >= bestSample {
+					bestSample = seekTable[i]
+					bestOffset = seekTable[i + 1]
+				}
+			}
+			if bestSample == 0 && audioEnd > audioStart {
+				let lo = audioStart
+				let hi = audioEnd
+				for hi - lo > frameBound * 2 {
+					let mid = lo + (hi - lo) / 2
+					if !(try syncFrom(mid)) || blockOffset >= hi {
+						hi = mid
+						continue
+					}
+					if blockSample <= target {
+						lo = blockOffset
+					} else {
+						hi = mid
+					}
+				}
+				bestOffset = lo - audioStart
+			}
+			try moveTo(audioStart + bestOffset)
+			blockLen = 0
+			blockPos = 0
+			blockSample = 0
+			blockSample = int(md.info.frames) unless (try syncFrom(audioStart + bestOffset))
+		}
+
+		// Repositions the source at `offset` from `base`, emptying the buffer.
+		// Fails when the source cannot seek or seeking fails.
+		def moveTo(offset int) !none {
+			let r = src
+			if r is os.File {
+				try r.seek(int64(base + offset))
+			} else if r is bytes.Reader {
+				try r.seek(base + offset)
+			} else {
+				fail "flac: the stream cannot seek"
+			}
+			head = 0
+			tail = 0
+			dataOffset = offset
+			eof = false
+		}
+
+		// Decodes the first valid frame at or after `offset`; false when there
+		// is none before the end.
+		// Fails when the source fails.
+		def syncFrom(offset int) !bool {
+			try moveTo(offset)
+			for {
+				try fill(frameBound)
+				let d = data
+				let at = head
+				let found = -1
+				for let i = at; i + 1 < tail; i++ {
+					if d[i] == 0xFF && (d[i + 1] & 0xFE) == 0xF8 {
+						found = i
+						break
+					}
+				}
+				if found < 0 {
+					return false when eof
+					head = tail - 1
+					head = 0 when head < 0
+					continue
+				}
+				head = found
+				let ok = parseFrame() onerror recover false
+				return true when ok
+				head = found + 1
+			}
+			return false
+		}
+
+		// Makes at least `need` bytes readable unless the source ends first.
+		// Fails when the reader fails.
+		def fill(need int) !none {
+			return none when tail - head >= need || eof
+			if head > 0 {
+				data[head:tail].copy(data) when tail > head
+				tail -= head
+				dataOffset += head
+				head = 0
+			}
+			if data.len() < need + 4096 {
+				let grown byte[]
+				grown.len(need * 2 + 65536)
+				data[0:tail].copy(grown)
+				data = grown
+			}
+			for tail < data.len() {
+				let n = try src.read(data[tail:])
+				if n == 0 {
+					eof = true
+					break
+				}
+				tail += n
+				break when tail - head >= need
+			}
+			return none
+		}
+
+		// Decodes the next frame into the block; false at the end of the
+		// stream.
+		// Fails when the frame is damaged or the reader fails.
+		def decodeFrame() !bool {
+			let need = frameBound
+			for {
+				try fill(need)
+				return false when head >= tail
+				let ok = parseFrame() onerror (err error) {
+					return err unless bits.overrun() && !eof
+					recover false
+				}
+				if ok {
+					try updateDigest()
+					return true
+				}
+				fail "flac: truncated frame at byte {dataOffset + head}" when eof
+				need = (tail - head) * 2
+			}
+			return false
+		}
+
+		// Parses the frame at `head` into the block and moves `head` past it;
+		// false when the buffered bytes end inside the frame.
+		// Fails when the frame is damaged.
+		def parseFrame() !bool {
+			let d = data
+			let at = head
+			fail "flac: truncated frame" when tail - at < 2
+			fail "flac: lost frame sync at byte {dataOffset + at}" unless d[at] == 0xFF && (d[at + 1] & 0xFE) == 0xF8
+			let b = bits
+			b.reset(d, at, tail)
+			b.read(15)
+			let variable = b.read(1) == 1
+			let sizeCode = b.read(4)
+			let rateCode = b.read(4)
+			let chanCode = b.read(4)
+			let depthCode = b.read(3)
+			fail "flac: reserved frame header bit set" when b.read(1) != 0
+			let first = b.read(8)
+			let number = 0
+			let more = 0
+			if first < 0x80 {
+				number = first
+			} else if (first & 0xE0) == 0xC0 {
+				number = first & 0x1F
+				more = 1
+			} else if (first & 0xF0) == 0xE0 {
+				number = first & 0x0F
+				more = 2
+			} else if (first & 0xF8) == 0xF0 {
+				number = first & 0x07
+				more = 3
+			} else if (first & 0xFC) == 0xF8 {
+				number = first & 0x03
+				more = 4
+			} else if (first & 0xFE) == 0xFC {
+				number = first & 0x01
+				more = 5
+			} else if first == 0xFE {
+				more = 6
+			} else {
+				fail "flac: bad frame number"
+			}
+			for let i = 0; i < more; i++ {
+				let c = b.read(8)
+				fail "flac: bad frame number" when (c & 0xC0) != 0x80
+				number = (number << 6) | (c & 0x3F)
+			}
+			let blockSize = 0
+			if sizeCode == 1 {
+				blockSize = 192
+			} else if sizeCode >= 2 && sizeCode <= 5 {
+				blockSize = 576 << (sizeCode - 2)
+			} else if sizeCode == 6 {
+				blockSize = b.read(8) + 1
+			} else if sizeCode == 7 {
+				blockSize = b.read(16) + 1
+			} else if sizeCode >= 8 {
+				blockSize = 256 << (sizeCode - 8)
+			} else {
+				fail "flac: reserved block size"
+			}
+			if rateCode == 12 {
+				b.read(8)
+			} else if rateCode == 13 || rateCode == 14 {
+				b.read(16)
+			} else if rateCode == 15 {
+				fail "flac: invalid sample rate code"
+			}
+			let bps = int(md.info.bitDepth)
+			if depthCode != 0 {
+				bps = flacDepths[depthCode]
+				fail "flac: reserved sample size" when bps < 0
+			}
+			let channels = chans.len()
+			let frameChannels = chanCode < 8 ?? (chanCode + 1, 2)
+			fail "flac: reserved channel assignment" when chanCode > 10
+			fail "flac: frame has {frameChannels} channels, the stream {channels}" when frameChannels != channels
+			let headerEnd = b.offset()
+			let crc = b.read(8)
+			return false when b.overrun()
+			fail "flac: frame header CRC mismatch" when crc != flacCrc8(d, at, headerEnd)
+
+			if blockSize > chans[0].len() {
+				for let c = 0; c < channels; c++ {
+					chans[c].len(blockSize)
+				}
+			}
+			for let c = 0; c < channels; c++ {
+				let side = (chanCode == 8 && c == 1) || (chanCode == 9 && c == 0) || (chanCode == 10 && c == 1)
+				try decodeSubframe(chans[c], blockSize, side ?? (bps + 1, bps))
+				return false when b.overrun()
+			}
+			b.align()
+			let crcAt = b.offset()
+			let crc16 = b.read(16)
+			return false when b.overrun()
+			fail "flac: frame CRC mismatch at byte {dataOffset + at}" when crc16 != flacCrc16(d, at, crcAt)
+
+			if chanCode == 8 {
+				let l = chans[0]
+				let s = chans[1]
+				for let i = 0; i < blockSize; i++ {
+					s[i] = l[i] - s[i]
+				}
+			} else if chanCode == 9 {
+				let s = chans[0]
+				let r = chans[1]
+				for let i = 0; i < blockSize; i++ {
+					s[i] = s[i] + r[i]
+				}
+			} else if chanCode == 10 {
+				let m = chans[0]
+				let s = chans[1]
+				for let i = 0; i < blockSize; i++ {
+					let mid = (m[i] << 1) | (s[i] & 1)
+					let sd = s[i]
+					m[i] = (mid + sd) >> 1
+					s[i] = (mid - sd) >> 1
+				}
+			}
+			blockOffset = dataOffset + at
+			blockSample = variable ?? (number, number * md.maxBlockSize)
+			blockLen = blockSize
+			blockPos = 0
+			head = crcAt + 2
+			return true
+		}
+
+		// Decodes one subframe of `n` samples at `bps` bits into `s`.
+		// Fails when the subframe is damaged.
+		def decodeSubframe(s int[], n int, bps int) !none {
+			let b = bits
+			fail "flac: subframe padding bit set" when b.read(1) != 0
+			let kind = b.read(6)
+			let wasted = 0
+			if b.read(1) == 1 {
+				wasted = b.readUnary() + 1
+				fail "flac: wasted bits exceed the sample size" when wasted >= bps
+			}
+			let depth = bps - wasted
+			if kind == 0 {
+				let v = b.readSigned(depth)
+				for let i = 0; i < n; i++ {
+					s[i] = v
+				}
+			} else if kind == 1 {
+				for let i = 0; i < n; i++ {
+					s[i] = b.readSigned(depth)
+				}
+			} else if kind >= 8 && kind <= 12 {
+				let order = kind - 8
+				fail "flac: predictor order exceeds the block" when order > n
+				for let i = 0; i < order; i++ {
+					s[i] = b.readSigned(depth)
+				}
+				try decodeResidual(s, n, order)
+				flacRestoreFixed(s, n, order)
+			} else if kind >= 32 {
+				let order = kind - 31
+				fail "flac: predictor order exceeds the block" when order > n
+				for let i = 0; i < order; i++ {
+					s[i] = b.readSigned(depth)
+				}
+				let precision = b.read(4) + 1
+				fail "flac: invalid coefficient precision" when precision == 16
+				let shift = b.readSigned(5)
+				fail "flac: negative prediction shift" when shift < 0
+				let c = coefs
+				for let i = 0; i < order; i++ {
+					c[i] = b.readSigned(precision)
+				}
+				try decodeResidual(s, n, order)
+				flacRestoreLpc(s, n, c, order, shift)
+			} else {
+				fail "flac: reserved subframe type {kind}"
+			}
+			if wasted > 0 {
+				for let i = 0; i < n; i++ {
+					s[i] = s[i] << wasted
+				}
+			}
+			return none
+		}
+
+		// Decodes the partitioned residual after `order` warm-up samples.
+		// Fails when the partitioning does not fit the block.
+		def decodeResidual(s int[], n int, order int) !none {
+			let b = bits
+			let method = b.read(2)
+			fail "flac: reserved residual coding method" when method > 1
+			let paramBits = method == 0 ?? (4, 5)
+			let escape = method == 0 ?? (15, 31)
+			let po = b.read(4)
+			let psize = n >> po
+			fail "flac: residual partitions do not fit the block" when (psize << po) != n || psize < order
+			let at = order
+			let parts = 1 << po
+			for let p = 0; p < parts; p++ {
+				let count = p == 0 ?? (psize - order, psize)
+				let k = b.read(paramBits)
+				if k == escape {
+					let raw = b.read(5)
+					for let i = at; i < at + count; i++ {
+						s[i] = b.readSigned(raw)
+					}
+				} else {
+					b.readRice(s, at, count, k)
+				}
+				at += count
+				return none when b.overrun()
+			}
+			return none
+		}
+
+		// Feeds the current block into the MD5 while verifying.
+		// Fails never; the error type leaves room for the digest.
+		def updateDigest() !none {
+			return none unless digesting
+			let channels = chans.len()
+			let width = (int(md.info.bitDepth) + 7) / 8
+			let size = blockLen * channels * width
+			digestBytes.len(size) when digestBytes.len() < size
+			let out = digestBytes
+			let o = 0
+			for let i = 0; i < blockLen; i++ {
+				for let c = 0; c < channels; c++ {
+					let v = chans[c][i]
+					for let k = 0; k < width; k++ {
+						out[o] = byte((v >> (8 * k)) & 0xFF)
+						o++
+					}
+				}
+			}
+			digest.write(out[0:size])
+			return none
+		}
+
+		// At the end of a verified stream, compares the digest with the stored
+		// MD5.
+		// Fails when they differ.
+		def checkDigest() !none {
+			return none unless digesting
+			digesting = false
+			let sum = digest.hash()
+			for let i = 0; i < 16; i++ {
+				fail "flac: decoded audio does not match the stored MD5" when sum[i] != md.md5[i]
+			}
+			return none
+		}
+	}
+
+	// Whether every byte is zero.
+	def flacIsZero(b byte[]) bool {
+		for let (_, v) in b {
+			return false when v != 0
+		}
+		return true
+	}
+
+	// Undoes a fixed predictor of `order` over `s[order:n]`, which holds the
+	// residual.
+	def flacRestoreFixed(s int[], n int, order int) {
+		if order == 1 {
+			for let i = 1; i < n; i++ {
+				s[i] += s[i - 1]
+			}
+		} else if order == 2 {
+			for let i = 2; i < n; i++ {
+				s[i] += 2 * s[i - 1] - s[i - 2]
+			}
+		} else if order == 3 {
+			for let i = 3; i < n; i++ {
+				s[i] += 3 * (s[i - 1] - s[i - 2]) + s[i - 3]
+			}
+		} else if order == 4 {
+			for let i = 4; i < n; i++ {
+				s[i] += 4 * (s[i - 1] + s[i - 3]) - 6 * s[i - 2] - s[i - 4]
+			}
+		}
+	}
+
+	// Undoes a linear predictor with quantized coefficients `c[0:order]` and
+	// `shift` over `s[order:n]`, which holds the residual.
+	def flacRestoreLpc(s int[], n int, c int[], order int, shift int) {
+		if order == 8 {
+			let c0 = c[0]
+			let c1 = c[1]
+			let c2 = c[2]
+			let c3 = c[3]
+			let c4 = c[4]
+			let c5 = c[5]
+			let c6 = c[6]
+			let c7 = c[7]
+			for let i = 8; i < n; i++ {
+				let sum = c0 * s[i - 1] + c1 * s[i - 2] + c2 * s[i - 3] + c3 * s[i - 4] + c4 * s[i - 5] + c5 * s[i - 6] + c6 * s[i - 7] + c7 * s[i - 8]
+				s[i] += sum >> shift
+			}
+			return
+		}
+		for let i = order; i < n; i++ {
+			let sum = 0
+			let back = i - 1
+			for let j = 0; j < order; j++ {
+				sum += c[j] * s[back - j]
+			}
+			s[i] += sum >> shift
+		}
+	}
+}

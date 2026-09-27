@@ -1,0 +1,357 @@
+internal partial module std.media.synth.engine {
+	use (
+		std.math
+		std.formats.audio
+		std.formats.audio::(SoundFont, SoundFontVoice)
+		std.media.dsp
+	)
+
+	// Voices that sound at once before the oldest is cut off, and the pool
+	// size, which leaves room for cut-off voices to fade instead of clicking.
+	const SYNTH_POLYPHONY = 64
+
+	const SYNTH_POOL = 96
+
+	// The limiter keeps every sample within this level.
+	const SYNTH_CEILING = 0.89
+
+	// Seconds the reverb rings on after its input stops (its combs fall 60 dB
+	// in about 1.3 s at this room size).
+	const SYNTH_REVERB_TAIL = 1.5
+
+	// What a `Synth` runs on: channels, the voice pool, the reverb and the
+	// output limiter, at `rate` frames a second.
+	type SynthEngine {
+		rate      int
+		// The bank the voices play; none plays the built-in tones.
+		font      ?SoundFont
+		tones     SynthTones
+		sine      float[]
+		channels  SynthChannel[]
+		voices    SynthVoice[]
+		// Serial number of the latest note-on.
+		serial    int
+		reverb    dsp.Reverb
+		limiter   dsp.Limiter
+		// Stereo scratch for the reverb's input and the limiter's block.
+		wet       float32[]
+		mixed     float32[]
+		stereo    audio.AudioInfo
+		// Mix buses for one control block.
+		left      float[]
+		right     float[]
+		send      float[]
+		// Frames left until the next control update.
+		blockLeft int
+		// Gain before the limiter.
+		master    float
+
+		// An engine at `rate` playing `font`, or built-in tones without one.
+		def new(rate int, font ?SoundFont) {
+			self.rate = rate.max(1000)
+			self.font = font
+			sine = synthSineTable()
+			tones = new SynthTones(self.rate, sine)
+			for let i = 0; i < 16; i++ {
+				channels.push(new SynthChannel(i == 9))
+			}
+			for let i = 0; i < SYNTH_POOL; i++ {
+				voices.push(new SynthVoice(float(self.rate), sine))
+			}
+			// The send is mono: half into each side gives the room the same
+			// input as one channel would. Wet only, at 1.2 (0.4 on the dsp
+			// scale); feedback 0.82 and damping 0.3 as a room size and damping.
+			reverb = new dsp.Reverb()
+			reverb.roomSize = (0.82 - 0.7) / 0.28
+			reverb.damping = 0.3 / 0.4
+			reverb.wet = 0.4
+			reverb.dry = 0.0
+			reverb.width = 1.0
+			// Down at once, back up over about a quarter second.
+			limiter = new dsp.Limiter()
+			limiter.ceiling = 20.0 * math.log10(SYNTH_CEILING)
+			limiter.lookahead = 0s
+			limiter.release = 150ms
+			stereo = audio.AudioInfo{sampleRate: uint32(self.rate), channels: uint16(2), format: audio.SampleFormat.Float32}
+			left.len(SYNTH_BLOCK)
+			right.len(SYNTH_BLOCK)
+			send.len(SYNTH_BLOCK)
+			master = 1.3
+		}
+
+		// Returns to the power-on state: silent, every controller reset.
+		def reset() {
+			for let (_, voice) in voices {
+				voice.active = false
+				voice.stage = SynthStage.Done
+			}
+			for let (_, channel) in channels {
+				channel.reset()
+			}
+			reverb.reset()
+			limiter.reset()
+			serial = 0
+			blockLeft = 0
+		}
+
+		// Starts a note; velocity 0 ends it.
+		def noteOn(channel int, key int, velocity int) {
+			let ch = channel & 15
+			let k = key & 127
+			if velocity <= 0 {
+				noteOff(ch, k)
+				return
+			}
+			let vel = velocity.min(127)
+			for let (_, voice) in voices {
+				voice.release() when voice.active && voice.channel == ch && voice.key == k && !voice.released && !voice.ignoreOff
+			}
+			serial += 1
+			let state = channels[ch]
+			let bank = font
+			if bank is none {
+				let tone = state.drums ?? (tones.drum(k), tones.program(state.program))
+				cut(ch, tone.exclusive) when tone.exclusive != 0
+				let voice = allocate()
+				voice.startTone(tone, ch, k, vel, serial)
+				voice.control(state, blockLeft) when blockLeft > 0
+				return
+			}
+			play(ch, k, vel, parts(bank, state.bank(), state.program, k, vel))
+		}
+
+		// The SoundFont voices of a note, trying bank 0 when the bank lacks the
+		// program and program 0 of a percussion bank lacking it.
+		def parts(font SoundFont, bank int, program int, key int, velocity int) SoundFontVoice[] {
+			let found = font.voices(bank, program, key, velocity)
+			return found when found.len() > 0
+			if bank == 128 {
+				return font.voices(128, 0, key, velocity) when program != 0
+				return found
+			}
+			return font.voices(0, program, key, velocity) when bank != 0
+			return found
+		}
+
+		// Starts SoundFont voices for a note, cutting off voices of the same
+		// exclusive class on the channel first.
+		def play(channel int, key int, velocity int, parts SoundFontVoice[]) {
+			let state = channels[channel]
+			for let (_, part) in parts {
+				cut(channel, part.exclusiveClass) when part.exclusiveClass != 0
+			}
+			for let (_, part) in parts {
+				let voice = allocate()
+				voice.startSample(part, channel, key, velocity, serial)
+				voice.control(state, blockLeft) when blockLeft > 0
+			}
+		}
+
+		// Cuts off the channel's earlier voices of exclusive class `group`.
+		def cut(channel int, group int) {
+			for let (_, voice) in voices {
+				voice.kill() when voice.active && voice.channel == channel && voice.exclusive == group && voice.serial != serial
+			}
+		}
+
+		// A free voice. Past `SYNTH_POLYPHONY` sounding voices the oldest
+		// released one, else the oldest, is cut off to make room; when even
+		// the pool is full the quietest voice is taken over.
+		def allocate() SynthVoice {
+			let sounding = 0
+			let victim = -1
+			for let (i, voice) in voices {
+				continue unless voice.active && !voice.killed
+				sounding += 1
+				if victim < 0 {
+					victim = i
+					continue
+				}
+				let best = voices[victim]
+				if voice.released != best.released {
+					victim = i when voice.released
+				} else if voice.serial < best.serial {
+					victim = i
+				}
+			}
+			voices[victim].kill() when sounding >= SYNTH_POLYPHONY && victim >= 0
+			let quietest = 0
+			for let (i, voice) in voices {
+				return voice unless voice.active
+				quietest = i when voice.env < voices[quietest].env
+			}
+			return voices[quietest]
+		}
+
+		// Ends a note, or holds it while the sustain pedal is down.
+		def noteOff(channel int, key int) {
+			let ch = channel & 15
+			let k = key & 127
+			let pedal = channels[ch].sustain
+			for let (_, voice) in voices {
+				continue unless voice.active && voice.channel == ch && voice.key == k && !voice.released && !voice.ignoreOff
+				if pedal {
+					voice.held = true
+				} else {
+					voice.release()
+				}
+			}
+		}
+
+		// Chooses the channel's program.
+		def programChange(channel int, program int) {
+			channels[channel & 15].program = program & 127
+		}
+
+		// Applies a controller, as `Synth.controlChange` lists.
+		def controlChange(channel int, controller int, value int) {
+			let ch = channel & 15
+			let state = channels[ch]
+			let v = value.clamp(0, 127)
+			if controller == 0 {
+				state.bankHigh = v
+			} else if controller == 32 {
+				state.bankLow = v
+			} else if controller == 1 {
+				state.modulation = v
+			} else if controller == 7 {
+				state.volume = v
+			} else if controller == 10 {
+				state.panning = v
+			} else if controller == 11 {
+				state.expression = v
+			} else if controller == 91 {
+				state.reverb = v
+			} else if controller == 64 {
+				let down = v >= 64
+				release(ch, true) when state.sustain && !down
+				state.sustain = down
+			} else if controller == 101 {
+				state.parameterHigh = v
+			} else if controller == 100 {
+				state.parameterLow = v
+			} else if controller == 98 || controller == 99 {
+				state.parameterHigh = 127
+				state.parameterLow = 127
+			} else if controller == 6 {
+				if state.bendRangeSelected() {
+					let cents = int(state.bendRange) % 100
+					state.bendRange = float(v * 100 + cents)
+				}
+			} else if controller == 38 {
+				if state.bendRangeSelected() {
+					let semitones = int(state.bendRange) / 100
+					state.bendRange = float(semitones * 100 + v.min(99))
+				}
+			} else if controller == 120 {
+				for let (_, voice) in voices {
+					voice.kill() when voice.active && voice.channel == ch
+				}
+			} else if controller == 121 {
+				release(ch, true) when state.sustain
+				state.resetControllers()
+			} else if controller >= 123 {
+				state.sustain = false
+				release(ch, false)
+			}
+		}
+
+		// Releases the channel's notes: those the pedal holds when `heldOnly`,
+		// else all of them but drums playing out.
+		def release(channel int, heldOnly bool) {
+			for let (_, voice) in voices {
+				continue unless voice.active && voice.channel == channel && !voice.released && !voice.ignoreOff
+				voice.release() when voice.held || !heldOnly
+			}
+		}
+
+		// Bends the channel's pitch, -8192 to 8191.
+		def pitchBend(channel int, value int) {
+			channels[channel & 15].bend = value.clamp(-8192, 8191)
+		}
+
+		// Releases every note on every channel and lifts every sustain pedal.
+		def allNotesOff() {
+			for let i = 0; i < 16; i++ {
+				channels[i].sustain = false
+				release(i, false)
+			}
+		}
+
+		// Seconds a note may sound after `allNotesOff`: its release, or for a
+		// note that plays out (built-in drums), its whole length, the second
+		// value then being true.
+		def ringTime(channel SynthChannel, key int, velocity int) (float, bool) {
+			let bank = font
+			if bank is none {
+				let tone = channel.drums ?? (tones.drum(key), tones.program(channel.program))
+				return (tone.attack + tone.hold + tone.decay * 80.0 / 96.0, true) when tone.ignoreOff
+				return (tone.release * 80.0 / 96.0, false)
+			}
+			let longest = 0.0
+			for let (_, part) in parts(bank, channel.bank(), channel.program, key, velocity) {
+				longest = longest.max(part.release * 80.0 / 96.0)
+			}
+			return (longest, false)
+		}
+
+		// Fills `buf` with stereo interleaved frames and returns how many,
+		// `buf.len() / 2`.
+		def render(buf float32[]) int {
+			let frames = buf.len() / 2
+			let done = 0
+			for done < frames {
+				if blockLeft == 0 {
+					for let (_, voice) in voices {
+						voice.control(channels[voice.channel], SYNTH_BLOCK) when voice.active
+					}
+					blockLeft = SYNTH_BLOCK
+				}
+				let count = blockLeft.min(frames - done)
+				mix(count)
+				limit(buf, done, count)
+				done += count
+				blockLeft -= count
+			}
+			return frames
+		}
+
+		// Mixes `count` frames of every voice and the reverb into the buses.
+		def mix(count int) {
+			for let i = 0; i < count; i++ {
+				left[i] = 0.0
+				right[i] = 0.0
+				send[i] = 0.0
+			}
+			for let (_, voice) in voices {
+				voice.render(count, left, right, send) when voice.active
+			}
+			wet.len(count * 2)
+			for let i = 0; i < count; i++ {
+				let half = float32(send[i] * 0.5)
+				wet[2 * i] = half
+				wet[2 * i + 1] = half
+			}
+			reverb.process(wet, stereo)
+			for let i = 0; i < count; i++ {
+				left[i] += float(wet[2 * i])
+				right[i] += float(wet[2 * i + 1])
+			}
+		}
+
+		// Writes `count` frames of the buses to `buf` from frame `at` through
+		// the limiter, which turns the gain down at once when the mix would
+		// pass `SYNTH_CEILING` and back up over about a quarter second.
+		def limit(buf float32[], at int, count int) {
+			mixed.len(count * 2)
+			for let i = 0; i < count; i++ {
+				mixed[2 * i] = float32(left[i] * master)
+				mixed[2 * i + 1] = float32(right[i] * master)
+			}
+			limiter.process(mixed, stereo)
+			for let i = 0; i < count * 2; i++ {
+				buf[at * 2 + i] = mixed[i]
+			}
+		}
+	}
+}

@@ -2,12 +2,52 @@ partial module std.formats.image {
 	use (
 		std.io
 		std.bytes
+		std.math.geom
+		std.gfx.color
+		std.mem
+		std.formats.image.gif::*
 	)
 
-	// GIF is the GIF codec. Decoding and encoding are not implemented yet;
-	// matchSignature reports that nothing matches.
+	// GIFDither is how the GIF encoder hides the banding left when an image
+	// with more than 256 colours is reduced to a palette: not at all, with a
+	// fixed 4x4 pattern, or by spreading each pixel's error to its neighbours.
+	enum GIFDither {
+		None
+		Ordered
+		FloydSteinberg
+	}
+
+	// GIF is the GIF codec. `decode` reads every frame of a GIF87a or GIF89a
+	// file into `frames`, composited, and returns the first; `encode(img,
+	// writer)` writes one image, and `encode(writer)` writes `frames` as an
+	// animation.
 	@codec("Graphics Interchange Format")
 	type GIF {
+		// The animation's frames in order. Each image is the whole logical
+		// screen as it looks while that frame shows, with the file's disposal
+		// and transparency already applied, so any frame stands alone.
+		// Lengths are the file's delays: a delay of 0 is kept as 0.
+		frames     ImageFrame[]
+		// How many times the animation plays, 0 meaning forever. A file
+		// without a loop extension plays once, so `decode` sets 1 for it.
+		loopCount  int          = 0
+		// The text of the file's first comment extension, empty when it has
+		// none. The encoders write it when it is not empty.
+		comment    string
+		// The background colour the logical screen names from the global
+		// colour table, or none when the file has no global table. Frames
+		// start from a transparent canvas whatever it is.
+		background ?color.Color = none
+		// How the encoder dithers an image it has to reduce to 256 colours;
+		// images with 256 colours or fewer are written exactly.
+		dither     GIFDither    = GIFDither.None
+
+		internal lzwPrefix int[]
+		internal lzwSuffix byte[]
+		internal lzwStack  byte[]
+		internal lzwPos    int
+		internal drawMask  byte[]
+
 		mimeType string[] {
 			def get() string[] {
 				return string["image/gif"]
@@ -19,41 +59,1212 @@ partial module std.formats.image {
 			}
 		}
 
-		// matchSignature reports whether the reader starts with a GIF signature.
-		// Not implemented yet: always false.
+		// matchSignature reports whether the reader starts with a GIF87a or
+		// GIF89a signature.
 		def matchSignature(r io.Reader) bool {
-			return false
+			let b byte[]
+			b.len(6)
+			let n = io.readFull(r, b) onerror recover 0
+			return n == 6 && gifHasSignature(b)
 		}
 
-		// info reads the image's dimensions and format from the bytes. Fails, as
-		// decoding is not implemented yet.
+		// info reads the screen size and the global colour table from the
+		// bytes. Fails when they do not start with a GIF header.
 		def info(data byte[]) !ImageInfo {
 			return info(new bytes.Buffer(data))
 		}
 
-		// info reads the image's dimensions and format from the reader. Fails, as
-		// decoding is not implemented yet.
+		// info reads the screen size and the global colour table from the
+		// reader, reading no further. Fails when the data is not a GIF header,
+		// or the reader does.
 		def info(reader io.Reader) !ImageInfo {
-			fail "not implemented"
+			let head byte[]
+			head.len(13)
+			let n = io.readFull(reader, head) onerror recover 0
+			fail "gif: not a GIF" unless n == 13 && gifHasSignature(head)
+			let pal = new color.Palette(0)
+			let flags = int(head[10])
+			if flags & 0x80 != 0 {
+				let count = 1 << ((flags & 7) + 1)
+				let table byte[]
+				table.len(count * 3)
+				let got = io.readFull(reader, table) onerror recover 0
+				fail "gif: truncated colour table" when got != table.len()
+				for let i = 0; i < count; i++ {
+					pal.add(new color.Color(color.RGBA{r: table[i * 3], g: table[i * 3 + 1], b: table[i * 3 + 2], a: byte(255)}))
+				}
+			}
+			return ImageInfo{
+				size: new geom.Size(float(gifLE16(head, 6)), float(gifLE16(head, 8))),
+				colorFormat: color.ColorFormat.Palette,
+				palette: pal,
+			}
 		}
 
-		// decode reads a GIF image from the bytes. Fails, as decoding is not
-		// implemented yet.
+		// decode reads a GIF from the bytes: every frame goes into `frames`,
+		// the loop count into `loopCount`, and the first frame is returned.
+		// Data cut short after a frame, or inside one, keeps what was read,
+		// as browsers do. Fails when the bytes are not a GIF or hold no image.
 		def decode(data byte[]) !Image {
-			return decode(new bytes.Buffer(data))
+			fail "gif: not a GIF" unless gifHasSignature(data)
+			fail "gif: truncated header" when data.len() < 13
+
+			let fresh ImageFrame[]
+			frames = fresh
+			loopCount = 1
+			comment = ""
+			background = none
+
+			let screenW = gifLE16(data, 6)
+			let screenH = gifLE16(data, 8)
+			let flags = int(data[10])
+			let bgIndex = int(data[11])
+			let pos = 13
+
+			let global byte[]
+			global.len(1024)
+			let hasGlobal = flags & 0x80 != 0
+			if hasGlobal {
+				let count = 1 << ((flags & 7) + 1)
+				fail "gif: truncated colour table" when pos + count * 3 > data.len()
+				gifReadPalette(data, pos, count, global)
+				pos += count * 3
+				let o = bgIndex * 4
+				background = new color.Color(color.RGBA{r: global[o], g: global[o + 1], b: global[o + 2], a: byte(255)})
+			}
+
+			let local byte[]
+			local.len(1024)
+			let indices byte[]
+
+			let delay = 0
+			let disposal = 0
+			let transIndex = -1
+
+			let canvas = new Image(0, 0)
+			let haveCanvas = false
+			let saved = new Image(0, 0)
+			let prevDisposal = 0
+			let prevX = 0
+			let prevY = 0
+			let prevW = 0
+			let prevH = 0
+			let sawComment = false
+
+			for pos < data.len() {
+				let kind = int(data[pos])
+				pos++
+				if kind == 0x3B {
+					break
+				} else if kind == 0x21 {
+					break when pos >= data.len()
+					let label = int(data[pos])
+					pos++
+					if label == 0xF9 && pos + 5 <= data.len() && int(data[pos]) >= 4 {
+						let packed = int(data[pos + 1])
+						disposal = (packed >> 2) & 7
+						delay = gifLE16(data, pos + 2)
+						transIndex = (packed & 1) != 0 ?? (int(data[pos + 4]), -1)
+					} else if label == 0xFF && pos + 12 <= data.len() && int(data[pos]) == 11 {
+						if isLoopExtension(data, pos + 1) {
+							let sub = pos + 12
+							if sub + 4 <= data.len() && int(data[sub]) >= 3 && int(data[sub + 1]) == 1 {
+								let n = gifLE16(data, sub + 2)
+								loopCount = n == 0 ?? (0, n + 1)
+							}
+						}
+					} else if label == 0xFE && !sawComment {
+						sawComment = true
+						comment = readComment(data, pos)
+					}
+					pos = gifSkipBlocks(data, pos)
+				} else if kind == 0x2C {
+					break when pos + 9 > data.len()
+					let fx = gifLE16(data, pos)
+					let fy = gifLE16(data, pos + 2)
+					let fw = gifLE16(data, pos + 4)
+					let fh = gifLE16(data, pos + 6)
+					let packed = int(data[pos + 8])
+					pos += 9
+					let pal = global
+					if packed & 0x80 != 0 {
+						let count = 1 << ((packed & 7) + 1)
+						break when pos + count * 3 > data.len()
+						gifReadPalette(data, pos, count, local)
+						pos += count * 3
+						pal = local
+					}
+					break when pos >= data.len()
+					let minSize = int(data[pos])
+					pos++
+					fail "gif: bad LZW code size {minSize}" when minSize < 1 || minSize > 11
+
+					if !haveCanvas {
+						if screenW == 0 || screenH == 0 {
+							screenW = fx + fw
+							screenH = fy + fh
+						}
+						fail "gif: empty logical screen" when screenW == 0 || screenH == 0
+						canvas = new Image(screenW, screenH)
+						haveCanvas = true
+					}
+
+					let pixels = fw * fh
+					indices.len(pixels) when indices.len() < pixels
+					let got = lzwDecode(data, pos, minSize, indices, pixels)
+					pos = lzwPos
+
+					if prevDisposal == 2 {
+						clearRect(canvas, prevX, prevY, prevW, prevH)
+					} else if prevDisposal == 3 && saved.size().width > 0 {
+						mem.copyN(canvas.raw(), saved.raw(), saved.raw().len())
+					}
+					if disposal == 3 {
+						saved = canvas.copy()
+					}
+
+					paint(canvas, indices, got, fx, fy, fw, fh, packed & 0x40 != 0, pal, transIndex)
+
+					frames.push(ImageFrame{
+						image: canvas.copy(),
+						length: duration(delay * 10000000),
+						offset: new geom.Point(0.0, 0.0),
+						blendMode: color.BlendMode.Normal,
+					})
+
+					prevDisposal = disposal
+					prevX = fx
+					prevY = fy
+					prevW = fw
+					prevH = fh
+					delay = 0
+					disposal = 0
+					transIndex = -1
+					break when got < pixels
+				} else {
+					break
+				}
+			}
+
+			fail "gif: no image in the file" when frames.len() == 0
+			return frames[0].image
 		}
 
-		// decode reads a GIF image from the reader. Fails, as decoding is not
-		// implemented yet.
+		// decode reads a GIF from the reader; see decode(data). Fails when the
+		// data is not a GIF or holds no image, or the reader fails.
 		def decode(reader io.Reader) !Image {
-			fail "not implemented"
+			let buf = new bytes.Buffer()
+			try buf.readFrom(reader)
+			return decode(buf.bytes())
 		}
 
-		// encode renders the image as GIF. Not implemented yet: returns no bytes.
-		def encode() byte[] {}
+		internal def isLoopExtension(data byte[], at int) bool {
+			let netscape = "NETSCAPE2.0".bytes()
+			let animexts = "ANIMEXTS1.0".bytes()
+			let a = true
+			let b = true
+			for let i = 0; i < 11; i++ {
+				a = false when data[at + i] != netscape[i]
+				b = false when data[at + i] != animexts[i]
+			}
+			return a || b
+		}
 
-		// encode writes the image as GIF to the writer. Not implemented yet; it
-		// cannot fail.
-		def encode(writer io.Writer) !none {}
+		internal def readComment(data byte[], pos int) string {
+			let text byte[]
+			let p = pos
+			for p < data.len() {
+				let n = int(data[p])
+				p++
+				break when n == 0
+				let end = p + n
+				end = data.len() when end > data.len()
+				text = text + data[p:end]
+				p = end
+			}
+			return string(text)
+		}
+
+		internal def clearRect(canvas Image, x int, y int, w int, h int) {
+			let cw = int(canvas.size().width)
+			let ch = int(canvas.size().height)
+			let x1 = x + w
+			let y1 = y + h
+			x1 = cw when x1 > cw
+			y1 = ch when y1 > ch
+			return when x >= x1 || y >= y1
+			let px = canvas.raw()
+			for let row = y; row < y1; row++ {
+				let o = canvas.pixelOffset(x, row)
+				px[o:o + (x1 - x) * 4] = 0
+			}
+		}
+
+		// Draws the first `count` decoded indices of a frame onto the canvas,
+		// skipping the transparent index and anything outside the canvas.
+		internal def paint(canvas Image, indices byte[], count int, fx int, fy int, fw int, fh int, interlaced bool, pal byte[], trans int) {
+			let cw = int(canvas.size().width)
+			let ch = int(canvas.size().height)
+			let px = canvas.raw()
+			let x1 = fx + fw
+			x1 = cw when x1 > cw
+			let passes = interlaced ?? (4, 1)
+			let src = 0
+			for let p = 0; p < passes; p++ {
+				let y = interlaced ?? (gifPasses[p * 2], 0)
+				let step = interlaced ?? (gifPasses[p * 2 + 1], 1)
+				for y < fh {
+					return when src >= count
+					let cy = fy + y
+					if cy < ch {
+						let row = src
+						let o = canvas.pixelOffset(fx, cy)
+						for let x = fx; x < x1; x++ {
+							break when row >= count
+							let idx = int(indices[row])
+							if idx != trans {
+								let po = idx * 4
+								px[o] = pal[po]
+								px[o + 1] = pal[po + 1]
+								px[o + 2] = pal[po + 2]
+								px[o + 3] = byte(255)
+							}
+							row++
+							o += 4
+						}
+					}
+					src += fw
+					y += step
+				}
+			}
+		}
+
+		// Decodes the LZW sub-blocks starting at `start` into `out`, stopping
+		// at the end code, a corrupt code, the end of the data, or `limit`
+		// pixels. Returns how many pixels it produced and leaves `lzwPos`
+		// after the image's block terminator.
+		internal def lzwDecode(data byte[], start int, minSize int, out byte[], limit int) int {
+			if lzwPrefix.len() == 0 {
+				lzwPrefix.len(gifMaxCodes)
+				lzwSuffix.len(gifMaxCodes)
+				lzwStack.len(gifMaxCodes + 1)
+			}
+			let prefix = lzwPrefix
+			let suffix = lzwSuffix
+			let stack = lzwStack
+
+			let clear = 1 << minSize
+			let eoi = clear + 1
+			let size = minSize + 1
+			let mask = (1 << size) - 1
+			let next = clear + 2
+			let prev = -1
+			let first = 0
+			let n = 0
+
+			let end = data.len()
+			let pos = start
+			let remain = 0
+			let acc = 0
+			let bits = 0
+			let terminated = false
+			let stop = false
+
+			for !stop {
+				for bits < size {
+					if remain == 0 {
+						if pos >= end {
+							stop = true
+							break
+						}
+						remain = int(data[pos])
+						pos++
+						if remain == 0 {
+							terminated = true
+							stop = true
+							break
+						}
+					}
+					if pos >= end {
+						stop = true
+						break
+					}
+					acc |= int(data[pos]) << bits
+					pos++
+					remain--
+					bits += 8
+				}
+				break when stop
+
+				let code = acc & mask
+				acc >>= size
+				bits -= size
+
+				if code == clear {
+					size = minSize + 1
+					mask = (1 << size) - 1
+					next = clear + 2
+					prev = -1
+					continue
+				}
+				break when code == eoi || n >= limit
+				if prev < 0 {
+					break when code >= clear
+					out[n] = byte(code)
+					n++
+					prev = code
+					first = code
+					continue
+				}
+				break when code > next
+
+				let sp = 0
+				let c = code
+				if code == next {
+					stack[sp] = byte(first)
+					sp++
+					c = prev
+				}
+				for c >= clear {
+					stack[sp] = suffix[c]
+					sp++
+					c = prefix[c]
+				}
+				first = c
+				stack[sp] = byte(c)
+				sp++
+
+				if next < gifMaxCodes {
+					prefix[next] = prev
+					suffix[next] = byte(first)
+					next++
+					if next == mask + 1 && size < 12 {
+						size++
+						mask = (1 << size) - 1
+					}
+				}
+				prev = code
+
+				for sp > 0 && n < limit {
+					sp--
+					out[n] = stack[sp]
+					n++
+				}
+			}
+
+			if terminated {
+				lzwPos = pos
+			} else {
+				pos += remain
+				lzwPos = gifSkipBlocks(data, pos)
+			}
+			return n
+		}
+
+		// encode renders the image as GIF; see encode(img, writer).
+		def encode(img Image) !byte[] {
+			let out = new bytes.Buffer()
+			try encode(img, out)
+			return out.bytes()
+		}
+
+		// encode writes the image as a single-frame GIF to the writer. An
+		// image with at most 256 colours keeps them exactly; one with more is
+		// reduced by median cut and dithered as `dither` says. Pixels with
+		// alpha below 128 become transparent. Fails when a side is over
+		// 65535 pixels, or the writer fails.
+		def encode(img Image, writer io.Writer) !none {
+			let w = int(img.size().width)
+			let h = int(img.size().height)
+			fail "gif: image must be 1 to 65535 pixels a side" when w < 1 || h < 1 || w > 65535 || h > 65535
+
+			let out = new GIFOut()
+			markChanges(none, img)
+			let pal = quantize(img, 0, 0, w, h, 256)
+			writeHeader(out, w, h, pal)
+			writeFrame(out, img, 0, 0, w, h, pal, false, 0, 0)
+			out.put(0x3B)
+			try writeAll(writer, out.bytes())
+		}
+
+		// encode writes `frames` as an animated GIF, looping as `loopCount`
+		// says. The canvas is the first frame's size; later frames are drawn
+		// onto it at their offset when their size differs. Only the part of
+		// each frame that changed is stored. Fails when there are no frames,
+		// the canvas is over 65535 pixels a side, or the writer fails.
+		def encode(writer io.Writer) !none {
+			fail "gif: no frames to encode" when frames.len() == 0
+			let w = int(frames[0].image.size().width)
+			let h = int(frames[0].image.size().height)
+			fail "gif: image must be 1 to 65535 pixels a side" when w < 1 || h < 1 || w > 65535 || h > 65535
+
+			let canvases Image[]
+			for let f in frames {
+				canvases.push(fitCanvas(f, w, h))
+			}
+
+			let global = sharedPalette(canvases)
+			let out = new GIFOut()
+			writeHeader(out, w, h, global)
+
+			if canvases.len() > 1 && loopCount != 1 {
+				out.put(0x21)
+				out.put(0xFF)
+				out.put(11)
+				for let b in "NETSCAPE2.0".bytes() {
+					out.put(int(b))
+				}
+				out.put(3)
+				out.put(1)
+				out.put16(loopCount <= 0 ?? (0, (loopCount - 1) & 0xFFFF))
+				out.put(0)
+			}
+
+			let base ?Image = none
+			for let i = 0; i < canvases.len(); i++ {
+				let cur = canvases[i]
+				let clearAfter = i + 1 < canvases.len() && needsClear(cur, canvases[i + 1])
+
+				let x0 = 0
+				let y0 = 0
+				let fw = w
+				let fh = h
+				let (bx, by, bw, bh) = markChanges(base, cur)
+				if !clearAfter {
+					x0 = bx
+					y0 = by
+					fw = bw
+					fh = bh
+				}
+
+				let local = global is none
+				let pal = new GIFPalette()
+				if global is none {
+					pal = quantize(cur, x0, y0, fw, fh, 255)
+				} else {
+					pal = global
+				}
+				let cs = int((int(frames[i].length) + 5000000) / 10000000)
+				cs = 65535 when cs > 65535
+				writeFrame(out, cur, x0, y0, fw, fh, pal, local, clearAfter ?? (2, 1), cs)
+				base = clearAfter ?? (none, cur)
+			}
+			out.put(0x3B)
+			try writeAll(writer, out.bytes())
+		}
+
+		// encode renders `frames` as an animated GIF; see encode(writer).
+		def encode() !byte[] {
+			let out = new bytes.Buffer()
+			try encode(out)
+			return out.bytes()
+		}
+
+		internal def writeAll(writer io.Writer, data byte[]) !none {
+			let done = 0
+			for done < data.len() {
+				let n = try writer.write(data[done:])
+				fail "gif: writer accepted no bytes" when n <= 0
+				done += n
+			}
+		}
+
+		// The frame as a canvas-sized image: the frame itself when it already
+		// is one at the origin, else drawn onto a transparent canvas.
+		internal def fitCanvas(f ImageFrame, w int, h int) Image {
+			let ox = int(f.offset.x)
+			let oy = int(f.offset.y)
+			if ox == 0 && oy == 0 && int(f.image.size().width) == w && int(f.image.size().height) == h && f.image.stride() == w * 4 {
+				return f.image
+			}
+			let c = new Image(w, h)
+			c.draw(f.image, ox, oy)
+			return c
+		}
+
+		// Whether a pixel shown in `a` has to vanish in `b`, which drawing
+		// over `a` cannot do.
+		internal def needsClear(a Image, b Image) bool {
+			let pa = a.raw()
+			let pb = b.raw()
+			let n = pa.len()
+			for let o = 3; o < n; o += 4 {
+				return true when int(pa[o]) >= 128 && int(pb[o]) < 128
+			}
+			return false
+		}
+
+		// Marks in `drawMask` every pixel that must be drawn over `base` (a
+		// transparent canvas when none) to show `cur`: the opaque ones the
+		// canvas does not already show. Returns the smallest rectangle
+		// holding them, 1x1 at the origin when there are none.
+		internal def markChanges(base ?Image, cur Image) (int, int, int, int) {
+			let w = int(cur.size().width)
+			let h = int(cur.size().height)
+			let px = cur.raw()
+			let bp byte[]
+			if base is none {} else {
+				bp = base.raw()
+			}
+			let hasBase = bp.len() > 0
+			drawMask.len(w * h)
+			let minX = w
+			let minY = h
+			let maxX = -1
+			let maxY = -1
+			let i = 0
+			for let y = 0; y < h; y++ {
+				let o = y * w * 4
+				for let x = 0; x < w; x++ {
+					let draw = int(px[o + 3]) >= 128
+					if draw && hasBase && int(bp[o + 3]) >= 128 && bp[o] == px[o] && bp[o + 1] == px[o + 1] && bp[o + 2] == px[o + 2] {
+						draw = false
+					}
+					if draw {
+						drawMask[i] = byte(1)
+						minX = x when x < minX
+						maxX = x when x > maxX
+						minY = y when y < minY
+						maxY = y
+					} else {
+						drawMask[i] = byte(0)
+					}
+					i++
+					o += 4
+				}
+			}
+			return (0, 0, 1, 1) when maxX < 0
+			return (minX, minY, maxX - minX + 1, maxY - minY + 1)
+		}
+
+		// One palette for the whole animation when all frames together use at
+		// most 255 colours, leaving room for the transparent index.
+		internal def sharedPalette(canvases Image[]) ?GIFPalette {
+			let pal = new GIFPalette()
+			pal.useExact = true
+			let last = -1
+			for let c in canvases {
+				let px = c.raw()
+				for let o = 0; o < px.len(); o += 4 {
+					continue when int(px[o + 3]) < 128
+					let key = (int(px[o]) << 16) | (int(px[o + 1]) << 8) | int(px[o + 2])
+					continue when key == last
+					last = key
+					continue when pal.exact.hasKey(key)
+					return none when pal.count == 255
+					pal.exact[key] = pal.count
+					pal.rgb.push(px[o], px[o + 1], px[o + 2])
+					pal.count++
+				}
+			}
+			if pal.count == 0 {
+				pal.rgb.push(byte(0), byte(0), byte(0))
+				pal.count = 1
+			}
+			pal.transparent = pal.count
+			return pal
+		}
+
+		// Builds the palette for the pixels of the rectangle that must be
+		// drawn: exact when they have at most `limit` colours (less one for
+		// transparency when any pixel is left transparent), else median cut.
+		internal def quantize(img Image, x0 int, y0 int, fw int, fh int, limit int) GIFPalette {
+			let w = int(img.size().width)
+			let px = img.raw()
+			let anyKept = false
+			let pal = new GIFPalette()
+			pal.useExact = true
+			let maxColors = limit
+			let last = -1
+			for let y = y0; y < y0 + fh; y++ {
+				let o = y * w * 4 + x0 * 4
+				for let x = 0; x < fw; x++ {
+					if drawMask[y * w + x0 + x] == byte(0) {
+						if !anyKept {
+							anyKept = true
+							maxColors = limit < 256 ?? (limit, 255)
+						}
+					} else if pal.useExact {
+						let key = (int(px[o]) << 16) | (int(px[o + 1]) << 8) | int(px[o + 2])
+						if key != last && !pal.exact.hasKey(key) {
+							if pal.count >= maxColors {
+								pal.useExact = false
+							} else {
+								pal.exact[key] = pal.count
+								pal.rgb.push(px[o], px[o + 1], px[o + 2])
+								pal.count++
+							}
+						}
+						last = key
+					}
+					o += 4
+				}
+			}
+			if pal.useExact && pal.count > maxColors {
+				pal.useExact = false
+			}
+			if !pal.useExact {
+				let reduced = medianCut(img, x0, y0, fw, fh, anyKept ?? (limit < 256 ?? (limit, 255), limit))
+				pal = reduced
+			}
+			if pal.count == 0 {
+				pal.rgb.push(byte(0), byte(0), byte(0))
+				pal.count = 1
+			}
+			pal.transparent = anyKept ?? (pal.count, -1)
+			return pal
+		}
+
+		// Median cut over a 5-bit-per-channel histogram of the pixels to draw.
+		internal def medianCut(img Image, x0 int, y0 int, fw int, fh int, k int) GIFPalette {
+			let w = int(img.size().width)
+			let px = img.raw()
+			let counts int[]
+			counts.len(32768)
+			counts[:] = 0
+			let sr int[]
+			sr.len(32768)
+			sr[:] = 0
+			let sg int[]
+			sg.len(32768)
+			sg[:] = 0
+			let sb int[]
+			sb.len(32768)
+			sb[:] = 0
+			for let y = y0; y < y0 + fh; y++ {
+				let o = y * w * 4 + x0 * 4
+				for let x = 0; x < fw; x++ {
+					if drawMask[y * w + x0 + x] != byte(0) {
+						let r = int(px[o])
+						let g = int(px[o + 1])
+						let b = int(px[o + 2])
+						let key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+						counts[key] += 1
+						sr[key] += r
+						sg[key] += g
+						sb[key] += b
+					}
+					o += 4
+				}
+			}
+
+			let keys int[]
+			for let i = 0; i < 32768; i++ {
+				keys.push(i) when counts[i] > 0
+			}
+			let starts = int[0]
+			let ends = int[keys.len()]
+			let tmp int[]
+			tmp.len(keys.len())
+
+			for starts.len() < k {
+				// Split the box with the most pixels times its widest spread.
+				let pick = -1
+				let pickScore = 0
+				let pickShift = 0
+				for let bi = 0; bi < starts.len(); bi++ {
+					let s = starts[bi]
+					let e = ends[bi]
+					continue when e - s < 2
+					let (shift, spread) = widest(keys, s, e)
+					let total = 0
+					for let i = s; i < e; i++ {
+						total += counts[keys[i]]
+					}
+					let score = total * (spread + 1)
+					if score > pickScore {
+						pickScore = score
+						pick = bi
+						pickShift = shift
+					}
+				}
+				break when pick < 0
+
+				let s = starts[pick]
+				let e = ends[pick]
+				// Counting sort of the box's keys on the chosen channel.
+				let hist int[]
+				hist.len(33)
+				hist[:] = 0
+				for let i = s; i < e; i++ {
+					hist[((keys[i] >> pickShift) & 31) + 1] += 1
+				}
+				for let v = 1; v < 33; v++ {
+					hist[v] += hist[v - 1]
+				}
+				for let i = s; i < e; i++ {
+					let v = (keys[i] >> pickShift) & 31
+					tmp[s + hist[v]] = keys[i]
+					hist[v] += 1
+				}
+				let total = 0
+				for let i = s; i < e; i++ {
+					keys[i] = tmp[i]
+					total += counts[keys[i]]
+				}
+				let acc = 0
+				let split = s + 1
+				for let i = s; i < e - 1; i++ {
+					acc += counts[keys[i]]
+					split = i + 1
+					break when acc * 2 >= total
+				}
+				ends[pick] = split
+				starts.push(split)
+				ends.push(e)
+			}
+
+			let pal = new GIFPalette()
+			for let bi = 0; bi < starts.len(); bi++ {
+				let n = 0
+				let r = 0
+				let g = 0
+				let b = 0
+				for let i = starts[bi]; i < ends[bi]; i++ {
+					let key = keys[i]
+					n += counts[key]
+					r += sr[key]
+					g += sg[key]
+					b += sb[key]
+				}
+				continue when n == 0
+				pal.rgb.push(byte((r + n / 2) / n), byte((g + n / 2) / n), byte((b + n / 2) / n))
+				pal.count++
+			}
+			return pal
+		}
+
+		// The channel (as a shift into the 15-bit key) with the widest range
+		// in the box, and that range.
+		internal def widest(keys int[], s int, e int) (int, int) {
+			let best = 0
+			let bestShift = 10
+			for let shift = 10; shift >= 0; shift -= 5 {
+				let lo = 31
+				let hi = 0
+				for let i = s; i < e; i++ {
+					let v = (keys[i] >> shift) & 31
+					lo = v when v < lo
+					hi = v when v > hi
+				}
+				if hi - lo > best {
+					best = hi - lo
+					bestShift = shift
+				}
+			}
+			return (bestShift, best)
+		}
+
+		// The logical screen descriptor, with `pal` as the global colour
+		// table when there is one.
+		internal def writeHeader(out GIFOut, w int, h int, pal ?GIFPalette) {
+			for let b in "GIF89a".bytes() {
+				out.put(int(b))
+			}
+			out.put16(w)
+			out.put16(h)
+			if pal is none {
+				out.put(0)
+				out.put(0)
+				out.put(0)
+			} else {
+				let bits = gifBitsFor(tableSize(pal))
+				out.put(0x80 | ((bits - 1) << 4) | (bits - 1))
+				out.put(0)
+				out.put(0)
+				writeTable(out, pal)
+			}
+			if comment.len() > 0 {
+				out.put(0x21)
+				out.put(0xFE)
+				let text = comment.bytes()
+				let p = 0
+				for p < text.len() {
+					let n = text.len() - p
+					n = 255 when n > 255
+					out.put(n)
+					for let i = 0; i < n; i++ {
+						out.put(int(text[p + i]))
+					}
+					p += n
+				}
+				out.put(0)
+			}
+		}
+
+		// Entries the table holds, the transparent index included.
+		internal def tableSize(pal GIFPalette) int {
+			return pal.transparent >= 0 ?? (pal.count + 1, pal.count)
+		}
+
+		internal def writeTable(out GIFOut, pal GIFPalette) {
+			let size = 1 << gifBitsFor(tableSize(pal))
+			for let i = 0; i < size; i++ {
+				if i < pal.count {
+					out.put(int(pal.rgb[i * 3]))
+					out.put(int(pal.rgb[i * 3 + 1]))
+					out.put(int(pal.rgb[i * 3 + 2]))
+				} else {
+					out.put(0)
+					out.put(0)
+					out.put(0)
+				}
+			}
+		}
+
+		// Writes one frame: its control extension, descriptor, optional local
+		// table and LZW data for the rectangle.
+		internal def writeFrame(out GIFOut, img Image, x0 int, y0 int, fw int, fh int, pal GIFPalette, local bool, disposal int, delayCs int) {
+			let indices = mapPixels(img, x0, y0, fw, fh, pal)
+			let trans = pal.transparent
+			if trans >= 0 || disposal != 0 || delayCs != 0 {
+				out.put(0x21)
+				out.put(0xF9)
+				out.put(4)
+				out.put((disposal << 2) | (trans >= 0 ?? (1, 0)))
+				out.put16(delayCs)
+				out.put(trans >= 0 ?? (trans, 0))
+				out.put(0)
+			}
+			out.put(0x2C)
+			out.put16(x0)
+			out.put16(y0)
+			out.put16(fw)
+			out.put16(fh)
+			let bits = gifBitsFor(tableSize(pal))
+			if local {
+				out.put(0x80 | (bits - 1))
+				writeTable(out, pal)
+			} else {
+				out.put(0)
+			}
+			lzwEncode(out, indices, bits < 2 ?? (2, bits))
+		}
+
+		// The palette index of every pixel in the rectangle, dithered as
+		// `dither` says when the palette is not exact.
+		internal def mapPixels(img Image, x0 int, y0 int, fw int, fh int, pal GIFPalette) byte[] {
+			let w = int(img.size().width)
+			let px = img.raw()
+			let out byte[]
+			out.len(fw * fh)
+			let trans = pal.transparent
+			let mode = pal.useExact ?? (GIFDither.None, dither)
+
+			let errCur int[]
+			let errNext int[]
+			if mode == GIFDither.FloydSteinberg {
+				errCur.len((fw + 2) * 3)
+				errCur[:] = 0
+				errNext.len((fw + 2) * 3)
+				errNext[:] = 0
+			}
+
+			let i = 0
+			for let y = 0; y < fh; y++ {
+				let o = (y0 + y) * w * 4 + x0 * 4
+				for let x = 0; x < fw; x++ {
+					if drawMask[(y0 + y) * w + x0 + x] == byte(0) {
+						out[i] = byte(trans)
+					} else {
+						let r = int(px[o])
+						let g = int(px[o + 1])
+						let b = int(px[o + 2])
+						if mode == GIFDither.Ordered {
+							let t = gifBayer[((y0 + y) & 3) * 4 + ((x0 + x) & 3)] * 2 - 15
+							r = (r + t).clamp(0, 255)
+							g = (g + t).clamp(0, 255)
+							b = (b + t).clamp(0, 255)
+						} else if mode == GIFDither.FloydSteinberg {
+							let e = (x + 1) * 3
+							r = (r + errCur[e] / 16).clamp(0, 255)
+							g = (g + errCur[e + 1] / 16).clamp(0, 255)
+							b = (b + errCur[e + 2] / 16).clamp(0, 255)
+						}
+						let idx = pal.indexOf(r, g, b)
+						out[i] = byte(idx)
+						if mode == GIFDither.FloydSteinberg {
+							let e = (x + 1) * 3
+							let dr = r - int(pal.rgb[idx * 3])
+							let dg = g - int(pal.rgb[idx * 3 + 1])
+							let db = b - int(pal.rgb[idx * 3 + 2])
+							errCur[e + 3] += dr * 7
+							errCur[e + 4] += dg * 7
+							errCur[e + 5] += db * 7
+							errNext[e - 3] += dr * 3
+							errNext[e - 2] += dg * 3
+							errNext[e - 1] += db * 3
+							errNext[e] += dr * 5
+							errNext[e + 1] += dg * 5
+							errNext[e + 2] += db * 5
+							errNext[e + 3] += dr
+							errNext[e + 4] += dg
+							errNext[e + 5] += db
+						}
+					}
+					i++
+					o += 4
+				}
+				if mode == GIFDither.FloydSteinberg {
+					let t = errCur
+					errCur = errNext
+					errNext = t
+					errNext[:] = 0
+				}
+			}
+			return out
+		}
+
+		// Compresses the indices with GIF's variable-width LZW and writes them
+		// as sub-blocks, preceded by the minimum code size.
+		internal def lzwEncode(out GIFOut, indices byte[], litWidth int) {
+			out.put(litWidth)
+			let clear = 1 << litWidth
+			let eoi = clear + 1
+			let size = litWidth + 1
+			let next = clear + 2
+
+			let hashKeys int[]
+			hashKeys.len(8192)
+			hashKeys[:] = -1
+			let hashCodes int[]
+			hashCodes.len(8192)
+
+			let bw = new GIFBitWriter(out)
+
+			bw.emit(clear, size)
+			let n = indices.len()
+			if n > 0 {
+				let prefix = int(indices[0])
+				for let i = 1; i < n; i++ {
+					let c = int(indices[i])
+					let key = (prefix << 8) | c
+					let h = ((key * 40503) >> 3) & 8191
+					let found = -1
+					for hashKeys[h] >= 0 {
+						if hashKeys[h] == key {
+							found = hashCodes[h]
+							break
+						}
+						h = (h + 1) & 8191
+					}
+					if found >= 0 {
+						prefix = found
+						continue
+					}
+					bw.emit(prefix, size)
+					if next < gifMaxCodes {
+						hashKeys[h] = key
+						hashCodes[h] = next
+						next++
+						size++ when next > (1 << size) && size < 12
+					} else {
+						bw.emit(clear, size)
+						hashKeys[:] = -1
+						size = litWidth + 1
+						next = clear + 2
+					}
+					prefix = c
+				}
+				bw.emit(prefix, size)
+				if next < gifMaxCodes {
+					next++
+					size++ when next > (1 << size) && size < 12
+				}
+			}
+			bw.emit(eoi, size)
+			bw.close()
+			out.put(0)
+		}
+	}
+}
+
+internal partial module std.formats.image.gif {
+	use std.bytes
+
+	// The 4x4 Bayer threshold matrix used by ordered dithering.
+	const gifBayer = int[0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+
+	// Rows of an interlaced image come in four passes; each pair is a pass's
+	// first row and row step.
+	const gifPasses = int[0, 8, 4, 8, 2, 4, 1, 2]
+
+	const gifMaxCodes = 4096
+
+	def gifLE16(data byte[], at int) int {
+		return int(data[at]) | (int(data[at + 1]) << 8)
+	}
+
+	def gifHasSignature(data byte[]) bool {
+		return false when data.len() < 6
+		return false unless data[0] == byte(71) && data[1] == byte(73) && data[2] == byte(70) && data[3] == byte(56)
+		return false unless data[4] == byte(55) || data[4] == byte(57)
+		return data[5] == byte(97)
+	}
+
+	// Skips a chain of sub-blocks starting at `pos` and returns the position
+	// after its terminator, or the end of the data when it is cut short.
+	def gifSkipBlocks(data byte[], pos int) int {
+		let p = pos
+		for p < data.len() {
+			let n = int(data[p])
+			p++
+			return p when n == 0
+			p += n
+		}
+		return data.len()
+	}
+
+	// Reads `count` RGB entries at `pos` into an RGBA table of 256 entries;
+	// entries past `count` stay opaque black.
+	def gifReadPalette(data byte[], pos int, count int, into byte[]) {
+		for let i = 0; i < 256; i++ {
+			let o = i * 4
+			if i < count {
+				into[o] = data[pos + i * 3]
+				into[o + 1] = data[pos + i * 3 + 1]
+				into[o + 2] = data[pos + i * 3 + 2]
+			} else {
+				into[o] = byte(0)
+				into[o + 1] = byte(0)
+				into[o + 2] = byte(0)
+			}
+			into[o + 3] = byte(255)
+		}
+	}
+
+	// The number of bits a palette of `count` entries needs, at least one.
+	def gifBitsFor(count int) int {
+		let bits = 1
+		for (1 << bits) < count {
+			bits++
+		}
+		return bits
+	}
+
+	// A growable byte sink for building the file.
+	type GIFOut {
+		data byte[]
+		n    int
+
+		def new() {
+			data.len(4096)
+		}
+
+		def put(b int) {
+			if n == data.len() {
+				data.len(n * 2)
+			}
+			data[n] = byte(b)
+			n++
+		}
+
+		def put16(v int) {
+			put(v & 0xFF)
+			put((v >> 8) & 0xFF)
+		}
+
+		def bytes() byte[] {
+			return data[0:n]
+		}
+	}
+
+	// Packs LZW codes least significant bit first into 255-byte sub-blocks.
+	type GIFBitWriter {
+		out      GIFOut
+		block    byte[]
+		blockLen int
+		acc      int
+		bits     int
+
+		def new(out GIFOut) {
+			self.out = out
+			block.len(255)
+		}
+
+		def emit(code int, size int) {
+			acc |= code << bits
+			bits += size
+			for bits >= 8 {
+				block[blockLen] = byte(acc & 0xFF)
+				blockLen++
+				acc >>= 8
+				bits -= 8
+				flushBlock() when blockLen == 255
+			}
+		}
+
+		def flushBlock() {
+			return when blockLen == 0
+			out.put(blockLen)
+			for let j = 0; j < blockLen; j++ {
+				out.put(int(block[j]))
+			}
+			blockLen = 0
+		}
+
+		// Writes the last partial byte and block.
+		def close() {
+			if bits > 0 {
+				block[blockLen] = byte(acc & 0xFF)
+				blockLen++
+				acc = 0
+				bits = 0
+			}
+			flushBlock()
+		}
+	}
+
+	// A frame's colour table and how colours are matched to it: exactly,
+	// through `exact`, when the image has few enough colours, else to the
+	// nearest entry through a cache keyed on 6 bits per channel.
+	type GIFPalette {
+		rgb         byte[]
+		count       int
+		exact       map<int, int>
+		useExact    bool
+		cache       int[]
+		transparent int           = -1
+		lastKey     int           = -1
+		lastIndex   int
+
+		def new() {
+			exact = new map<int, int>()
+		}
+
+		// The palette index for a colour.
+		def indexOf(r int, g int, b int) int {
+			if useExact {
+				let key = (r << 16) | (g << 8) | b
+				return lastIndex when key == lastKey
+				lastKey = key
+				lastIndex = exact.hasKey(key) ?? (exact[key], 0)
+				return lastIndex
+			}
+			if cache.len() == 0 {
+				cache.len(1 << 18)
+				cache[:] = -1
+			}
+			let key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2)
+			let hit = cache[key]
+			return hit when hit >= 0
+			let cr = (r & 0xFC) | 2
+			let cg = (g & 0xFC) | 2
+			let cb = (b & 0xFC) | 2
+			let best = 0
+			let bestD = 1 << 30
+			for let i = 0; i < count; i++ {
+				let dr = int(rgb[i * 3]) - cr
+				let dg = int(rgb[i * 3 + 1]) - cg
+				let db = int(rgb[i * 3 + 2]) - cb
+				let d = dr * dr * 3 + dg * dg * 4 + db * db * 2
+				if d < bestD {
+					bestD = d
+					best = i
+				}
+			}
+			cache[key] = best
+			return best
+		}
 	}
 }

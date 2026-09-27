@@ -1,0 +1,838 @@
+internal partial module std.formats.audio.flac {
+	use (
+		std.io
+		std.math
+		std.bytes
+		std.crypto.hash
+		std.formats.audio::*
+	)
+
+	// Name the encoder writes as the Vorbis comment vendor.
+	const flacVendor = "ADM std.formats.audio"
+
+	// Encodes an audio stream as FLAC with a codec's settings.
+	type FlacEncoder {
+		level       int
+		blockSize   int
+		maxLpcOrder int
+		maxPartOrd  int
+		seekEvery   int64
+		tags        map<string, string[]>
+		pictures    FlacPicture[]
+
+		channels int
+		depth    int
+		rate     int
+
+		// One block of input, one array per channel.
+		input       int[][]
+		mid         int[]
+		side        int[]
+		shifted     int[]
+		residual    int[]
+		// One subframe per candidate signal: left, right, mid, side.
+		subs        FlacBitWriter[]
+		frame       FlacBitWriter
+		digest      hash.MD5
+		digestBytes byte[]
+
+		// Partition search: sums per partition and the parameters chosen.
+		sums               int[]
+		params             int[]
+		bestParams         int[]
+		bestOrder          int
+		bestPrecision      int
+		bestPartitionOrder int
+		bestRice2          bool
+
+		// LPC analysis.
+		window    float[]
+		windowLen int
+		windowed  float[]
+		autoc     float[]
+		lpc       float[]
+		lpcErr    float[]
+		work      float[]
+		qcoefs    int[]
+		bestCoefs int[]
+		bestShift int
+
+		// Encodes with the codec's compression level, block size, tags and
+		// pictures.
+		def new(codec FLAC) {
+			level = codec.compression
+			level = 0 when level < 0
+			level = 8 when level > 8
+			blockSize = codec.blockSize
+			blockSize = 16 when blockSize < 16
+			blockSize = 65535 when blockSize > 65535
+			tags = codec.tags
+			seekEvery = int64(codec.seekInterval)
+			pictures = codec.pictures
+			let orders = int[0, 0, 0, 6, 8, 8, 12, 12, 16]
+			let partitions = int[3, 3, 3, 4, 4, 5, 6, 6, 8]
+			maxLpcOrder = orders[level]
+			maxPartOrd = partitions[level]
+			frame = new FlacBitWriter()
+			for let i = 0; i < 4; i++ {
+				subs.push(new FlacBitWriter())
+			}
+			digest = new hash.MD5()
+			sums.len(1 << 9)
+			params.len(1 << 9)
+			bestParams.len(1 << 9)
+			autoc.len(33)
+			lpc.len(33 * 33)
+			lpcErr.len(33)
+			work.len(33)
+			qcoefs.len(32)
+			bestCoefs.len(32)
+		}
+
+		// Reads the stream to its end and writes it as a FLAC file.
+		// Fails when the stream has no channels or no sample rate, or the
+		// stream or the writer fails.
+		def encode(stream AudioStream, writer io.Writer) !none {
+			let info = stream.info()
+			let streamChannels = int(info.channels)
+			fail "flac: the stream has no channels" when streamChannels <= 0
+			rate = int(info.sampleRate)
+			fail "flac: the stream has no sample rate" when rate <= 0 || rate > 655350
+			channels = streamChannels > 8 ?? (8, streamChannels)
+			depth = int(info.bitDepth)
+			depth = 24 when info.format == SampleFormat.Float32 || info.format == SampleFormat.Float64 || depth == 0 || depth > 24
+			depth = 4 when depth < 4
+
+			for let c = 0; c < channels; c++ {
+				let s int[]
+				s.len(blockSize)
+				input.push(s)
+			}
+			mid.len(blockSize)
+			side.len(blockSize)
+			shifted.len(blockSize)
+			residual.len(blockSize)
+			windowed.len(blockSize)
+
+			let frames = new bytes.Buffer()
+			let buf float32[]
+			buf.len(blockSize * streamChannels)
+			let scale = float(int64(1) << int64(depth - 1))
+			let top = (1 << (depth - 1)) - 1
+			let bottom = -(1 << (depth - 1))
+			let total = 0
+			let frameNumber = 0
+			let minFrame = 0
+			let maxFrame = 0
+			let ended = false
+			// SEEKTABLE points as (sample, frame offset, frames) triples.
+			let points int[]
+			let interval = int(seekEvery * int64(rate) / 1000000000)
+			let nextPoint = 0
+			for !ended {
+				let n = 0
+				for n < blockSize {
+					let got = try stream.read(buf[n * streamChannels:])
+					if got == 0 {
+						ended = true
+						break
+					}
+					for let i = n; i < n + got; i++ {
+						let at = i * streamChannels
+						for let c = 0; c < channels; c++ {
+							let t = float(buf[at + c]) * scale
+							let v = t >= 0.0 ?? (int(t + 0.5), int(t - 0.5))
+							v = top when v > top
+							v = bottom when v < bottom
+							input[c][i] = v
+						}
+					}
+					n += got
+				}
+				break when n == 0
+				updateDigest(n)
+				if interval > 0 && total >= nextPoint {
+					points.push(total, frames.len(), n)
+					for nextPoint <= total {
+						nextPoint += interval
+					}
+				}
+				encodeFrame(n, frameNumber)
+				let encoded = frame.bytes()
+				try frames.write(encoded)
+				minFrame = encoded.len() when minFrame == 0 || encoded.len() < minFrame
+				maxFrame = encoded.len() when encoded.len() > maxFrame
+				total += n
+				frameNumber++
+			}
+
+			let head = new FlacBitWriter()
+			head.write(0x664C6143, 32)
+			writeStreamInfo(head, total, minFrame, maxFrame)
+			writeSeekTable(head, points)
+			writeComments(head, pictures.len() == 0)
+			for let (i, pic) in pictures {
+				writePicture(head, pic, i == pictures.len() - 1)
+			}
+			try writer.write(head.bytes())
+			try writer.write(frames.bytes())
+			return none
+		}
+
+		// Feeds `n` frames of input into the MD5 of the samples.
+		def updateDigest(n int) {
+			let width = (depth + 7) / 8
+			let size = n * channels * width
+			digestBytes.len(size) when digestBytes.len() < size
+			let out = digestBytes
+			let o = 0
+			for let i = 0; i < n; i++ {
+				for let c = 0; c < channels; c++ {
+					let v = input[c][i]
+					for let k = 0; k < width; k++ {
+						out[o] = byte((v >> (8 * k)) & 0xFF)
+						o++
+					}
+				}
+			}
+			digest.write(out[0:size])
+		}
+
+		// Writes the STREAMINFO block header and body.
+		def writeStreamInfo(w FlacBitWriter, total int, minFrame int, maxFrame int) {
+			w.write(0, 1)
+			w.write(flacStreamInfo, 7)
+			w.write(34, 24)
+			w.write(blockSize, 16)
+			w.write(blockSize, 16)
+			w.write(minFrame, 24)
+			w.write(maxFrame, 24)
+			w.write(rate, 20)
+			w.write(channels - 1, 3)
+			w.write(depth - 1, 5)
+			w.write(total >> 32, 4)
+			w.write(total & 0xFFFFFFFF, 32)
+			for let (_, b) in digest.hash() {
+				w.write(int(b), 8)
+			}
+		}
+
+		// Writes the SEEKTABLE block from (sample, offset, frames) triples,
+		// nothing when there are none.
+		def writeSeekTable(w FlacBitWriter, points int[]) {
+			let count = points.len() / 3
+			return when count == 0
+			w.write(0, 1)
+			w.write(flacSeekTable, 7)
+			w.write(count * 18, 24)
+			for let i = 0; i < count; i++ {
+				let sample = points[3 * i]
+				let offset = points[3 * i + 1]
+				w.write(sample >> 32, 32)
+				w.write(sample & 0xFFFFFFFF, 32)
+				w.write(offset >> 32, 32)
+				w.write(offset & 0xFFFFFFFF, 32)
+				w.write(points[3 * i + 2], 16)
+			}
+		}
+
+		// Writes the VORBIS_COMMENT block with the vendor and the tags.
+		def writeComments(w FlacBitWriter, last bool) {
+			let body = new FlacBitWriter()
+			let vendor = flacVendor.bytes()
+			flacWriteLE32(body, vendor.len())
+			flacWriteBytes(body, vendor)
+			let fields byte[][]
+			for let (key, values) in tags {
+				for let (_, value) in values {
+					fields.push("{key}={value}".bytes())
+				}
+			}
+			flacWriteLE32(body, fields.len())
+			for let (_, field) in fields {
+				flacWriteLE32(body, field.len())
+				flacWriteBytes(body, field)
+			}
+			let data = body.bytes()
+			w.write(last ?? (1, 0), 1)
+			w.write(flacVorbisComment, 7)
+			w.write(data.len(), 24)
+			flacWriteBytes(w, data)
+		}
+
+		// Writes a PICTURE block.
+		def writePicture(w FlacBitWriter, pic FlacPicture, last bool) {
+			let mime = pic.mimeType.bytes()
+			let desc = pic.description.bytes()
+			w.write(last ?? (1, 0), 1)
+			w.write(flacPicture, 7)
+			w.write(32 + mime.len() + desc.len() + pic.data.len(), 24)
+			w.write(int(pic.kind), 32)
+			w.write(mime.len(), 32)
+			flacWriteBytes(w, mime)
+			w.write(desc.len(), 32)
+			flacWriteBytes(w, desc)
+			w.write(pic.width, 32)
+			w.write(pic.height, 32)
+			w.write(pic.depth, 32)
+			w.write(pic.colors, 32)
+			w.write(pic.data.len(), 32)
+			flacWriteBytes(w, pic.data)
+		}
+
+		// Encodes the `n` frames of input as frame `number` into `frame`.
+		def encodeFrame(n int, number int) {
+			let f = frame
+			f.reset()
+			let chanCode = channels - 1
+			if channels == 2 && level > 0 {
+				let l = input[0]
+				let r = input[1]
+				for let i = 0; i < n; i++ {
+					side[i] = l[i] - r[i]
+					mid[i] = (l[i] + r[i]) >> 1
+				}
+				let first = 0
+				let second = 1
+				if level >= 8 {
+					// Measure every assignment exactly.
+					encodeSubframe(l, n, depth, subs[0])
+					encodeSubframe(r, n, depth, subs[1])
+					encodeSubframe(mid, n, depth, subs[2])
+					encodeSubframe(side, n, depth + 1, subs[3])
+					(chanCode, first, second) = flacStereoChoice(subs[0].bitLen(), subs[1].bitLen(), subs[2].bitLen(), subs[3].bitLen())
+				} else {
+					// Pick the assignment from fixed-predictor estimates, then
+					// encode only the two channels it keeps.
+					(chanCode, first, second) = flacStereoChoice(flacFixedCost(l, n), flacFixedCost(r, n), flacFixedCost(mid, n), flacFixedCost(side, n))
+					let signals = int[][l, r, mid, side]
+					encodeSubframe(signals[first], n, first == 3 ?? (depth + 1, depth), subs[first])
+					encodeSubframe(signals[second], n, second == 3 ?? (depth + 1, depth), subs[second])
+				}
+				writeHeader(f, n, number, chanCode)
+				f.append(subs[first])
+				f.append(subs[second])
+			} else {
+				writeHeader(f, n, number, chanCode)
+				for let c = 0; c < channels; c++ {
+					encodeSubframe(input[c], n, depth, subs[0])
+					f.append(subs[0])
+				}
+			}
+			f.align()
+			let data = f.bytes()
+			f.write(flacCrc16(data, 0, data.len()), 16)
+		}
+
+		// Writes a frame header for `n` frames, fixed blocking.
+		def writeHeader(f FlacBitWriter, n int, number int, chanCode int) {
+			f.write(0xFFF8, 16)
+			let sizeCode = 7
+			if n == 192 {
+				sizeCode = 1
+			} else if n == 576 || n == 1152 || n == 2304 || n == 4608 {
+				sizeCode = 2 + flacLog2(n / 576)
+			} else if n >= 256 && n <= 32768 && (n & (n - 1)) == 0 {
+				sizeCode = 8 + flacLog2(n / 256)
+			} else if n <= 256 {
+				sizeCode = 6
+			}
+			let rateCode = 0
+			for let i = 1; i < 12; i++ {
+				rateCode = i when flacRates[i] == rate
+			}
+			let depthCode = 0
+			for let i = 1; i < 8; i++ {
+				depthCode = i when flacDepths[i] == depth
+			}
+			f.write(sizeCode, 4)
+			f.write(rateCode, 4)
+			f.write(chanCode, 4)
+			f.write(depthCode, 3)
+			f.write(0, 1)
+			if number < 0x80 {
+				f.write(number, 8)
+			} else {
+				let more = 1
+				for number >= (1 << (5 * more + 6)) {
+					more++
+				}
+				let lead = (0xFF00 >> (more + 1)) & 0xFF
+				f.write(lead | (number >> (6 * more)), 8)
+				for let i = more - 1; i >= 0; i-- {
+					f.write(0x80 | ((number >> (6 * i)) & 0x3F), 8)
+				}
+			}
+			if sizeCode == 6 {
+				f.write(n - 1, 8)
+			} else if sizeCode == 7 {
+				f.write(n - 1, 16)
+			}
+			let head = f.bytes()
+			f.write(flacCrc8(head, 0, head.len()), 8)
+		}
+
+		// Encodes `x[0:n]` at `bps` bits as the smallest subframe the level
+		// searches, into `w`.
+		def encodeSubframe(x int[], n int, bps int, w FlacBitWriter) {
+			w.reset()
+			let first = x[0]
+			let bits = 0
+			let constant = true
+			for let i = 0; i < n; i++ {
+				bits = bits | x[i]
+				constant = false when x[i] != first
+			}
+			if constant {
+				w.write(0, 8)
+				w.write(first, bps)
+				return
+			}
+			let wasted = uint64(bits).trailingZeros()
+			wasted = bps - 1 when wasted >= bps
+			let s = x
+			if wasted > 0 {
+				s = shifted
+				for let i = 0; i < n; i++ {
+					s[i] = x[i] >> wasted
+				}
+			}
+			let depthLeft = bps - wasted
+
+			// Fixed predictor with the smallest residual magnitude.
+			let fixedOrder = 0
+			let bestSum = -1
+			for let order = 0; order <= 4 && order < n; order++ {
+				let sum = flacFixedResidual(s, n, order, residual)
+				if bestSum < 0 || sum < bestSum {
+					bestSum = sum
+					fixedOrder = order
+				}
+			}
+			flacFixedResidual(s, n, fixedOrder, residual)
+			let fixedBits = searchRice(n, fixedOrder) + fixedOrder * depthLeft
+			let kind = 1
+			let order = fixedOrder
+			let bestBits = fixedBits
+
+			if maxLpcOrder > 0 && n > maxLpcOrder * 2 {
+				let lpcBits = analyse(s, n, depthLeft)
+				if lpcBits >= 0 && lpcBits < bestBits {
+					bestBits = lpcBits
+					kind = 2
+					order = bestOrder
+				}
+			}
+			kind = 0 when n * depthLeft <= bestBits + 16
+
+			w.write(kind == 0 ?? (1, kind == 1 ?? (8 + order, 32 + order - 1)), 7)
+			if wasted > 0 {
+				w.write(1, 1)
+				w.writeUnary(wasted - 1)
+			} else {
+				w.write(0, 1)
+			}
+			if kind == 0 {
+				for let i = 0; i < n; i++ {
+					w.write(s[i], depthLeft)
+				}
+				return
+			}
+			for let i = 0; i < order; i++ {
+				w.write(s[i], depthLeft)
+			}
+			if kind == 1 {
+				flacFixedResidual(s, n, order, residual)
+			} else {
+				let precision = bestPrecision
+				w.write(precision - 1, 4)
+				w.write(bestShift, 5)
+				for let i = 0; i < order; i++ {
+					w.write(bestCoefs[i], precision)
+				}
+				flacLpcResidual(s, n, bestCoefs, order, bestShift, residual)
+			}
+			searchRice(n, order)
+			writeResidual(w, n, order)
+		}
+
+		// Tries LPC orders on `s[0:n]` and returns the estimated bits of the
+		// best, leaving its coefficients in `bestCoefs`, order in `bestOrder`,
+		// shift in `bestShift` and precision in `bestPrecision`; -1 when LPC does
+		// not apply.
+		def analyse(s int[], n int, bps int) int {
+			if windowLen != n {
+				window.len(n) when window.len() < n
+				flacTukey(window, n)
+				windowLen = n
+			}
+			let win = window
+			let wd = windowed
+			for let i = 0; i < n; i++ {
+				wd[i] = float(s[i]) * win[i]
+			}
+			let maxOrder = maxLpcOrder
+			for let lag = 0; lag <= maxOrder; lag++ {
+				let sum = 0.0
+				for let i = lag; i < n; i++ {
+					sum += wd[i] * wd[i - lag]
+				}
+				autoc[lag] = sum
+			}
+			return -1 when autoc[0] <= 0.0
+			flacLevinson(autoc, maxOrder, lpc, lpcErr, work)
+
+			let precision = bps > 16 ?? (15, 12)
+			// The expected size misjudges strongly predictable signals, where
+			// quantizing the coefficients costs more than the model saves, so
+			// levels 3 and 4 also measure the largest order and half of it, and
+			// from 5 on every order is measured.
+			let pick = 1
+			if level < 5 {
+				let bestEst = 0.0
+				for let order = 1; order <= maxOrder; order++ {
+					let e = lpcErr[order - 1]
+					let perSample = e > 0.0 ?? (0.5 * math.ln(e / float(n)) / math.ln(2.0), 0.0)
+					perSample = 0.0 when perSample < 0.0
+					let est = float(n - order) * perSample + float(order * (precision + bps))
+					if order == 1 || est < bestEst {
+						bestEst = est
+						pick = order
+					}
+				}
+			}
+			let best = -1
+			for let order = 1; order <= maxOrder; order++ {
+				let measured = level >= 5 || order == pick || order == maxOrder || order == maxOrder / 2
+				continue unless measured
+				let shift = flacQuantize(lpc, order, precision, qcoefs)
+				continue when shift < 0
+				continue unless flacLpcResidual(s, n, qcoefs, order, shift, residual)
+				let bits = searchRice(n, order) + order * (bps + precision) + 9
+				if best < 0 || bits < best {
+					best = bits
+					bestOrder = order
+					bestShift = shift
+					bestPrecision = precision
+					for let j = 0; j < order; j++ {
+						bestCoefs[j] = qcoefs[j]
+					}
+				}
+			}
+			return best
+		}
+
+		// Finds the partition order and Rice parameters for `residual[order:n]`
+		// and returns the estimated bits of the coded residual, leaving the
+		// parameters in `bestParams`.
+		def searchRice(n int, order int) int {
+			let po = maxPartOrd
+			for po > 0 && ((n & ((1 << po) - 1)) != 0 || (n >> po) <= order) {
+				po--
+			}
+			let parts = 1 << po
+			let psize = n >> po
+			let res = residual
+			for let p = 0; p < parts; p++ {
+				let from = p == 0 ?? (order, p * psize)
+				let sum = 0
+				for let i = from; i < (p + 1) * psize; i++ {
+					let v = res[i]
+					sum += (v << 1) ^ (v >> 63)
+				}
+				sums[p] = sum
+			}
+			let best = -1
+			for let split = po; split >= 0; split-- {
+				let count = 1 << split
+				let size = n >> split
+				let bits = 0
+				let wide = false
+				for let p = 0; p < count; p++ {
+					let cnt = p == 0 ?? (size - order, size)
+					let sum = sums[p]
+					let k = 0
+					let cost = cnt + sum
+					for let t = 1; t <= 30; t++ {
+						let c = cnt * (t + 1) + (sum >> t)
+						if c < cost {
+							cost = c
+							k = t
+						}
+						break when (sum >> t) == 0
+					}
+					params[p] = k
+					wide = true when k > 14
+					bits += cost
+				}
+				bits += count * (wide ?? (5, 4))
+				if best < 0 || bits < best {
+					best = bits
+					bestPartitionOrder = split
+					for let p = 0; p < count; p++ {
+						bestParams[p] = params[p]
+					}
+					bestRice2 = wide
+				}
+				if split > 0 {
+					for let p = 0; p < count / 2; p++ {
+						sums[p] = sums[2 * p] + sums[2 * p + 1]
+					}
+				}
+			}
+			return best + 6
+		}
+
+		// Writes `residual[order:n]` with the parameters `searchRice` chose.
+		def writeResidual(w FlacBitWriter, n int, order int) {
+			let po = bestPartitionOrder
+			let wide = bestRice2
+			w.write(wide ?? (1, 0), 2)
+			w.write(po, 4)
+			let parts = 1 << po
+			let psize = n >> po
+			let at = order
+			for let p = 0; p < parts; p++ {
+				let cnt = p == 0 ?? (psize - order, psize)
+				let k = bestParams[p]
+				w.write(k, wide ?? (5, 4))
+				w.writeRice(residual, at, cnt, k)
+				at += cnt
+			}
+		}
+	}
+
+	// The channel assignment with the smallest total from the sizes of the
+	// left, right, mid and side signals: the frame header code and the two
+	// signals it stores, as indices into left, right, mid, side.
+	def flacStereoChoice(left int, right int, mid int, side int) (int, int, int) {
+		let code = 1
+		let first = 0
+		let second = 1
+		let best = left + right
+		if left + side < best {
+			best = left + side
+			code = 8
+			first = 0
+			second = 3
+		}
+		if side + right < best {
+			best = side + right
+			code = 9
+			first = 3
+			second = 1
+		}
+		if mid + side < best {
+			code = 10
+			first = 2
+			second = 3
+		}
+		return (code, first, second)
+	}
+
+	// Estimated bits of `x[0:n]` under its best fixed predictor, Rice coded
+	// with one parameter.
+	def flacFixedCost(x int[], n int) int {
+		return n * 8 when n < 5
+		let s0 = 0
+		let s1 = 0
+		let s2 = 0
+		let s3 = 0
+		let s4 = 0
+		let a = x[3]
+		let b = x[2]
+		let c = x[1]
+		let d = x[0]
+		for let i = 4; i < n; i++ {
+			let v = x[i]
+			let e1 = v - a
+			let e2 = e1 - (a - b)
+			let e3 = e2 - (a - 2 * b + c)
+			let e4 = e3 - (a - 3 * b + 3 * c - d)
+			s0 += v < 0 ?? (-v, v)
+			s1 += e1 < 0 ?? (-e1, e1)
+			s2 += e2 < 0 ?? (-e2, e2)
+			s3 += e3 < 0 ?? (-e3, e3)
+			s4 += e4 < 0 ?? (-e4, e4)
+			d = c
+			c = b
+			b = a
+			a = v
+		}
+		let sum = s0
+		sum = s1 when s1 < sum
+		sum = s2 when s2 < sum
+		sum = s3 when s3 < sum
+		sum = s4 when s4 < sum
+		let count = n - 4
+		let k = 0
+		for (count << (k + 1)) <= sum * 2 && k < 30 {
+			k++
+		}
+		return count * (k + 1) + (sum * 2 >> k)
+	}
+
+	// Writes a little-endian 32-bit number.
+	def flacWriteLE32(w FlacBitWriter, v int) {
+		w.write(v & 0xFF, 8)
+		w.write((v >> 8) & 0xFF, 8)
+		w.write((v >> 16) & 0xFF, 8)
+		w.write((v >> 24) & 0xFF, 8)
+	}
+
+	// Writes the bytes, whole.
+	def flacWriteBytes(w FlacBitWriter, data byte[]) {
+		for let (_, b) in data {
+			w.write(int(b), 8)
+		}
+	}
+
+	// The base-2 logarithm of a power of two.
+	def flacLog2(v int) int {
+		let n = 0
+		for (1 << n) < v {
+			n++
+		}
+		return n
+	}
+
+	// Fills `res[order:n]` with the residual of the fixed predictor of
+	// `order` over `s` and returns the sum of its magnitudes.
+	def flacFixedResidual(s int[], n int, order int, res int[]) int {
+		let sum = 0
+		if order == 0 {
+			for let i = 0; i < n; i++ {
+				let r = s[i]
+				res[i] = r
+				sum += r < 0 ?? (-r, r)
+			}
+		} else if order == 1 {
+			for let i = 1; i < n; i++ {
+				let r = s[i] - s[i - 1]
+				res[i] = r
+				sum += r < 0 ?? (-r, r)
+			}
+		} else if order == 2 {
+			for let i = 2; i < n; i++ {
+				let r = s[i] - 2 * s[i - 1] + s[i - 2]
+				res[i] = r
+				sum += r < 0 ?? (-r, r)
+			}
+		} else if order == 3 {
+			for let i = 3; i < n; i++ {
+				let r = s[i] - 3 * (s[i - 1] - s[i - 2]) - s[i - 3]
+				res[i] = r
+				sum += r < 0 ?? (-r, r)
+			}
+		} else {
+			for let i = 4; i < n; i++ {
+				let r = s[i] - 4 * (s[i - 1] + s[i - 3]) + 6 * s[i - 2] + s[i - 4]
+				res[i] = r
+				sum += r < 0 ?? (-r, r)
+			}
+		}
+		return sum
+	}
+
+	// Fills `res[order:n]` with the residual of the linear predictor with
+	// quantized coefficients `c[0:order]` and `shift` over `s`; false when a
+	// residual does not fit in 32 bits.
+	def flacLpcResidual(s int[], n int, c int[], order int, shift int, res int[]) bool {
+		let limit = 0x7FFFFFFF
+		for let i = order; i < n; i++ {
+			let sum = 0
+			let back = i - 1
+			for let j = 0; j < order; j++ {
+				sum += c[j] * s[back - j]
+			}
+			let r = s[i] - (sum >> shift)
+			return false when r > limit || r < -limit
+			res[i] = r
+		}
+		return true
+	}
+
+	// Fills `w[0:n]`, which must hold `n` values, with a Tukey window of ratio
+	// one half.
+	def flacTukey(w float[], n int) {
+		let taper = n / 4
+		for let i = 0; i < n; i++ {
+			w[i] = 1.0
+		}
+		return when taper < 1
+		for let i = 0; i < taper; i++ {
+			let v = 0.5 - 0.5 * math.cos(math.Pi * float(i) / float(taper))
+			w[i] = v
+			w[n - 1 - i] = v
+		}
+	}
+
+	// Solves the normal equations for orders 1 to `maxOrder` from the
+	// autocorrelation `autoc`: row `order - 1` of `lpc` (stride 33) holds the
+	// predictor coefficients of that order, `err[order - 1]` its error.
+	def flacLevinson(autoc float[], maxOrder int, lpc float[], err float[], work float[]) {
+		let e = autoc[0]
+		for let i = 0; i < maxOrder; i++ {
+			work[i] = 0.0
+		}
+		for let i = 0; i < maxOrder; i++ {
+			let r = -autoc[i + 1]
+			for let j = 0; j < i; j++ {
+				r -= work[j] * autoc[i - j]
+			}
+			r = e != 0.0 ?? (r / e, 0.0)
+			work[i] = r
+			let half = i >> 1
+			for let j = 0; j < half; j++ {
+				let tmp = work[j]
+				work[j] += r * work[i - 1 - j]
+				work[i - 1 - j] += r * tmp
+			}
+			work[half] += work[half] * r when (i & 1) != 0
+			e *= 1.0 - r * r
+			for let j = 0; j <= i; j++ {
+				lpc[i * 33 + j] = -work[j]
+			}
+			err[i] = e
+		}
+	}
+
+	// Quantizes the coefficients of `order` from `lpc` to `precision`-bit
+	// integers in `q` and returns the shift, -1 when they cannot be stored.
+	def flacQuantize(lpc float[], order int, precision int, q int[]) int {
+		let row = (order - 1) * 33
+		let cmax = 0.0
+		for let j = 0; j < order; j++ {
+			let a = lpc[row + j]
+			a = -a when a < 0.0
+			cmax = a when a > cmax
+		}
+		return -1 when cmax <= 0.0
+		let log2cmax = 0
+		for float(int64(1) << int64(log2cmax + 1)) <= cmax {
+			log2cmax++
+		}
+		if cmax < 1.0 {
+			log2cmax = -1
+			for cmax * float(int64(1) << int64(-log2cmax)) < 1.0 {
+				log2cmax--
+			}
+		}
+		let shift = precision - 2 - log2cmax
+		shift = 15 when shift > 15
+		return -1 when shift < 0
+		let top = (1 << (precision - 1)) - 1
+		let bottom = -(1 << (precision - 1))
+		let scale = float(int64(1) << int64(shift))
+		let error = 0.0
+		for let j = 0; j < order; j++ {
+			error += lpc[row + j] * scale
+			let v = error >= 0.0 ?? (int(error + 0.5), int(error - 0.5))
+			v = top when v > top
+			v = bottom when v < bottom
+			error -= float(v)
+			q[j] = v
+		}
+		return shift
+	}
+}
