@@ -1,0 +1,337 @@
+internal partial module std.net.irc.proto {
+	use (
+		std.crypto::(rand)
+		std.crypto.hash::(Hash, digest, hmac, pbkdf2)
+		std.data.encoding::(base64encode, base64decode)
+		std.net
+		std.net.irc::*
+		std.net.tls
+	)
+
+	// The longest line accepted: 8191 bytes of tags and 512 of message
+	// (IRCv3 message-tags), with room for the line ending.
+	const maxLine = 8704
+
+	// The longest message without its tags, CRLF included (RFC 2812 §2.3).
+	const maxMessage = 512
+
+	// A read timeout that waits without end: the runtime's poll takes a
+	// negative wait as none. Connections are read with it where a timeout
+	// would cut a TLS record in half.
+	const waitForever = duration(-1)
+
+	// The capabilities a client asks for when the server offers them.
+	const wantedCaps = "account-notify account-tag away-notify batch cap-notify chghost echo-message extended-join invite-notify labeled-response message-tags multi-prefix sasl server-time setname userhost-in-names"
+
+	// replyError is the IrcError of a numeric reply.
+	def replyError(op string, m Message) IrcError {
+		let text = m.text()
+		return IrcError{message: "{op}: {m.command} {text}", code: m.command, reply: m.numeric(), text: text}
+	}
+
+	// protocolError is the IrcError of a failure that is not a reply.
+	def protocolError(op string, message string) IrcError {
+		return IrcError{message: "{op}: {message}", code: "0", reply: 0, text: message}
+	}
+
+	// writeFully writes all of data to a stream. Fails when a write does
+	// or moves nothing.
+	def writeFully(stream net.Stream, data byte[], timeout duration) !none {
+		let off = 0
+		for off < data.len() {
+			let n = try stream.write(data[off:], timeout)
+			fail net.errorOf(net.ErrorCode.Pipe, "write", "", "wrote nothing") when n <= 0
+			off += n
+		}
+		return none
+	}
+
+	// LineReader reads lines ending in CRLF, or a bare LF, from a stream.
+	type LineReader {
+		stream  net.Stream
+		pending byte[]
+
+		def new(stream net.Stream) {
+			self.stream = stream
+		}
+
+		// readLine is the next non-empty line without its line ending,
+		// waiting up to `timeout` for each read. Fails when the stream
+		// ends first, a read fails, or the line is longer than `maxLine`.
+		def readLine(timeout duration) !string {
+			let scanned = 0
+			for {
+				for let i = scanned; i < pending.len(); i++ {
+					if pending[i] == byte(10) {
+						let end = i
+						end-- when end > 0 && pending[end - 1] == byte(13)
+						let line = string(pending[:end])
+						pending = pending[i + 1:].clone()
+						return line unless line == ""
+						return try readLine(timeout)
+					}
+				}
+				scanned = pending.len()
+				fail protocolError("read", "line longer than {maxLine} bytes") when pending.len() > maxLine
+				let buf byte[] = []
+				buf.len(4096)
+				let n = try stream.read(buf, timeout)
+				fail net.errorOf(net.ErrorCode.Closed, "read", "", "connection closed") when n == 0
+				pending = pending + buf[:n]
+			}
+			fail "unreachable"
+		}
+	}
+
+	// fitLine cuts a message line to the 510 bytes RFC 2812 allows before
+	// the CRLF, at a UTF-8 boundary; the tags part may add up to 8191.
+	def fitLine(line string) string {
+		let b = line.bytes()
+		let tagEnd = 0
+		if line.startsWith("@") {
+			let space = line.indexOf(" ")
+			tagEnd = space < 0 ?? (0, line[:space + 1].bytes().len())
+		}
+		let limit = tagEnd + maxMessage - 2
+		return line when b.len() <= limit
+		let cut = limit
+		for cut > tagEnd && (int(b[cut]) & 0xC0) == 0x80 {
+			cut--
+		}
+		return string(b[:cut])
+	}
+
+	// splitText cuts text into pieces of at most `limit` bytes, at a space
+	// when one is near the end and never inside a UTF-8 sequence; newlines
+	// split it too.
+	def splitText(text string, limit int) string[] {
+		let out string[] = []
+		for let row in text.replace("\r\n", "\n").split("\n") {
+			let rest = row.bytes()
+			if rest.len() == 0 {
+				continue
+			}
+			for rest.len() > limit {
+				let cut = limit
+				for cut > 0 && (int(rest[cut]) & 0xC0) == 0x80 {
+					cut--
+				}
+				let space = cut
+				for space > limit / 2 && rest[space] != byte(32) {
+					space--
+				}
+				cut = space when rest[space] == byte(32) && space > limit / 2
+				out.push(string(rest[:cut]))
+				rest = rest[cut:].clone()
+				rest = rest[1:].clone() when rest.len() > 0 && rest[0] == byte(32)
+			}
+			out.push(string(rest)) when rest.len() > 0
+		}
+		return out
+	}
+
+	// validNick reports whether a nickname may be used (RFC 2812 §2.3.1,
+	// modern servers' rules): a letter or special first, then letters,
+	// digits, specials and `-`, at most `limit` bytes.
+	def validNick(nick string, limit int) bool {
+		return false when nick == "" || nick.bytes().len() > limit
+		let first = true
+		for let c in nick {
+			let letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			let special = c := '[' || ']' || '\\' || '`' || '_' || '^' || '{' || '|' || '}'
+			let digit = c >= '0' && c <= '9'
+			return false unless letter || special || (!first && (digit || c == '-'))
+			first = false
+		}
+		return true
+	}
+
+	// validChannel reports whether a channel name may be used: a `#` or
+	// `&`, then no space, comma, BELL or colon, at most `limit` bytes.
+	def validChannel(name string, limit int) bool {
+		return false when name.len() < 2 || name.bytes().len() > limit
+		return false unless name.startsWith("#") || name.startsWith("&")
+		for let c in name {
+			return false when c := ' ' || ',' || ':' || '\u0007'
+		}
+		return true
+	}
+
+	// isChannel reports whether a target names a channel rather than a
+	// nickname.
+	def isChannel(target string) bool {
+		return target.startsWith("#") || target.startsWith("&")
+	}
+
+	// fingerprintOf is the SHA-256 of a certificate's DER in lower-case
+	// hex, the form SASL EXTERNAL and `Accounts.addCertificate` use.
+	def fingerprintOf(der byte[]) string {
+		return digest(Hash.SHA256, der).hex().lower()
+	}
+
+	// peerFingerprint is the fingerprint of the certificate the other end
+	// of a TLS connection presented, "" when it presented none.
+	def peerFingerprint(conn tls.Conn) string {
+		let certs = conn.connectionState().peerCertificates
+		return "" when certs.len() == 0
+		return fingerprintOf(certs[0].raw)
+	}
+
+	// clientConfig is the TLS config of a client connection: `base`, the
+	// server name set to the host dialled when it names none.
+	def clientConfig(base ?tls.Config, host string) tls.Config {
+		let config = tls.Config{}
+		config = base unless base is none
+		config = tls.withServerName(config, host) when config.serverName == ""
+		return config
+	}
+
+	// saslChunks cuts a SASL payload into AUTHENTICATE arguments: base64
+	// in pieces of 400, `+` after a last piece of exactly 400, `+` alone
+	// for an empty payload.
+	def saslChunks(payload byte[]) string[] {
+		let text = base64encode(payload)
+		return ["+"] when text == ""
+		let out string[] = []
+		let i = 0
+		for i < text.len() {
+			let end = i + 400
+			end = text.len() when end > text.len()
+			out.push(text[i:end])
+			i = end
+		}
+		out.push("+") when text.len() % 400 == 0
+		return out
+	}
+
+	// SaslReader gathers the AUTHENTICATE pieces of one payload.
+	type SaslReader {
+		text string = ""
+
+		def new() {}
+
+		// Takes one piece; returns true once the payload is complete.
+		// Fails when it grows past 8 KiB.
+		def add(piece string) !bool {
+			return true when piece == "+"
+			text += piece
+			fail protocolError("AUTHENTICATE", "payload too long") when text.len() > 8192
+			return piece.len() < 400
+		}
+
+		// The decoded payload. Fails when it is not base64.
+		def payload() !byte[] {
+			let out = try base64decode(text)
+			text = ""
+			return out
+		}
+	}
+
+	// scramName escapes a user name for a SCRAM message (`=` and `,`).
+	def scramName(name string) string {
+		return name.replace("=", "=3D").replace(",", "=2C")
+	}
+
+	// scramUnname reads an escaped SCRAM user name back.
+	def scramUnname(name string) string {
+		return name.replace("=2C", ",").replace("=3D", "=")
+	}
+
+	// scramAttrs reads the `k=v` attributes of a SCRAM message.
+	def scramAttrs(message string) map<string, string> {
+		let out = map<string, string>{}
+		for let part in message.split(",") {
+			continue when part.len() < 2 || part[1] != '='
+			out[part[:1]] = part[2:]
+		}
+		return out
+	}
+
+	// xorBytes is a XOR b, byte by byte, over the shorter length.
+	def xorBytes(a byte[], b byte[]) byte[] {
+		let n = a.len() < b.len() ?? (a.len(), b.len())
+		let out byte[] = []
+		out.len(n)
+		for let i = 0; i < n; i++ {
+			out[i] = byte(int(a[i]) ^ int(b[i]))
+		}
+		return out
+	}
+
+	// nonce is 18 random bytes in base64, for SCRAM.
+	def nonce() !string {
+		return base64encode(try rand(18))
+	}
+
+	// ScramClient is the client side of one SCRAM-SHA-256 exchange.
+	type ScramClient {
+		user        string
+		password    string
+		clientNonce string
+		firstBare   string = ""
+		serverSig   byte[]
+
+		def new(user string, password string, clientNonce string) {
+			self.user = user
+			self.password = password
+			self.clientNonce = clientNonce
+		}
+
+		// The client-first message.
+		def first() string {
+			firstBare = "n={scramName(user)},r={clientNonce}"
+			return "n,," + firstBare
+		}
+
+		// The client-final message answering the server-first one.
+		// Fails when the server's nonce does not extend ours or its
+		// parameters are missing.
+		def final(serverFirst string) !string {
+			let attrs = scramAttrs(serverFirst)
+			let serverNonce = attrs.get("r")
+			let saltText = attrs.get("s")
+			let iterText = attrs.get("i")
+			fail protocolError("SCRAM", "server-first lacks a nonce") when serverNonce is none
+			fail protocolError("SCRAM", "server-first lacks a salt") when saltText is none
+			fail protocolError("SCRAM", "server-first lacks an iteration count") when iterText is none
+			fail protocolError("SCRAM", "server nonce does not extend ours") unless serverNonce.startsWith(clientNonce)
+			let iterations = iterText.toInt<int>()
+			fail protocolError("SCRAM", "bad iteration count") when iterations < 1
+			let salt = try base64decode(saltText)
+			let salted = pbkdf2(Hash.SHA256, password.bytes(), salt, iterations, 32)
+			let clientKey = hmac(Hash.SHA256, salted, "Client Key".bytes())
+			let storedKey = digest(Hash.SHA256, clientKey)
+			let withoutProof = "c=biws,r={serverNonce}"
+			let authMessage = "{firstBare},{serverFirst},{withoutProof}"
+			let signature = hmac(Hash.SHA256, storedKey, authMessage.bytes())
+			let proof = xorBytes(clientKey, signature)
+			let serverKey = hmac(Hash.SHA256, salted, "Server Key".bytes())
+			serverSig = hmac(Hash.SHA256, serverKey, authMessage.bytes())
+			return "{withoutProof},p={base64encode(proof)}"
+		}
+
+		// Checks the server-final message. Fails when the server's
+		// signature does not prove it knows the password.
+		def verify(serverFinal string) !none {
+			let attrs = scramAttrs(serverFinal)
+			let err = attrs.get("e")
+			fail protocolError("SCRAM", "server refused: {err}") unless err is none
+			let v = attrs.get("v")
+			fail protocolError("SCRAM", "server-final lacks a signature") when v is none
+			let got = try base64decode(v)
+			fail protocolError("SCRAM", "server signature does not match") unless sameBytes(got, serverSig)
+			return none
+		}
+	}
+
+	// sameBytes compares two byte strings in time that depends on their
+	// lengths only.
+	def sameBytes(a byte[], b byte[]) bool {
+		return false when a.len() != b.len()
+		let diff = 0
+		for let i = 0; i < a.len(); i++ {
+			diff = diff | (int(a[i]) ^ int(b[i]))
+		}
+		return diff == 0
+	}
+}

@@ -1,0 +1,422 @@
+internal partial module std.formats.archive.zip {
+	use (
+		std.io
+		std.bytes
+		std.os
+		std.time
+		std.crypto
+		std.crypto.hash
+		std.data.compress.flate
+		std.formats.archive::*
+		std.formats.archive.stream::*
+	)
+
+	// What the central directory needs about an entry already written.
+	type ZipWritten {
+		name       byte[]
+		comment    byte[]
+		flags      int
+		method     int
+		dosTime    int
+		dosDate    int
+		crc        int
+		packed     int
+		size       int
+		offset     int
+		external   int
+		modTime    int
+		aesVersion int
+		aesMethod  int
+		strength   int
+		// Written in place: sizes in the local header, no data descriptor and
+		// no extra field there.
+		inPlace    bool
+
+		def new() {}
+	}
+
+	// Counts what passes through to the archive's writer, so offsets and
+	// compressed sizes are known without seeking.
+	type CountingWriter {
+		out     io.Writer
+		written int
+
+		def new(out io.Writer) {
+			self.out = out
+		}
+
+		// write implements io.Writer. Fails when the wrapped writer does.
+		def write(buf byte[]) !int {
+			try writeAll(out, buf)
+			written += buf.len()
+			return buf.len()
+		}
+	}
+
+	// Encrypts what is written to it before passing it on: the traditional
+	// cipher, or WinZip AES with its HMAC over the ciphertext.
+	type EncryptingWriter {
+		out     io.Writer
+		legacy  ?ZipCrypto
+		ctr     ?AesCtr
+		mac     ?hash.HMAC
+		scratch byte[]
+
+		def new(out io.Writer) {
+			self.out = out
+			scratch = []
+		}
+
+		// write implements io.Writer. Fails when the wrapped writer does.
+		def write(buf byte[]) !int {
+			scratch.len(buf.len())
+			buf.copy(scratch)
+			let legacyCipher = legacy
+			legacyCipher.encrypt(scratch) unless legacyCipher is none
+			let aes = ctr
+			aes.apply(scratch) unless aes is none
+			let tagger = mac
+			tagger.write(scratch) unless tagger is none
+			try writeAll(out, scratch)
+			return buf.len()
+		}
+	}
+
+	// Writes a zip archive entry by entry; the central directory goes out on
+	// close.
+	type ZipWriter {
+		out        CountingWriter
+		opts       WriteOptions
+		comment    string
+		encryption ZipEncryption
+		written    ZipWritten[]
+		closed     bool
+
+		def new(out io.Writer, opts WriteOptions, comment string, encryption ZipEncryption) {
+			self.out = new CountingWriter(out)
+			self.opts = opts
+			self.comment = comment
+			self.encryption = encryption
+			written = []
+		}
+
+		def add(path string, opts AddOptions = AddOptions{}) !none {
+			return addTree(self, path, opts)
+		}
+
+		def add(entry Entry, content io.Reader) !none {
+			fail "zip: the archive is closed" when closed
+			let name = entry.name.replace("\\", "/")
+			for name.startsWith("/") {
+				name = name[1:]
+			}
+			fail "zip: entry name is empty" when name.isEmpty()
+			let dir = isDirMode(entry.mode) || name.endsWith("/")
+			let link = isLinkMode(entry.mode)
+			name += "/" when dir && !name.endsWith("/")
+
+			let w = new ZipWritten()
+			w.name = name.bytes()
+			w.comment = entry.comment.bytes()
+			w.offset = out.written
+			let modTime = isZeroTime(entry.modTime) ?? (time.now(), entry.modTime)
+			let (dosDate, dosTime) = timeToDos(modTime)
+			w.dosDate = dosDate
+			w.dosTime = dosTime
+			w.modTime = unixSeconds(modTime)
+			let mode = entry.mode
+			if dir && int(mode) & 0o777 == 0 {
+				mode = os.FileMode(int(mode) | int(os.FileMode.Dir) | 0o755)
+			} else if dir {
+				mode = os.FileMode(int(mode) | int(os.FileMode.Dir))
+			} else if int(mode) & 0o777 == 0 {
+				mode = os.FileMode(int(mode) | (link ?? (0o777, 0o644)))
+			}
+			w.external = (unixMode(mode) << 16) | (dir ?? (0x10, 0))
+			let nonAscii = false
+			for let b in w.name {
+				nonAscii = true when int(b) >= 0x80
+			}
+			for let b in w.comment {
+				nonAscii = true when int(b) >= 0x80
+			}
+			w.flags = nonAscii ?? (flagUTF8, 0)
+
+			let payload byte[] = []
+			payload = entry.linkTarget.bytes() when link
+			let streaming = !dir && !link
+			let encrypt = streaming && !opts.password.isEmpty()
+			w.method = streaming && opts.level != CompressionLevel.None ?? (methodDeflate, methodStore)
+			if streaming && !encrypt && entry.method == "store" {
+				let held = new bytes.Buffer()
+				try held.readFrom(content)
+				payload = held.bytes()
+				streaming = false
+				w.method = methodStore
+				w.inPlace = true
+			}
+			if streaming {
+				w.flags |= flagDescriptor
+			} else {
+				w.crc = int(hash.crc32(payload))
+				w.size = payload.len()
+				w.packed = payload.len()
+			}
+			if encrypt {
+				w.flags |= flagEncrypted
+				if encryption != ZipEncryption.Traditional {
+					w.strength = aesStrength(encryption)
+					w.aesVersion = 2
+					w.aesMethod = w.method
+					w.method = methodAES
+				}
+			}
+
+			try writeAll(out, localHeader(w))
+			let dataStart = out.written
+			if streaming {
+				try writeData(w, content, encrypt)
+			} else {
+				try writeAll(out, payload)
+			}
+			w.packed = out.written - dataStart
+			if streaming {
+				let descriptor byte[] = []
+				put32(descriptor, sigDescriptor)
+				put32(descriptor, w.crc)
+				if w.packed >= max32 || w.size >= max32 {
+					put64(descriptor, w.packed)
+					put64(descriptor, w.size)
+				} else {
+					put32(descriptor, w.packed)
+					put32(descriptor, w.size)
+				}
+				try writeAll(out, descriptor)
+			}
+			written.push(w)
+			return none
+		}
+
+		// Streams one entry's bytes through compression and encryption, filling
+		// in its CRC-32 and size.
+		def writeData(w ZipWritten, content io.Reader, encrypt bool) !none {
+			let sink = new EncryptingWriter(out)
+			let mac ?hash.HMAC = none
+			if encrypt {
+				if w.method == methodAES {
+					let salt = try crypto.rand(aesSaltLength(w.strength))
+					let keys = try deriveAesKeys(opts.password, salt, w.strength)
+					try writeAll(out, salt)
+					try writeAll(out, keys.verifier)
+					sink.ctr = new AesCtr(keys.cipher)
+					sink.mac = keys.mac
+					mac = keys.mac
+				} else {
+					let cipher = new ZipCrypto(opts.password)
+					let head = try crypto.rand(12)
+					head[11] = byte((w.dosTime >> 8) & 0xFF)
+					cipher.encrypt(head)
+					try writeAll(out, head)
+					sink.legacy = cipher
+				}
+			}
+			let deflater ?flate.Writer = none
+			deflater = new flate.Writer(sink, flateLevel(opts.level)) when w.method == methodDeflate || w.aesMethod == methodDeflate
+			let crc = new hash.CRC32()
+			let buf byte[]
+			buf.len(64 * 1024)
+			let size = 0
+			for {
+				let n = try content.read(buf)
+				break when n <= 0
+				crc.write(buf[0:n])
+				size += n
+				let d = deflater
+				if d is none {
+					try writeAll(sink, buf[0:n])
+				} else {
+					try writeAll(d, buf[0:n])
+				}
+			}
+			let d = deflater
+			try d.close() unless d is none
+			w.size = size
+			w.crc = w.aesVersion == 2 ?? (0, int(crc.checksum ^ 0xFFFFFFFF))
+			let tagger = mac
+			try writeAll(out, tagger.hash()[0:10]) unless tagger is none
+			return none
+		}
+
+		// close implements io.Closer: writes the central directory and the end
+		// records. It does not close the writer the archive was created on.
+		// Fails when the writer does.
+		def close() !none {
+			return none when closed
+			closed = true
+			let dirStart = out.written
+			let zip64 = written.len() >= max16
+			for let w in written {
+				let record = centralHeader(w)
+				zip64 = true when w.offset >= max32 || w.size >= max32 || w.packed >= max32
+				try writeAll(out, record)
+			}
+			let dirSize = out.written - dirStart
+			zip64 = true when dirStart >= max32 || dirSize >= max32
+			let tail byte[] = []
+			if zip64 {
+				let end64At = out.written
+				put32(tail, sigEnd64)
+				put64(tail, 44)
+				put16(tail, (3 << 8) | 45)
+				put16(tail, 45)
+				put32(tail, 0)
+				put32(tail, 0)
+				put64(tail, written.len())
+				put64(tail, written.len())
+				put64(tail, dirSize)
+				put64(tail, dirStart)
+				put32(tail, sigLocator64)
+				put32(tail, 0)
+				put64(tail, end64At)
+				put32(tail, 1)
+			}
+			let note = comment.bytes()
+			fail "zip: the archive comment is longer than 65535 bytes" when note.len() > max16
+			put32(tail, sigEnd)
+			put16(tail, 0)
+			put16(tail, 0)
+			put16(tail, written.len() < max16 ?? (written.len(), max16))
+			put16(tail, written.len() < max16 ?? (written.len(), max16))
+			put32(tail, dirSize < max32 ?? (dirSize, max32))
+			put32(tail, dirStart < max32 ?? (dirStart, max32))
+			put16(tail, note.len())
+			for let b in note {
+				tail.push(b)
+			}
+			try writeAll(out, tail)
+			return none
+		}
+	}
+
+	// The WinZip AES strength code of an encryption choice.
+	def aesStrength(encryption ZipEncryption) int {
+		match encryption {
+			case ZipEncryption.AES128:
+				return 1
+			case ZipEncryption.AES192:
+				return 2
+		}
+		return 3
+	}
+
+	// The DEFLATE level of a CompressionLevel.
+	def flateLevel(level CompressionLevel) int {
+		match level {
+			case CompressionLevel.Fastest:
+				return 1
+			case CompressionLevel.Fast:
+				return 3
+			case CompressionLevel.Best:
+				return 9
+		}
+		return 6
+	}
+
+	// Extra fields shared by the local and central headers: the Unix
+	// modification time, and the AES parameters of an encrypted entry.
+	def commonExtra(w ZipWritten) byte[] {
+		let extra byte[] = []
+		put16(extra, 0x5455)
+		put16(extra, 5)
+		extra.push(byte(1))
+		put32(extra, w.modTime & 0xFFFFFFFF)
+		if w.aesVersion > 0 {
+			put16(extra, 0x9901)
+			put16(extra, 7)
+			put16(extra, w.aesVersion)
+			extra.push(byte('A'))
+			extra.push(byte('E'))
+			extra.push(byte(w.strength))
+			put16(extra, w.aesMethod)
+		}
+		return extra
+	}
+
+	def versionNeeded(w ZipWritten, zip64 bool) int {
+		return 51 when w.aesVersion > 0
+		return 45 when zip64
+		return 20
+	}
+
+	def localHeader(w ZipWritten) byte[] {
+		let extra = w.inPlace ?? (byte[], commonExtra(w))
+		let out byte[] = []
+		put32(out, sigLocal)
+		put16(out, versionNeeded(w, false))
+		put16(out, w.flags)
+		put16(out, w.method)
+		put16(out, w.dosTime)
+		put16(out, w.dosDate)
+		let known = w.flags & flagDescriptor == 0
+		put32(out, known ?? (w.crc, 0))
+		put32(out, known ?? (w.packed, 0))
+		put32(out, known ?? (w.size, 0))
+		put16(out, w.name.len())
+		put16(out, extra.len())
+		for let b in w.name {
+			out.push(b)
+		}
+		for let b in extra {
+			out.push(b)
+		}
+		return out
+	}
+
+	def centralHeader(w ZipWritten) byte[] {
+		let big byte[] = []
+		put64(big, w.size) when w.size >= max32
+		put64(big, w.packed) when w.packed >= max32
+		put64(big, w.offset) when w.offset >= max32
+		let extra byte[] = []
+		if big.len() > 0 {
+			put16(extra, 0x0001)
+			put16(extra, big.len())
+			for let b in big {
+				extra.push(b)
+			}
+		}
+		for let b in commonExtra(w) {
+			extra.push(b)
+		}
+		// The central copy of the timestamp field carries the flag byte and
+		// modification time only, which is exactly what commonExtra wrote.
+		let out byte[] = []
+		put32(out, sigCentral)
+		put16(out, (3 << 8) | versionNeeded(w, big.len() > 0))
+		put16(out, versionNeeded(w, big.len() > 0))
+		put16(out, w.flags)
+		put16(out, w.method)
+		put16(out, w.dosTime)
+		put16(out, w.dosDate)
+		put32(out, w.crc)
+		put32(out, w.packed >= max32 ?? (max32, w.packed))
+		put32(out, w.size >= max32 ?? (max32, w.size))
+		put16(out, w.name.len())
+		put16(out, extra.len())
+		put16(out, w.comment.len())
+		put16(out, 0)
+		put16(out, 0)
+		put32(out, w.external)
+		put32(out, w.offset >= max32 ?? (max32, w.offset))
+		for let b in w.name {
+			out.push(b)
+		}
+		for let b in extra {
+			out.push(b)
+		}
+		for let b in w.comment {
+			out.push(b)
+		}
+		return out
+	}
+}

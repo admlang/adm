@@ -1,0 +1,754 @@
+partial module std.formats.video {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.formats.image
+		std.formats.audio
+		std.formats.video.demux::*
+		std.formats.media.source::*
+		std.formats.video.loader::*
+	)
+
+	// A video file opened for playback: its tracks, the decoded pictures of
+	// its main video track and the decoded sound of its first audio track.
+	// The picture and sound streams share one reading of the file, so a
+	// player reads both in step; `seek` moves them together.
+	type Video {
+		internal demux    Demux
+		internal details  VideoInfo
+		internal pictures ?FrameStream       = none
+		internal sound    ?audio.AudioStream = none
+		// Where it was opened from, so `reopen` can read it again: a path,
+		// or the bytes when `inMemory`.
+		internal path     string
+		internal data     byte[]
+		internal inMemory bool
+
+		internal def new(demux Demux, details VideoInfo, path string, data byte[], inMemory bool) {
+			self.demux = demux
+			self.details = details
+			self.path = path
+			self.data = data
+			self.inMemory = inMemory
+		}
+
+		// reopen opens the same file or bytes again: a second reading with
+		// its own position, tracks and decoders, as a player needs to decode
+		// pictures on one task while the sound is read on another. Closing
+		// either leaves the other open.
+		//
+		// Fails for a video opened from a reader, which cannot be read twice,
+		// or as opening the file does.
+		def reopen() !Video {
+			return open(path) when path != ""
+			fail "video: a video opened from a reader cannot be opened again" unless inMemory
+			return open(data)
+		}
+
+		// What the file says about its main video track.
+		def info() VideoInfo {
+			return details
+		}
+
+		// Every track of the file, in the container's order.
+		def tracks() Track[] {
+			return demux.container.tracks()
+		}
+
+		// The decoded pictures of the main video track, in presentation
+		// order, through the decoder registered for its codec. Every call
+		// returns the same stream.
+		//
+		// With `onGpu`, pictures the GPU decodes stay in its memory: their
+		// frames have `onGpu` set and empty planes, for drawing with
+		// `DrawContext.drawVideo` without the pictures passing through main
+		// memory; `download` gives such a frame its planes. Frames the CPU
+		// decodes are ordinary either way. The last call's choice applies to
+		// the pictures decoded after it.
+		//
+		// Fails when the file has no video track, no decoder is registered
+		// for its codec, or configuring the decoder does.
+		def frames(onGpu bool = false) !VideoStream {
+			let made = pictures
+			if !(made is none) {
+				keepOnGpu(made.decoder, onGpu)
+				return made
+			}
+			let track = demux.mainVideo()
+			fail "video: the file has no video track" when track is none
+			let t Track = track
+			let decoder = try decoderFor(t)
+			keepOnGpu(decoder, onGpu)
+			demux.want(t.index)
+			let stream = new FrameStream(demux, t, decoder, details)
+			pictures = stream
+			return stream
+		}
+
+		// What the GPU does for the main video track's pictures: whether it
+		// decodes them (or will, before they are read) and through which
+		// interface, whether it can encode the codec, and why the pictures
+		// decode in software when they do. ADM_VIDEO_HW chooses the
+		// interface or turns the GPU off.
+		def hardware() VideoHardware {
+			let track = demux.mainVideo()
+			return VideoHardware{reason: "the file has no video track"} when track is none
+			let t Track = track
+			let made = pictures
+			let decoder VideoDecoder = made is none ?? (decoderFor(t) onerror (err error) {
+				return VideoHardware{reason: "{err}"}
+			}, made.decoder)
+			return decoder.hardware() when decoder is HardwareDecoder
+			return VideoHardware{reason: "the {t.codec} decoder runs on the CPU only"}
+		}
+
+		// The decoded sound of the first audio track, none when the file has
+		// no audio track. The stream belongs to this video: closing the video
+		// ends it. Every call returns the same stream.
+		//
+		// Fails when the track's codec has no packet decoder
+		// (`audio.AudioDecoder`) or its configuration is damaged.
+		def audio() !?audio.AudioStream {
+			let made = sound
+			return made unless made is none
+			let track = demux.firstAudio()
+			return none when track is none
+			let t Track = track
+			let decoder = try soundDecoder(t)
+			demux.want(t.index)
+			let stream = new SoundStream(demux, t, decoder)
+			sound = stream
+			return stream
+		}
+
+		// Stops decoding pictures: the stream `frames` returned ends, and the
+		// file's picture packets are no longer kept for it, so reading only
+		// the sound stays cheap. `frames` starts a new stream from where the
+		// file is read then, which shows pictures from the next keyframe on
+		// (`seek` to show them from an exact time).
+		def stopFrames() {
+			let made = pictures
+			return when made is none
+			made.stopped = true
+			let track = demux.mainVideo()
+			demux.unwant(track.index) unless track is none
+			pictures = none
+		}
+
+		// Moves every stream of this video to the last keyframe at or before
+		// `time`; each then decodes forward to `time`.
+		//
+		// Fails when the file cannot seek or the container fails.
+		def seek(time duration) !none {
+			return demux.seek(time)
+		}
+
+		// Closes the container and the file it reads.
+		//
+		// Fails when closing it does.
+		def close() !none {
+			return demux.container.close()
+		}
+	}
+
+	// Opens the video file at path, finding its container by signature and
+	// then by extension. The video owns the file: `close` closes it.
+	//
+	// Fails when the file cannot be opened, no container recognises it, or
+	// reading its headers does.
+	def open(path string) !Video {
+		let f = try os.open(path)
+		let format = pick(f, os.extension(path)) onerror (err error) {
+			f.close() onerror recover none
+			fail err
+		}
+		f.seek(int64(0)) onerror (err error) {
+			f.close() onerror recover none
+			fail err
+		}
+		let c = format.open(f) onerror (err error) {
+			f.close() onerror recover none
+			fail err
+		}
+		return describe(c, path = path)
+	}
+
+	// Opens the video held in the bytes, finding its container by
+	// signature.
+	//
+	// Fails when no container recognises the bytes or reading their headers
+	// does.
+	def open(data byte[]) !Video {
+		let (format, _) = try containerRegistry.probe(data)
+		return describe(try format.open(new bytes.Reader(data)), data = data, inMemory = true)
+	}
+
+	// Opens the video the reader delivers, finding its container by
+	// signature. Containers that find samples by offset (MP4) read the whole
+	// stream into memory first.
+	//
+	// Fails when no container recognises the stream or reading its headers
+	// does.
+	def open(reader io.Reader) !Video {
+		let (format, r) = try containerRegistry.probe(reader)
+		return describe(try format.open(r))
+	}
+}
+
+internal partial module std.formats.video.loader {
+	use (
+		std.io
+		std.bytes::(Endian)
+		std.reflection
+		std.formats
+		std.formats.audio
+		std.formats.video::*
+		std.formats.video.demux::*
+	)
+
+	let containerRegistry = new formats.CodecRegistry<ContainerCodec>("video", codec)
+	let decoderRegistry = new DecoderRegistry()
+
+	// The video decoders found through the `decoder` annotation, by codec
+	// name.
+	type DecoderRegistry {
+		registry map<string, reflection.TypeDescriptor>
+		loaded   bool
+
+		def new() {
+			registry = new map<string, reflection.TypeDescriptor>()
+		}
+
+		atomic def discover() {
+			return when loaded
+			loaded = true
+			for let (_, hit) in reflection.attrs(decoder) {
+				let found = reflection.asType(hit.node)
+				continue when found is none
+				let name = hit.attr.arguments.valueOf("name")
+				continue when name is none
+				let label = string(name).lower()
+				continue when label.len() == 0
+				registry.set(label, found)
+			}
+		}
+
+		// A fresh decoder for the codec, none when none is registered.
+		def create(codec string) ?VideoDecoder {
+			discover()
+			let t = registry.get(codec)
+			return none when t is none
+			let made = reflection.instantiate(t)
+			return none unless made is VideoDecoder
+			let out VideoDecoder = made
+			return out
+		}
+	}
+
+	// A configured decoder for the video track.
+	//
+	// Fails when no decoder is registered for its codec or configuring it
+	// does.
+	// Asks a decoder that can hand pictures to the GPU to keep them there,
+	// or not.
+	def keepOnGpu(decoder VideoDecoder, on bool) {
+		if decoder is HardwareDecoder {
+			decoder.keepOnGpu(on)
+		}
+	}
+
+	def decoderFor(track Track) !VideoDecoder {
+		let made = decoderRegistry.create(track.codec)
+		fail "video: no decoder is registered for the \"{track.codec}\" codec" when made is none
+		let d VideoDecoder = made
+		try d.configure(track)
+		return d
+	}
+
+	// A packet decoder for the audio track, through its codec's
+	// `decoder(config)`.
+	//
+	// Fails when std.formats.audio has no packet decoder for the codec or
+	// the track's configuration is damaged.
+	def soundDecoder(track Track) !audio.AudioDecoder {
+		let codec = track.codec
+		return new audio.AAC().decoder(track.config) when codec == "aac"
+		// Layers I and II decode through the same MPEG audio decoder.
+		return new audio.MP3().decoder(track.config) when codec := "mp3" || "mp2" || "mp1"
+		return new audio.Vorbis().decoder(track.config) when codec == "vorbis"
+		return new audio.Opus().decoder(track.config) when codec == "opus"
+		return new audio.WMA().decoder(track.config) when codec := "wmav1" || "wmav2"
+		return new audio.AC3().decoder(track.config) when codec == "ac3"
+		return new audio.EAC3().decoder(track.config) when codec == "eac3"
+		return new audio.AMR().decoder(track.config) when codec == "amr"
+		let layout = pcmFormat(codec)
+		if !(layout is none) {
+			let format audio.SampleFormat = layout
+			let pcm = new audio.PCM()
+			pcm.info = audio.AudioInfo{sampleRate: track.sampleRate, channels: track.channels, format: format}
+			return pcm.decoder(codec.endsWith("be") ?? (Endian.Big, Endian.Little))
+		}
+		fail "video: no audio decoder for the \"{codec}\" codec"
+	}
+
+	// The sample layout of a PCM codec name (`pcm_u8`, `pcm_s16le`,
+	// `pcm_f32be`), none for any other name or a layout PCM does not read.
+	def pcmFormat(codec string) ?audio.SampleFormat {
+		return audio.SampleFormat.Uint8 when codec == "pcm_u8"
+		return none unless codec.startsWith("pcm_") && (codec.endsWith("le") || codec.endsWith("be"))
+		let kind = codec[4:codec.len() - 2]
+		return audio.SampleFormat.Int16 when kind == "s16"
+		return audio.SampleFormat.Int24 when kind == "s24"
+		return audio.SampleFormat.Int32 when kind == "s32"
+		return audio.SampleFormat.Float32 when kind == "f32"
+		return audio.SampleFormat.Float64 when kind == "f64"
+		return none
+	}
+
+	// The container that recognises the reader's signature, else the one
+	// that lists the extension.
+	//
+	// Fails when neither finds one.
+	def pick(reader io.Reader, extension string) !ContainerCodec {
+		let byName = containerRegistry.matchExt(extension)
+		let (format, _) = containerRegistry.probe(reader) onerror (err error) {
+			fail err when byName is none
+			let named ContainerCodec = byName
+			return named
+		}
+		return format
+	}
+
+	// The video over a container: its main video track described.
+	def describe(c Container, path string = "", data byte[] = byte[], inMemory bool = false) Video {
+		let demux = new Demux(c)
+		let name = ""
+		name = c.name() when c is Described
+		let details = VideoInfo{
+			width:       uint32(0),
+			height:      uint32(0),
+			frameRate:   FrameRate{numerator: uint32(0), denominator: uint32(1)},
+			length:      0s,
+			codec:       "",
+			container:   name,
+			rotation:    0,
+			pixelAspect: 1.0,
+			seekable:    demux.seekable(),
+		}
+		for let (_, t) in c.tracks() {
+			details.length = t.length when t.length > details.length
+		}
+		let main = demux.mainVideo()
+		if !(main is none) {
+			let t Track = main
+			details.width = t.width
+			details.height = t.height
+			details.frameRate = t.frameRate
+			details.codec = t.codec
+			details.rotation = t.rotation
+			details.pixelAspect = t.pixelAspect
+		}
+		return new Video(demux, details, path, data, inMemory)
+	}
+
+	// Packets a stream has not taken yet, per track.
+	type PacketQueue {
+		items Packet[]
+		head  int
+
+		def new() {}
+
+		def push(p Packet) {
+			items.push(p)
+		}
+
+		def pop() ?Packet {
+			return none when head >= items.len()
+			let p = items[head]
+			head++
+			if head >= 256 && head * 2 >= items.len() {
+				items = items[head:].clone()
+				head = 0
+			}
+			return p
+		}
+
+		def clear() {
+			items = Packet[]
+			head = 0
+		}
+	}
+
+	// One reading of a container shared by the streams of a video: packets
+	// of a track a stream wants wait in its queue until that stream takes
+	// them; packets of other tracks are dropped.
+	type Demux {
+		container  Container
+		queues     PacketQueue[]
+		wanted     bool[]
+		// Counts seeks, so a stream notices one another stream made.
+		generation int
+		// Where the last seek asked to go.
+		target     duration
+
+		def new(container Container) {
+			self.container = container
+			let count = container.tracks().len()
+			wanted.len(count)
+			for let i = 0; i < count; i++ {
+				queues.push(new PacketQueue())
+			}
+		}
+
+		// Whether seeking works: a guess from the container's source.
+		def seekable() bool {
+			let c = container
+			return c.seekable() when c is Seekable
+			return true
+		}
+
+		// The first video track, none when there is none.
+		def mainVideo() ?Track {
+			for let (_, t) in container.tracks() {
+				return t when t.kind == TrackKind.Video
+			}
+			return none
+		}
+
+		// The first audio track, none when there is none.
+		def firstAudio() ?Track {
+			for let (_, t) in container.tracks() {
+				return t when t.kind == TrackKind.Audio
+			}
+			return none
+		}
+
+		// Keeps the packets of the track for a stream from now on.
+		def want(track int) {
+			wanted[track] = true when track >= 0 && track < wanted.len()
+		}
+
+		// Stops keeping the packets of the track and drops those queued.
+		def unwant(track int) {
+			return when track < 0 || track >= wanted.len()
+			wanted[track] = false
+			queues[track].clear()
+		}
+
+		// The next packet of the track, none at the end of the file.
+		//
+		// Fails when the container does.
+		def next(track int) !?Packet {
+			let queued = queues[track].pop()
+			return queued unless queued is none
+			for {
+				let got = try container.next()
+				return none when got is none
+				let p Packet = got
+				return p when p.track == track
+				queues[p.track].push(p) when p.track >= 0 && p.track < wanted.len() && wanted[p.track]
+			}
+			return none
+		}
+
+		// Moves the container to `time` and drops every queued packet.
+		//
+		// Fails when the container cannot seek.
+		def seek(time duration) !none {
+			try container.seek(time)
+			for let (_, q) in queues {
+				q.clear()
+			}
+			generation++
+			target = time
+			return none
+		}
+	}
+
+	// What a container reports about seeking beyond `Container`.
+	interface Seekable {
+		// Whether `seek` can move back in the file.
+		def seekable() bool
+	}
+
+	// The decoded pictures of one video track.
+	type FrameStream {
+		demux      Demux
+		track      Track
+		decoder    VideoDecoder
+		details    VideoInfo
+		ready      VideoFrame[]
+		head       int
+		generation int
+		// Pictures ending at or before this time are dropped: a seek's
+		// target.
+		skipUntil  duration
+		flushed    bool
+		at         duration
+		// Ended by `Video.stopFrames`.
+		stopped    bool
+
+		def new(demux Demux, track Track, decoder VideoDecoder, details VideoInfo) {
+			self.demux = demux
+			self.track = track
+			self.decoder = decoder
+			self.details = details
+			// A stream made after a seek starts at its target.
+			generation = demux.generation
+			skipUntil = demux.target
+			at = demux.target
+		}
+
+		// info implements VideoStream.
+		def info() VideoInfo {
+			return details
+		}
+
+		// next implements VideoStream.
+		//
+		// Fails when the container or the decoder does.
+		def next() !?VideoFrame {
+			return none when stopped
+			if generation != demux.generation {
+				generation = demux.generation
+				decoder = try decoderFor(track)
+				ready = VideoFrame[]
+				head = 0
+				flushed = false
+				skipUntil = demux.target
+				at = demux.target
+			}
+			for {
+				if head < ready.len() {
+					let f = ready[head]
+					head++
+					let end = f.time + f.length
+					let early = f.length > 0s ?? (end <= skipUntil, f.time < skipUntil)
+					continue when early
+					at = end
+					return f
+				}
+				return none when flushed
+				ready = VideoFrame[]
+				head = 0
+				let got = try demux.next(track.index)
+				if got is none {
+					ready = try decoder.flush()
+					flushed = true
+				} else {
+					let p Packet = got
+					ready = try decoder.decode(p)
+				}
+			}
+			return none
+		}
+
+		// seek implements VideoStream: moves the whole video.
+		//
+		// Fails when the container cannot seek.
+		def seek(time duration) !none {
+			try demux.seek(time)
+			return none
+		}
+
+		// position implements VideoStream: where the last picture returned
+		// ends, or a seek's target.
+		def position() duration {
+			return at
+		}
+	}
+
+	// The decoded sound of one audio track, as an `AudioStream`.
+	type SoundStream {
+		demux      Demux
+		track      Track
+		decoder    audio.AudioDecoder
+		details    audio.AudioInfo
+		channels   int
+		rate       int
+		pcm        float32[]
+		pcmAt      int
+		framePos   uint64
+		generation int
+		// Frames still to drop before the seek target.
+		drop       int64
+		// Whether the position was taken from the first packet after a
+		// seek.
+		placed     bool
+		flushed    bool
+		closed     bool
+		// Whether a packet's samples past its length are dropped: the end
+		// trimming of Vorbis and Opus streams, whose containers give the
+		// last packet only the length the encoder's input had.
+		trims      bool
+
+		def new(demux Demux, track Track, decoder audio.AudioDecoder) {
+			self.demux = demux
+			self.track = track
+			self.decoder = decoder
+			generation = demux.generation
+			trims = track.codec := "vorbis" || "opus"
+			let d = decoder.info()
+			rate = int(d.sampleRate) > 0 ?? (int(d.sampleRate), int(track.sampleRate))
+			channels = int(d.channels) > 0 ?? (int(d.channels), int(track.channels))
+			let frames = rate > 0 ?? (uint64(int64(track.length) / 1000 * int64(rate) / 1000000), uint64(0))
+			details = audio.AudioInfo{
+				sampleRate: uint32(rate),
+				channels:   uint16(channels),
+				bitDepth:   uint16(32),
+				format:     audio.SampleFormat.Float32,
+				frames:     frames,
+				length:     track.length,
+				codec:      track.codec,
+				bitrate:    d.bitrate,
+				seekable:   demux.seekable(),
+			}
+			// A stream made after a seek starts at its target.
+			framePos = uint64(frameOf(demux.target).max(int64(0)))
+		}
+
+		// info implements AudioStream.
+		def info() audio.AudioInfo {
+			return details
+		}
+
+		// read implements AudioStream.
+		//
+		// Fails when `buf` does not hold whole frames, or the container or
+		// the decoder fails.
+		def read(buf float32[]) !int {
+			fail "video: the audio stream is closed" when closed
+			if generation != demux.generation {
+				generation = demux.generation
+				decoder.reset()
+				pcm = float32[]
+				pcmAt = 0
+				flushed = false
+				placed = false
+				framePos = uint64(frameOf(demux.target).max(int64(0)))
+			}
+			try settle()
+			fail "video: the audio has no channels" when channels <= 0
+			fail "video: a buffer of {buf.len()} samples does not hold whole frames" when buf.len() % channels != 0
+			let want = buf.len() / channels
+			let done = 0
+			for done < want {
+				if pcmAt >= pcm.len() {
+					break unless try refill()
+					continue
+				}
+				let take = ((pcm.len() - pcmAt) / channels).min(want - done)
+				pcm[pcmAt:pcmAt + take * channels].copy(buf[done * channels:])
+				pcmAt += take * channels
+				done += take
+			}
+			framePos += uint64(done)
+			return done
+		}
+
+		// Learns the rate and channels from the first packet when neither
+		// the decoder nor the container gave them.
+		//
+		// Fails when the container or the decoder does.
+		def settle() !none {
+			return none when channels > 0 && rate > 0
+			try refill()
+			let d = decoder.info()
+			rate = int(d.sampleRate) when int(d.sampleRate) > 0
+			channels = int(d.channels) when int(d.channels) > 0
+			details.sampleRate = uint32(rate)
+			details.channels = uint16(channels)
+			return none
+		}
+
+		// Decodes the next packet into `pcm`; false at the end.
+		//
+		// Fails when the container or the decoder does.
+		def refill() !bool {
+			for {
+				return false when flushed
+				let got = try demux.next(track.index)
+				let samples float32[]
+				if got is none {
+					samples = try decoder.flush()
+					flushed = true
+				} else {
+					let p Packet = got
+					samples = try decoder.decode(p.data)
+					if !placed && samples.len() > 0 {
+						placed = true
+						let target = int64(framePos)
+						let here = frameOf(p.pts)
+						drop = target - here
+						framePos = uint64(here) when drop < 0
+					}
+				}
+				if !(got is none) && trims && channels > 0 {
+					let p Packet = got
+					let allowed = p.length > 0s ?? (int(frameOf(p.pts + p.length) - frameOf(p.pts)), -1)
+					samples = samples[0:allowed * channels] when allowed >= 0 && allowed * channels < samples.len()
+				}
+				if drop > 0 && channels > 0 {
+					let frames = int64(samples.len() / channels)
+					let cut = drop.min(frames)
+					drop -= cut
+					samples = samples[int(cut) * channels:]
+				}
+				continue when samples.len() == 0
+				pcm = samples
+				pcmAt = 0
+				return true
+			}
+			return false
+		}
+
+		// The frame nearest `time` at the stream's rate, negative before the
+		// start.
+		def frameOf(time duration) int64 {
+			return int64(0) when rate <= 0
+			let units = int64(time) / 100 * int64(rate)
+			return (units + (units < 0 ?? (int64(-5000000), int64(5000000)))) / 10000000
+		}
+
+		// seek implements AudioStream: moves the whole video to the frame's
+		// time.
+		//
+		// Fails when the container cannot seek.
+		def seek(frame uint64) !none {
+			fail "video: the audio has no sample rate" when rate <= 0
+			return seek(duration(int64(frame) * 1000000000 / int64(rate)))
+		}
+
+		// seek implements AudioStream: moves the whole video to `time`.
+		//
+		// Fails when the container cannot seek.
+		def seek(time duration) !none {
+			return demux.seek(time)
+		}
+
+		// skip implements AudioStream.
+		//
+		// Fails when the container cannot seek.
+		def skip(offset duration) !none {
+			let now = rate > 0 ?? (duration(int64(framePos) * 1000000000 / int64(rate)), 0s)
+			let target = now + offset
+			target = 0s when target < 0s
+			return seek(target)
+		}
+
+		// position implements AudioStream.
+		def position() uint64 {
+			return framePos
+		}
+
+		// close implements io.Closer: ends this stream; the video keeps the
+		// file.
+		//
+		// Does not fail.
+		def close() !none {
+			closed = true
+			return none
+		}
+	}
+}

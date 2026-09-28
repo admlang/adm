@@ -1,0 +1,662 @@
+internal partial module std.net.irc.proto {
+	use (
+		std.crypto.hash::(Hash, digest, hmac)
+		std.data.encoding::(base64encode, base64decode)
+		std.metrics
+		std.net
+		std.net.irc::*
+		std.net.tls
+		std.services::(metric)
+		std.time
+	)
+
+	// The capabilities a server offers; `sasl` is added with its
+	// mechanisms when the server has an authenticator.
+	const serverCaps = "account-notify account-tag away-notify cap-notify echo-message extended-join invite-notify message-tags multi-prefix server-time setname userhost-in-names"
+
+	// Session is the server side of one client connection. Its task reads
+	// lines and answers them; a writer task drains `outbox`, so a slow
+	// client never holds up the others. Everything that touches other
+	// users goes through the server's `Hub`, one command at a time.
+	type Session {
+		server      Server
+		hub         Hub
+		stats       ServerStats
+		socket      net.Connection
+		stream      net.Stream
+		lines       LineReader
+		// Lines waiting for the writer; "" tells it to close.
+		outbox      channel<string>
+		// The client's certificate fingerprint under TLS, "" without one.
+		fingerprint string                = ""
+		secured     bool                  = false
+
+		nick        string                = "*"
+		// The nickname folded under the server's case mapping; "" until
+		// NICK.
+		folded      string                = ""
+		user        string                = ""
+		realName    string                = ""
+		host        string                = ""
+		pass        string                = ""
+		registered  bool                  = false
+		// CAP LS or REQ before registration holds it until CAP END.
+		capHold     bool                  = false
+		capVersion  int                   = 0
+		caps        map<string, bool>
+		account     string                = ""
+
+		// SASL in progress: the mechanism, the payload being gathered and
+		// the SCRAM state between steps.
+		saslMech    string                = ""
+		saslIn      SaslReader            = new SaslReader()
+		scramStep   int                   = 0
+		scramFirst  string                = ""
+		scramNonce  string                = ""
+		scramUser   string                = ""
+		scramKeys   ?ScramCredentials     = none
+
+		invisible   bool                  = false
+		wallops     bool                  = false
+		oper        bool                  = false
+		localOper   bool                  = false
+		restricted  bool                  = false
+		notices     bool                  = false
+		away        string                = ""
+		// Channels joined, by folded name.
+		channels    map<string, Chan>
+		signOn      int64                 = 0
+		// When the user last spoke (PRIVMSG, NOTICE), monotonic ns, for
+		// WHOIS idle.
+		spoke       int64                 = 0
+		// The flood timer of RFC 1459 §8.10, monotonic ns.
+		penalty     int64                 = 0
+		quitReason  string                = ""
+
+		atomic lastRead   int64           = 0
+		atomic pingSent   int64           = 0
+		atomic closed     bool            = false
+		atomic writerDone bool            = false
+
+		def new(server Server, hub Hub, stats ServerStats, socket net.Connection, sendQueue int) {
+			self.server = server
+			self.hub = hub
+			self.stats = stats
+			self.socket = socket
+			stream = socket
+			lines = new LineReader(socket)
+			outbox = new channel<string>(sendQueue)
+			host = socket.remoteAddr().host
+			signOn = time.wallNs() / 1000000000
+			spoke = time.monoNs()
+		}
+
+		// run serves the connection until the client quits, is killed,
+		// stops answering PINGs or the connection fails; then the hub
+		// tells the user's channels.
+		def run() {
+			serve() onerror (err error) {
+				quitReason = remoteReason(err) when quitReason == ""
+				recover none
+			}
+			end()
+			hub.quit(self, quitReason == "" ?? ("Connection closed", quitReason))
+		}
+
+		internal def serve() !none {
+			if server.security == Security.Tls {
+				try secure()
+			}
+			let writer = async writeLines()
+			writer.keepAlive()
+			lastRead = time.monoNs()
+			let watchdog = async watchPing()
+			watchdog.keepAlive()
+			for !closed {
+				let line = try lines.readLine(waitForever)
+				lastRead = time.monoNs()
+				pingSent = 0
+				stats.messagesIn.inc()
+				if messageLength(line) > maxMessage {
+					num(417, ["Input line was too long"])
+					continue
+				}
+				let failure ?error = none
+				let m = parse(line) onerror (err error) {
+					failure = err
+					recover new Message("")
+				}
+				continue unless failure is none
+				try throttle()
+				handle(m)
+			}
+			return none
+		}
+
+		// secure runs the TLS server handshake and keeps the client's
+		// certificate fingerprint for SASL EXTERNAL.
+		internal def secure() !none {
+			let config = server.tls
+			fail "irc: Security.Tls needs a TLS config" when config is none
+			let conn = tls.server(socket, config)
+			try conn.handshake(server.timeout)
+			stream = conn
+			lines = new LineReader(conn)
+			secured = true
+			fingerprint = peerFingerprint(conn)
+			return none
+		}
+
+		// throttle holds back a client that sends faster than one message
+		// every two seconds after a burst of ten seconds' worth (RFC 1459
+		// §8.10); operators are not held.
+		internal def throttle() !none {
+			return none unless server.floodControl
+			return none when oper
+			let now = time.monoNs()
+			penalty = now when penalty < now
+			penalty += int64(2s)
+			let ahead = penalty - now - int64(10s)
+			time.sleep(duration(ahead)) when ahead > 0
+			return none
+		}
+
+		// writeLines drains the outbox onto the connection until it meets
+		// the closing "", then closes the connection.
+		internal def writeLines() {
+			for {
+				let line = <-outbox
+				break when line == ""
+				let failure ?error = none
+				writeFully(stream, (line + "\r\n").bytes(), server.timeout) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+				stats.messagesOut.inc()
+			}
+			writerDone = true
+			closed = true
+			stream.close() onerror recover none
+			socket.close() onerror recover none
+		}
+
+		// watchPing sends a PING once the client has been quiet for the
+		// server's `pingInterval` and ends the connection when no answer
+		// comes within `pingTimeout`; an unregistered client gets
+		// `pingTimeout` to register.
+		internal def watchPing() {
+			for !closed {
+				time.sleep(250ms)
+				let now = time.monoNs()
+				if !registered {
+					if now - lastRead > int64(server.pingTimeout) && int64(server.pingTimeout) > 0 {
+						end("Registration timed out")
+						return
+					}
+					continue
+				}
+				continue when int64(server.pingInterval) <= 0
+				let sent = pingSent
+				if sent == 0 && now - lastRead > int64(server.pingInterval) {
+					pingSent = now
+					sendLine("PING :{server.name}")
+					continue
+				}
+				if sent > 0 && now - sent > int64(server.pingTimeout) {
+					let seconds = int(server.pingTimeout) / 1000000000
+					end("Ping timeout: {seconds} seconds")
+					return
+				}
+			}
+		}
+
+		// end closes the connection after what is queued, with ERROR
+		// first when a reason is given. Safe from any task, the hub's
+		// included.
+		def end(reason string = "") {
+			return when closed
+			if reason != "" {
+				quitReason = reason when quitReason == ""
+				sendLine("ERROR :Closing Link: {host} ({reason})")
+			}
+			closed = true
+			if writerDone || outbox.len() >= outbox.cap() {
+				stream.close() onerror recover none
+				socket.close() onerror recover none
+				return
+			}
+			outbox <- ""
+		}
+
+		// sendLine queues one line. A client whose queue is full is cut
+		// off ("SendQ exceeded") rather than let it hold anyone up.
+		def sendLine(line string) {
+			return when writerDone || closed
+			if outbox.len() >= outbox.cap() - 1 {
+				quitReason = "SendQ exceeded" when quitReason == ""
+				closed = true
+				stream.close() onerror recover none
+				socket.close() onerror recover none
+				return
+			}
+			outbox <- fitLine(line)
+		}
+
+		// send queues a message in the form this client asked for: the
+		// `time` tag under `server-time`, `account` under `account-tag`,
+		// the other tags under `message-tags` only.
+		def send(m Message) {
+			let tags = map<string, string>{}
+			for let (name, value) in m.messageTags {
+				continue when name == "time" && !hasCap("server-time")
+				continue when name == "account" && !hasCap("account-tag")
+				continue unless name == "time" || name == "account" || hasCap("message-tags")
+				tags[name] = value
+			}
+			tags["time"] = serverTime() when hasCap("server-time") && !tags.hasKey("time")
+			let out = new Message(m.command, m.params)
+			out.source = m.source
+			out.messageTags = tags
+			sendLine(out.str())
+		}
+
+		// num queues a numeric reply from the server, addressed to the
+		// client's nickname.
+		def num(code int, params string[]) {
+			let text = "{code}"
+			text = "00{code}" when code < 10
+			text = "0{code}" when code >= 10 && code < 100
+			let m = new Message(text, [nick] + params)
+			m.source = server.name
+			send(m)
+		}
+
+		// fromServer queues a command sent by the server itself.
+		def fromServer(command string, params string[]) {
+			let m = new Message(command, params)
+			m.source = server.name
+			send(m)
+		}
+
+		def hasCap(name string) bool {
+			return caps.hasKey(name)
+		}
+
+		// The client as `nick!user@host`.
+		def mask() string {
+			return "{nick}!{user}@{host}"
+		}
+
+		internal def handle(m Message) {
+			switch {
+				case m.command == "CAP":
+					capCommand(m)
+				case m.command == "AUTHENTICATE":
+					authenticate(m)
+				case m.command == "PING":
+					if m.params.len() == 0 {
+						num(409, ["No origin specified"])
+						return
+					}
+					fromServer("PONG", [server.name, m.params[0]])
+				case m.command == "PONG":
+					return
+				case m.command == "PASS":
+					if registered {
+						num(462, ["You may not reregister"])
+						return
+					}
+					if m.params.len() == 0 {
+						num(461, ["PASS", "Not enough parameters"])
+						return
+					}
+					pass = m.params[0]
+				default:
+					hub.dispatch(self, m)
+			}
+		}
+
+		// capCommand answers CAP LS, LIST, REQ and END (IRCv3
+		// capability negotiation, version 302).
+		internal def capCommand(m Message) {
+			if m.params.len() == 0 {
+				num(461, ["CAP", "Not enough parameters"])
+				return
+			}
+			let sub = m.params[0].upper()
+			let me = registered ?? (nick, "*")
+			switch {
+				case sub == "LS":
+					capHold = true unless registered
+					capVersion = m.params[1].toInt<int>() when m.params.len() > 1 && m.params[1].isNumeric()
+					// Version 302 implies cap-notify.
+					caps["cap-notify"] = true when capVersion >= 302
+					fromServer("CAP", [me, "LS", offered(capVersion >= 302).join(" ")])
+				case sub == "LIST":
+					let names string[] = []
+					for let (name, _) in caps {
+						names.push(name)
+					}
+					names.sort((a, b) => a < b)
+					fromServer("CAP", [me, "LIST", names.join(" ")])
+				case sub == "REQ":
+					capHold = true unless registered
+					let wanted = m.params.len() > 1 ?? (m.params[1], "")
+					let available = map<string, bool>{}
+					for let item in offered(false) {
+						available[item] = true
+					}
+					let ok = wanted.trim() != ""
+					for let item in wanted.split(" ") {
+						continue when item == ""
+						let name = item.trimPrefix("-")
+						ok = false unless available.hasKey(name)
+						ok = false when item.startsWith("-") && name == "cap-notify" && capVersion >= 302
+					}
+					if !ok {
+						fromServer("CAP", [me, "NAK", wanted])
+						return
+					}
+					for let item in wanted.split(" ") {
+						continue when item == ""
+						if item.startsWith("-") {
+							caps.delete(item[1:])
+						} else {
+							caps[item] = true
+						}
+					}
+					fromServer("CAP", [me, "ACK", wanted])
+				case sub == "END":
+					return when registered
+					capHold = false
+					hub.tryRegister(self)
+				default:
+					num(410, [m.params[0], "Invalid CAP command"])
+			}
+		}
+
+		// offered lists the capabilities, with values when `values`.
+		internal def offered(values bool) string[] {
+			let out = serverCaps.split(" ")
+			if !(server.authenticator is none) {
+				let mechs = secured ?? ("PLAIN,EXTERNAL,SCRAM-SHA-256", "PLAIN,SCRAM-SHA-256")
+				out.push(values ?? ("sasl=" + mechs, "sasl"))
+			}
+			return out
+		}
+
+		// authenticate runs one step of a SASL exchange (IRCv3 sasl 3.1):
+		// PLAIN, EXTERNAL (the TLS client certificate) or SCRAM-SHA-256.
+		internal def authenticate(m Message) {
+			if !hasCap("sasl") {
+				num(421, ["AUTHENTICATE", "Unknown command"])
+				return
+			}
+			if account != "" {
+				num(907, ["You have already authenticated using SASL"])
+				return
+			}
+			if m.params.len() == 0 {
+				num(461, ["AUTHENTICATE", "Not enough parameters"])
+				return
+			}
+			let arg = m.params[0]
+			if arg == "*" {
+				resetSasl()
+				num(906, ["SASL authentication aborted"])
+				return
+			}
+			if saslMech == "" {
+				let mech = arg.upper()
+				let known = (mech := "PLAIN" || "SCRAM-SHA-256") || (secured && mech == "EXTERNAL")
+				if !known {
+					num(908, [secured ?? ("PLAIN,EXTERNAL,SCRAM-SHA-256", "PLAIN,SCRAM-SHA-256"), "are available SASL mechanisms"])
+					num(904, ["SASL authentication failed"])
+					return
+				}
+				saslMech = mech
+				sendLine("AUTHENTICATE +")
+				return
+			}
+			let failure ?error = none
+			let complete = saslIn.add(arg) onerror (err error) {
+				failure = err
+				recover false
+			}
+			if !(failure is none) {
+				resetSasl()
+				num(905, ["SASL message too long"])
+				return
+			}
+			return unless complete
+			let payload = saslIn.payload() onerror (err error) {
+				failure = err
+				recover []
+			}
+			if !(failure is none) {
+				saslFailed()
+				return
+			}
+			saslStep(payload)
+		}
+
+		internal def saslStep(payload byte[]) {
+			let auth = server.authenticator
+			if auth is none {
+				saslFailed()
+				return
+			}
+			switch {
+				case saslMech == "PLAIN":
+					let parts = splitOnZero(payload)
+					if parts.len() != 3 {
+						saslFailed()
+						return
+					}
+					let failure ?error = none
+					let found = auth.login(parts[1], parts[2]) onerror (err error) {
+						failure = err
+						recover Account{name: ""}
+					}
+					if !(failure is none) || (parts[0] != "" && parts[0] != parts[1]) {
+						saslFailed()
+						return
+					}
+					saslSucceeded(found.name)
+				case saslMech == "EXTERNAL":
+					let failure ?error = none
+					let found = auth.certificate(fingerprint) onerror (err error) {
+						failure = err
+						recover Account{name: ""}
+					}
+					let wanted = string(payload)
+					if fingerprint == "" || !(failure is none) || (wanted != "" && wanted != found.name) {
+						saslFailed()
+						return
+					}
+					saslSucceeded(found.name)
+				default:
+					scramExchange(auth, string(payload))
+			}
+		}
+
+		// scram runs the server side of SCRAM-SHA-256 (RFC 5802, 7677).
+		internal def scramExchange(auth Authenticator, text string) {
+			if scramStep == 0 {
+				// client-first: gs2 header "n,," then n=user,r=nonce.
+				if !text.startsWith("n,,") {
+					saslFailed()
+					return
+				}
+				scramFirst = text[3:]
+				let attrs = scramAttrs(scramFirst)
+				let name = attrs.get("n")
+				let clientNonce = attrs.get("r")
+				if name is none {
+					saslFailed()
+					return
+				}
+				if clientNonce is none {
+					saslFailed()
+					return
+				}
+				scramUser = scramUnname(name)
+				let failure ?error = none
+				let keys = auth.scram(scramUser) onerror (err error) {
+					failure = err
+					recover ScramCredentials{salt: [], iterations: 0, storedKey: [], serverKey: []}
+				}
+				let serverPart = nonce() onerror (err error) {
+					failure = err
+					recover ""
+				}
+				if !(failure is none) {
+					saslFailed()
+					return
+				}
+				scramKeys = keys
+				scramNonce = clientNonce + serverPart
+				scramStep = 1
+				let first = "r={scramNonce},s={base64encode(keys.salt)},i={keys.iterations}"
+				scramFirst = scramFirst + "," + first
+				for let piece in saslChunks(first.bytes()) {
+					sendLine("AUTHENTICATE {piece}")
+				}
+				return
+			}
+			if scramStep == 1 {
+				let keys = scramKeys
+				if keys is none {
+					saslFailed()
+					return
+				}
+				let attrs = scramAttrs(text)
+				let proofText = attrs.get("p")
+				if proofText is none {
+					saslFailed()
+					return
+				}
+				let r = attrs.get("r")
+				let c = attrs.get("c")
+				if r is none || r != scramNonce {
+					saslFailed()
+					return
+				}
+				if c is none || c != "biws" {
+					saslFailed()
+					return
+				}
+				let withoutProof = text[:text.indexOf(",p=")]
+				let authMessage = scramFirst + "," + withoutProof
+				let signature = hmac(Hash.SHA256, keys.storedKey, authMessage.bytes())
+				let failure ?error = none
+				let proof = base64decode(proofText) onerror (err error) {
+					failure = err
+					recover []
+				}
+				let clientKey = xorBytes(proof, signature)
+				if !(failure is none) || proof.len() != 32 || !sameBytes(digest(Hash.SHA256, clientKey), keys.storedKey) {
+					saslFailed()
+					return
+				}
+				let serverSig = hmac(Hash.SHA256, keys.serverKey, authMessage.bytes())
+				for let piece in saslChunks("v={base64encode(serverSig)}".bytes()) {
+					sendLine("AUTHENTICATE {piece}")
+				}
+				scramStep = 2
+				return
+			}
+			// The client acknowledges the server-final message with "+".
+			saslSucceeded(scramUser)
+		}
+
+		internal def saslSucceeded(name string) {
+			resetSasl()
+			account = name
+			let who = registered ?? (mask(), "{nick}!{user == "" ?? ("*", user)}@{host}")
+			num(900, [who, name, "You are now logged in as {name}"])
+			num(903, ["SASL authentication successful"])
+			hub.accountChanged(self) when registered
+		}
+
+		internal def saslFailed() {
+			resetSasl()
+			stats.saslFailures.inc()
+			num(904, ["SASL authentication failed"])
+		}
+
+		internal def resetSasl() {
+			saslMech = ""
+			saslIn = new SaslReader()
+			scramStep = 0
+			scramFirst = ""
+			scramNonce = ""
+			scramUser = ""
+			scramKeys = none
+		}
+	}
+
+	// splitOnZero splits a SASL PLAIN payload at its NUL bytes.
+	def splitOnZero(payload byte[]) string[] {
+		let out string[] = []
+		let start = 0
+		for let i = 0; i <= payload.len(); i++ {
+			if i == payload.len() || payload[i] == byte(0) {
+				out.push(string(payload[start:i]))
+				start = i + 1
+			}
+		}
+		return out
+	}
+
+	// messageLength is the length of a line without its tags, CRLF
+	// counted.
+	def messageLength(line string) int {
+		let rest = line
+		if rest.startsWith("@") {
+			let space = rest.indexOf(" ")
+			rest = space < 0 ?? ("", rest[space + 1:])
+		}
+		return rest.bytes().len() + 2
+	}
+
+	// remoteReason is the QUIT reason of a connection that failed.
+	def remoteReason(err error) string {
+		return "Connection closed" when err is net.NetError && err.kind == net.ErrorCode.Closed
+		return "Read error: {err.message}"
+	}
+
+	// serverTime is now in the form of the IRCv3 `time` tag:
+	// `YYYY-MM-DDThh:mm:ss.sssZ`, UTC.
+	def serverTime() string {
+		let ns = time.wallNs()
+		let whole = time.fromUnixNs(ns - ns % 1000000000).str().trimSuffix("Z")
+		let ms = int((ns % 1000000000) / 1000000)
+		let digits = "{ms}"
+		for digits.len() < 3 {
+			digits = "0" + digits
+		}
+		return "{whole}.{digits}Z"
+	}
+
+	// ServerStats holds the metrics of IRC servers, registered once per
+	// server and shared by its sessions; the names are process-wide, so
+	// every server of the process adds to the same counts.
+	type ServerStats {
+		@metric("net.irc.server.connections.open")
+		connectionsOpen metrics.Gauge
+		@metric("net.irc.server.connections.total")
+		connectionsTotal metrics.Counter
+		@metric("net.irc.server.messages.in")
+		messagesIn metrics.Counter
+		@metric("net.irc.server.messages.out")
+		messagesOut metrics.Counter
+		@metric("net.irc.server.registrations")
+		registrations metrics.Counter
+		@metric("net.irc.server.sasl.failed")
+		saslFailures metrics.Counter
+
+		def new() {}
+	}
+}

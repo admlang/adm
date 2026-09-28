@@ -1,1 +1,561 @@
-partial module std.net.ftp {}
+partial module std.net.ftp {
+	use (
+		std.fs
+		std.io
+		std.net
+		std.net.ftp.proto::*
+		std.net.tls
+		std.os
+		std.time::(Time)
+	)
+
+	// Client is an FTP and FTPS client. Files move in binary; a transfer
+	// runs over its own data connection while the control connection
+	// waits for its end, so one transfer runs at a time. Implements
+	// `net.RemoteFiles`.
+	//
+	// ```
+	// let client = new ftp.Client(Security.Explicit)
+	// try client.connect("files.example.com")
+	// try client.login("alice", password)
+	// try client.upload("report.pdf", "/inbox/report.pdf")
+	// try client.download("/photos", "photos")
+	// try client.close()
+	// ```
+	type Client {
+		security Security    = Security.Plain
+		mode     Mode        = Mode.Passive
+		// How files cross: `Binary` byte for byte (TYPE I), `Ascii` as text
+		// with the line endings converted (TYPE A). Listings are text
+		// under either.
+		dataType DataType    = DataType.Binary
+		// How long each read or write of the control and data
+		// connections may wait.
+		timeout  duration    = 30s
+		// The TLS settings with FTPS; none verifies the server against
+		// the system roots under the host name it was dialled by.
+		tls      ?tls.Config = none
+
+		internal control     ?Control = none
+		internal greeting    string   = ""
+		internal welcomeText string   = ""
+
+		def new(security Security = Security.Plain, mode Mode = Mode.Passive, timeout duration = 30s) {
+			self.security = security
+			self.mode = mode
+			self.timeout = timeout
+		}
+
+		// Connects to a server, `host` or `host:port`; the port defaults to
+		// 21, or 990 with `Security.Implicit`. With FTPS the connection is
+		// protected before this returns.
+		// Fails with NetError when the dial does, TLSError when the
+		// handshake does, FtpError when the server turns the client away.
+		def connect(addr string) !none {
+			fail protocolError("connect", "already connected") unless control is none
+			let target = net.withPort(addr, security == Security.Implicit ?? (990, 21))
+			let host = hostOf(target)
+			let socket = try net.dialStream(target, timeout)
+			let c = new Control(socket, timeout, host)
+			c.tlsConfig = clientConfig(tls, host)
+			let failure ?error = none
+			handshake(c) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				socket.close() onerror recover none
+				fail failure
+			}
+			control = c
+			return none
+		}
+
+		internal def handshake(c Control) !none {
+			try c.upgrade(c.tlsConfig) when security == Security.Implicit
+			let greet = try c.readReply()
+			fail replyError("connect", greet) unless greet.code == 220
+			greeting = replyText(greet)
+			try readFeatures(c)
+			// A server hosting several sites is told which one (RFC 7151),
+			// before AUTH so it can pick the site's certificate too.
+			if c.hasFeature("HOST") && !isIPLiteral(c.host) {
+				let chosen = try c.command("HOST {c.host}")
+				fail replyError("HOST", chosen) unless chosen.code / 100 == 2
+			}
+			if security == Security.Explicit {
+				try c.expect("AUTH TLS", "AUTH TLS", 2)
+				try c.upgrade(c.tlsConfig)
+				// What a server offers may change once the connection is
+				// protected (RFC 4217 §6).
+				try readFeatures(c)
+			}
+			return none
+		}
+
+		// readFeatures asks FEAT and records the features the server lists;
+		// a server without FEAT lists none.
+		internal def readFeatures(c Control) !none {
+			let feat = try c.command("FEAT")
+			c.features = map<string, string>{}
+			return none unless feat.code == 211
+			for let line in feat.lines[1:] {
+				let text = line.trim()
+				continue when text == "" || text.lower() == "end"
+				let space = text.indexOf(" ")
+				let name = space < 0 ?? (text, text[:space])
+				let args = space < 0 ?? ("", text[space + 1:])
+				c.features[name.upper()] = args
+			}
+			return none
+		}
+
+		// Logs in; the default is an anonymous login. With FTPS the data
+		// connections are protected too once this returns. The password
+		// is a `Secret` and prints as `***`.
+		// Fails with FtpError (`530`) when the server refuses the login,
+		// NetError when the connection fails.
+		def login(user string = "anonymous", password Secret<string> = "") !none {
+			let c = try connected()
+			let reply = try c.command("USER {user}")
+			reply = try c.command("PASS {password.reveal()}") when reply.code == 331
+			fail replyError("login", reply) unless reply.code := 230 || 202
+			welcomeText = replyText(reply)
+			if security != Security.Plain {
+				try c.expect("PBSZ", "PBSZ 0", 2)
+				try c.expect("PROT", "PROT P", 2)
+				c.protected = true
+			}
+			try c.useType("I")
+			if c.hasFeature("UTF8") {
+				c.command("OPTS UTF8 ON") onerror recover Reply{code: 0, lines: []}
+			}
+			return none
+		}
+
+		// The server's greeting, sent when the client connected; empty
+		// before `connect`.
+		def banner() string {
+			return greeting
+		}
+
+		// The text the server sent with its login reply; empty before
+		// `login`.
+		def welcome() string {
+			return welcomeText
+		}
+
+		// Reports whether the server announced a feature in its FEAT
+		// reply (`MLST`, `EPSV`, `UTF8`, `REST`, ...).
+		def hasFeature(name string) bool {
+			let c = control
+			return false when c is none
+			return c.hasFeature(name.upper())
+		}
+
+		// Reports whether the control connection is open.
+		def isOpen() bool {
+			return !(control is none)
+		}
+
+		// Lists the working directory. Fails as `list(path)` does.
+		def list() !fs.FileEntry[] {
+			return try list("")
+		}
+
+		// Implements fs.FileStore: MLSD when the server has it, else a
+		// LIST parsed in the Unix `ls -l` or DOS form.
+		// Fails with FtpError when the path is missing or not a directory.
+		def list(path string) !fs.FileEntry[] {
+			let c = try connected()
+			let useMlsd = c.hasFeature("MLST")
+			let verb = useMlsd ?? ("MLSD", "LIST")
+			let line = path == "" ?? (verb, "{verb} {path}")
+			let reader = try openTransfer(c, verb, line)
+			let text = try readText(reader)
+			let out fs.FileEntry[] = []
+			for let raw in text.split("\n") {
+				let row = raw.trimEnd("\r")
+				continue when row == ""
+				let entry ?fs.FileEntry = none
+				if useMlsd {
+					entry = parseFacts(row, path)
+				} else {
+					entry = parseListLine(row, path)
+				}
+				out.push(entry) unless entry is none
+			}
+			return out
+		}
+
+		// Implements fs.FileStore: MLST when the server has it, else SIZE
+		// and MDTM, with a directory told apart by changing into it.
+		// Fails with FtpError when the path is missing.
+		def stat(path string) !fs.FileEntry {
+			let c = try connected()
+			if c.hasFeature("MLST") {
+				let reply = try c.command("MLST {path}")
+				fail replyError("stat", reply) unless reply.code == 250
+				for let line in reply.lines[1:] {
+					let facts = line.trim()
+					continue when facts == "" || !facts.contains("=")
+					let entry = parseFacts(facts, "")
+					continue when entry is none
+					entry.path = path
+					entry.name = os.base(path)
+					return entry
+				}
+				fail replyError("stat", reply)
+			}
+			let entry = fs.FileEntry{name: os.base(path), path: path}
+			// SIZE counts the bytes of the TYPE in effect (RFC 3659 §4).
+			try c.useType("I")
+			let size = try c.command("SIZE {path}")
+			if size.code == 213 {
+				entry.size = size.lines[0].trim().toInt<int64>()
+				let mdtm = try c.command("MDTM {path}")
+				entry.modified = parseTime(mdtm.lines[0].trim()) when mdtm.code == 213
+				return entry
+			}
+			let here = try currentDir()
+			let cwd = try c.command("CWD {path}")
+			fail replyError("stat", size) unless cwd.code == 250
+			try c.expect("CWD", "CWD {here}", 2)
+			entry.kind = fs.FileKind.Dir
+			return entry
+		}
+
+		// Implements fs.FileStore: the same as `download(path, offset)`.
+		// Fails as it does.
+		def open(path string, offset int64) !io.ReadCloser {
+			return try download(path, offset)
+		}
+
+		// Implements fs.FileStore: an upload writer, appending with
+		// `append` (APPE) or replacing the file (STOR). The upload ends
+		// when the writer closes; nothing else may run on the client
+		// until then.
+		// Fails with FtpError when the server refuses the file.
+		def create(path string, append bool) !io.WriteCloser {
+			let c = try connected()
+			try c.useType(wantedType())
+			let verb = append ?? ("APPE", "STOR")
+			let data = try openData(c, verb, "{verb} {path}")
+			return new TransferWriter(data, c, verb, dataType == DataType.Ascii)
+		}
+
+		// Implements fs.FileStore: an upload writer that continues a file
+		// from `offset` on (REST, then STOR), as a restarted upload does;
+		// offset 0 replaces the file. Under `DataType.Ascii` the offset
+		// counts ASCII-form bytes. The upload ends when the writer closes.
+		// Fails with FtpError when the file is missing, shorter than the
+		// offset, or the server cannot restart there.
+		def resume(path string, offset int64) !io.WriteCloser {
+			let c = try connected()
+			try c.useType(wantedType())
+			let data = try openData(c, "STOR", "STOR {path}", offset)
+			return new TransferWriter(data, c, "STOR", dataType == DataType.Ascii)
+		}
+
+		// Opens a remote file for reading; the transfer ends when the
+		// reader closes, and nothing else may run on the client until then.
+		// Fails with FtpError when the file is missing or unreadable.
+		def download(remote string) !io.ReadCloser {
+			return try download(remote, int64(0))
+		}
+
+		// Opens a remote file for reading from `offset` on (REST), to
+		// resume a transfer that broke off.
+		// Fails with FtpError when the file is missing or the server
+		// cannot restart there.
+		def download(remote string, offset int64) !io.ReadCloser {
+			let c = try connected()
+			try c.useType(wantedType())
+			let data = try openData(c, "RETR", "RETR {remote}", offset)
+			return new TransferReader(data, c, "RETR", dataType == DataType.Ascii)
+		}
+
+		// Implements net.RemoteFiles: copies a remote file to a local
+		// path, or a remote directory with everything under it.
+		// Fails with FtpError when the remote path is missing, the os
+		// error when a local write fails.
+		def download(remote string, local string) !none {
+			return try fs.copy(self, remote, new fs.DiskStore(), local)
+		}
+
+		// Uploads what `from` reads to a remote file, replacing it.
+		// Fails with FtpError when the server refuses the file, or as the
+		// read does.
+		def upload(from io.Reader, remote string) !none {
+			let writer = try create(remote, false)
+			io.copy(from, writer) onerror (err error) {
+				writer.close() onerror recover none
+				fail err
+			}
+			return try writer.close()
+		}
+
+		// Uploads what `from` reads to a remote file from `offset` on
+		// (REST, then STOR), to finish an upload that broke off: `from`
+		// starts at the byte the remote file ends with.
+		// Fails with FtpError when the server cannot restart there, or as
+		// the read does.
+		def upload(from io.Reader, remote string, offset int64) !none {
+			let writer = try resume(remote, offset)
+			io.copy(from, writer) onerror (err error) {
+				writer.close() onerror recover none
+				fail err
+			}
+			return try writer.close()
+		}
+
+		// Uploads bytes to a remote file, replacing it.
+		// Fails with FtpError when the server refuses the file.
+		def upload(data byte[], remote string) !none {
+			let writer = try create(remote, false)
+			let failure ?error = none
+			writer.write(data) onerror (err error) {
+				failure = err
+				recover 0
+			}
+			let closed ?error = none
+			writer.close() onerror (err error) {
+				closed = err
+				recover none
+			}
+			fail failure unless failure is none
+			fail closed unless closed is none
+			return none
+		}
+
+		// Implements net.RemoteFiles: copies a local file to a remote
+		// path, or a local directory with everything under it.
+		// Fails with the os error when the local path is missing,
+		// FtpError when the server refuses a file.
+		def upload(local string, remote string) !none {
+			return try fs.copy(new fs.DiskStore(), local, self, remote)
+		}
+
+		// Implements fs.FileStore (DELE).
+		// Fails with FtpError when the file is missing or protected.
+		def remove(path string) !none {
+			let c = try connected()
+			try c.expect("remove", "DELE {path}", 2)
+			return none
+		}
+
+		// Implements fs.FileStore (RNFR, RNTO).
+		// Fails with FtpError when the source is missing or the move is refused.
+		def rename(from string, to string) !none {
+			let c = try connected()
+			try c.expect("rename", "RNFR {from}", 3)
+			try c.expect("rename", "RNTO {to}", 2)
+			return none
+		}
+
+		// Implements fs.FileStore (MKD).
+		// Fails with FtpError when the directory exists or the parent is missing.
+		def makeDir(path string) !none {
+			let c = try connected()
+			try c.expect("makeDir", "MKD {path}", 2)
+			return none
+		}
+
+		// Implements fs.FileStore (RMD).
+		// Fails with FtpError when the directory is missing or not empty.
+		def removeDir(path string) !none {
+			let c = try connected()
+			try c.expect("removeDir", "RMD {path}", 2)
+			return none
+		}
+
+		// Implements fs.FileStore: sets permission bits with `SITE CHMOD`,
+		// the command Unix servers take for it.
+		// Fails with FtpError when the file is missing or the server has
+		// no SITE CHMOD.
+		def chmod(path string, mode int) !none {
+			let c = try connected()
+			try c.expect("chmod", "SITE CHMOD {mode.toRadix(8)} {path}", 2)
+			return none
+		}
+
+		// Implements fs.FileStore: sets the modification time with MFMT.
+		// Fails with FtpError when the file is missing or the server has
+		// no MFMT.
+		def touch(path string, modified Time) !none {
+			let c = try connected()
+			try c.expect("touch", "MFMT {formatTime(modified)} {path}", 2)
+			return none
+		}
+
+		// Changes the remote working directory (CWD); relative paths are
+		// taken from it.
+		// Fails with FtpError when the directory is missing.
+		def changeDir(path string) !none {
+			let c = try connected()
+			try c.expect("changeDir", "CWD {path}", 2)
+			return none
+		}
+
+		// The remote working directory (PWD).
+		// Fails with FtpError when the server does not say.
+		def currentDir() !string {
+			let c = try connected()
+			let reply = try c.expect("currentDir", "PWD", 2)
+			let text = reply.lines[0]
+			let open = text.indexOf("\"")
+			fail replyError("currentDir", reply) when open < 0
+			let out = ""
+			let i = open + 1
+			for i < text.len() {
+				if text[i] == '"' {
+					break unless i + 1 < text.len() && text[i + 1] == '"'
+					i++
+				}
+				out += text[i:i + 1]
+				i++
+			}
+			return out
+		}
+
+		// Implements std.io.Closer: says goodbye (QUIT) and closes the
+		// connection. Closing twice does nothing.
+		// Fails when the connection refuses to close.
+		def close() !none {
+			let c = control
+			return none when c is none
+			control = none
+			if !c.busy {
+				c.command("QUIT") onerror recover Reply{code: 0, lines: []}
+			}
+			c.stream.close() onerror recover none
+			return try c.socket.close()
+		}
+
+		// Closes the connection when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		internal def connected() !Control {
+			let c = control
+			fail net.errorOf(net.ErrorCode.Closed, "ftp", "", "not connected") when c is none
+			return c
+		}
+
+		internal def openTransfer(c Control, op string, line string) !TransferReader {
+			let data = try openData(c, op, line)
+			return new TransferReader(data, c, op)
+		}
+
+		internal def readText(reader TransferReader) !string {
+			let buf byte[] = []
+			buf.len(8192)
+			let out byte[] = []
+			let failure ?error = none
+			for {
+				let n = reader.read(buf) onerror (err error) {
+					failure = err
+					recover 0
+				}
+				break when n <= 0
+				out = out + buf[:n]
+			}
+			reader.close() onerror (err error) {
+				failure = err when failure is none
+				recover none
+			}
+			fail failure unless failure is none
+			return string(out)
+		}
+
+		// openData opens the data connection of a transfer and sends its
+		// command; on return the server is sending or waiting for data.
+		internal def openData(c Control, op string, line string, restart int64 = 0) !net.Stream {
+			let conn net.Connection = new net.Connection(-1)
+			if mode == Mode.Passive {
+				conn = try passiveData(c, op, line, restart)
+			} else {
+				conn = try activeData(c, op, line, restart)
+			}
+			c.busy = true
+			return conn unless c.protected
+			return secureData(conn, c) onerror (err error) {
+				c.busy = false
+				c.readReply() onerror recover Reply{code: 0, lines: []}
+				fail err
+			}
+		}
+
+		internal def passiveData(c Control, op string, line string, restart int64) !net.Connection {
+			let port = try passivePort(c)
+			let conn = try net.dialStream(joinHostPort(c.host, port), timeout)
+			let reply = transferCommand(c, op, line, restart) onerror (err error) {
+				conn.close() onerror recover none
+				fail err
+			}
+			if reply.code / 100 != 1 {
+				conn.close() onerror recover none
+				fail replyError(op, reply)
+			}
+			return conn
+		}
+
+		internal def activeData(c Control, op string, line string, restart int64) !net.Connection {
+			let local = c.socket.localAddr().host
+			let ln = try listenOn(local, 0)
+			let port = ln.address().port
+			let announce = local.contains(":") ?? ("EPRT |2|{local}|{port}|", "EPRT |1|{local}|{port}|")
+			let told = c.command(announce) onerror (err error) {
+				ln.close() onerror recover none
+				fail err
+			}
+			if told.code / 100 != 2 && !local.contains(":") {
+				let p1 = port / 256
+				let p2 = port % 256
+				told = c.command("PORT {local.replace(".", ",")},{p1},{p2}") onerror (err error) {
+					ln.close() onerror recover none
+					fail err
+				}
+			}
+			if told.code / 100 != 2 {
+				ln.close() onerror recover none
+				fail replyError(op, told)
+			}
+			let reply = transferCommand(c, op, line, restart) onerror (err error) {
+				ln.close() onerror recover none
+				fail err
+			}
+			if reply.code / 100 != 1 {
+				ln.close() onerror recover none
+				fail replyError(op, reply)
+			}
+			return try acceptWithin(ln, timeout)
+		}
+
+		// transferCommand sends the command of a transfer, right after REST
+		// when it restarts (RFC 959 §4.1.3: REST is immediately followed by
+		// the transfer command), and returns its reply.
+		// Fails with FtpError when the server refuses the restart.
+		internal def transferCommand(c Control, op string, line string, restart int64) !Reply {
+			if restart > 0 {
+				let rest = try c.command("REST {restart}")
+				fail replyError(op, rest) unless rest.code == 350
+			}
+			return try c.command(line)
+		}
+
+		// wantedType is the TYPE file transfers run under.
+		internal def wantedType() string {
+			return dataType == DataType.Ascii ?? ("A", "I")
+		}
+
+		internal def passivePort(c Control) !int {
+			let ext = try c.command("EPSV")
+			return try parseEpsv(replyText(ext)) when ext.code == 229
+			let reply = try c.command("PASV")
+			fail replyError("PASV", reply) unless reply.code == 227
+			return try parsePasv(replyText(reply))
+		}
+	}
+}

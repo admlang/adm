@@ -1,0 +1,475 @@
+internal partial module std.net.mail.pop3.proto {
+	use (
+		std.bytes
+		std.crypto.hash
+		std.metrics
+		std.net
+		std.net.mail.pop3::*
+		std.net.mail.wire::*
+		std.services::(metric)
+	)
+
+	// Status is one `+OK` or `-ERR` line, the indicator stripped.
+	struct Status {
+		ok       bool
+		response string
+		text     string
+	}
+
+	// parseStatus reads a status line: `+OK text`, `-ERR [CODE] text`, or
+	// the `+ challenge` continuation of AUTH (ok, text the challenge).
+	// Fails on anything else.
+	def parseStatus(line string) !Status {
+		return Status{ok: true, response: "", text: line[3:].trimPrefix(" ")} when line.startsWith("+OK")
+		return Status{ok: true, response: "+", text: line.len() > 2 ?? (line[2:], "")} when line == "+" || line.startsWith("+ ")
+		fail protocolError("reply", "malformed reply {line.truncate(64)}") unless line.startsWith("-ERR")
+		let text = line[4:].trimPrefix(" ")
+		let close = text.startsWith("[") ?? (text.indexOf("]"), -1)
+		return Status{ok: false, response: text[1:close], text: text[close + 1:].trimPrefix(" ")} when close > 0
+		return Status{ok: false, response: "", text: text}
+	}
+
+	// statusError is the Pop3Error of a `-ERR` status answering `op`.
+	def statusError(op string, status Status) Pop3Error {
+		let shown = status.response == "" ?? (status.text, "[{status.response}] {status.text}")
+		return Pop3Error{message: "pop3: {op}: {shown}", code: status.response == "" ?? ("ERR", status.response), response: status.response, text: status.text}
+	}
+
+	// protocolError is the Pop3Error of something that breaks the protocol.
+	def protocolError(op string, message string) Pop3Error {
+		return Pop3Error{message: "pop3: {op}: {message}", code: "PROTOCOL", response: "", text: message}
+	}
+
+	// readMultiline reads the lines of a multi-line response up to the lone
+	// `.`, the byte-stuffed dots undone, joined with CRLF (RFC 1939 §3).
+	def readMultiline(lines LineReader, timeout duration) !byte[] {
+		let out = new bytes.Buffer()
+		for {
+			let line = try lines.readLine(timeout)
+			break when line == "."
+			let text = line.startsWith(".") ?? (line[1:], line)
+			try out.write((text + "\r\n").bytes())
+		}
+		return out.bytes()
+	}
+
+	// apopDigest is the APOP digest: MD5 of the greeting's stamp and the
+	// password, in lower-case hex.
+	def apopDigest(stamp string, password string) string {
+		return hash.digest(hash.Hash.MD5, (stamp + password).bytes()).hex().lower()
+	}
+
+	// stampOf is the `<...@...>` stamp of a greeting, empty when it has
+	// none.
+	def stampOf(greeting string) string {
+		let open = greeting.indexOf("<")
+		return "" when open < 0
+		let close = greeting.indexOf(">", open)
+		return "" when close < 0
+		let stamp = greeting[open:close + 1]
+		return stamp.contains("@") ?? (stamp, "")
+	}
+
+	// topOf is the header of a message and the first `count` lines of its
+	// body.
+	def topOf(message byte[], count int) byte[] {
+		let i = 0
+		// The header ends at the first empty line.
+		for i < message.len() {
+			let end = i
+			for end < message.len() && message[end] != 0x0A {
+				end++
+			}
+			let blank = end == i || (end == i + 1 && message[i] == 0x0D)
+			i = end + 1
+			break when blank
+		}
+		let kept = 0
+		for kept < count && i < message.len() {
+			for i < message.len() && message[i] != 0x0A {
+				i++
+			}
+			i++
+			kept++
+		}
+		return message.slice(0, i > message.len() ?? (message.len(), i))
+	}
+
+	// DropLocks are the maildrops held by sessions of this process.
+	type DropLocks {
+		held string[] = []
+
+		def new() {}
+
+		// take locks `path`, false when it is held already.
+		atomic def take(path string) bool {
+			return false when held.indexOf(path) >= 0
+			held.push(path)
+			return true
+		}
+
+		atomic def give(path string) {
+			let at = held.indexOf(path)
+			held.remove(at) when at >= 0
+		}
+	}
+
+	let dropLocks = new DropLocks()
+
+	// ---- server side ---------------------------------------------------------
+
+	// ServerStats holds the metrics of POP3 servers, registered once per
+	// process and shared by every server.
+	type ServerStats {
+		@metric("net.pop3.server.connections.open")
+		connectionsOpen metrics.Gauge
+		@metric("net.pop3.server.connections.total")
+		connectionsTotal metrics.Counter
+		@metric("net.pop3.server.logins.total")
+		logins metrics.Counter
+		@metric("net.pop3.server.logins.failed")
+		loginFailures metrics.Counter
+		@metric("net.pop3.server.messages.retrieved")
+		retrieved metrics.Counter
+		@metric("net.pop3.server.messages.deleted")
+		deleted metrics.Counter
+
+		def new() {}
+	}
+
+	// Session is one connection a `Server` serves.
+	type Session {
+		server  Server
+		stats   ServerStats
+		socket  net.Connection
+		stream  net.Stream
+		lines   LineReader
+		closed  bool           = false
+		secured bool           = false
+		user    string         = ""
+		// The maildrop once logged in, its entries as numbered at login and
+		// the numbers marked deleted.
+		drop    ?Maildrop      = none
+		entries Entry[]        = []
+		deleted bool[]         = []
+
+		def new(server Server, stats ServerStats, socket net.Connection) {
+			self.server = server
+			self.stats = stats
+			self.socket = socket
+			stream = socket
+			lines = new LineReader(socket, 1024)
+		}
+
+		// run serves the connection until it ends, then closes it.
+		def run() {
+			serve() onerror recover none
+			end()
+		}
+
+		// end releases the maildrop, removing nothing, and closes the
+		// connection.
+		def end() {
+			return when closed
+			closed = true
+			let held = drop
+			drop = none
+			held.release() unless held is none
+			stream.close() onerror recover none
+			socket.close() onerror recover none
+		}
+
+		internal def serve() !none {
+			try secure() when server.security == Security.Implicit
+			try ok("{hostname()} POP3 server ready")
+			for !closed {
+				let line = try lines.readLine(server.idleTimeout)
+				let space = line.indexOf(" ")
+				let verb = space < 0 ?? (line.upper(), line[:space].upper())
+				let arg = space < 0 ?? ("", line[space + 1:])
+				try handle(verb, arg)
+			}
+			return none
+		}
+
+		internal def handle(verb string, arg string) !none {
+			match verb {
+				case "CAPA":
+					return try capabilities()
+				case "QUIT":
+					return try quit()
+				case "NOOP":
+					return try ok("")
+				case "UTF8":
+					return try ok("UTF8 enabled")
+			}
+			if drop is none {
+				match verb {
+					case "STLS":
+						return try startTls()
+					case "USER":
+						return try userCommand(arg)
+					case "PASS":
+						return try pass(arg)
+					case "AUTH":
+						return try auth(arg)
+					case "APOP":
+						return try err("", "APOP not supported")
+				}
+				return try err("", "Unknown command or not logged in")
+			}
+			match verb {
+				case "STAT":
+					return try stat()
+				case "LIST":
+					return try list(arg, false)
+				case "UIDL":
+					return try list(arg, true)
+				case "RETR":
+					return try retrieve(arg, -1)
+				case "TOP":
+					return try top(arg)
+				case "DELE":
+					return try delete(arg)
+				case "RSET":
+					for let i = 0; i < deleted.len(); i++ {
+						deleted[i] = false
+					}
+					return try ok("maildrop has {entries.len()} messages")
+			}
+			return try err("", "Unknown command")
+		}
+
+		internal def capabilities() !none {
+			let rows = ["Capability list follows", "TOP", "UIDL", "RESP-CODES", "AUTH-RESP-CODE", "PIPELINING", "UTF8", "IMPLEMENTATION ADM"]
+			if drop is none {
+				rows.push("USER") when secured || !server.requireTls
+				rows.push("SASL PLAIN") when secured || !server.requireTls
+				rows.push("STLS") when canStartTls()
+			}
+			return try multi("+OK " + rows[0], rows[1:])
+		}
+
+		internal def canStartTls() bool {
+			return server.security == Security.StartTls && !secured && !(server.tls is none)
+		}
+
+		internal def startTls() !none {
+			return try err("", "STLS not offered") unless canStartTls()
+			try ok("Begin TLS negotiation")
+			try secure()
+			user = ""
+			return none
+		}
+
+		internal def secure() !none {
+			let config = server.tls
+			fail protocolError("TLS", "the server has no TLS config") when config is none
+			stream = try secureServer(socket, config, server.timeout)
+			lines = new LineReader(stream, 1024)
+			secured = true
+			return none
+		}
+
+		internal def userCommand(arg string) !none {
+			return try err("AUTH", "Must issue STLS first") when server.requireTls && !secured
+			return try err("", "Syntax: USER name") when arg.trim() == ""
+			user = arg.trim()
+			return try ok("send PASS")
+		}
+
+		internal def pass(arg string) !none {
+			return try err("", "Send USER first") when user == ""
+			let name = user
+			user = ""
+			return try login(name, arg)
+		}
+
+		internal def auth(arg string) !none {
+			return try multi("+OK", ["PLAIN"]) when arg.trim() == ""
+			return try err("AUTH", "Must issue STLS first") when server.requireTls && !secured
+			let words = arg.trim().split(" ").filter(w => w != "")
+			return try err("", "Unrecognized authentication type") unless words[0].upper() == "PLAIN"
+			let response = words.len() > 1 ?? (words[1], "")
+			if response == "" {
+				try writeFully(stream, "+ \r\n".bytes(), server.timeout)
+				response = try lines.readLine(server.idleTimeout)
+			}
+			return try err("", "Authentication cancelled") when response == "*"
+			let malformed = false
+			let fields = plainFields(response == "=" ?? ("", response)) onerror (e error) {
+				malformed = true
+				recover []
+			}
+			return try err("", "Malformed PLAIN response") when malformed
+			return try login(fields[1], fields[2])
+		}
+
+		internal def loginAs(name string, secret Secret<string>) !?Maildrop {
+			return try server.authenticator.login(name, secret)
+		}
+
+		// login asks the authenticator and opens the maildrop.
+		internal def login(name string, password string) !none {
+			let secret Secret<string> = password
+			let failure ?error = none
+			let opened = loginAs(name, secret) onerror (e error) {
+				failure = e
+				recover none
+			}
+			if !(failure is none) || opened is none {
+				stats.loginFailures.inc()
+				let response = "AUTH"
+				if failure is Pop3Error {
+					response = failure.response unless failure.response == ""
+				}
+				return try err(response, response == "IN-USE" ?? ("Maildrop already locked", "Invalid credentials"))
+			}
+			let refusal ?error = none
+			let listing = opened.list() onerror (e error) {
+				refusal = e
+				recover []
+			}
+			if !(refusal is none) {
+				opened.release()
+				let inUse = false
+				inUse = refusal.response == "IN-USE" when refusal is Pop3Error
+				return try err(inUse ?? ("IN-USE", "SYS/TEMP"), inUse ?? ("Maildrop already locked", "Maildrop cannot be read"))
+			}
+			drop = opened
+			entries = listing
+			deleted = []
+			for let _ in listing {
+				deleted.push(false)
+			}
+			stats.logins.inc()
+			return try ok("maildrop has {entries.len()} messages")
+		}
+
+		internal def stat() !none {
+			let count = 0
+			let size int64 = 0
+			for let i = 0; i < entries.len(); i++ {
+				continue when deleted[i]
+				count++
+				size += entries[i].size
+			}
+			return try ok("{count} {size}")
+		}
+
+		internal def list(arg string, uids bool) !none {
+			if arg.trim() != "" {
+				let index = numberOf(arg)
+				return try err("", "No such message") when index < 0
+				let value = uids ?? (entries[index].uid, "{entries[index].size}")
+				return try ok("{index + 1} {value}")
+			}
+			let rows string[] = []
+			for let i = 0; i < entries.len(); i++ {
+				continue when deleted[i]
+				let value = uids ?? (entries[i].uid, "{entries[i].size}")
+				rows.push("{i + 1} {value}")
+			}
+			return try multi("+OK", rows)
+		}
+
+		internal def top(arg string) !none {
+			let words = arg.trim().split(" ").filter(w => w != "")
+			return try err("", "Syntax: TOP msg n") unless words.len() == 2 && words[1].isNumeric()
+			return try retrieve(words[0], words[1].toInt<int>())
+		}
+
+		// retrieve sends message `arg`, whole or (`count` >= 0) its header
+		// and first `count` body lines.
+		internal def retrieve(arg string, count int) !none {
+			let index = numberOf(arg)
+			return try err("", "No such message") when index < 0
+			let held = drop
+			fail protocolError("RETR", "not logged in") when held is none
+			let failed = false
+			let reader = held.open(entries[index].uid) onerror (e error) {
+				failed = true
+				recover new bytes.Buffer()
+			}
+			return try err("SYS/TEMP", "Message cannot be read") when failed
+			let data = new bytes.Buffer()
+			try data.readFrom(reader)
+			let content = count < 0 ?? (data.bytes(), topOf(data.bytes(), count))
+			try writeFully(stream, "+OK {entries[index].size} octets\r\n".bytes(), server.timeout)
+			stats.retrieved.inc() when count < 0
+			return try writeFully(stream, dotStuffed(content), server.timeout)
+		}
+
+		internal def delete(arg string) !none {
+			let index = numberOf(arg)
+			return try err("", "No such message") when index < 0
+			deleted[index] = true
+			return try ok("message {index + 1} deleted")
+		}
+
+		// numberOf is the index of message number `arg`, -1 when it is not
+		// one or is marked deleted.
+		internal def numberOf(arg string) int {
+			let text = arg.trim()
+			return -1 unless text.isNumeric() && text.len() <= 9
+			let index = text.toInt<int>() - 1
+			return -1 when index < 0 || index >= entries.len() || deleted[index]
+			return index
+		}
+
+		internal def quit() !none {
+			let held = drop
+			if held is none {
+				try ok("{hostname()} signing off")
+				end()
+				return none
+			}
+			let doomed string[] = []
+			for let i = 0; i < entries.len(); i++ {
+				doomed.push(entries[i].uid) when deleted[i]
+			}
+			let failed = false
+			if doomed.len() > 0 {
+				held.remove(doomed) onerror (e error) {
+					failed = true
+					recover none
+				}
+			}
+			if failed {
+				try err("SYS/PERM", "Some deleted messages not removed")
+			} else {
+				stats.deleted.update(float64(doomed.len()))
+				try ok("{hostname()} signing off ({entries.len() - doomed.len()} messages left)")
+			}
+			end()
+			return none
+		}
+
+		// ---- replies -------------------------------------------------------------
+
+		internal def ok(text string) !none {
+			let line = text == "" ?? ("+OK", "+OK " + text)
+			return try writeFully(stream, (line + "\r\n").bytes(), server.timeout)
+		}
+
+		internal def err(response string, text string) !none {
+			let code = response == "" ?? ("", "[{response}] ")
+			return try writeFully(stream, "-ERR {code}{text}\r\n".bytes(), server.timeout)
+		}
+
+		// multi writes a status line and the rows of a multi-line response.
+		internal def multi(first string, rows string[]) !none {
+			let out = first + "\r\n"
+			for let row in rows {
+				let stuffed = row.startsWith(".") ?? ("." + row, row)
+				out += stuffed + "\r\n"
+			}
+			return try writeFully(stream, (out + ".\r\n").bytes(), server.timeout)
+		}
+
+		internal def hostname() string {
+			return server.hostname unless server.hostname == ""
+			return addressLiteral(socket.localAddr())
+		}
+	}
+}

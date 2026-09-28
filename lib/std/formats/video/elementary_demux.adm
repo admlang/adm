@@ -1,0 +1,335 @@
+internal partial module std.formats.video.elementary {
+	use (
+		std.formats.video::*
+		std.formats.video.demux::*
+		std.formats.media.source::*
+		std.formats.video.pes::*
+		std.formats.video.mpeg4::*
+	)
+
+	// The codec of a stream from its first start code: "h264", "mpeg2" (the
+	// sequence header tells MPEG-1 apart later) or "mpeg4"; "" for anything
+	// else, such as the pack header of a program stream.
+	def esCodec(head byte[]) string {
+		let at = findPrefix(head, 0)
+		return "" when at < 0 || at + 3 >= head.len()
+		let code = int(head[at + 3])
+		// Only zero bytes may come before the first start code, unless it
+		// introduces an H.264 sequence parameter set, which chance hardly
+		// produces.
+		for let i = 0; i < at; i++ {
+			continue when head[i] == 0
+			return "h264" when code := 0x67 || 0x47 || 0x27
+			return ""
+		}
+		return "mpeg2" when code == 0xB3
+		return "mpeg4" when code == 0xB0 || code == 0xB5 || (code >= 0x20 && code <= 0x2F)
+		if code <= 0x1F {
+			// A video object start code is followed by a video object
+			// layer; an H.264 NAL unit header by anything else.
+			let next = findPrefix(head, at + 3)
+			return "mpeg4" when next >= 0 && next + 3 < head.len() && int(head[next + 3]) >= 0x20 && int(head[next + 3]) <= 0x2F
+		}
+		return "" when (code & 0x80) != 0
+		let kind = code & 0x1F
+		return "h264" when kind := 1 || 5 || 6 || 7 || 8 || 9
+		return ""
+	}
+
+	// EsContainer cuts an elementary stream into one packet per picture.
+	type EsContainer {
+		src       Source
+		codec     string
+		list      Track[]
+		// Bytes read and not yet handed out, starting at file offset
+		// `pendingAt`; start codes before `scanAt` are already looked at.
+		pending   byte[]
+		pendingAt int
+		scanAt    int
+		// Whether the bytes pending hold the start of a picture already.
+		picture   bool
+		ended     bool
+		// The bytes before the first picture: the parameter sets, sequence
+		// or object layer headers a decoder needs, replayed after a seek.
+		header    byte[]
+		replay    bool
+		// Timestamp every packet carries: where decoding (re)started.
+		base      duration
+		// Frame rate: frames a second as rateNum / rateDen.
+		rateNum   int64
+		rateDen   int64
+		// Read buffer.
+		chunk     byte[]
+		// The first picture, read to learn the track, handed out first.
+		held      ?Packet  = none
+
+		def new(src Source) {
+			self.src = src
+			list = Track[]
+			pending = byte[]
+			header = byte[]
+			rateNum = 25
+			rateDen = 1
+			chunk = byte[]
+			chunk.len(65536)
+		}
+
+		// Reads the codec and the headers of the stream.
+		//
+		// Fails when the stream is none of the three, or the reader fails.
+		def read() !none {
+			let head = try src.peek(64)
+			codec = esCodec(head)
+			fail "es: not an H.264, MPEG-1/2 or MPEG-4 video stream" when codec == ""
+			let first = try cut()
+			fail "es: the stream holds no picture" when first is none
+			let p Packet = first
+			let at = picStart(p.data)
+			header = p.data[:at].clone()
+			let t = newTrack(0, TrackKind.Video, codec)
+			let probe = new StreamProbe(codec)
+			if codec == "h264" {
+				probe.h264(p.data)
+			} else if codec == "mpeg2" {
+				probe.video(p.data)
+			} else {
+				let d = new Mpeg4Decoder()
+				d.feed(header, 0s)
+				probe.width = d.width
+				probe.height = d.height
+				if d.fixedIncrement > 0 {
+					probe.rateNum = d.resolution
+					probe.rateDen = d.fixedIncrement
+				}
+			}
+			probe.apply(t)
+			if probe.rateNum > 0 {
+				rateNum = int64(probe.rateNum)
+				rateDen = int64(probe.rateDen)
+			}
+			list.push(t)
+			held = first
+			return none
+		}
+
+		// Offset in a first packet where its picture begins.
+		def picStart(data byte[]) int {
+			let at = findPrefix(data, 0)
+			for at >= 0 && at + 3 < data.len() {
+				return at when startsPicture(data, at)
+				at = findPrefix(data, at + 3)
+			}
+			return data.len()
+		}
+
+		// Whether the start code at `at` begins the coded data of a picture.
+		def startsPicture(data byte[], at int) bool {
+			let code = int(data[at + 3])
+			return code == 0x00 when codec := "mpeg1" || "mpeg2"
+			return code == 0xB6 when codec == "mpeg4"
+			return (code & 0x1F) := 1 || 5
+		}
+
+		// Whether a new packet begins at the start code at `at`, the packet
+		// so far holding a picture.
+		def startsUnit(data byte[], at int) bool {
+			let code = int(data[at + 3])
+			if codec := "mpeg1" || "mpeg2" {
+				return code := 0x00 || 0xB3 || 0xB8
+			}
+			if codec == "mpeg4" {
+				return code <= 0x2F || (code := 0xB0 || 0xB2 || 0xB3 || 0xB5 || 0xB6)
+			}
+			let kind = code & 0x1F
+			return true when kind := 6 || 7 || 8 || 9 || 14 || 15
+			// A slice starts a picture when first_mb_in_slice is 0.
+			return (kind := 1 || 5) && at + 4 < data.len() && (int(data[at + 4]) & 0x80) != 0
+		}
+
+		// Moves to file offset `offset`, which begins a picture shown at
+		// `time`, forgetting the bytes read ahead.
+		//
+		// Fails when the source cannot go there.
+		def restart(offset int, time duration) !none {
+			try src.seek(offset)
+			held = none
+			pending = byte[]
+			pendingAt = offset
+			scanAt = 0
+			picture = false
+			ended = false
+			base = time
+			replay = offset > 0
+			return none
+		}
+
+		// The next picture's packet, none at the end.
+		//
+		// Fails when the reader does.
+		def cut() !?Packet {
+			for {
+				let at = findPrefix(pending, scanAt)
+				if at >= 0 && at + 4 < pending.len() {
+					scanAt = at + 3
+					if picture && startsUnit(pending, at) {
+						return take(at)
+					}
+					picture = true when startsPicture(pending, at)
+					continue
+				}
+				if ended {
+					return none when pending.len() == 0
+					return take(pending.len())
+				}
+				// Keep the last bytes, which may begin a start code.
+				scanAt = (pending.len() - 4).max(scanAt).max(0)
+				let n = try src.read(chunk)
+				if n <= 0 {
+					ended = true
+				} else {
+					pending.push(...chunk[:n])
+				}
+			}
+			return none
+		}
+
+		// The first `count` pending bytes as a packet.
+		def take(count int) Packet {
+			let data = pending[:count].clone()
+			pending = pending[count:].clone()
+			pendingAt += count
+			scanAt = 0
+			picture = false
+			if replay {
+				data = header.concat(data)
+				replay = false
+			}
+			return newPacket(0, data, base, base, 0s, isKeyPayload(codec, data))
+		}
+
+		// How much of a frame the picture in `data` shows: half for an
+		// MPEG-2 field picture.
+		def share(data byte[]) int64 {
+			return int64(2) unless codec == "mpeg2"
+			let at = findCode(data, 0, 0xB5)
+			for at >= 0 && at + 7 < data.len() {
+				if (int(data[at + 4]) >> 4) == 8 {
+					// picture_structure: 3 is a frame, 1 or 2 a field.
+					return (int(data[at + 6]) & 3) == 3 ?? (int64(2), int64(1))
+				}
+				at = findCode(data, at + 4, 0xB5)
+			}
+			return int64(2)
+		}
+
+		// name implements Described.
+		def name() string {
+			return "es"
+		}
+
+		// seekable implements Seekable.
+		def seekable() bool {
+			return src.seekable()
+		}
+
+		// tracks implements Container.
+		def tracks() Track[] {
+			return list
+		}
+
+		// next implements Container.
+		//
+		// Fails when the reader does.
+		def next() !?Packet {
+			let first = held
+			if !(first is none) {
+				held = none
+				return first
+			}
+			return try cut()
+		}
+
+		// seek implements Container: reads the pictures from the start,
+		// counting frames at the stream's rate, and resumes at the last
+		// keyframe whose first shown frame lies at or before `time`.
+		//
+		// Fails when the source cannot seek or the reader fails.
+		def seek(time duration) !none {
+			fail "es: the stream cannot seek" unless src.seekable()
+			try restart(0, 0s)
+			let pick = 0
+			let pickTime = 0s
+			// Half frames decoded so far.
+			let halves = int64(0)
+			// An MPEG-4 keyframe whose shown time waits for the B-VOPs after
+			// it, which a decoder starting there drops.
+			let cand = -1
+			let candHalves = int64(0)
+			for {
+				let offset = pendingAt
+				let got = try cut()
+				break when got is none
+				let p Packet = got
+				if cand >= 0 {
+					if bVop(p.data) {
+						candHalves += 2
+					} else {
+						if timeOf(candHalves) <= time {
+							pick = cand
+							pickTime = timeOf(candHalves)
+						}
+						cand = -1
+					}
+				}
+				break when timeOf(halves) > time && cand < 0
+				if p.keyframe && codec == "mpeg4" {
+					cand = offset
+					candHalves = halves
+				} else if p.keyframe {
+					let shown = timeOf(halves + 2 * leading(p.data))
+					if shown <= time {
+						pick = offset
+						pickTime = shown
+					}
+				}
+				halves += share(p.data)
+			}
+			if cand >= 0 && timeOf(candHalves) <= time {
+				pick = cand
+				pickTime = timeOf(candHalves)
+			}
+			try restart(pick, pickTime)
+			return none
+		}
+
+		// The time `halves` half frames into the stream.
+		def timeOf(halves int64) duration {
+			return duration(halves * rateDen * 500000000 / rateNum)
+		}
+
+		// Frames of an MPEG-2 GOP shown before its I-picture that a decoder
+		// starting there drops: the B-pictures ahead of it in an open GOP.
+		def leading(data byte[]) int64 {
+			return int64(0) unless codec == "mpeg2"
+			let gop = findCode(data, 0, 0xB8)
+			return int64(0) when gop >= 0 && gop + 7 < data.len() && (int(data[gop + 7]) & 0x40) != 0
+			let at = findCode(data, 0, 0x00)
+			return int64(0) when at < 0 || at + 5 >= data.len()
+			return int64((int(data[at + 4]) << 2) | (int(data[at + 5]) >> 6))
+		}
+
+		// Whether the packet is an MPEG-4 B-VOP.
+		def bVop(data byte[]) bool {
+			return false unless codec == "mpeg4"
+			let at = findCode(data, 0, 0xB6)
+			return at >= 0 && at + 4 < data.len() && (int(data[at + 4]) >> 6) == 2
+		}
+
+		// close implements io.Closer: closes the file.
+		//
+		// Fails when closing it does.
+		def close() !none {
+			return src.close()
+		}
+	}
+}

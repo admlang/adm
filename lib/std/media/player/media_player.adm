@@ -3,6 +3,7 @@ partial module std.media.player {
 		std.gfx
 		std.formats.audio
 		std.formats.image
+		std.formats.video
 		std.media.dsp
 		std.media.player.engine::*
 	)
@@ -55,7 +56,9 @@ partial module std.media.player {
 
 		// Where pictures go: a video's frames, else the visualizer for audio,
 		// else its cover art. Set or cleared at any time, also while playing;
-		// with none, video is not decoded and only its sound plays.
+		// with none (and `picture` never called), video is not decoded and
+		// only its sound plays. Once `picture` is called, video pictures are
+		// left to the app and no longer drawn here.
 		display    ?gfx.Raster = none
 		// Draws audio tracks into `display`; with none, their cover art shows.
 		visualizer ?Visualizer = none
@@ -106,6 +109,14 @@ partial module std.media.player {
 		// pause.
 		internal running    bool
 		internal wake       channel<bool>  = new channel<bool>(size = 1)
+		// The picture task: it paints on its own so drawing never holds up
+		// the sound. The sound task leaves it the block last played and
+		// wakes it; it draws the state it finds then.
+		internal painting   bool
+		internal paintWake  channel<bool>  = new channel<bool>(size = 1)
+		internal lastBlock  float32[]
+		// Counts the blocks left for it, so a block is visualized once.
+		internal blockCount int
 		// What the events last reported, so each change is reported once.
 		internal toldState  PlayerState    = PlayerState.Stopped
 		internal toldTrack  ?Track         = none
@@ -115,6 +126,10 @@ partial module std.media.player {
 		// copied, so the display never shows half a frame; and what the cover
 		// frame last drawn showed, so it is drawn again only when that changes.
 		internal canvas     ?image.Image   = none
+		// The latest due picture of the current video, for `picture`, and
+		// whether anyone asked for it.
+		internal latest        ?video.VideoFrame = none
+		internal pictureWanted bool
 		internal painted    ?Track         = none
 		internal paintedFit ScaleMode      = ScaleMode.Contain
 		internal paintedTag bool
@@ -140,7 +155,7 @@ partial module std.media.player {
 			if track is none {
 				let first = pickNext(false)
 				fail "player: the playlist is empty" when first is none
-				take(first,!queueHas(first))
+				take(first, !queueHas(first))
 			}
 			return none when status == PlayerState.Playing
 			status = PlayerState.Playing
@@ -179,7 +194,7 @@ partial module std.media.player {
 		atomic def next() !none {
 			let following = pickNext(false)
 			fail "player: there is no next track" when following is none
-			change(following,!queueHas(following))
+			change(following, !queueHas(following))
 		}
 
 		// previous restarts the current track when it is more than 3 s in, else
@@ -233,6 +248,17 @@ partial module std.media.player {
 			return seek(deck.position() + offset)
 		}
 
+		// The current video's picture due now, for drawing it yourself with
+		// `DrawContext.drawVideo`: on the OpenGL renderer a picture the GPU
+		// decoded is drawn without passing through main memory, which drawing
+		// into `display` cannot do. None when no video plays or no picture is
+		// due yet. The first call makes the player decode pictures even with
+		// no `display`; `onFrame` then fires when a new picture is due.
+		atomic def picture() ?video.VideoFrame {
+			pictureWanted = true
+			return latest
+		}
+
 		// What the player is doing.
 		atomic def state() PlayerState {
 			return status
@@ -268,6 +294,10 @@ partial module std.media.player {
 
 		// Starts the playback task unless it runs, or wakes it from a pause.
 		internal def start() {
+			if !painting {
+				painting = true
+				async paintLoop()
+			}
 			if running {
 				signal()
 				return
@@ -288,13 +318,51 @@ partial module std.media.player {
 				let block = step()
 				report()
 				if block.len() == 0 {
+					wakePainter(block)
 					break unless waiting()
 					<-wake
 					continue
 				}
+				// The picture of the block about to be heard is drawn while
+				// the sink takes it.
+				wakePainter(block)
 				deliver(block)
-				paint(block)
 			}
+		}
+
+		// Leaves the picture task the block just played (none when playback
+		// paused or ended) and wakes it unless a wake is pending.
+		internal atomic def wakePainter(block float32[]) {
+			if block.len() > 0 {
+				lastBlock = block
+				blockCount++
+			}
+			paintWake <- true when paintWake.len() == 0
+		}
+
+		// The picture task: paints whenever woken, until playback has ended
+		// and the last state is painted.
+		internal def paintLoop() {
+			let seen = 0
+			for {
+				<-paintWake
+				let (block, count) = takeBlock()
+				paint(block, count != seen)
+				seen = count
+				break when paintDone()
+			}
+		}
+
+		internal atomic def takeBlock() (float32[], int) {
+			return (lastBlock, blockCount)
+		}
+
+		// Whether the picture task ends: playback stopped and nothing woke it
+		// since.
+		internal atomic def paintDone() bool {
+			return false when running || paintWake.len() > 0
+			painting = false
+			return true
 		}
 
 		// Whether the task should wait for a wake rather than end: it ends
@@ -302,6 +370,8 @@ partial module std.media.player {
 		internal atomic def waiting() bool {
 			if status == PlayerState.Stopped {
 				running = false
+				// The picture task paints the end and finishes.
+				paintWake <- true when paintWake.len() == 0
 				return false
 			}
 			return true
@@ -321,13 +391,20 @@ partial module std.media.player {
 			}
 		}
 
-		// Draws the frame for the block just played into `display`: the
-		// visualizer's picture of it, else the current track's cover art
-		// (drawn again only when the track, its tags, the size or `fit`
-		// change), else black. Calls `onFrame` after each frame.
-		internal def paint(block float32[]) {
+		// Draws the frame for the block about to be heard into `display`: the
+		// current video's picture due now, else the visualizer's picture of
+		// the block (when `fresh`, once per block), else the current track's
+		// cover art (drawn again only when the track, its tags, the size or
+		// `fit` change), else black. Calls `onFrame` after each frame.
+		internal def paint(block float32[], fresh bool) {
 			let (shown, drawer, scale, playing) = frameState()
-			return when shown is none
+			let (picture, moving) = dueFrame(!(shown is none) || picturesWanted())
+			keepLatest(picture, moving)
+			if shown is none {
+				// Pictures for `picture` only.
+				notify(onFrame) when moving && !(picture is none)
+				return
+			}
 			let target gfx.Raster = shown
 			let w = int(target.size().width)
 			let h = int(target.size().height)
@@ -339,7 +416,22 @@ partial module std.media.player {
 			let current = canvas
 			return when current is none
 			let buffer image.Image = current
+			if moving {
+				// A video: its picture due now, or the last one kept. An app
+				// that draws pictures itself (`picture`) is only told.
+				if picturesWanted() {
+					notify(onFrame) unless picture is none
+					return
+				}
+				return when picture is none
+				video.draw(picture, buffer, fitMode(scale))
+				blit(buffer, target, 0, 0)
+				notify(onFrame)
+				paintedOk = false
+				return
+			}
 			if !(drawer is none) {
+				return unless fresh
 				clearRaster(buffer)
 				drawer.draw(block, blockInfo(), buffer)
 				blit(buffer, target, 0, 0)
@@ -358,6 +450,57 @@ partial module std.media.player {
 			paintedFit = scale
 			paintedTag = tagged
 			paintedOk = true
+		}
+
+		// The picture of the current video track due at the current position,
+		// and whether the track is a video. None when no new picture is due,
+		// or `wanted` is false (no display): then the video's pictures stop.
+		// Decoding runs outside the player's lock, under the video's own, so
+		// a slow picture never holds up the sound being mixed.
+		internal def dueFrame(wanted bool) (?video.VideoFrame, bool) {
+			let (current, at) = currentVideo()
+			return (none, false) when current is none
+			let moving VideoTrack = current
+			if !wanted {
+				moving.stopPictures()
+				return (none, true)
+			}
+			let picture = moving.pictureAt(at) onerror (err error) {
+				pictureFailed(err)
+				moving.giveUp()
+				recover none
+			}
+			return (picture, true)
+		}
+
+		// The current track's video and its position, taken under the lock.
+		internal atomic def currentVideo() (?VideoTrack, duration) {
+			return (none, 0s) when deck is none
+			let playing Deck = deck
+			let source = playing.stream
+			return (none, 0s) unless source is VideoTrack
+			let moving VideoTrack = source
+			return (moving, playing.position())
+		}
+
+		// Records a picture that failed to decode.
+		internal atomic def pictureFailed(err error) {
+			failures.push((currentIndex(), err))
+		}
+
+		// Whether `picture` was ever called.
+		internal atomic def picturesWanted() bool {
+			return pictureWanted
+		}
+
+		// Records the picture due now for `picture`; none once the current
+		// track is no video.
+		internal atomic def keepLatest(picture ?video.VideoFrame, moving bool) {
+			if !moving {
+				latest = none
+				return
+			}
+			latest = picture unless picture is none
 		}
 
 		// What a frame is drawn from, taken under the lock.
@@ -439,7 +582,7 @@ partial module std.media.player {
 			return when left > crossfade || left <= 0s
 			let following = pickNext(true)
 			return when following is none
-			change(following,!queueHas(following))
+			change(following, !queueHas(following))
 		}
 
 		// The track after the current one ended: the next, or the end.
@@ -454,7 +597,7 @@ partial module std.media.player {
 			let fading = deck
 			deck = none
 			fading.close() unless fading is none
-			take(following,!queueHas(following))
+			take(following, !queueHas(following))
 		}
 
 		// Opens the current track into `deck`; on failure records it and moves
@@ -468,6 +611,16 @@ partial module std.media.player {
 				return false
 			}
 			deck = new Deck(playing, stream, sink.sampleRate(), sink.channels())
+			// A video shown from its start keeps its pictures from the first
+			// packet.
+			if (!(display is none) || pictureWanted) && stream is VideoTrack {
+				let moving VideoTrack = stream
+				moving.startPictures() onerror (err error) {
+					failures.push((currentIndex(), err))
+					moving.giveUp()
+					return true
+				}
+			}
 			return true
 		}
 

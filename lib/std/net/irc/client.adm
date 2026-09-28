@@ -1,4 +1,883 @@
 partial module std.net.irc {
-	// Client is the IRC client; it has no members yet.
-	type Client {}
+	use (
+		std.net
+		std.net.irc.proto::*
+		std.net.tls
+		std.time
+	)
+
+	// Channel is what a client knows of a channel it is in.
+	struct Channel {
+		name    string
+		topic   string
+		// Who set the topic and when (Unix seconds); empty and 0 when
+		// the server did not say.
+		topicBy string
+		topicAt int64
+		// The modes as MODE shows them: `+nt`, `+kl secret 10`.
+		modes   string
+		// Nickname to status prefixes: "@" for an operator, "+" for
+		// voice, "" for neither.
+		members map<string, string>
+	}
+
+	// Whois is the answer to WHOIS.
+	struct Whois {
+		nick       string
+		user       string
+		host       string
+		realName   string
+		server     string
+		serverInfo string
+		// The channels, each with the user's status prefix.
+		channels   string[]
+		// The away message, "" when the user is not away.
+		away       string
+		operator   bool
+		// The account the user logged in to, "" for none.
+		account    string
+		// The connection runs over TLS.
+		secure     bool
+		// Seconds since the user last spoke, and when it connected (Unix
+		// seconds).
+		idle       int64
+		signOn     int64
+	}
+
+	// ChannelListing is one channel of a LIST reply.
+	struct ChannelListing {
+		name  string
+		users int
+		topic string
+	}
+
+	// WhoEntry is one user of a WHO reply.
+	struct WhoEntry {
+		// The channel the reply is about, `*` for none.
+		channel  string
+		nick     string
+		user     string
+		host     string
+		server   string
+		realName string
+		away     bool
+		operator bool
+		// The status prefixes on `channel`.
+		status   string
+	}
+
+	// Client is an IRC client (RFC 1459, 2812) with IRCv3 capability
+	// negotiation and SASL. `connect` registers; a reader task then keeps
+	// the connection alive (PINGs, CTCP VERSION and friends), tracks the
+	// channels the client is in, and passes every message on to `next` and
+	// `messages`. The commands that have an answer (`join`, `whois`,
+	// `list`, ...) wait for it and fail with the server's error reply.
+	//
+	// ```
+	// let client = new irc.Client("adabot", Security.Tls)
+	// try client.connect("irc.libera.chat")
+	// try client.join("#adm")
+	// try client.say("#adm", "hello")
+	// for let m in client.messages() {
+	//     try client.say(m.target(), "pong") when m.command == "PRIVMSG" && m.text() == "ping"
+	// }
+	// ```
+	type Client {
+		// The nickname asked for; when it is taken during `connect`, `_`
+		// is appended until one is free (three tries).
+		nick            string
+		// The user name (ident); empty takes the nickname.
+		user            string          = ""
+		// The real name (gecos); empty takes the nickname.
+		realName        string          = ""
+		// The server password (PASS); empty sends none.
+		password        Secret<string>  = ""
+		security        Security        = Security.Plain
+		// The TLS settings with `Tls`; none verifies the server against
+		// the system roots under the host name it was dialled by. A
+		// certificate in it is what SASL EXTERNAL presents.
+		tls             ?tls.Config     = none
+		// How long each read and write may wait, and each command for its
+		// answer.
+		timeout         duration        = 30s
+		// The account to log in to during registration (SASL); empty logs
+		// in to none. The connection fails when the login does.
+		saslAccount     string          = ""
+		saslPassword    Secret<string>  = ""
+		saslMechanism   SaslMechanism   = SaslMechanism.Plain
+		// The IRCv3 capabilities to ask for when the server offers them.
+		capabilities    string[]        = wantedCaps.split(" ")
+		// What the client answers to CTCP VERSION.
+		version         string          = "ADM IRC client"
+		// How long the server may stay quiet before the client sends it a
+		// PING; the connection fails when it answers nothing within
+		// `timeout` more. 0 sends none.
+		pingInterval    duration        = 120s
+		// Holds back bursts: 5 lines go at once, then one every 2
+		// seconds, which keeps a client clear of servers' flood limits.
+		throttle        bool            = true
+
+		internal socket  ?net.Connection = none
+		internal stream  ?net.Stream     = none
+		internal lines   ?LineReader     = none
+		internal sender  ?Sender         = none
+		internal state   ClientState     = new ClientState()
+		internal inbox   channel<Incoming>
+		internal atomic open     bool    = false
+		internal atomic lastRead int64   = 0
+		internal atomic quitting bool    = false
+		internal atomic lastError ?error = none
+		// The SCRAM exchange a mechanism answer started, picked up by the
+		// registration loop.
+		internal pendingScram ?ScramClient = none
+
+		def new(nick string, security Security = Security.Plain, timeout duration = 30s) {
+			self.nick = nick
+			self.security = security
+			self.timeout = timeout
+			inbox = new channel<Incoming>(4096)
+		}
+
+		// Connects to a server, `host` or `host:port` (the port defaults to
+		// 6667, or 6697 with TLS), and registers: CAP negotiation, SASL
+		// when `saslAccount` is set, PASS, NICK and USER, up to the end
+		// of the message of the day.
+		// Fails with NetError when the dial does, TLSError when the
+		// handshake does, IrcError when the server refuses the
+		// registration or the SASL login.
+		def connect(addr string) !none {
+			fail protocolError("connect", "already connected") when open
+			let target = net.withPort(addr, security == Security.Tls ?? (6697, 6667))
+			let host = hostOf(target)
+			let conn = try net.dialStream(target, timeout)
+			let failure ?error = none
+			register(conn, host) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				conn.close() onerror recover none
+				socket = none
+				stream = none
+				fail failure
+			}
+			open = true
+			lastRead = time.monoNs()
+			let reader = async readLoop()
+			reader.keepAlive()
+			if int64(pingInterval) > 0 {
+				let pinger = async keepAlive()
+				pinger.keepAlive()
+			}
+			return none
+		}
+
+		internal def register(conn net.Connection, host string) !none {
+			socket = conn
+			let s net.Stream = conn
+			s = try secure(conn, clientConfig(tls, host), timeout) when security == Security.Tls
+			stream = s
+			let reader = new LineReader(s)
+			lines = reader
+			let out = new Sender(s, timeout, throttle, 5, 2s)
+			sender = out
+			try out.write("CAP LS 302")
+			try out.write("PASS {password.reveal()}") unless password.reveal() == ""
+			let tries = 0
+			let wanted = nick
+			try out.write("NICK {wanted}")
+			let ident = user == "" ?? (nick, user)
+			try out.write("USER {ident} 0 * :{realName == "" ?? (nick, realName)}")
+			let offered = map<string, string>{}
+			let requested = 0
+			let answered = 0
+			let capDone = false
+			let registered = false
+			let scram ?ScramClient = none
+			let saslIn = new SaslReader()
+			for {
+				let line = try reader.readLine(timeout)
+				let failure ?error = none
+				let m = parse(line) onerror (err error) {
+					failure = err
+					recover new Message("")
+				}
+				continue unless failure is none
+				state.apply(m)
+				deliver(m)
+				switch {
+					case m.command == "PING":
+						try out.write("PONG :{m.text()}")
+					case m.command == "ERROR":
+						fail protocolError("connect", m.text())
+					case m.command == "CAP" && m.params.len() >= 3:
+						let sub = m.params[1].upper()
+						switch {
+							case sub == "LS":
+								let more = m.params.len() > 3 && m.params[2] == "*"
+								for let item in m.text().split(" ") {
+									continue when item == ""
+									let eq = item.indexOf("=")
+									offered[eq < 0 ?? (item, item[:eq])] = eq < 0 ?? ("", item[eq + 1:])
+								}
+								continue when more
+								let ask string[] = []
+								for let cap in capabilities {
+									ask.push(cap) when offered.hasKey(cap) && cap != "sasl"
+								}
+								ask.push("sasl") when saslAccount != "" && offered.hasKey("sasl")
+								fail protocolError("connect", "the server offers no SASL") when saslAccount != "" && !offered.hasKey("sasl")
+								if ask.len() == 0 {
+									try out.write("CAP END")
+									capDone = true
+									continue
+								}
+								for let chunk in capChunks(ask) {
+									try out.write("CAP REQ :{chunk}")
+									requested++
+								}
+							case sub := "ACK" || "NAK":
+								answered++
+								if sub == "ACK" {
+									for let item in m.text().split(" ") {
+										continue when item == ""
+										if item.startsWith("-") {
+											state.dropCap(item[1:])
+										} else {
+											let value = offered.get(item)
+											state.ackCap(item, value is none ?? ("", value))
+										}
+									}
+								}
+								continue when answered < requested || capDone
+								if saslAccount != "" {
+									fail protocolError("connect", "the server refused the sasl capability") unless state.hasCap("sasl")
+									try out.write("AUTHENTICATE {saslMechanism.value}")
+									continue
+								}
+								try out.write("CAP END")
+								capDone = true
+						}
+					case m.command == "AUTHENTICATE":
+						let complete = try saslIn.add(m.target())
+						continue unless complete
+						let challenge = try saslIn.payload()
+						let reply = try saslResponse(challenge, scram)
+						scram = pendingScram when saslMechanism == SaslMechanism.ScramSha256 && scram is none
+						for let piece in saslChunks(reply) {
+							try out.write("AUTHENTICATE {piece}")
+						}
+					case m.command == "903":
+						try out.write("CAP END")
+						capDone = true
+					case m.command := "902" || "904" || "905" || "906" || "908":
+						fail replyError("SASL", m)
+					case m.command := "431" || "432" || "433" || "436" || "437":
+						fail replyError("NICK", m) when registered || tries >= 3
+						tries++
+						wanted += "_"
+						try out.write("NICK {wanted}")
+					case m.command := "464" || "465":
+						fail replyError("connect", m)
+					case m.command == "421" && m.params.len() > 1 && m.params[1].upper() == "CAP":
+						capDone = true
+					case m.command == "001":
+						registered = true
+					case m.command := "376" || "422":
+						return none when registered
+				}
+			}
+			fail "unreachable"
+		}
+
+		// saslResponse answers one server challenge of the SASL exchange.
+		internal def saslResponse(challenge byte[], scram ?ScramClient) !byte[] {
+			let secret = saslPassword.reveal()
+			switch {
+				case saslMechanism == SaslMechanism.Plain:
+					let zero byte[] = [byte(0)]
+					return saslAccount.bytes() + zero + saslAccount.bytes() + zero + secret.bytes()
+				case saslMechanism == SaslMechanism.External:
+					return []
+			}
+			if scram is none {
+				let fresh = new ScramClient(saslAccount, secret, try nonce())
+				pendingScram = fresh
+				return fresh.first().bytes()
+			}
+			let text = string(challenge)
+			if text.startsWith("v=") || text.startsWith("e=") {
+				try scram.verify(text)
+				return []
+			}
+			return (try scram.final(text)).bytes()
+		}
+
+		// deliver passes a message on to `next`; a client that reads none
+		// loses what comes past 4096 waiting messages.
+		internal def deliver(m Message) {
+			let item = new Incoming()
+			item.message = m
+			inbox <- item when inbox.len() < inbox.cap() - 1
+		}
+
+		// readLoop reads the connection until it ends: it answers PINGs
+		// and CTCP requests, keeps the state, feeds the waiting commands,
+		// and passes each message on.
+		internal def readLoop() {
+			let reader = lines
+			return when reader is none
+			let failure ?error = none
+			for open {
+				let line = reader.readLine(waitForever) onerror (err error) {
+					failure = err
+					recover ""
+				}
+				break unless failure is none
+				lastRead = time.monoNs()
+				let bad ?error = none
+				let m = parse(line) onerror (err error) {
+					bad = err
+					recover new Message("")
+				}
+				continue unless bad is none
+				state.apply(m)
+				answer(m)
+				for let w in state.currentWaiters() {
+					w.offer(m)
+				}
+				deliver(m)
+				if m.command == "ERROR" {
+					failure = protocolError("ERROR", m.text()) unless quitting
+					break
+				}
+			}
+			open = false
+			let end = new Incoming()
+			end.ended = true
+			end.failure = failure
+			lastError = failure
+			inbox <- end
+			for let w in state.currentWaiters() {
+				w.stop()
+			}
+			closeTransport()
+		}
+
+		// answer replies to PING and to the CTCP requests VERSION, PING,
+		// TIME, CLIENTINFO and SOURCE (the last two as their own names).
+		internal def answer(m Message) {
+			let out = sender
+			return when out is none
+			if m.command == "PING" {
+				out.write("PONG :{m.text()}") onerror recover none
+				return
+			}
+			return unless m.command == "PRIVMSG" && m.isCtcp()
+			let from = m.nick()
+			let reply = ""
+			switch {
+				case m.ctcpCommand() == "VERSION":
+					reply = "VERSION {version}"
+				case m.ctcpCommand() == "PING":
+					reply = "PING {m.ctcpText()}"
+				case m.ctcpCommand() == "TIME":
+					reply = "TIME {time.now().str()}"
+				case m.ctcpCommand() == "CLIENTINFO":
+					reply = "CLIENTINFO ACTION CLIENTINFO PING TIME VERSION"
+			}
+			return when reply == "" || from == ""
+			// With echo-message the client's own requests come back.
+			return when state.folded(from) == state.folded(state.nick())
+			out.write("NOTICE {from} :\u0001{reply}\u0001") onerror recover none
+		}
+
+		// keepAlive PINGs a quiet server and closes the connection when no
+		// answer comes.
+		internal def keepAlive() {
+			let pinged = int64(0)
+			for open {
+				time.sleep(1s)
+				let now = time.monoNs()
+				pinged = 0 when lastRead > pinged && pinged > 0
+				if pinged == 0 && now - lastRead > int64(pingInterval) {
+					pinged = now
+					send("PING :{now}") onerror recover none
+					continue
+				}
+				if pinged > 0 && lastRead < pinged && now - pinged > int64(timeout) {
+					lastError = protocolError("ping", "the server stopped answering")
+					closeTransport()
+					return
+				}
+			}
+		}
+
+		internal def closeTransport() {
+			let st = stream
+			if !(st is none) {
+				st.close() onerror recover none
+			}
+			let so = socket
+			if !(so is none) {
+				so.close() onerror recover none
+			}
+		}
+
+		// The next message from the server, waiting for it; none once the
+		// connection has ended cleanly (after `quit` or `close`).
+		// Fails when the connection failed or the server sent ERROR.
+		def next() !?Message {
+			let item = <-inbox
+			if item.ended {
+				// Leave the end in place for the next caller.
+				inbox <- item
+				let failure = item.failure
+				fail failure unless failure is none
+				return none
+			}
+			return item.message
+		}
+
+		// The messages from the server, for `for let m in client.messages()`;
+		// the loop ends with the connection. After it, `error()` holds a
+		// failure that ended it, none for a clean end.
+		def messages() Messages {
+			return new Messages(self)
+		}
+
+		// The failure that ended the connection, none while it is open or
+		// after a clean end.
+		def error() ?error {
+			return lastError
+		}
+
+		// Reports whether the connection is open.
+		def isOpen() bool {
+			return open
+		}
+
+		// The nickname the server knows the client by.
+		def nickname() string {
+			return state.nick()
+		}
+
+		// The account the client is logged in to, "" for none.
+		def account() string {
+			return state.accountName()
+		}
+
+		// The value of an ISUPPORT token (`NETWORK`, `CHANTYPES`,
+		// `PREFIX`); "" when the server sent none or it has no value.
+		def feature(name string) string {
+			return state.feature(name)
+		}
+
+		// Reports whether the server acknowledged an IRCv3 capability.
+		def hasCapability(name string) bool {
+			return state.hasCap(name)
+		}
+
+		// The channels the client is in, sorted.
+		def channels() string[] {
+			return state.channelNames()
+		}
+
+		// A channel the client is in: its topic, modes and members; none
+		// when the client is not in it.
+		def getChannel(name string) ?Channel {
+			return state.channel(name)
+		}
+
+		// Sends one raw line. Fails when the connection is closed or the
+		// write fails.
+		def send(line string) !none {
+			fail protocolError("send", "line breaks in a line") when line.contains("\r") || line.contains("\n")
+			let out = sender
+			fail protocolError("send", "not connected") when out is none || !open
+			return try out.write(line)
+		}
+
+		// Sends a message. Fails as `send(line)` does.
+		def send(m Message) !none {
+			return try send(m.str())
+		}
+
+		// Says `text` to a channel or nickname (PRIVMSG), in as many
+		// messages as it needs; newlines start new ones.
+		// Fails when the write does.
+		def say(target string, text string) !none {
+			for let piece in splitText(text, textBudget("PRIVMSG", target)) {
+				try send("PRIVMSG {target} :{piece}")
+			}
+			return none
+		}
+
+		// Sends a NOTICE: text that is never answered automatically.
+		// Fails when the write does.
+		def notice(target string, text string) !none {
+			for let piece in splitText(text, textBudget("NOTICE", target)) {
+				try send("NOTICE {target} :{piece}")
+			}
+			return none
+		}
+
+		// Sends a `/me` action (CTCP ACTION).
+		// Fails when the write does.
+		def action(target string, text string) !none {
+			return try ctcp(target, "ACTION", text)
+		}
+
+		// Sends a CTCP request (`VERSION`, `PING`, `TIME`, ...); the reply
+		// comes as a NOTICE through `next`.
+		// Fails when the write does.
+		def ctcp(target string, command string, text string = "") !none {
+			let body = text == "" ?? (command.upper(), "{command.upper()} {text}")
+			return try send("PRIVMSG {target} :\u0001{body}\u0001")
+		}
+
+		// The room left for text in one message to `target`: 512 bytes
+		// less the line around it, the source the server adds included.
+		internal def textBudget(command string, target string) int {
+			let around = ":{state.nick()}!{user == "" ?? (nick, user)}@".bytes().len() + 64 + " {command} {target} :\r\n".bytes().len()
+			let room = 512 - around
+			return room < 64 ?? (64, room)
+		}
+
+		// Joins a channel, with its key when it has one, and waits for the
+		// server to confirm.
+		// Fails with IrcError when the server refuses (`473` invite only,
+		// `474` banned, `475` bad key, `471` full, `403` no such channel).
+		def join(name string, key string = "") !none {
+			let want = state.folded(name)
+			let me = state.folded(state.nick())
+			let line = key == "" ?? ("JOIN {name}", "JOIN {name} {key}")
+			// The join is done at the end of the member list (366), which the
+			// server sends after the JOIN and the topic, so `getChannel`
+			// sees the whole channel once this returns.
+			let replies = try request(line, def (m Message) bool {
+				return state.folded(m.nick()) == me && state.folded(m.target()) == want when m.command == "JOIN"
+				return m.params.len() > 1 && state.folded(m.params[1]) == want when m.command == "366"
+				return isJoinError(m) && m.params.len() > 1 && state.folded(m.params[1]) == want
+			}, m => m.command == "366" || isJoinError(m))
+			let last = replies[replies.len() - 1]
+			fail replyError("JOIN", last) unless last.command == "366"
+			return none
+		}
+
+		// Leaves a channel and waits for the server to confirm.
+		// Fails with IrcError (`442`) when the client is not in it.
+		def part(name string, reason string = "") !none {
+			let want = state.folded(name)
+			let me = state.folded(state.nick())
+			let line = reason == "" ?? ("PART {name}", "PART {name} :{reason}")
+			let replies = try request(line, def (m Message) bool {
+				return state.folded(m.nick()) == me && state.folded(m.target()) == want when m.command == "PART"
+				return (m.command := "403" || "442") && m.params.len() > 1 && state.folded(m.params[1]) == want
+			})
+			let last = replies[replies.len() - 1]
+			fail replyError("PART", last) unless last.command == "PART"
+			return none
+		}
+
+		// Changes the client's nickname and waits for the server to
+		// confirm.
+		// Fails with IrcError (`433` in use, `432` not allowed).
+		def changeNick(newNick string) !none {
+			let me = state.folded(state.nick())
+			let replies = try request("NICK {newNick}", def (m Message) bool {
+				return state.folded(m.nick()) == me when m.command == "NICK"
+				return m.command := "431" || "432" || "433" || "436" || "437" || "484"
+			})
+			let last = replies[replies.len() - 1]
+			fail replyError("NICK", last) unless last.command == "NICK"
+			return none
+		}
+
+		// Sets a channel's topic and waits for the server to confirm.
+		// Fails with IrcError (`482` when the channel's topic is locked
+		// to operators, `442` when the client is not in it).
+		def setTopic(name string, text string) !none {
+			let want = state.folded(name)
+			let replies = try request("TOPIC {name} :{text}", def (m Message) bool {
+				return state.folded(m.target()) == want when m.command == "TOPIC"
+				return (m.command := "403" || "442" || "477" || "482") && m.params.len() > 1 && state.folded(m.params[1]) == want
+			})
+			let last = replies[replies.len() - 1]
+			fail replyError("TOPIC", last) unless last.command == "TOPIC"
+			return none
+		}
+
+		// The modes of a channel (`+nt`) or of the client itself (`+iw`).
+		// Fails with IrcError when the channel does not exist.
+		def mode(target string) !string {
+			let want = state.folded(target)
+			let replies = try request("MODE {target}", def (m Message) bool {
+				return true when m.command == "221"
+				return (m.command := "324" || "403" || "401" || "502") && m.params.len() > 1 && state.folded(m.params[1]) == want
+			})
+			let last = replies[replies.len() - 1]
+			return last.params[1:].join(" ") when last.command == "221"
+			fail replyError("MODE", last) unless last.command == "324"
+			return last.params[2:].join(" ")
+		}
+
+		// Changes modes: `mode("#adm", "+o", ["alice"])`,
+		// `mode("#adm", "+kl", ["secret", "10"])`. The change comes back
+		// as a MODE message; refusals come as error replies through `next`.
+		// Fails when the write does.
+		def mode(target string, changes string, args string[] = []) !none {
+			let line = "MODE {target} {changes}"
+			line += " " + args.join(" ") when args.len() > 0
+			return try send(line)
+		}
+
+		// Removes a user from a channel and waits for the server to
+		// confirm.
+		// Fails with IrcError (`482` without channel operator status,
+		// `441` when the user is not in the channel).
+		def kick(name string, nick string, reason string = "") !none {
+			let want = state.folded(name)
+			let victim = state.folded(nick)
+			let line = reason == "" ?? ("KICK {name} {nick}", "KICK {name} {nick} :{reason}")
+			let replies = try request(line, def (m Message) bool {
+				return state.folded(m.target()) == want && m.params.len() > 1 && state.folded(m.params[1]) == victim when m.command == "KICK"
+				return m.command := "401" || "403" || "441" || "442" || "476" || "482"
+			})
+			let last = replies[replies.len() - 1]
+			fail replyError("KICK", last) unless last.command == "KICK"
+			return none
+		}
+
+		// Invites a user to a channel and waits for the server to confirm.
+		// Fails with IrcError (`443` already there, `482` without
+		// channel operator status on an invite-only channel).
+		def invite(nick string, name string) !none {
+			let replies = try request("INVITE {nick} {name}", (m Message) => m.command := "341" || "401" || "403" || "442" || "443" || "482")
+			let last = replies[replies.len() - 1]
+			fail replyError("INVITE", last) unless last.command == "341"
+			return none
+		}
+
+		// Marks the client away with a message, or back with none.
+		// Fails when the connection does.
+		def away(message string = "") !none {
+			let line = message == "" ?? ("AWAY", "AWAY :{message}")
+			let replies = try request(line, (m Message) => m.command := "305" || "306")
+			fail protocolError("AWAY", "no answer") when replies.len() == 0
+			return none
+		}
+
+		// Asks the server about a user.
+		// Fails with IrcError (`401`) when no one has that nickname.
+		def whois(target string) !Whois {
+			let want = state.folded(target)
+			let replies = try request("WHOIS {target}", def (m Message) bool {
+				return false unless m.command := "301" || "311" || "312" || "313" || "317" || "318" || "319" || "330" || "401" || "671"
+				return m.params.len() > 1 && state.folded(m.params[1]) == want
+			}, (m Message) => m.command == "318")
+			let out = Whois{nick: target, user: "", host: "", realName: "", server: "", serverInfo: "", channels: [], away: "", operator: false, account: "", secure: false, idle: 0, signOn: 0}
+			for let m in replies {
+				let p = m.params
+				switch {
+					case m.command == "401":
+						fail replyError("WHOIS", m)
+					case m.command == "311" && p.len() > 5:
+						out.nick = p[1]
+						out.user = p[2]
+						out.host = p[3]
+						out.realName = p[5]
+					case m.command == "312" && p.len() > 3:
+						out.server = p[2]
+						out.serverInfo = p[3]
+					case m.command == "319":
+						for let c in m.text().split(" ") {
+							out.channels.push(c) unless c == ""
+						}
+					case m.command == "301":
+						out.away = m.text()
+					case m.command == "313":
+						out.operator = true
+					case m.command == "330" && p.len() > 2:
+						out.account = p[2]
+					case m.command == "671":
+						out.secure = true
+					case m.command == "317" && p.len() > 3:
+						out.idle = p[2].toInt<int64>() when p[2].isNumeric()
+						out.signOn = p[3].toInt<int64>() when p[3].isNumeric()
+				}
+			}
+			return out
+		}
+
+		// The channels the server lists; `mask` narrows it to channels
+		// named in a comma-separated list.
+		// Fails when the connection does.
+		def list(mask string = "") !ChannelListing[] {
+			let line = mask == "" ?? ("LIST", "LIST {mask}")
+			let replies = try request(line, (m Message) => m.command := "321" || "322" || "323" || "481", (m Message) => m.command := "323" || "481")
+			let out ChannelListing[] = []
+			for let m in replies {
+				fail replyError("LIST", m) when m.command == "481"
+				continue unless m.command == "322" && m.params.len() > 2
+				let count = m.params[2].isNumeric() ?? (m.params[2].toInt<int>(), 0)
+				out.push(ChannelListing{name: m.params[1], users: count, topic: m.params.len() > 3 ?? (m.params[3], "")})
+			}
+			return out
+		}
+
+		// The users a WHO mask matches: a channel's members, or the users
+		// whose nickname, user name, host, real name or server match.
+		// Fails when the connection does.
+		def who(mask string) !WhoEntry[] {
+			let want = state.folded(mask)
+			let replies = try request("WHO {mask}", def (m Message) bool {
+				return true when m.command == "352"
+				return m.command == "315" && m.params.len() > 1 && state.folded(m.params[1]) == want
+			}, (m Message) => m.command == "315")
+			let out WhoEntry[] = []
+			for let m in replies {
+				let p = m.params
+				continue unless m.command == "352" && p.len() > 7
+				let flags = p[6]
+				let real = p[7]
+				let space = real.indexOf(" ")
+				real = real[space + 1:] when space >= 0
+				out.push(WhoEntry{channel: p[1], user: p[2], host: p[3], server: p[4], nick: p[5], realName: real, away: flags.startsWith("G"), operator: flags.contains("*"), status: flags.trimStart("HG*")})
+			}
+			return out
+		}
+
+		// The nicknames in a channel, each with its status prefixes, as
+		// NAMES reports them now.
+		// Fails when the connection does.
+		def names(name string) !string[] {
+			let want = state.folded(name)
+			let replies = try request("NAMES {name}", (m Message) => (m.command == "353" && m.params.len() > 2 && state.folded(m.params[2]) == want) || (m.command == "366" && m.params.len() > 1 && state.folded(m.params[1]) == want), (m Message) => m.command == "366")
+			let out string[] = []
+			for let m in replies {
+				continue unless m.command == "353"
+				for let entry in m.text().split(" ") {
+					out.push(entry) unless entry == ""
+				}
+			}
+			return out
+		}
+
+		// Leaves the server with a reason and waits for it to close the
+		// connection.
+		// Fails when the write does.
+		def quit(reason string = "") !none {
+			return none unless open
+			quitting = true
+			try send(reason == "" ?? ("QUIT", "QUIT :{reason}"))
+			let deadline = time.monoNs() + int64(timeout)
+			for open && time.monoNs() < deadline {
+				time.sleep(20ms)
+			}
+			return try close()
+		}
+
+		// Closes the connection without a QUIT. Never fails.
+		def close() !none {
+			quitting = true
+			open = false
+			closeTransport()
+			return none
+		}
+
+		// request sends a line and gathers the replies `wants` accepts,
+		// until the first one `last` says ends them.
+		internal def request(line string, wants def (Message) bool, last def (Message) bool) !Message[] {
+			let w = new Waiter(wants)
+			state.addWaiter(w)
+			let failure ?error = none
+			send(line) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				state.removeWaiter(w)
+				fail failure
+			}
+			let timer = async expire(w, timeout)
+			timer.keepAlive()
+			let out Message[] = []
+			for {
+				let m = <-w.got
+				if m.command == "" {
+					state.removeWaiter(w)
+					fail protocolError(line.split(" ")[0], open ?? ("no answer within the timeout", "the connection closed"))
+				}
+				out.push(m)
+				break when last(m)
+			}
+			w.over = true
+			state.removeWaiter(w)
+			return out
+		}
+
+		// request gathers replies until the first one `wants` accepts.
+		internal def request(line string, wants def (Message) bool) !Message[] {
+			return try request(line, wants, (m Message) => true)
+		}
+
+		internal def expire(w Waiter, after duration) {
+			time.sleep(after)
+			w.stop()
+		}
+
+		// Names the client and the nickname.
+		def str() string {
+			return "irc.Client({state.nick() == "" ?? (nick, state.nick())})"
+		}
+	}
+
+	// Messages walks a client's incoming messages.
+	type Messages {
+		client Client
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		// Implements Iterator<Message>.
+		def iterate() ?Message {
+			return client.next() onerror recover none
+		}
+	}
+
+	// isJoinError reports whether a numeric refuses a JOIN.
+	internal def isJoinError(m Message) bool {
+		return m.command := "403" || "405" || "437" || "471" || "473" || "474" || "475" || "476" || "477" || "479" || "489"
+	}
+
+	// hostOf is the host of a `host:port` address, without brackets.
+	internal def hostOf(addr string) string {
+		let a = net.parseAddress(addr) onerror recover new net.Address()
+		return a.host
+	}
+
+	// secure runs the TLS client handshake over a fresh connection.
+	internal def secure(conn net.Connection, config tls.Config, timeout duration) !net.Stream {
+		let t = tls.client(conn, config)
+		try t.handshake(timeout)
+		return t
+	}
+
+	// capChunks groups capability names into CAP REQ arguments under 400
+	// bytes.
+	internal def capChunks(names string[]) string[] {
+		let out string[] = []
+		let row = ""
+		for let name in names {
+			if row != "" && row.len() + name.len() + 1 > 400 {
+				out.push(row)
+				row = ""
+			}
+			row = row == "" ?? (name, row + " " + name)
+		}
+		out.push(row) unless row == ""
+		return out
+	}
 }

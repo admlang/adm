@@ -1,0 +1,1103 @@
+internal partial module std.net.ftp.proto {
+	use (
+		std.bytes
+		std.fs
+		std.io
+		std.metrics
+		std.net
+		std.net.ftp::*
+		std.net.tls
+		std.os
+		std.services::(metric)
+		std.time
+	)
+
+	// The commands HELP lists, RFC 959 order first.
+	const helpCommands = "USER PASS ACCT CWD CDUP REIN QUIT PORT PASV TYPE STRU MODE RETR STOR STOU APPE ALLO REST RNFR RNTO ABOR DELE RMD MKD PWD LIST NLST SITE SYST STAT HELP NOOP FEAT OPTS AUTH PBSZ PROT EPRT EPSV HOST MDTM MFMT SIZE MLST MLSD XCWD XCUP XMKD XRMD XPWD"
+
+	// Session is the server side of one control connection. A reader task
+	// takes command lines off the connection into `commands`; the session
+	// answers them in order, and during a transfer looks at them between
+	// chunks, so ABOR and STAT are answered while data moves.
+	type Session {
+		server              Server
+		socket              net.Connection
+		stream              net.Stream
+		lines               LineReader
+		stats               ServerStats
+		hosts               Hosts
+		// The site HOST picked; none serves the server's own.
+		site                ?VirtualHost         = none
+		commands            channel<ControlLine>
+		// The reader waits on it after passing on AUTH, until the session
+		// has upgraded (or refused) and the next line is to be read from
+		// the new stream.
+		resume              channel<bool>
+		// Lines the reader passed on during a transfer, answered after it.
+		queued              ControlLine[]
+		// The control connection is under TLS (AUTH TLS or implicit).
+		secured             bool                 = false
+		// The data connections carry TLS (PROT P).
+		protected           bool                 = false
+		pbsz                bool                 = false
+		// TYPE A: files cross the data connection with CRLF line endings.
+		ascii               bool                 = false
+		user                string               = ""
+		account             ?Account             = none
+		cwd                 string               = "/"
+		restart             int64                = 0
+		renameFrom          string               = ""
+		passive             ?net.Listener        = none
+		activeAddr          string               = ""
+		// The transfer running, for STAT, its data connection, for ABOR to
+		// close, and whether ABOR stopped it.
+		atomic transferring bool                 = false
+		transferName        string               = ""
+		transferred         int64                = 0
+		atomic dataSocket   ?net.Connection      = none
+		atomic aborted      bool                 = false
+		// For the idle watchdog: when the last command ended, and whether
+		// one is being answered.
+		atomic lastActive   int64                = 0
+		atomic handling     bool                 = false
+		atomic closed       bool                 = false
+
+		def new(server Server, stats ServerStats, hosts Hosts, socket net.Connection) {
+			self.server = server
+			self.stats = stats
+			self.hosts = hosts
+			self.socket = socket
+			stream = socket
+			lines = new LineReader(socket)
+			commands = new channel<ControlLine>(64)
+			resume = new channel<bool>(1)
+		}
+
+		// run serves the connection until the client quits, goes idle
+		// past the server's `idleTimeout` or the connection fails.
+		def run() {
+			serve() onerror recover none
+			end()
+		}
+
+		// end closes the connection and any passive listener; the reader's
+		// read fails and it stops.
+		def end() {
+			return when closed
+			closed = true
+			dropPassive()
+			stream.close() onerror recover none
+			socket.close() onerror recover none
+		}
+
+		internal def serve() !none {
+			try secure() when server.security == Security.Implicit
+			try reply(220, server.banner)
+			lastActive = time.monoNs()
+			let reader = async readCommands()
+			reader.keepAlive()
+			let watchdog = async watchIdle()
+			watchdog.keepAlive()
+			for !closed {
+				let next = nextCommand()
+				return none unless next.failure is none
+				let (verb, arg) = verbOf(next.line)
+				handling = true
+				let outcome ?error = none
+				handle(verb, arg) onerror (err error) {
+					outcome = err
+					recover none
+				}
+				lastActive = time.monoNs()
+				handling = false
+				resume <- true when verb == "AUTH"
+				fail outcome unless outcome is none
+			}
+			return none
+		}
+
+		// watchIdle closes the connection with 421 once no command has come
+		// for the server's `idleTimeout`, a transfer or a command being
+		// answered not counting as idle. The reads themselves wait without
+		// a timeout: a TLS read cut short by one would lose its record.
+		internal def watchIdle() {
+			let limit = int64(server.idleTimeout)
+			return when limit <= 0
+			for !closed {
+				time.sleep(250ms)
+				continue when handling || transferring
+				if time.monoNs() - lastActive > limit {
+					reply(421, "Idle timeout, closing the connection") onerror recover none
+					end()
+					return
+				}
+			}
+		}
+
+		// nextCommand is the oldest line held back during a transfer, else
+		// the next the reader passes on.
+		internal def nextCommand() ControlLine {
+			return queued.shift() when queued.len() > 0
+			return <- commands
+		}
+
+		// readCommands passes each command line on to the session, waiting
+		// for it without a timeout (the watchdog handles idleness). ABOR
+		// during a transfer is acted on here: it closes the data
+		// connection, which ends the transfer wherever it waits. A failure
+		// is passed on and ends the reading.
+		internal def readCommands() {
+			for !closed {
+				let failure ?error = none
+				let line = lines.readLine(waitForever) onerror (err error) {
+					failure = err
+					recover ""
+				}
+				if !(failure is none) {
+					commands <- new ControlLine("", failure)
+					return
+				}
+				let (verb, _) = verbOf(line)
+				if verb == "ABOR" && transferring {
+					aborted = true
+					let data = dataSocket
+					if !(data is none) {
+						data.close() onerror recover none
+					}
+					continue
+				}
+				commands <- new ControlLine(line)
+				if verb == "AUTH" {
+					let ready = <-resume
+					return unless ready
+				}
+				return when verb == "QUIT"
+			}
+		}
+
+		// secure runs the TLS server handshake over the control connection.
+		// Fails when the server has no TLS config or the handshake fails.
+		internal def secure() !none {
+			let config = server.tls
+			fail "the server has no TLS config" when config is none
+			let conn = tls.server(socket, config)
+			try conn.handshake(server.timeout)
+			stream = conn
+			lines = new LineReader(conn)
+			secured = true
+			return none
+		}
+
+		// reply writes a reply, a multi-line one when `text` has newlines.
+		// Fails when the write does.
+		def reply(code int, text string) !none {
+			let rows = text.split("\n")
+			let out = ""
+			for let i = 0; i < rows.len(); i++ {
+				let row = rows[i].trimEnd("\r")
+				if i == rows.len() - 1 {
+					out += "{code} {row}\r\n"
+				} else if i == 0 {
+					out += "{code}-{row}\r\n"
+				} else {
+					out += " {row}\r\n"
+				}
+			}
+			return writeFully(stream, out.bytes(), server.timeout)
+		}
+
+		internal def handle(verb string, arg string) !none {
+			switch {
+				case verb == "HOST":
+					return try hostCommand(arg)
+				case verb == "USER":
+					return try userCommand(arg)
+				case verb == "PASS":
+					return try passCommand(arg)
+				case verb == "ACCT":
+					return try reply(202, "No account needed") unless account is none
+					return try reply(503, "Log in with USER and PASS first")
+				case verb == "REIN":
+					user = ""
+					account = none
+					site = none
+					cwd = "/"
+					restart = 0
+					renameFrom = ""
+					ascii = false
+					dropPassive()
+					activeAddr = ""
+					return try reply(220, server.banner)
+				case verb == "AUTH":
+					return try authCommand(arg)
+				case verb == "PBSZ":
+					return try reply(503, "Run AUTH TLS first") unless secured
+					pbsz = true
+					return try reply(200, "PBSZ=0")
+				case verb == "PROT":
+					return try protCommand(arg)
+				case verb == "QUIT":
+					reply(221, "Goodbye") onerror recover none
+					end()
+					return none
+				case verb == "NOOP":
+					return try reply(200, "OK")
+				case verb == "SYST":
+					return try reply(215, "UNIX Type: L8")
+				case verb == "HELP":
+					return try help(arg)
+				case verb == "FEAT":
+					let feats = ["Features:", "EPRT", "EPSV", "HOST", "MDTM", "MFMT", "MLST type*;size*;modify*;unix.mode*;", "PASV", "REST STREAM", "SIZE", "TVFS", "UTF8"]
+					if !(server.tls is none) && server.security != Security.Plain {
+						feats.push("AUTH TLS")
+						feats.push("PBSZ")
+						feats.push("PROT")
+					}
+					feats.push("End")
+					return try reply(211, feats.join("\n"))
+				case verb == "OPTS":
+					return try reply(200, "UTF8 is always on") when arg.upper().startsWith("UTF8")
+					return try reply(501, "Unknown option")
+				case verb == "TYPE":
+					return try typeCommand(arg)
+				case verb == "MODE":
+					return try reply(200, "Mode S") when arg.upper().trim() == "S"
+					return try reply(504, "Only stream mode (S)")
+				case verb == "STRU":
+					return try reply(200, "Structure F") when arg.upper().trim() == "F"
+					return try reply(504, "Only file structure (F)")
+				case verb == "ALLO":
+					return try reply(202, "No storage allocation needed")
+				case verb == "ABOR":
+					dropPassive()
+					activeAddr = ""
+					return try reply(226, "No transfer to abort")
+				case verb == "STAT" && arg == "":
+					return try status()
+			}
+			let a = account
+			return try reply(530, "Log in first") when a is none
+			return try loggedIn(a, verb, arg)
+		}
+
+		// typeCommand takes TYPE A (with the default Non-print format), I and
+		// L 8; EBCDIC, Telnet and carriage-control formats and other byte
+		// sizes are refused.
+		internal def typeCommand(arg string) !none {
+			let parts = arg.upper().split(" ").filter(p => p != "")
+			return try reply(501, "TYPE needs an argument") when parts.len() == 0
+			switch {
+				case parts[0] == "A" && (parts.len() == 1 || parts[1] == "N"):
+					ascii = true
+					return try reply(200, "Type set to A")
+				case parts[0] == "I" && parts.len() == 1:
+					ascii = false
+					return try reply(200, "Type set to I")
+				case parts[0] == "L" && parts.len() == 2 && parts[1] == "8":
+					ascii = false
+					return try reply(200, "Type set to L 8")
+			}
+			return try reply(504, "Type {arg} is not supported")
+		}
+
+		internal def help(arg string) !none {
+			if arg != "" {
+				let wanted = arg.trim().upper()
+				return try reply(214, "{wanted} is supported") when helpCommands.split(" ").includes(wanted)
+				return try reply(502, "{wanted} is not a command here")
+			}
+			let rows string[] = ["The following commands are recognized:"]
+			let words = helpCommands.split(" ")
+			for let i = 0; i < words.len(); i += 8 {
+				let end = i + 8
+				end = words.len() when end > words.len()
+				rows.push(words[i:end].join(" "))
+			}
+			rows.push("Help OK")
+			return try reply(214, rows.join("\n"))
+		}
+
+		// status is the STAT reply without an argument: the connection,
+		// the login, and the settings a transfer would use.
+		internal def status() !none {
+			let rows string[] = ["Status of the FTP server"]
+			rows.push("Connected to {socket.remoteAddr().str()}")
+			rows.push(account is none ?? ("Not logged in", "Logged in as {user}"))
+			rows.push(ascii ?? ("TYPE: ASCII", "TYPE: BINARY"))
+			rows.push("Control connection " + (secured ?? ("protected by TLS", "in plain text")))
+			rows.push("Data connections " + (protected ?? ("protected by TLS", "in plain text")))
+			rows.push("End of status")
+			return try reply(211, rows.join("\n"))
+		}
+
+		internal def loggedIn(a Account, verb string, arg string) !none {
+			switch {
+				case verb := "PWD" || "XPWD":
+					return try reply(257, "\"{cwd.replace("\"", "\"\"")}\" is the current directory")
+				case verb := "CWD" || "XCWD":
+					return try changeDir(a, arg)
+				case verb := "CDUP" || "XCUP":
+					return try changeDir(a, "..")
+				case verb == "PASV":
+					return try passiveMode(false)
+				case verb == "EPSV":
+					return try passiveMode(true)
+				case verb == "PORT":
+					return try activeMode(arg, false)
+				case verb == "EPRT":
+					return try activeMode(arg, true)
+				case verb == "REST":
+					return try reply(501, "Bad offset") unless arg.trim().isNumeric()
+					restart = arg.trim().toInt<int64>()
+					return try reply(350, "Restarting at {restart}")
+				case verb := "LIST" || "NLST" || "MLSD":
+					return try listing(a, verb, arg)
+				case verb == "STAT":
+					return try statPath(a, arg)
+				case verb == "MLST":
+					return try mlst(a, arg)
+				case verb == "SIZE":
+					return try size(a, arg)
+				case verb == "MDTM":
+					let entry = a.store.stat(path(arg)) onerror recover fs.FileEntry{name: ""}
+					return try reply(550, "No such file") when entry.name == "" || entry.kind == fs.FileKind.Dir
+					return try reply(213, formatTime(entry.modified))
+				case verb == "RETR":
+					return try retrieve(a, arg)
+				case verb == "SITE":
+					let (command, rest) = verbOf(arg.trim())
+					return try reply(214, "SITE commands: CHMOD <mode> <path>, HELP") when command == "HELP"
+					return try reply(504, "SITE {command} is not implemented") unless command == "CHMOD"
+					return try reply(550, "Permission denied") when a.readOnly
+					return try siteChmod(a, rest)
+				case verb == "MFMT":
+					return try reply(550, "Permission denied") when a.readOnly
+					return try mfmt(a, arg)
+			}
+			if a.readOnly && (verb := "STOR" || "STOU" || "APPE" || "DELE" || "RNFR" || "RNTO" || "MKD" || "XMKD" || "RMD" || "XRMD") {
+				restart = 0
+				return try reply(550, "Permission denied")
+			}
+			switch {
+				case verb := "STOR" || "APPE":
+					return try storeFile(a, path(arg), append = verb == "APPE")
+				case verb == "STOU":
+					return try storeFile(a, try uniquePath(a, arg), unique = true)
+				case verb == "DELE":
+					let target = path(arg)
+					return try done(def () !none { return a.store.remove(target) }, 250, "File removed")
+				case verb == "RNFR":
+					let entry = a.store.stat(path(arg)) onerror recover fs.FileEntry{name: ""}
+					return try reply(550, "No such file") when entry.name == ""
+					renameFrom = path(arg)
+					return try reply(350, "Ready for RNTO")
+				case verb == "RNTO":
+					return try reply(503, "Send RNFR first") when renameFrom == ""
+					let from = renameFrom
+					renameFrom = ""
+					let to = path(arg)
+					return try done(def () !none { return a.store.rename(from, to) }, 250, "Renamed")
+				case verb := "MKD" || "XMKD":
+					let target = path(arg)
+					return try done(def () !none { return a.store.makeDir(target) }, 257, "\"{target.replace("\"", "\"\"")}\" created")
+				case verb := "RMD" || "XRMD":
+					let target = path(arg)
+					return try done(def () !none { return a.store.removeDir(target) }, 250, "Directory removed")
+			}
+			return try reply(502, "{verb} is not implemented")
+		}
+
+		// done answers a store call: `code` and `text` when it succeeded,
+		// 550 with its message when it failed.
+		internal def done(op def () !none, code int, text string) !none {
+			let failure ?error = none
+			op() onerror (err error) {
+				failure = err
+				recover none
+			}
+			return try reply(code, text) when failure is none
+			return try reply(550, failure.message)
+		}
+
+		internal def path(arg string) string {
+			return os.clean(arg) when arg.startsWith("/")
+			return os.clean(os.join(cwd, arg))
+		}
+
+		// uniquePath is a name for STOU in the working directory that no
+		// file has: the argument, or `file`, with `.1`, `.2`… added until
+		// it is free. Fails when the store cannot be listed.
+		internal def uniquePath(a Account, arg string) !string {
+			let base = path(arg.trim() == "" ?? ("file", arg.trim()))
+			let candidate = base
+			for let i = 1; i < 100000; i++ {
+				let taken = true
+				a.store.stat(candidate) onerror (err error) {
+					taken = false
+					recover fs.FileEntry{}
+				}
+				return candidate unless taken
+				candidate = "{base}.{i}"
+			}
+			fail "no free name for {base}"
+		}
+
+		internal def userCommand(arg string) !none {
+			return try reply(530, "Run AUTH TLS first") when server.security == Security.Explicit && !secured
+			user = arg
+			account = none
+			return try reply(331, "Password required")
+		}
+
+		internal def passCommand(arg string) !none {
+			return try reply(503, "Send USER first") when user == ""
+			let secret Secret<string> = arg
+			let failure ?error = none
+			let granted = login(user, secret) onerror (err error) {
+				failure = err
+				recover Account{store: new fs.MemoryStore()}
+			}
+			if !(failure is none) {
+				stats.loginFailures.inc()
+				time.sleep(500ms)
+				return try reply(530, "Login incorrect")
+			}
+			account = granted
+			stats.logins.inc()
+			cwd = "/"
+			let text = server.welcome == "" ?? ("Logged in", server.welcome)
+			return try reply(230, text)
+		}
+
+		internal def login(name string, password Secret<string>) !Account {
+			let chosen = site
+			let auth = chosen is none ?? (server.authenticator, chosen.authenticator)
+			return try auth.login(name, password) unless auth is none
+			fail "login refused" unless name := "anonymous" || "ftp"
+			let store = chosen is none ?? (server.store, chosen.store)
+			return Account{store: store, readOnly: true}
+		}
+
+		// hostCommand picks the site a client asks for (RFC 7151), before it
+		// logs in.
+		internal def hostCommand(arg string) !none {
+			return try reply(503, "HOST comes before USER") unless user == "" && account is none
+			let name = arg.trim()
+			return try reply(501, "HOST needs a name") when name == ""
+			return try reply(220, "Host {name} accepted") when hosts.len() == 0
+			let found = hosts.find(name)
+			return try reply(504, "Unknown host {name}") when found is none
+			site = found
+			return try reply(220, "Host {name} accepted")
+		}
+
+		// siteChmod runs `SITE CHMOD <octal mode> <path>`.
+		internal def siteChmod(a Account, arg string) !none {
+			let (mode, rest) = verbOf(arg.trim())
+			let octal = /^[0-7]{1,4}$/
+			return try reply(501, "SITE CHMOD <octal mode> <path>") unless octal.test(mode) && rest.trim() != ""
+			let target = path(rest.trim())
+			let bits = mode.toInt<int>(8)
+			return try done(def () !none { return a.store.chmod(target, bits) }, 200, "SITE CHMOD command ok")
+		}
+
+		// mfmt runs `MFMT <YYYYMMDDHHMMSS> <path>`: sets the modification
+		// time and answers it back (213).
+		internal def mfmt(a Account, arg string) !none {
+			let (stamp, rest) = verbOf(arg.trim())
+			let stamped = parseTime(stamp)
+			return try reply(501, "MFMT <YYYYMMDDHHMMSS> <path>") when stamped.unixNs() == 0 || rest.trim() == ""
+			let target = path(rest.trim())
+			return try done(def () !none { return a.store.touch(target, stamped) }, 213, "Modify={formatTime(stamped)}; {rest.trim()}")
+		}
+
+		internal def authCommand(arg string) !none {
+			return try reply(504, "TLS is not offered") when server.tls is none || server.security == Security.Plain
+			return try reply(503, "Already under TLS") when secured
+			return try reply(504, "Only AUTH TLS") unless arg.upper() := "TLS" || "SSL" || "TLS-C"
+			try reply(234, "Starting TLS")
+			return try secure()
+		}
+
+		internal def protCommand(arg string) !none {
+			return try reply(503, "Run PBSZ first") unless pbsz
+			let level = arg.upper().trim()
+			if level == "P" {
+				protected = true
+				return try reply(200, "Data protected")
+			}
+			if level == "C" {
+				return try reply(534, "Data must be protected") when server.security != Security.Plain
+				protected = false
+				return try reply(200, "Data clear")
+			}
+			return try reply(504, "Protection level not supported")
+		}
+
+		internal def changeDir(a Account, arg string) !none {
+			let target = path(arg == "" ?? ("/", arg))
+			let entry = a.store.stat(target) onerror recover fs.FileEntry{name: ""}
+			return try reply(550, "No such directory") when entry.name == "" || entry.kind != fs.FileKind.Dir
+			cwd = target
+			return try reply(250, "Directory changed to {cwd}")
+		}
+
+		internal def dropPassive() {
+			let ln = passive
+			return when ln is none
+			ln.close() onerror recover none
+			passive = none
+		}
+
+		internal def passiveMode(extended bool) !none {
+			dropPassive()
+			activeAddr = ""
+			let local = socket.localAddr().host
+			return try reply(425, "PASV needs IPv4, use EPSV") when !extended && local.contains(":")
+			let bound = bindPassive(local) onerror recover none
+			return try reply(425, "Cannot open a data port") when bound is none
+			let ln net.Listener = bound
+			passive = ln
+			let port = ln.address().port
+			return try reply(229, "Entering Extended Passive Mode (|||{port}|)") when extended
+			let host = server.passiveHost == "" ?? (local, server.passiveHost)
+			let p1 = port / 256
+			let p2 = port % 256
+			return try reply(227, "Entering Passive Mode ({host.replace(".", ",")},{p1},{p2})")
+		}
+
+		// bindPassive listens on a port of the server's passive range, any
+		// port when it sets none. Fails when every port is taken.
+		internal def bindPassive(host string) !?net.Listener {
+			let low = server.passivePortMin
+			let high = server.passivePortMax
+			return try listenOn(host, 0) when low <= 0 || high < low
+			let span = high - low + 1
+			let start = int(time.now().unixNs() % int64(span))
+			for let i = 0; i < span; i++ {
+				let port = low + (start + i) % span
+				let ln = tryListen(host, port) onerror recover none
+				return ln unless ln is none
+			}
+			fail net.errorOf(net.ErrorCode.AddrInUse, "listen", host, "no free passive port")
+		}
+
+		internal def tryListen(host string, port int) !?net.Listener {
+			return try listenOn(host, port)
+		}
+
+		internal def activeMode(arg string, extended bool) !none {
+			dropPassive()
+			let failure ?error = none
+			let host = ""
+			let port = 0
+			if extended {
+				(host, port) = parseEprt(arg) onerror (err error) {
+					failure = err
+					recover ("", 0)
+				}
+			} else {
+				(host, port) = parseHostPort(arg) onerror (err error) {
+					failure = err
+					recover ("", 0)
+				}
+			}
+			return try reply(501, "Bad address") unless failure is none
+			// Data goes only to the client itself, never a third host.
+			return try reply(500, "Data connections go to the client only") when host != socket.remoteAddr().host || port < 1024
+			activeAddr = joinHostPort(host, port)
+			return try reply(200, "Active mode to {activeAddr}")
+		}
+
+		// openData opens the data connection of a transfer the client has
+		// set up with PASV/EPSV or PORT/EPRT.
+		// Fails when none was set up or it does not connect.
+		internal def openData() !net.Stream {
+			let ln = passive
+			let conn net.Connection = new net.Connection(-1)
+			if !(ln is none) {
+				passive = none
+				conn = try acceptWithin(ln, server.timeout)
+			} else if activeAddr != "" {
+				let target = activeAddr
+				activeAddr = ""
+				conn = try net.dialStream(target, server.timeout)
+			} else {
+				fail "use PASV or PORT first"
+			}
+			dataSocket = conn
+			if aborted {
+				// ABOR came before the data connection did.
+				conn.close() onerror recover none
+				fail "aborted by the client"
+			}
+			return conn unless protected
+			let settings = server.tls
+			fail "the server has no TLS config" when settings is none
+			let config tls.Config = settings
+			let wrapped = tls.server(conn, config)
+			wrapped.handshake(server.timeout) onerror (err error) {
+				conn.close() onerror recover none
+				fail err
+			}
+			return wrapped
+		}
+
+		// beginTransfer marks a transfer as running, for STAT and ABOR.
+		internal def beginTransfer(name string) {
+			transferName = name
+			transferred = 0
+			aborted = false
+			transferring = true
+		}
+
+		// endTransfer answers the end of a transfer that opened its data
+		// connection: 226, or 426 when it failed or ABOR stopped it, then
+		// the ABOR's own 226. It counts the transfer in the metrics.
+		internal def endTransfer(inbound bool, started int64, failure ?error) !none {
+			transferring = false
+			dataSocket = none
+			record(inbound, transferred, started, failure is none && !aborted)
+			if aborted {
+				try reply(426, "Connection closed; transfer aborted")
+				return try reply(226, "Abort successful")
+			}
+			return try reply(426, "Transfer aborted: {failure.message}") unless failure is none
+			return try reply(226, "Transfer complete ({transferred} bytes)")
+		}
+
+		// checkControl takes the lines the reader passed on during a
+		// transfer: STAT is answered with its progress, the rest wait for
+		// after it. Fails when ABOR stopped the transfer.
+		internal def checkControl() !none {
+			fail "aborted by the client" when aborted
+			for commands.len() > 0 {
+				let next = <-commands
+				if !(next.failure is none) {
+					queued.push(next)
+					continue
+				}
+				let (verb, arg) = verbOf(next.line)
+				if verb == "STAT" && arg == "" {
+					try reply(213, "Transferring {transferName}: {transferred} bytes so far")
+					continue
+				}
+				queued.push(next)
+			}
+			return none
+		}
+
+		// send copies a source to the data connection, in the ASCII form
+		// under TYPE A with the first `skip` bytes of that form left out.
+		// Fails when a read or write does, or ABOR stops it.
+		internal def send(data net.Stream, source io.Reader, skip int64) !none {
+			let endings = new LineEndings()
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			let left = skip
+			for {
+				try checkControl()
+				let n = try source.read(buf)
+				break when n <= 0
+				let chunk = ascii ?? (endings.toWire(buf[:n]), buf[:n])
+				if left > 0 {
+					let dropped = int(left)
+					dropped = chunk.len() when dropped > chunk.len()
+					chunk = chunk[dropped:]
+					left -= int64(dropped)
+				}
+				continue when chunk.len() == 0
+				try writeFully(data, chunk, server.timeout)
+				transferred += int64(chunk.len())
+			}
+			return none
+		}
+
+		// receive copies the data connection into a sink, back from the
+		// ASCII form under TYPE A. Fails when a read or write does, or
+		// ABOR stops it.
+		internal def receive(data net.Stream, sink io.Writer) !none {
+			let endings = new LineEndings()
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			for {
+				try checkControl()
+				let n = try data.read(buf, server.timeout)
+				break when n <= 0
+				transferred += int64(n)
+				let chunk = ascii ?? (endings.fromWire(buf[:n]), buf[:n])
+				try writeAll(sink, chunk)
+			}
+			try writeAll(sink, endings.flush()) when ascii
+			return none
+		}
+
+		// record counts a finished transfer: its bytes, in or out, whether
+		// it failed, and its speed when it moved any.
+		internal def record(inbound bool, moved int64, started int64, ok bool) {
+			if inbound {
+				stats.bytesIn.update(float64(moved))
+			} else {
+				stats.bytesOut.update(float64(moved))
+			}
+			if !ok {
+				stats.transferFailures.inc()
+				return
+			}
+			stats.transfers.inc()
+			let elapsed = time.monoNs() - started
+			return when moved <= 0 || elapsed <= 0
+			stats.speed.update(float64(moved) * 1000000000.0 / float64(elapsed))
+		}
+
+		// transferFrom runs a download: 150, the data connection, the
+		// source over it, then the closing replies.
+		internal def transferFrom(name string, source io.Reader, skip int64) !none {
+			// Running from before the 150, so an ABOR right after it counts.
+			beginTransfer(name)
+			try reply(150, "Opening {ascii ?? ("ASCII", "BINARY")} mode data connection for {name}")
+			let started = time.monoNs()
+			let failure ?error = none
+			let data = openData() onerror (err error) {
+				failure = err
+				recover new net.Connection(-1)
+			}
+			if !(failure is none) {
+				return try endTransfer(false, started, failure) when aborted
+				transferring = false
+				stats.transferFailures.inc()
+				return try reply(425, "Cannot open the data connection")
+			}
+			send(data, source, skip) onerror (err error) {
+				failure = err
+				recover none
+			}
+			data.close() onerror recover none
+			return try endTransfer(false, started, failure)
+		}
+
+		// listingEntries is what LIST, NLST, MLSD and STAT with a path show:
+		// a directory's entries, or the one file named. Fails when the
+		// path is missing, or MLSD names a file.
+		internal def listingEntries(a Account, verb string, target string) !fs.FileEntry[] {
+			let dir = path(target)
+			let entry = try a.store.stat(dir)
+			fail "not a directory" when verb == "MLSD" && entry.kind != fs.FileKind.Dir
+			return [entry] unless entry.kind == fs.FileKind.Dir
+			return try a.store.list(dir)
+		}
+
+		// listingRows renders entries as a verb lists them.
+		internal def listingRows(entries fs.FileEntry[], verb string, target string) string[] {
+			let rows string[] = []
+			for let e in entries {
+				switch {
+					case verb == "MLSD":
+						rows.push(factsLine(e, e.name))
+					case verb == "NLST":
+						rows.push(target == "" ?? (e.name, remotePath(target, e.name)))
+					default:
+						rows.push(listLine(e))
+				}
+			}
+			return rows
+		}
+
+		internal def listing(a Account, verb string, arg string) !none {
+			let target = listTarget(arg)
+			let failure ?error = none
+			let entries = listingEntries(a, verb, target) onerror (err error) {
+				failure = err
+				recover []
+			}
+			return try reply(550, "{target}: {failure.message}") unless failure is none
+			let rows = listingRows(entries, verb, target)
+			let text = rows.len() == 0 ?? ("", rows.join("\n") + "\n")
+			// Listings are text: under either TYPE they cross in the ASCII form.
+			let wasAscii = ascii
+			ascii = true
+			let outcome ?error = none
+			transferFrom(verb, new bytes.Buffer(text.bytes()), int64(0)) onerror (err error) {
+				outcome = err
+				recover none
+			}
+			ascii = wasAscii
+			fail outcome unless outcome is none
+			return none
+		}
+
+		// statPath is STAT with a path: its listing over the control
+		// connection (213).
+		internal def statPath(a Account, arg string) !none {
+			let target = listTarget(arg)
+			let failure ?error = none
+			let entries = listingEntries(a, "LIST", target) onerror (err error) {
+				failure = err
+				recover []
+			}
+			return try reply(550, "{target}: {failure.message}") unless failure is none
+			let rows = ["Status of {target}:"] + listingRows(entries, "LIST", target)
+			rows.push("End of status")
+			return try reply(213, rows.join("\n"))
+		}
+
+		internal def mlst(a Account, arg string) !none {
+			let target = path(arg)
+			let failure ?error = none
+			let entry = a.store.stat(target) onerror (err error) {
+				failure = err
+				recover fs.FileEntry{}
+			}
+			return try reply(550, "No such file") unless failure is none
+			return try reply(250, "Listing {target}\n{factsLine(entry, target)}\nEnd")
+		}
+
+		// size answers SIZE with the bytes a RETR would send under the
+		// TYPE in effect (RFC 3659 §4): the file's size in binary, its
+		// ASCII-form length under TYPE A.
+		internal def size(a Account, arg string) !none {
+			let target = path(arg)
+			let entry = a.store.stat(target) onerror recover fs.FileEntry{name: ""}
+			return try reply(550, "No such file") when entry.name == "" || entry.kind == fs.FileKind.Dir
+			return try reply(213, "{entry.size}") unless ascii
+			let failure ?error = none
+			let n = asciiLength(a, target) onerror (err error) {
+				failure = err
+				recover int64(0)
+			}
+			return try reply(550, failure.message) unless failure is none
+			return try reply(213, "{n}")
+		}
+
+		// asciiLength is a file's length in the ASCII form. Fails when it
+		// cannot be read.
+		internal def asciiLength(a Account, target string) !int64 {
+			let source = try a.store.open(target, 0)
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			let n int64 = 0
+			let lastCR = false
+			for {
+				let got = source.read(buf) onerror (err error) {
+					source.close() onerror recover none
+					fail err
+				}
+				break when got <= 0
+				n += wireLength(buf[:got], lastCR)
+				lastCR = buf[got - 1] == byte(13)
+			}
+			source.close() onerror recover none
+			return n
+		}
+
+		// localOffset is the byte of a file an ASCII-form offset stands for,
+		// for a restarted ASCII upload. Fails when the file is shorter, or
+		// the offset falls between the CR and LF of a line ending.
+		internal def localOffset(a Account, target string, wireOffset int64) !int64 {
+			let source = try a.store.open(target, 0)
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			let wire int64 = 0
+			let local int64 = 0
+			let lastCR = false
+			for wire < wireOffset {
+				let got = source.read(buf) onerror (err error) {
+					source.close() onerror recover none
+					fail err
+				}
+				if got <= 0 {
+					source.close() onerror recover none
+					fail "the file is shorter than the restart offset"
+				}
+				for let i = 0; i < got && wire < wireOffset; i++ {
+					let b = buf[i]
+					let width int64 = (b == byte(10) && !lastCR) ?? (int64(2), int64(1))
+					if wire + width > wireOffset {
+						source.close() onerror recover none
+						fail "the restart offset splits a line ending"
+					}
+					wire += width
+					local++
+					lastCR = b == byte(13)
+				}
+			}
+			source.close() onerror recover none
+			return local
+		}
+
+		internal def retrieve(a Account, arg string) !none {
+			let offset = restart
+			restart = 0
+			let target = path(arg)
+			let failure ?error = none
+			// Under TYPE A the offset counts ASCII-form bytes, skipped as sent.
+			let local = ascii ?? (int64(0), offset)
+			let opened = openSource(a, target, local) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return try reply(550, failure.message) unless failure is none
+			return try reply(550, "Cannot open the file") when opened is none
+			let source io.ReadCloser = opened
+			let skip = ascii ?? (offset, int64(0))
+			transferFrom(os.base(target), source, skip) onerror (err error) {
+				failure = err
+				recover none
+			}
+			source.close() onerror recover none
+			fail failure unless failure is none
+			return none
+		}
+
+		internal def openSource(a Account, target string, offset int64) !?io.ReadCloser {
+			return try a.store.open(target, offset)
+		}
+
+		// openSink is where STOR, APPE and STOU write: the file from the
+		// restart offset on, appended to, or replaced.
+		internal def openSink(a Account, target string, append bool, offset int64) !?io.WriteCloser {
+			return try a.store.resume(target, offset) when offset > 0
+			return try a.store.create(target, append)
+		}
+
+		// storeFile runs an upload: STOR (from the REST offset when one was
+		// given), APPE, or STOU, whose reply names the file.
+		internal def storeFile(a Account, target string, append bool = false, unique bool = false) !none {
+			let offset = restart
+			restart = 0
+			let failure ?error = none
+			if offset > 0 && ascii {
+				offset = localOffset(a, target, offset) onerror (err error) {
+					failure = err
+					recover int64(0)
+				}
+				return try reply(554, "Cannot restart at that offset: {failure.message}") unless failure is none
+			}
+			let created = openSink(a, target, append, offset) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return try reply(550, failure.message) unless failure is none
+			return try reply(550, "Cannot create the file") when created is none
+			let sink io.WriteCloser = created
+			let opening = unique ?? ("FILE: {os.base(target)}", "Opening {ascii ?? ("ASCII", "BINARY")} mode data connection for {os.base(target)}")
+			beginTransfer(os.base(target))
+			try reply(150, opening)
+			let started = time.monoNs()
+			let data = openData() onerror (err error) {
+				failure = err
+				recover new net.Connection(-1)
+			}
+			if !(failure is none) {
+				if aborted {
+					if sink is io.Aborter {
+						sink.abort() onerror recover none
+					} else {
+						sink.close() onerror recover none
+					}
+					return try endTransfer(true, started, failure)
+				}
+				sink.close() onerror recover none
+				transferring = false
+				stats.transferFailures.inc()
+				return try reply(425, "Cannot open the data connection")
+			}
+			receive(data, sink) onerror (err error) {
+				failure = err
+				recover none
+			}
+			data.close() onerror recover none
+			if aborted && sink is io.Aborter {
+				// The client abandoned the upload: the file stays as it was.
+				sink.abort() onerror recover none
+			} else {
+				sink.close() onerror (err error) {
+					failure = err when failure is none
+					recover none
+				}
+			}
+			return try endTransfer(true, started, failure)
+		}
+	}
+
+	// listTarget is the path of a LIST, NLST, MLSD or STAT argument, the
+	// `ls` options some clients send (`-la`) left out.
+	def listTarget(arg string) string {
+		let target = arg.trim()
+		for target.startsWith("-") {
+			let space = target.indexOf(" ")
+			target = space < 0 ?? ("", target[space + 1:].trim())
+		}
+		return target
+	}
+
+	// writeAll writes every byte to a writer. Fails when a write does or
+	// moves nothing.
+	def writeAll(sink io.Writer, data byte[]) !none {
+		let off = 0
+		for off < data.len() {
+			let n = try sink.write(data[off:])
+			fail "write moved no bytes" when n <= 0
+			off += n
+		}
+		return none
+	}
+
+	// ServerStats holds the metrics of FTP servers, registered once per
+	// server and shared by its sessions; the names are process-wide, so
+	// every server of the process adds to the same counts.
+	type ServerStats {
+		@metric("net.ftp.server.connections.open")
+		connectionsOpen metrics.Gauge
+		@metric("net.ftp.server.connections.total")
+		connectionsTotal metrics.Counter
+		@metric("net.ftp.server.bytes.in")
+		bytesIn metrics.Counter
+		@metric("net.ftp.server.bytes.out")
+		bytesOut metrics.Counter
+		@metric("net.ftp.server.transfers.total")
+		transfers metrics.Counter
+		@metric("net.ftp.server.transfers.failed")
+		transferFailures metrics.Counter
+		// Bytes per second of each transfer that moved data.
+		@metric("net.ftp.server.transfer.speed")
+		speed metrics.Histogram
+		@metric("net.ftp.server.logins.total")
+		logins metrics.Counter
+		@metric("net.ftp.server.logins.failed")
+		loginFailures metrics.Counter
+
+		def new() {}
+	}
+
+	// VirtualHost is one site a server serves under a host name (HOST).
+	type VirtualHost {
+		store         fs.FileStore
+		authenticator ?Authenticator
+
+		def new(store fs.FileStore, authenticator ?Authenticator) {
+			self.store = store
+			self.authenticator = authenticator
+		}
+	}
+
+	// Hosts are a server's sites by lower-cased host name. Safe from many
+	// tasks.
+	type Hosts {
+		sites map<string, VirtualHost>
+
+		def new() {}
+
+		atomic def add(name string, store fs.FileStore, authenticator ?Authenticator) {
+			sites[name.lower()] = new VirtualHost(store, authenticator)
+		}
+
+		atomic def find(name string) ?VirtualHost {
+			return sites.get(name.lower())
+		}
+
+		atomic def len() int {
+			return sites.len()
+		}
+	}
+}

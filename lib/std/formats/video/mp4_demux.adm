@@ -1,0 +1,532 @@
+internal partial module std.formats.video.isobmff {
+	use (
+		std.formats.video::*
+		std.formats.video.demux::*
+		std.formats.media.bmff::*
+		std.formats.media.source::*
+	)
+
+	// An OpusHead identification header built from an ISO BMFF `dOps` box,
+	// none when the box is too short.
+	def opusHead(r BoxReader, box Box) ?byte[] {
+		return none unless r.holds(box, 11)
+		let at = box.start
+		let count = r.u8(at + 1)
+		let preSkip = r.u16(at + 2)
+		let rate = r.u32(at + 4)
+		let gain = r.u16(at + 8)
+		let family = r.u8(at + 10)
+		let out = byte[]("OpusHead")
+		out.push(byte(1), byte(count), byte(preSkip & 0xFF), byte(preSkip >> 8))
+		out.push(byte(rate & 0xFF), byte((rate >> 8) & 0xFF), byte((rate >> 16) & 0xFF), byte((rate >> 24) & 0xFF))
+		out.push(byte(gain & 0xFF), byte(gain >> 8), byte(family))
+		out.push(...r.data[at + 11:box.end]) when family != 0
+		return out
+	}
+
+	// One track of the file and its samples, flattened from the sample
+	// tables or movie fragments into one entry per sample.
+	type Mp4Track {
+		track     Track
+		id        int
+		timescale int
+		samples   SampleTable
+		// Ticks subtracted from every time: the edit list's media start.
+		mediaTime int
+		// Ticks added to every time: the edit list's leading empty edits.
+		delay     int
+		// Defaults `trex` gives the samples of movie fragments.
+		defaults  TrackDefaults
+		// The next sample to return.
+		next      int
+		// The avcC record of each H.264 sample entry, and the entry the last
+		// sample returned used: a sample of another entry brings its
+		// parameter sets along.
+		configs   byte[][]
+		lastEntry int           = 1
+
+		def new() {
+			configs = byte[][]
+			samples = new SampleTable()
+			defaults = TrackDefaults{duration: 0, size: 0, flags: 0}
+		}
+
+		// The presentation time of sample `i`.
+		def pts(i int) duration {
+			return ticks(samples.times[i] + samples.shifts[i] - mediaTime + delay, timescale)
+		}
+
+		// The decode time of sample `i`.
+		def dts(i int) duration {
+			return ticks(samples.times[i] - mediaTime + delay, timescale)
+		}
+
+		// How long sample `i` lasts.
+		def length(i int) duration {
+			let times = samples.times
+			let stop = i + 1 < times.len() ?? (times[i + 1], samples.end)
+			return ticks(stop - times[i], timescale)
+		}
+	}
+
+	// The demultiplexer of an ISO base media file.
+	type Mp4Container {
+		src   Source
+		parts Mp4Track[]
+		list  Track[]
+		// The payload of the `moov` box, whose offsets its boxes use.
+		movie BoxReader
+		scale int
+		brand int
+
+		def new(src Source) {
+			self.src = src
+		}
+
+		// Reads the top-level boxes: `ftyp`, `moov` and every `moof`.
+		//
+		// Fails when there is no `moov` box, a box is damaged, or the source
+		// fails.
+		def read() !none {
+			let at = 0
+			let moofData byte[][]
+			let moofAt int[]
+			let moov byte[]
+			let size = src.size()
+			for size < 0 || at + 8 <= size {
+				try src.seek(at)
+				let head = try src.peek(16)
+				break when head.len() < 8
+				let boxSize = be(head, 0, 4)
+				let kind = be(head, 4, 4)
+				let header = 8
+				if boxSize == 1 {
+					break when head.len() < 16
+					boxSize = be(head, 8, 8)
+					header = 16
+				} else if boxSize == 0 {
+					break when size < 0
+					boxSize = size - at
+				}
+				break when boxSize < header
+				if kind == boxFtyp && boxSize >= 12 {
+					brand = be(head, 8, 4)
+				} else if kind == boxMoov {
+					try src.skip(header)
+					moov = try src.read(boxSize - header)
+				} else if kind == boxMoof {
+					try src.skip(header)
+					moofData.push(try src.read(boxSize - header))
+					moofAt.push(at)
+				}
+				at += boxSize
+			}
+			fail "mp4: the file has no moov box" when moov.len() == 0
+			movie = new BoxReader(moov)
+			let m = movie
+			let root = Box{kind: boxMoov, start: 0, end: moov.len()}
+			let mvhd = try m.child(root, boxMvhd)
+			if !(mvhd is none) {
+				let h Box = mvhd
+				let wide = m.holds(h, 1) && m.u8(h.start) == 1
+				scale = m.holds(h, wide ?? (24, 16)) ?? (m.u32(h.start + (wide ?? (20, 12))), 0)
+			}
+			for let (_, trak) in try m.boxes(0, moov.len()) {
+				continue unless trak.kind == boxTrak
+				let t = try readTrack(trak)
+				continue when t is none
+				let part Mp4Track = t
+				part.track.index = parts.len()
+				parts.push(part)
+			}
+			let mvex = try m.child(root, boxMvex)
+			if !(mvex is none) {
+				let ex Box = mvex
+				for let (_, part) in parts {
+					part.defaults = try trackDefaults(m, ex, part.id)
+				}
+			}
+			for let (i, data) in moofData {
+				let fragment = new BoxReader(data)
+				for let (_, traf) in try fragment.boxes(0, data.len()) {
+					continue unless traf.kind == boxTraf
+					let id = try fragmentTrack(fragment, traf)
+					for let (_, part) in parts {
+						try part.samples.readFragment(fragment, traf, moofAt[i], part.defaults) when part.id == id
+					}
+				}
+			}
+			for let (_, part) in parts {
+				complete(part)
+				list.push(part.track)
+			}
+			return none
+		}
+
+		// The lowercase container name the file's brand gives.
+		def name() string {
+			return "mov" when brand == brandQt || brand == 0
+			let text = fourcc(brand)
+			return "3gp" when text.startsWith("3g")
+			return "mp4"
+		}
+
+		// Reads one `trak`: its header, media header, handler, sample
+		// description and tables; none for a track with no sample table.
+		//
+		// Fails when a box it needs is damaged.
+		def readTrack(trak Box) !?Mp4Track {
+			let m = movie
+			let part = new Mp4Track()
+			let tkhdBox = try m.child(trak, boxTkhd)
+			let rotation = 0
+			if !(tkhdBox is none) {
+				let tkhd Box = tkhdBox
+				let wide = m.holds(tkhd, 1) && m.u8(tkhd.start) == 1
+				part.id = m.holds(tkhd, wide ?? (24, 16)) ?? (m.u32(tkhd.start + (wide ?? (20, 12))), 0)
+				let matrix = tkhd.start + (wide ?? (52, 40))
+				if matrix + 20 <= tkhd.end {
+					let a = m.s32(matrix)
+					let b = m.s32(matrix + 4)
+					if a == 0 && b > 0 {
+						rotation = 90
+					} else if a < 0 && b == 0 {
+						rotation = 180
+					} else if a == 0 && b < 0 {
+						rotation = 270
+					}
+				}
+			}
+			let mdhdBox = try m.path(trak, boxMdia, boxMdhd)
+			return none when mdhdBox is none
+			let mdhd Box = mdhdBox
+			let media = try mediaHeader(m, mdhd)
+			part.timescale = media.timescale
+
+			let hdlrBox = try m.path(trak, boxMdia, boxHdlr)
+			let handler = 0
+			if !(hdlrBox is none) {
+				let hdlr Box = hdlrBox
+				handler = m.u32(hdlr.start + 8) when m.holds(hdlr, 12)
+			}
+			let kind = TrackKind.Data
+			if handler == boxVide {
+				kind = TrackKind.Video
+			} else if handler == boxSoun {
+				kind = TrackKind.Audio
+			} else if fourcc(handler) := "sbtl" || "text" || "subt" || "clcp" {
+				kind = TrackKind.Subtitle
+			}
+			part.track = newTrack(0, kind, "")
+			part.track.rotation = rotation
+			let lang = media.language
+			if lang != 0 && lang != 0x7FFF && lang != 0x55C4 {
+				let code = byte[byte(((lang >> 10) & 0x1F) + 0x60), byte(((lang >> 5) & 0x1F) + 0x60), byte((lang & 0x1F) + 0x60)]
+				part.track.language = string(code)
+			}
+			part.track.length = ticks(media.length, part.timescale)
+
+			let stblBox = try m.path(trak, boxMdia, boxMinf, boxStbl)
+			return none when stblBox is none
+			let stbl Box = stblBox
+			let stsd = try m.child(stbl, boxStsd)
+			if !(stsd is none) {
+				let description Box = stsd
+				try readDescription(part, description)
+			}
+			try part.samples.read(m, stbl)
+			let delta = part.samples.firstDelta
+			if part.track.kind == TrackKind.Video && delta > 0 {
+				let g = gcd(part.timescale, delta)
+				part.track.frameRate = FrameRate{numerator: uint32(part.timescale / g), denominator: uint32(delta / g)}
+			}
+
+			let elst = try m.path(trak, boxEdts, boxElst)
+			if !(elst is none) {
+				let edits Box = elst
+				let edit = editList(m, edits, scale, part.timescale)
+				part.delay = edit.delay
+				if edit.start >= 0 {
+					part.mediaTime = edit.start
+					part.track.length = ticks(edit.length, scale) when edit.length > 0 && scale > 0
+				}
+			}
+			return part
+		}
+
+		// Reads the first sample entry of `stsd` into the track: codec,
+		// picture or sound format, and the decoder configuration.
+		//
+		// Fails when a box inside the entry is damaged.
+		def readDescription(part Mp4Track, stsd Box) !none {
+			let m = movie
+			return none unless m.holds(stsd, 8)
+			let entries = try m.boxes(stsd.start + 8, stsd.end)
+			return none when entries.len() == 0
+			let entry = entries[0]
+			let code = fourcc(entry.kind)
+			let t = part.track
+			if t.kind == TrackKind.Video {
+				return none unless m.holds(entry, 78)
+				t.width = uint32(m.u16(entry.start + 24))
+				t.height = uint32(m.u16(entry.start + 26))
+				let inner = Box{kind: entry.kind, start: entry.start + 78, end: entry.end}
+				let config = 0
+				if code := "avc1" || "avc3" {
+					t.codec = "h264"
+					config = boxAvcC
+				} else if code := "hvc1" || "hev1" {
+					t.codec = "hevc"
+					config = boxHvcC
+				} else if code == "vp08" {
+					t.codec = "vp8"
+					config = boxVpcC
+				} else if code == "vp09" {
+					t.codec = "vp9"
+					config = boxVpcC
+				} else if code == "av01" {
+					t.codec = "av1"
+					config = boxAv1C
+				} else if code == "mp4v" {
+					let esdsBox = try m.child(inner, boxEsds)
+					if !(esdsBox is none) {
+						let descriptors = esds(m, esdsBox)
+						t.codec = objectCodec(descriptors.objectType)
+						t.config = descriptors.config
+					}
+					t.codec = "mpeg4" when t.codec == ""
+				} else if code := "jpeg" || "mjpa" || "mjpb" {
+					t.codec = "mjpeg"
+				} else if code := "s263" || "h263" {
+					t.codec = "h263"
+				} else {
+					t.codec = code.trim().lower()
+				}
+				if config != 0 {
+					let box = try m.child(inner, config)
+					if !(box is none) {
+						let b Box = box
+						t.config = m.data[b.start:b.end].clone()
+					}
+				}
+				if t.codec == "h264" {
+					for let (_, e) in entries {
+						let found = try m.child(Box{kind: e.kind, start: e.start + 78, end: e.end}, boxAvcC)
+						let avcc byte[]
+						if !(found is none) && m.holds(e, 78) {
+							let b Box = found
+							avcc = m.data[b.start:b.end].clone()
+						}
+						part.configs.push(avcc)
+					}
+				}
+				let pasp = try m.child(inner, boxPasp)
+				if !(pasp is none) {
+					let p Box = pasp
+					let h = m.holds(p, 8) ?? (m.u32(p.start), 0)
+					let v = m.holds(p, 8) ?? (m.u32(p.start + 4), 0)
+					t.pixelAspect = float64(h) / float64(v) when h > 0 && v > 0
+				}
+			} else if t.kind == TrackKind.Audio {
+				let fields = soundEntry(m, entry)
+				return none when fields is none
+				let sound SoundEntry = fields
+				t.sampleRate = uint32(sound.sampleRate)
+				t.channels = uint16(sound.channels)
+				let inner = Box{kind: entry.kind, start: sound.children, end: entry.end}
+				if code == "mp4a" {
+					let esdsBox = try findEsds(m, inner)
+					t.codec = "aac"
+					if !(esdsBox is none) {
+						let descriptors = esds(m, esdsBox)
+						let name = objectCodec(descriptors.objectType)
+						t.codec = name when name != ""
+						t.config = descriptors.config
+					}
+				} else if code := ".mp3" || "mp3 " {
+					t.codec = "mp3"
+				} else if code == "Opus" {
+					t.codec = "opus"
+					let dops = try m.child(inner, boxDOps)
+					if !(dops is none) {
+						let head = opusHead(m, dops)
+						if !(head is none) {
+							t.config = head
+							t.sampleRate = uint32(48000)
+						}
+					}
+				} else if code := "twos" || "sowt" || "lpcm" || "raw " || "in24" || "in32" || "fl32" || "fl64" {
+					// A version 2 description says float and big-endian in its
+					// format flags; the other codes say it themselves.
+					let flags = 0
+					flags = m.u32(entry.start + 52) when sound.version == 2 && m.holds(entry, 56)
+					t.codec = quickTimePcm(code, sound.sampleSize, flags)
+				} else if code == "ac-3" {
+					t.codec = "ac3"
+				} else if code == "samr" {
+					t.codec = "amr"
+				} else if code == "fLaC" {
+					t.codec = "flac"
+				} else if code == "alac" {
+					t.codec = "alac"
+				} else {
+					t.codec = code.trim().lower()
+				}
+			} else {
+				t.codec = code.trim().lower()
+			}
+			part.track = t
+			return none
+		}
+
+		// Fills in what only the whole sample list gives: a length when the
+		// headers gave none, and the frame rate of a fragmented video track.
+		def complete(part Mp4Track) {
+			let t = part.track
+			let times = part.samples.times
+			let count = times.len()
+			t.length = ticks(part.samples.end - times[0], part.timescale) when int64(t.length) == 0 && count > 0
+			if t.kind == TrackKind.Video && t.frameRate.numerator == 0 && count > 1 {
+				let delta = times[1] - times[0]
+				if delta > 0 {
+					let g = gcd(part.timescale, delta)
+					t.frameRate = FrameRate{numerator: uint32(part.timescale / g), denominator: uint32(delta / g)}
+				}
+			}
+			part.track = t
+		}
+
+		// tracks implements Container.
+		def tracks() Track[] {
+			return list
+		}
+
+		// next implements Container: the sample that comes first in the
+		// file among the tracks' next samples.
+		//
+		// Fails when the sample lies past the end of the file or the source
+		// fails.
+		def next() !?Packet {
+			let best = -1
+			let bestAt = 0
+			for let (i, part) in parts {
+				continue when part.next >= part.samples.count()
+				let at = part.samples.offsets[part.next]
+				if best < 0 || at < bestAt {
+					best = i
+					bestAt = at
+				}
+			}
+			return none when best < 0
+			let part = parts[best]
+			let k = part.next
+			part.next++
+			try src.seek(bestAt)
+			let data = try src.peek(part.samples.sizes[k])
+			let entry = k < part.samples.entries.len() ?? (part.samples.entries[k], 1)
+			if entry != part.lastEntry && entry >= 1 && entry <= part.configs.len() {
+				part.lastEntry = entry
+				data = avcParameterSets(part.configs[entry - 1]).concat(data)
+			}
+			if data.len() < part.samples.sizes[k] {
+				// A file cut short: what is left of the sample is the last
+				// packet of every track.
+				for let (_, other) in parts {
+					other.next = other.samples.count()
+				}
+				return none when data.len() == 0
+			}
+			return newPacket(best, data, part.pts(k), part.dts(k), part.length(k), part.samples.sync[k])
+		}
+
+		// seek implements Container: the main video track moves to its last
+		// sync sample presenting at or before `time`, every other track to
+		// its first sample decoding at or after that sample.
+		//
+		// Does not fail.
+		def seek(time duration) !none {
+			let main = -1
+			for let (i, part) in parts {
+				if part.track.kind == TrackKind.Video {
+					main = i
+					break
+				}
+			}
+			let from = time
+			if main >= 0 {
+				let v = parts[main]
+				let count = v.samples.count()
+				let pick = 0
+				for let i = 0; i < count; i++ {
+					continue unless v.samples.sync[i]
+					break when v.pts(i) > time
+					pick = i
+				}
+				v.next = pick
+				from = pick < count ?? (v.dts(pick), time)
+			}
+			for let (i, part) in parts {
+				continue when i == main
+				let k = 0
+				for k < part.samples.count() && part.dts(k) + part.length(k) <= from {
+					k++
+				}
+				part.next = k
+			}
+			// Decoders start again from the first sample entry's setup.
+			for let (_, part) in parts {
+				part.lastEntry = 1
+			}
+			return none
+		}
+
+		// close implements io.Closer: closes the file.
+		//
+		// Fails when closing it does.
+		def close() !none {
+			return src.close()
+		}
+	}
+
+	// The parameter sets of an avcC record as length-prefixed NAL units, the
+	// form H.264 samples take; empty for a damaged record.
+	def avcParameterSets(avcc byte[]) byte[] {
+		let out byte[]
+		return out when avcc.len() < 7 || avcc[0] != byte(1)
+		let size = (int(avcc[4]) & 3) + 1
+		let p = 6
+		let count = int(avcc[5]) & 31
+		for let pass = 0; pass < 2; pass++ {
+			for let i = 0; i < count; i++ {
+				return out when p + 2 > avcc.len()
+				let n = (int(avcc[p]) << 8) | int(avcc[p + 1])
+				p += 2
+				return out when p + n > avcc.len()
+				for let k = size - 1; k >= 0; k-- {
+					out.push(byte((n >> (8 * k)) & 255))
+				}
+				out.push(...avcc[p:p + n])
+				p += n
+			}
+			break when pass == 1 || p >= avcc.len()
+			count = int(avcc[p])
+			p++
+		}
+		return out
+	}
+
+	// The codec name of QuickTime PCM: `sowt` little-endian, `twos` and the
+	// `in`/`fl` codes big-endian, `raw ` unsigned bytes, `lpcm` as its
+	// format `flags` say (1 float, 2 big-endian).
+	def quickTimePcm(code string, sampleSize int, flags int) string {
+		return "pcm_u8" when code == "raw "
+		return pcmCodec(sampleSize, false, false) when code == "sowt"
+		return pcmCodec(sampleSize, false, true) when code == "twos" && sampleSize > 8
+		return pcmCodec(24, false, true) when code == "in24"
+		return pcmCodec(32, false, true) when code == "in32"
+		return pcmCodec(32, true, true) when code == "fl32"
+		return pcmCodec(64, true, true) when code == "fl64"
+		return pcmCodec(sampleSize, (flags & 1) != 0, (flags & 2) != 0) when code == "lpcm"
+		return "pcm"
+	}
+}

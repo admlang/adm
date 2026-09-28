@@ -1,0 +1,229 @@
+partial module std.net.mail.smtp {
+	use (
+		std.io
+		std.net
+		std.net.mail.smtp.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Handler takes the messages a `Server` accepts.
+	interface Handler {
+		// Called once per message after the client sent it; `data` reads
+		// the message as received, with the server's `Received:` header in
+		// front. Failing refuses the message; the client is told the
+		// failure's `SmtpError` reply when it carries one, else `451`.
+		def deliver(envelope Envelope, data io.Reader) !none
+	}
+
+	// RecipientFilter is an optional part of a `Handler`: a handler that
+	// also implements it decides each `RCPT TO` as it arrives.
+	interface RecipientFilter {
+		// Fails to refuse `recipient`; the client is told the failure's
+		// `SmtpError` reply when it carries one, else `550`.
+		def recipient(envelope Envelope, recipient string) !none
+	}
+
+	// Authenticator decides the `AUTH` logins of a `Server`.
+	interface Authenticator {
+		// Fails when the user or the password is wrong; the client is told
+		// `535`, not why.
+		def login(user string, password Secret<string>) !none
+	}
+
+	// Server is an SMTP server (RFC 5321), one task per connection, that
+	// hands each accepted message to its `handler`. It offers
+	// `PIPELINING`, `8BITMIME`, `SMTPUTF8`, `SIZE`, `CHUNKING`, `DSN`,
+	// `ENHANCEDSTATUSCODES`, `STARTTLS` with `tls` and `AUTH` with an
+	// `authenticator`. Implements `net.Server`: `start` returns at once and
+	// `close` stops it; `listenAndServe` is the blocking form, `serve` the
+	// form over a listener the caller made.
+	//
+	// ```
+	// let server = new smtp.Server(new Inbox(), ":2525")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr           string         = ":25"
+		handler        Handler
+		authenticator  ?Authenticator = none
+		// With `StartTls`, the server offers `STARTTLS`; with `Implicit`,
+		// every connection starts with the TLS handshake. Both need `tls`.
+		security       Security       = Security.Plain
+		tls            ?tls.Config    = none
+		// The name the server gives in its greeting, `EHLO` reply and
+		// `Received:` header; empty uses the machine's host name.
+		hostname       string         = ""
+		// The text of the `220` greeting after the host name.
+		banner         string         = "ESMTP ready"
+		// Refuse `MAIL` until the client logged in (a submission server,
+		// RFC 6409).
+		requireAuth    bool           = false
+		// Refuse `AUTH` and `MAIL` until the session runs over TLS.
+		requireTls     bool           = false
+		// The largest message taken, announced through `SIZE`; 0 is no
+		// limit.
+		maxMessageSize int64          = 0
+		// Recipients taken per message; one past it is told `452`.
+		maxRecipients  int            = 100
+		// How long a connection may wait for the next command.
+		idleTimeout    duration       = 300s
+		// How long each read of the message data may wait.
+		timeout        duration       = 60s
+		// Connections served at once; one past it is told `421`. 0 is no
+		// limit.
+		maxConnections int            = 0
+		backlog        int            = 128
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+		internal stats          ServerStats   = new ServerStats()
+
+		def new(handler Handler, addr string = ":25") {
+			self.handler = handler
+			self.addr = addr
+		}
+
+		// Listens on `addr` and serves until `close`. Fails when the address
+		// cannot be bound.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Serves the connections `ln` accepts until `close`. Fails when
+		// accepting fails other than by `close`.
+		def serve(ln net.Listener) !none {
+			try checkConfig()
+			fail protocolError("serve", "the server is already serving") when running
+			listener = ln
+			running = true
+			for running {
+				let failure ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				if maxConnections > 0 && open.len() >= maxConnections {
+					let refused net.Stream = accepted
+					writeFully(refused, "421 4.3.2 Too many connections, try again later\r\n".bytes(), 1s) onerror recover none
+					accepted.close() onerror recover none
+					continue
+				}
+				let session = new Session(self, stats, accepted)
+				track(session)
+				let task = async runSession(session)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Listens on `addr` and serves in the background. Fails when the
+		// address cannot be bound.
+		def start() !none {
+			return none when running
+			try checkConfig()
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Stops accepting and closes every open connection. Fails when the
+		// listener cannot be closed.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				try ln.close()
+			}
+			for let s in takeSessions() {
+				s.end()
+			}
+			return none
+		}
+
+		// The address the server listens on.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// The connections open now.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		internal def checkConfig() !none {
+			fail protocolError("serve", "Security.{security.value} needs a TLS config") when security != Security.Plain && tls is none
+			return none
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		internal def runSession(session Session) {
+			session.run()
+			untrack(session)
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			open = []
+			stats.connectionsOpen.set(-float64(sessions.len()))
+			return sessions
+		}
+
+		// bind listens on `addr` once the `listen` permission allows
+		// `smtp://addr` (`smtps` with implicit TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("smtps", "smtp")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "smtp.Server({addr})"
+		}
+	}
+}

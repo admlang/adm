@@ -1,0 +1,326 @@
+partial module std.net.telnet {
+	use (
+		std.metrics
+		std.net
+		std.net.telnet.proto::*
+		std.net.tls
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// Server accepts Telnet connections and runs `handler` for each, in its
+	// own task, once option negotiation has settled: the session then
+	// knows the client's terminal, window size and environment.
+	// Implements `net.Server`: `start` returns at once and `close` stops
+	// it; `listenAndServe` is the blocking form, `serve` the form over a
+	// listener the caller made.
+	//
+	// ```
+	// let server = new telnet.Server(new telnet.HandlerFunc(def (s telnet.Session) !none {
+	//     let name = try s.readLine()
+	//     let password = try s.readSecret("Password: ")
+	//     try s.writeLine("Hello {name}, your terminal is {s.terminal()}")
+	//     return none
+	// }), ":2323")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr               string                = ":23"
+		handler            ?Handler              = none
+		// With `Implicit`, every connection starts with the TLS handshake
+		// (telnets); it needs `tls`.
+		security           Security              = Security.Plain
+		tls                ?tls.Config           = none
+		// How long each read or write may wait.
+		timeout            duration              = 300s
+		// How long the option negotiation at the start of a session may
+		// take before the handler runs anyway.
+		negotiationTimeout duration              = 2s
+		// Whether the server echoes what clients type (character mode), not
+		// the client; `Session.echo` changes it per session.
+		serverEcho         bool                  = false
+		// Offer LINEMODE: clients that take it edit lines locally.
+		linemode           bool                  = true
+		// Offer End of Record, so `Session.prompt` can mark prompts.
+		endOfRecord        bool                  = false
+		// Character sets offered (CHARSET), in preference order.
+		charsets           string[]              = ["UTF-8"]
+		// Server status sent to clients that ask (MSSP): NAME, PLAYERS,
+		// UPTIME, ... Empty does not offer MSSP.
+		status             map<string, string[]>
+		// Offer GMCP messages beside the text.
+		gmcp               bool                  = false
+		// Compress output for clients that take it (MCCP2).
+		compression        bool                  = false
+		// Take compressed input from clients that offer it (MCCP3).
+		compressedInput    bool                  = false
+		// Connections served at once; one past it is closed. 0 is no limit.
+		maxConnections     int                   = 0
+		backlog            int                   = 128
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+		internal errorHooks     ErrorHook[]   = []
+
+		// Shared by every server of the process.
+		@metric("net.telnet.server.connections.open")
+		internal connectionsOpen metrics.Gauge
+		@metric("net.telnet.server.connections.total")
+		internal connectionsTotal metrics.Counter
+		@metric("net.telnet.server.sessions.failed")
+		internal sessionsFailed metrics.Counter
+
+		def new(handler Handler, addr string = ":23") {
+			self.handler = handler
+			self.addr = addr
+		}
+
+		// Binds `addr` and serves until `close`.
+		// Fails with PolicyDenied when the policy denies listening there,
+		// NetError when the address cannot be bound or an accept fails.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Accepts on the listener until it closes; each connection runs in
+		// its own task. Returns none after `close`.
+		// Fails with NetError when an accept fails for another reason, or
+		// TelnetError when telnets is asked for without a TLS config.
+		def serve(ln net.Listener) !none {
+			fail telnetError("Security.Implicit needs a TLS config") when security == Security.Implicit && tls is none
+			fail telnetError("the server is already serving") when running
+			listener = ln
+			running = true
+			for running {
+				let failure ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running || (maxConnections > 0 && open.len() >= maxConnections) {
+					accepted.close() onerror recover none
+					continue
+				}
+				let task = async runConnection(accepted)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with PolicyDenied or NetError when the address cannot be
+		// bound, TelnetError when telnets lacks a TLS config.
+		def start() !none {
+			return none when running
+			fail telnetError("Security.Implicit needs a TLS config") when security == Security.Implicit && tls is none
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting and closes every session.
+		// A second call does nothing. Never fails.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			for let s in takeSessions() {
+				s.close() onerror recover none
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed before
+		// `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// Sessions open right now.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		// Registers fn to hear what a session's handler failed with, and
+		// sessions that failed to start (a TLS handshake refused).
+		def onError(fn def (error)) {
+			errorHooks.push(new ErrorHook(fn))
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror (err error) {
+				report(err)
+				recover none
+			}
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def report(err error) {
+			for let hook in errorHooks {
+				hook.fn(err)
+			}
+		}
+
+		// runConnection sets the session up, runs the handler and closes it.
+		internal def runConnection(conn net.Connection) {
+			let failure ?error = none
+			let session = openSession(conn) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if session is none {
+				conn.close() onerror recover none
+				sessionsFailed.inc()
+				report(failure) unless failure is none
+				return
+			}
+			track(session)
+			let h = handler
+			if !(h is none) {
+				h.serve(session) onerror (err error) {
+					sessionsFailed.inc()
+					report(err)
+					recover none
+				}
+			}
+			session.close() onerror recover none
+			untrack(session)
+		}
+
+		// openSession wraps a connection (TLS for telnets), offers the
+		// options and waits for the negotiation to settle.
+		internal def openSession(conn net.Connection) !?Session {
+			conn.urgentInline() onerror recover none
+			let stream net.Stream = conn
+			let plain = true
+			if security == Security.Implicit {
+				stream = try serverTLS(conn, tls, timeout)
+				plain = false
+			}
+			let engine = new Engine(conn, stream, true, timeout)
+			engine.plainTCP = plain
+			engine.myStatus = status
+			engine.myCharsets = charsets
+			try offer(engine)
+			let session = new Session(engine, serverEcho)
+			settle(engine)
+			return session
+		}
+
+		// offer sets what the server agrees to and sends its requests.
+		internal def offer(engine Engine) !none {
+			let local int[] = [int(Option.SuppressGoAhead), int(Option.Status), int(Option.Binary), int(Option.Charset)]
+			local.push(int(Option.Echo))
+			local.push(int(Option.EndOfRecord)) when endOfRecord
+			local.push(int(Option.Mssp)) when status.len() > 0
+			local.push(int(Option.Gmcp)) when gmcp
+			local.push(int(Option.Mccp2)) when compression
+			local.push(int(Option.Mccp3)) when compressedInput
+			for let o in local {
+				engine.acceptLocal[o] = true
+			}
+			let remote = [int(Option.TerminalType), int(Option.WindowSize), int(Option.TerminalSpeed), int(Option.DisplayLocation), int(Option.Environment), int(Option.Binary), int(Option.FlowControl), int(Option.Charset), int(Option.Gmcp)]
+			remote.push(int(Option.Linemode)) when linemode
+			for let o in remote {
+				engine.acceptRemote[o] = true
+			}
+			for let o in [int(Option.TerminalType), int(Option.WindowSize), int(Option.TerminalSpeed), int(Option.DisplayLocation), int(Option.Environment), int(Option.FlowControl)] {
+				try engine.requestRemote(o, true)
+			}
+			try engine.requestRemote(int(Option.Linemode), true) when linemode
+			try engine.requestLocal(int(Option.SuppressGoAhead), true)
+			try engine.requestLocal(int(Option.Echo), true) when serverEcho
+			try engine.requestLocal(int(Option.EndOfRecord), true) when endOfRecord
+			try engine.requestLocal(int(Option.Charset), true) when charsets.len() > 0
+			try engine.requestLocal(int(Option.Mssp), true) when status.len() > 0
+			try engine.requestLocal(int(Option.Gmcp), true) when gmcp
+			try engine.requestLocal(int(Option.Mccp2), true) when compression
+			try engine.requestLocal(int(Option.Mccp3), true) when compressedInput
+			return none
+		}
+
+		// settle lets the negotiation finish: timing marks make sure the
+		// client answered every request, the subnegotiations they started
+		// and the whole terminal type list, within `negotiationTimeout`. A client that answers none
+		// (a raw socket) costs the timeout once.
+		internal def settle(engine Engine) {
+			let limit = time.now() + negotiationTimeout
+			// Each round trip may bring the next terminal name, which asks for
+			// one more: keep going while they come.
+			for let round = 0; round < 20; round++ {
+				let left = limit - time.now()
+				return when int64(left) <= 0
+				let before = engine.terminals.len()
+				engine.timingMark(left) onerror recover none
+				return when engine.timingMarks > 0
+				// A new terminal name asks for the next one: settle again.
+				return when engine.terminals.len() == before && round > 0
+			}
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			connectionsOpen.inc()
+			connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			open = []
+			connectionsOpen.set(-float64(sessions.len()))
+			return sessions
+		}
+
+		// Binds `addr` once the `listen` permission allows `telnet://addr`
+		// (`telnets` with TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("telnets", "telnet")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "telnet.Server({addr})"
+		}
+	}
+
+	internal type ErrorHook {
+		fn def (error)
+
+		def new(fn def (error)) {
+			self.fn = fn
+		}
+	}
+}

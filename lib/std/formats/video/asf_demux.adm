@@ -1,0 +1,276 @@
+internal partial module std.formats.video.asf {
+	use (
+		std.formats.video::*
+		std.formats.video.demux::*
+		std.formats.media.source::*
+		std.formats.media.asf::*
+	)
+
+	// One stream of an ASF file and the media object being reassembled on
+	// it.
+	type AsfTrack {
+		track     Track
+		stream    AsfStream
+		assembler AsfAssembler
+
+		def new(track Track, stream AsfStream) {
+			self.track = track
+			self.stream = stream
+			assembler = new AsfAssembler(keepPartial = true)
+		}
+	}
+
+	// The demultiplexer of an ASF file.
+	type AsfContainer {
+		src         Source
+		streams     AsfTrack[]
+		list        Track[]
+		byNumber    map<int, int>
+		preroll     int
+		packetSize  int
+		packetCount int
+		dataStart   int
+		// Packets read so far.
+		index       int
+		// Completed media objects not yet returned.
+		ready       Packet[]
+		readyBegan  int[]
+		readyAt     int
+		// The simple index: packet numbers every `indexStep` 100 ns units.
+		indexStep   int
+		indexPacket int[]
+		dropBefore  duration
+		dropping    bool
+		// After a seek: every object is dropped until the video's next
+		// keyframe.
+		waiting     bool
+
+		def new(src Source) {
+			self.src = src
+			byNumber = new map<int, int>()
+		}
+
+		// Reads the header object and the data object's header, and the
+		// simple index when the source can seek.
+		//
+		// Fails when the file is not ASF, the header is cut short, or the
+		// reader fails.
+		def read() !none {
+			let header = new AsfHeader()
+			try header.read(src)
+			preroll = header.preroll
+			packetSize = header.packetSize
+			packetCount = header.packetCount
+			dataStart = header.dataOffset
+			let total = header.playDuration > 0 ?? (duration(int64(header.playDuration) * 100 - int64(preroll) * 1000000), 0s)
+			total = 0s when total < 0s
+			for let (_, stream) in header.streams {
+				let t = trackOf(stream)
+				t.length = total
+				let perFrame = header.frameTimes.get(stream.number)
+				if t.kind == TrackKind.Video && !(perFrame is none) {
+					let each int = perFrame
+					let g = gcd(10000000, each)
+					t.frameRate = FrameRate{numerator: uint32(10000000 / g), denominator: uint32(each / g)}
+				}
+				byNumber.set(stream.number, streams.len())
+				streams.push(new AsfTrack(t, stream))
+				list.push(t)
+			}
+			let dataEnd = header.dataSize >= 50 ?? (dataStart - 50 + header.dataSize, -1)
+			if src.seekable() && dataEnd > 0 {
+				try readIndex(dataEnd)
+				try src.seek(dataStart)
+			}
+			return none
+		}
+
+		// The track a stream of the header describes.
+		def trackOf(stream AsfStream) Track {
+			let t = newTrack(streams.len(), TrackKind.Data, "")
+			let format = stream.format
+			if stream.media == AsfMedia.Audio {
+				t.kind = TrackKind.Audio
+				t.codec = format.len() >= 16 ?? (waveCodecOf(format), waveCodec(stream.formatTag))
+				t.channels = uint16(stream.channels)
+				t.sampleRate = uint32(stream.sampleRate)
+				t.config = waveConfig(t.codec, format)
+			} else if stream.media == AsfMedia.Video {
+				t.kind = TrackKind.Video
+				t.width = uint32(le(format, 0, 4))
+				t.height = uint32(le(format, 4, 4))
+				// The BITMAPINFOHEADER after the picture size and flags.
+				let bih = 11
+				t.codec = bitmapCodec(be(format, bih + 16, 4))
+				let bihSize = le(format, bih, 4)
+				t.config = format[bih + 40:(bih + bihSize).min(format.len())].clone() when bihSize > 40 && bih + 40 < format.len()
+			} else if stream.media == AsfMedia.Command {
+				t.codec = "command"
+			}
+			return t
+		}
+
+		// Reads the Simple Index Object after the data object, if there is
+		// one.
+		//
+		// Fails when the reader does.
+		def readIndex(at int) !none {
+			let pos = at
+			let size = src.size()
+			for pos + 24 <= size {
+				try src.seek(pos)
+				let obj = try src.read(24)
+				let objSize = le(obj, 16, 8)
+				break when objSize < 24
+				if asfIsGuid(obj, 0, asfSimpleIndex) && objSize >= 56 {
+					let body = try src.read(objSize - 24)
+					indexStep = le(body, 16, 8)
+					let count = le(body, 28, 4)
+					for let i = 0; i < count && 32 + i * 6 + 4 <= body.len(); i++ {
+						indexPacket.push(le(body, 32 + i * 6, 4))
+					}
+					return none
+				}
+				pos += objSize
+			}
+			return none
+		}
+
+		// name implements Described.
+		def name() string {
+			for let (_, t) in list {
+				return "asf" when t.kind == TrackKind.Video
+			}
+			return "wma"
+		}
+
+		// seekable implements Seekable.
+		def seekable() bool {
+			return src.seekable()
+		}
+
+		// tracks implements Container.
+		def tracks() Track[] {
+			return list
+		}
+
+		// next implements Container: the media objects of the data packets
+		// in the order they complete.
+		//
+		// Fails when the reader does.
+		def next() !?Packet {
+			for {
+				if readyAt < ready.len() {
+					let p = ready[readyAt]
+					readyAt++
+					if waiting {
+						let video = list[p.track].kind == TrackKind.Video
+						continue unless video && p.keyframe
+						waiting = false
+						dropBefore = p.pts
+						dropping = true
+					}
+					continue when dropping && list[p.track].kind != TrackKind.Video && p.pts < dropBefore
+					return p
+				}
+				ready = Packet[]
+				readyBegan = int[]
+				readyAt = 0
+				return none when packetCount > 0 && index >= packetCount
+				let packet = try src.peek(packetSize)
+				let avail = packet.len()
+				return none when avail == 0
+				try src.skip(avail)
+				index++
+				packet.len(packetSize) when avail < packetSize
+				parsePacket(packet, avail)
+			}
+			return none
+		}
+
+		// Splits a data packet, of which `avail` bytes arrived, into
+		// payloads and adds them to their streams' media objects. A payload
+		// the end of the file cuts is dropped.
+		def parsePacket(p byte[], avail int) {
+			for let (_, payload) in asfPayloads(p, avail) {
+				continue when payload.cut
+				let slot = byNumber.get(payload.stream)
+				continue when slot is none
+				let track int = slot
+				for let (_, obj) in streams[track].assembler.add(payload, index - 1) {
+					deliver(track, obj)
+				}
+			}
+		}
+
+		// Queues a complete media object, undoing the audio spread.
+		def deliver(track int, obj AsfObject) {
+			let s = streams[track]
+			let out = asfUnspread(s.stream, obj.data)
+			let pts = duration(int64(obj.time - preroll) * 1000000)
+			let isKey = obj.key || s.track.kind != TrackKind.Video
+			ready.push(newPacket(track, out, pts, pts, 0s, isKey))
+			readyBegan.push(obj.began)
+		}
+
+		// seek implements Container: to the packet the simple index gives
+		// for `time`, or else the one a scan from the start finds holding
+		// the last video keyframe at or before it. Objects before that
+		// keyframe are dropped, and the other streams' objects that present
+		// before it.
+		//
+		// Fails when the source cannot seek or the reader fails.
+		def seek(time duration) !none {
+			fail "asf: the stream cannot seek" unless src.seekable()
+			let video = false
+			for let (_, t) in list {
+				video = true when t.kind == TrackKind.Video
+			}
+			let packet = 0
+			if indexStep > 0 && indexPacket.len() > 0 {
+				let slot = int((int64(time) / 100 + int64(preroll) * 10000) / int64(indexStep))
+				slot = slot.min(indexPacket.len() - 1).max(0)
+				packet = indexPacket[slot]
+			} else if video {
+				try restart(0)
+				for {
+					let got = try next()
+					break when got is none
+					let p Packet = got
+					continue unless list[p.track].kind == TrackKind.Video && p.keyframe
+					break when p.pts > time
+					packet = readyBegan[readyAt - 1]
+				}
+			}
+			try restart(packet)
+			waiting = video
+			dropBefore = time
+			dropping = !video && time > 0s
+			return none
+		}
+
+		// Moves to data packet `packet` with no object half read.
+		//
+		// Fails when the source cannot seek there.
+		def restart(packet int) !none {
+			try src.seek(dataStart + packet * packetSize)
+			index = packet
+			for let (_, s) in streams {
+				s.assembler.reset()
+			}
+			ready = Packet[]
+			readyBegan = int[]
+			readyAt = 0
+			waiting = false
+			dropping = false
+			return none
+		}
+
+		// close implements io.Closer: closes the file.
+		//
+		// Fails when closing it does.
+		def close() !none {
+			return src.close()
+		}
+	}
+}

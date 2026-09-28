@@ -1,0 +1,216 @@
+partial module std.net.mail.pop3 {
+	use (
+		std.io
+		std.net
+		std.net.mail.pop3.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Maildrop is one user's mail as a `Server` serves it, locked to the
+	// session that logged in until it ends.
+	interface Maildrop {
+		// The messages, in the order the session numbers them. Fails when
+		// the store cannot be read.
+		def list() !Entry[]
+
+		// Reads message `uid` as stored. Fails when it is gone or unreadable.
+		def open(uid string) !io.Reader
+
+		// Removes the messages the session deleted, at `QUIT`. Fails when
+		// one cannot be removed; the client is told `-ERR`.
+		def remove(uids string[]) !none
+
+		// Ends the session's hold on the maildrop, whether or not `QUIT`
+		// came.
+		def release()
+	}
+
+	// Authenticator decides the logins of a `Server` and hands over the
+	// user's maildrop.
+	interface Authenticator {
+		// Fails when the user or the password is wrong (the client is told
+		// `-ERR [AUTH]`), or with a `Pop3Error` whose `response` is
+		// `IN-USE` when another session holds the maildrop.
+		def login(user string, password Secret<string>) !Maildrop
+	}
+
+	// Server is a POP3 server (RFC 1939), one task per connection. It
+	// offers `CAPA`, `TOP`, `UIDL`, `USER`, `RESP-CODES`, `PIPELINING`,
+	// `UTF8`, `SASL PLAIN`, and `STLS` with `tls`; APOP is not offered,
+	// since an `Authenticator` checks passwords, never hands them out.
+	// Implements `net.Server`.
+	//
+	// ```
+	// let server = new pop3.Server(users, ":110")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr           string        = ":110"
+		authenticator  Authenticator
+		// With `StartTls`, the server offers `STLS`; with `Implicit`, every
+		// connection starts with the TLS handshake. Both need `tls`.
+		security       Security      = Security.Plain
+		tls            ?tls.Config   = none
+		// The name the server gives in its greeting; empty uses the
+		// machine's host name.
+		hostname       string        = ""
+		// Refuse logins until the session runs over TLS.
+		requireTls     bool          = false
+		// How long a connection may wait for the next command; RFC 1939
+		// asks for at least 10 minutes.
+		idleTimeout    duration      = 600s
+		// How long each write of a message may wait.
+		timeout        duration      = 60s
+		// Connections served at once; one past it is refused. 0 is no
+		// limit.
+		maxConnections int           = 0
+		backlog        int           = 128
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+		internal stats          ServerStats   = new ServerStats()
+
+		def new(authenticator Authenticator, addr string = ":110") {
+			self.authenticator = authenticator
+			self.addr = addr
+		}
+
+		// Listens on `addr` and serves until `close`. Fails when the address
+		// cannot be bound.
+		def listenAndServe() !none {
+			try checkConfig()
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Listens on `addr` and serves in the background. Fails when the
+		// address cannot be bound.
+		def start() !none {
+			return none when running
+			try checkConfig()
+			let ln = try bind()
+			listener = ln
+			let task = async serveQuietly(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Stops accepting and closes every open connection, releasing their
+		// maildrops without removing anything. Fails when the listener
+		// cannot be closed.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				try ln.close()
+			}
+			for let s in takeSessions() {
+				s.end()
+			}
+			return none
+		}
+
+		// The address the server listens on.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// The connections open now.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		internal def checkConfig() !none {
+			fail protocolError("serve", "Security.{security.value} needs a TLS config") when security != Security.Plain && tls is none
+			return none
+		}
+
+		internal def serveQuietly(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		// serve accepts on `ln` until `close`, one task per connection.
+		internal def serve(ln net.Listener) !none {
+			fail protocolError("serve", "the server is already serving") when running
+			listener = ln
+			running = true
+			for running {
+				let failure ?error = none
+				let accepted = acceptOne(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				if maxConnections > 0 && open.len() >= maxConnections {
+					let refused net.Stream = accepted
+					writeFully(refused, "-ERR [SYS/TEMP] Too many connections\r\n".bytes(), 1s) onerror recover none
+					accepted.close() onerror recover none
+					continue
+				}
+				let session = new Session(self, stats, accepted)
+				track(session)
+				let task = async runSession(session)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		internal def acceptOne(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def runSession(session Session) {
+			session.run()
+			untrack(session)
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			open = []
+			stats.connectionsOpen.set(-float64(sessions.len()))
+			return sessions
+		}
+
+		// bind listens on `addr` once the `listen` permission allows
+		// `pop3://addr` (`pop3s` with implicit TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("pop3s", "pop3")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+	}
+}

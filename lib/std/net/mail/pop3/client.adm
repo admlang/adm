@@ -1,0 +1,330 @@
+partial module std.net.mail.pop3 {
+	use (
+		std.formats.mail
+		std.formats.mail::(Message)
+		std.io
+		std.net
+		std.net.mail.pop3.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Client is a POP3 client (RFC 1939) for one maildrop session, with the
+	// extensions of RFC 2449 (`CAPA`, `UIDL`, `TOP`, response codes),
+	// `STLS` (RFC 2595), `AUTH` (RFC 5034) and `UTF8` (RFC 6856).
+	// Messages are numbered from 1 in the session; deletions take effect
+	// when `close` ends it with `QUIT`.
+	//
+	// ```
+	// let client = new pop3.Client(pop3.Security.Implicit)
+	// try client.connect("pop.example.com")
+	// try client.login("alice", "s3cret")
+	// for let entry in try client.list() {
+	//     let message = try client.retrieve(entry.number)
+	//     try client.delete(entry.number)
+	// }
+	// try client.close()
+	// ```
+	type Client {
+		security Security    = Security.StartTls
+		// The TLS settings of `STLS` and `Implicit`; none verifies the
+		// server against the system roots.
+		tls      ?tls.Config = none
+		// How long each command may wait for its reply.
+		timeout  duration    = 30s
+
+		internal socket       ?net.Connection = none
+		internal stream       ?net.Stream     = none
+		internal lines        ?LineReader     = none
+		internal host         string          = ""
+		internal greeting     string          = ""
+		internal capabilities string[]        = []
+		internal secure       bool            = false
+
+		def new(security Security = Security.StartTls, timeout duration = 30s) {
+			self.security = security
+			self.timeout = timeout
+		}
+
+		// Opens the connection (port 110, 995 with `Implicit`), reads the
+		// greeting, asks `CAPA` and, with `StartTls`, upgrades. Fails when
+		// the server cannot be reached, answers `-ERR`, or does not offer
+		// `STLS` when it is asked for.
+		def connect(addr string) !none {
+			fail protocolError("connect", "already connected") unless socket is none
+			let target = net.withPort(addr, security == Security.Implicit ?? (995, 110))
+			let scheme = security == Security.Implicit ?? ("pop3s", "pop3")
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", scheme + "://" + target)
+			host = hostOf(target)
+			let conn = try net.dialStream(target, timeout)
+			socket = conn
+			stream = conn
+			lines = new LineReader(conn)
+			handshake() onerror (err error) {
+				drop()
+				fail err
+			}
+			return none
+		}
+
+		internal def handshake() !none {
+			try upgrade() when security == Security.Implicit
+			let greet = try readStatus()
+			fail statusError("connect", greet) unless greet.ok
+			greeting = greet.text
+			try readCapabilities()
+			if security == Security.StartTls {
+				try expect("STLS", "STLS")
+				try upgrade()
+				// What a server offers may change once the connection is
+				// protected (RFC 2595 §4).
+				try readCapabilities()
+			}
+			return none
+		}
+
+		// readCapabilities asks CAPA; a server without it offers nothing
+		// the client can count on.
+		internal def readCapabilities() !none {
+			capabilities = []
+			let status = try command("CAPA")
+			return none unless status.ok
+			for let line in string(try readMultiline(try reader(), timeout)).split("\r\n") {
+				capabilities.push(line.trim()) unless line.trim() == ""
+			}
+			return none
+		}
+
+		internal def upgrade() !none {
+			let conn = socket
+			fail protocolError("TLS", "not connected") when conn is none
+			let secured = try secureClient(conn, tls, host, timeout)
+			stream = secured
+			lines = new LineReader(secured)
+			secure = true
+			return none
+		}
+
+		// Logs in and opens the maildrop. `method` none picks `APOP` when
+		// the greeting carries a stamp and the connection is plain, else
+		// `USER`/`PASS`; with `XOAuth2`, `password` is the access token.
+		// Fails when the server refuses the login (`AUTH` or `IN-USE` in
+		// the error's `response`).
+		def login(user string, password Secret<string>, method ?AuthMethod = none) !none {
+			let stamp = stampOf(greeting)
+			let chosen = AuthMethod.User
+			if method is none {
+				if stamp != "" && !secure {
+					chosen = AuthMethod.Apop
+				} else if !hasCapability("USER") && saslOffers("PLAIN") {
+					chosen = AuthMethod.Plain
+				}
+			} else {
+				chosen = method
+			}
+			if hasCapability("UTF8") {
+				command("UTF8") onerror recover Status{ok: false, response: "", text: ""}
+			}
+			let secret = password.reveal()
+			match chosen {
+				case AuthMethod.User:
+					try expect("USER", "USER " + user)
+					try expect("PASS", "PASS " + secret)
+				case AuthMethod.Apop:
+					fail protocolError("APOP", "the greeting carries no stamp") when stamp == ""
+					try expect("APOP", "APOP {user} {apopDigest(stamp, secret)}")
+				case AuthMethod.Plain:
+					try expect("AUTH", "AUTH PLAIN " + plainResponse(user, secret))
+				case AuthMethod.XOAuth2:
+					let status = try command("AUTH XOAUTH2 " + xoauth2Response(user, secret))
+					// A refused token comes back as a `+` challenge carrying the
+					// error; an empty line asks for the final answer.
+					status = try command("") when status.ok && status.response == "+"
+					fail statusError("AUTH", status) unless status.ok
+			}
+			// Some servers change what they offer after login (RFC 2449 §5).
+			readCapabilities() onerror recover none
+			return none
+		}
+
+		// saslOffers reports whether the `SASL` capability lists `mechanism`.
+		internal def saslOffers(mechanism string) bool {
+			for let cap in capabilities {
+				continue unless cap.upper().startsWith("SASL ")
+				return cap.upper().split(" ").indexOf(mechanism) > 0
+			}
+			return false
+		}
+
+		// The number of messages and their total size (`STAT`). Fails when
+		// the server refuses it.
+		def stat() !(int, int64) {
+			let status = try expect("STAT", "STAT")
+			let words = status.text.split(" ").filter(w => w != "")
+			fail protocolError("STAT", "malformed reply {status.text}") unless words.len() >= 2 && words[0].isNumeric() && words[1].isNumeric()
+			return (words[0].toInt<int>(), words[1].toInt<int64>())
+		}
+
+		// Every message not marked deleted, with its size and unique ID
+		// (`LIST` and `UIDL`; the ID is empty when the server lacks UIDL).
+		// Fails when the server refuses it.
+		def list() !Entry[] {
+			try expect("LIST", "LIST")
+			let entries Entry[] = []
+			for let line in string(try readMultiline(try reader(), timeout)).split("\r\n") {
+				let words = line.split(" ").filter(w => w != "")
+				continue unless words.len() >= 2 && words[0].isNumeric() && words[1].isNumeric()
+				entries.push(Entry{number: words[0].toInt<int>(), size: words[1].toInt<int64>(), uid: ""})
+			}
+			let uids = try command("UIDL")
+			return entries unless uids.ok
+			for let line in string(try readMultiline(try reader(), timeout)).split("\r\n") {
+				let words = line.split(" ").filter(w => w != "")
+				continue unless words.len() == 2 && words[0].isNumeric()
+				let number = words[0].toInt<int>()
+				for let e in entries {
+					e.uid = words[1] when e.number == number
+				}
+			}
+			return entries
+		}
+
+		// Message `number` (`RETR`). Fails when there is no such message or
+		// it does not parse.
+		def retrieve(number int) !Message {
+			try expect("RETR", "RETR {number}")
+			return try mail.parse(try readMultiline(try reader(), timeout))
+		}
+
+		// Writes message `number` as it is stored to `writer`. Fails when
+		// there is no such message or `writer` fails.
+		def retrieve(number int, writer io.Writer) !none {
+			try expect("RETR", "RETR {number}")
+			let data = try readMultiline(try reader(), timeout)
+			try writer.write(data)
+			return none
+		}
+
+		// The header of message `number` and the first `lines` lines of its
+		// body (`TOP`). Fails when there is no such message, the server
+		// lacks TOP, or it does not parse.
+		def top(number int, lines int = 0) !Message {
+			try expect("TOP", "TOP {number} {lines}")
+			return try mail.parse(try readMultiline(try reader(), timeout))
+		}
+
+		// Marks message `number` deleted (`DELE`); `close` removes it,
+		// `reset` takes the mark back. Fails when there is no such message.
+		def delete(number int) !none {
+			try expect("DELE", "DELE {number}")
+			return none
+		}
+
+		// Takes back every deletion mark of the session (`RSET`). Fails
+		// when the connection is broken.
+		def reset() !none {
+			try expect("RSET", "RSET")
+			return none
+		}
+
+		// Keeps the connection alive (`NOOP`). Fails when it is broken.
+		def noop() !none {
+			try expect("NOOP", "NOOP")
+			return none
+		}
+
+		// The greeting the server sent on connect.
+		def banner() string {
+			return greeting
+		}
+
+		// Whether the server listed `name` in its `CAPA` reply.
+		def hasCapability(name string) bool {
+			let want = name.upper()
+			for let cap in capabilities {
+				let space = cap.indexOf(" ")
+				let keyword = space < 0 ?? (cap, cap[:space])
+				return true when keyword.upper() == want
+			}
+			return false
+		}
+
+		// Whether the connection runs over TLS.
+		def isSecure() bool {
+			return secure
+		}
+
+		// Whether the client is connected.
+		def isOpen() bool {
+			return !(socket is none)
+		}
+
+		// Ends the session with `QUIT`, removing the messages marked
+		// deleted, and closes the connection. Fails when the server could
+		// not remove them.
+		def close() !none {
+			fail protocolError("close", "not connected") when socket is none
+			let status = command("QUIT") onerror (err error) {
+				drop()
+				fail err
+			}
+			drop()
+			fail statusError("QUIT", status) unless status.ok
+			return none
+		}
+
+		def dispose() {
+			return when socket is none
+			command("QUIT") onerror recover Status{ok: false, response: "", text: ""}
+			drop()
+		}
+
+		// command sends one line and reads the status line answering it.
+		internal def command(line string) !Status {
+			fail protocolError("command", "line breaks in a command") when line.contains("\r") || line.contains("\n")
+			try writeFully(try output(), (line + "\r\n").bytes(), timeout)
+			return try readStatus()
+		}
+
+		// expect sends a command and fails unless the server answers `+OK`.
+		internal def expect(op string, line string) !Status {
+			let status = try command(line)
+			fail statusError(op, status) unless status.ok
+			return status
+		}
+
+		internal def readStatus() !Status {
+			return try parseStatus(try (try reader()).readLine(timeout))
+		}
+
+		internal def output() !net.Stream {
+			let s = stream
+			fail protocolError("command", "not connected") when s is none
+			return s
+		}
+
+		internal def reader() !LineReader {
+			let r = lines
+			fail protocolError("command", "not connected") when r is none
+			return r
+		}
+
+		// drop closes the connection without a word to the server.
+		internal def drop() {
+			let s = stream
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			let conn = socket
+			if !(conn is none) {
+				conn.close() onerror recover none
+			}
+			socket = none
+			stream = none
+			lines = none
+			secure = false
+			capabilities = []
+		}
+	}
+}

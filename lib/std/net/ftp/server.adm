@@ -1,4 +1,223 @@
 partial module std.net.ftp {
-	// Server is the FTP server; it has no members yet.
-	type Server {}
+	use (
+		std.fs
+		std.net
+		std.net.ftp.proto::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Server is an FTP and FTPS server over a `fs.FileStore`, one task per
+	// connection. Without an `authenticator` it takes anonymous logins
+	// (`anonymous` or `ftp`, any password) and serves `store` read-only;
+	// with one, the authenticator's account decides what each user sees.
+	// Implements `net.Server`: `start` returns at once and `close` stops
+	// it; `listenAndServe` is the blocking form, `serve` the form over a
+	// listener the caller made.
+	//
+	// ```
+	// let users = new ftp.Users()
+	// users.add("alice", "s3cret", new fs.DiskStore("/srv/alice"))
+	// let server = new ftp.Server(new fs.DiskStore("/srv/pub"), ":21")
+	// server.authenticator = users
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr           string         = ":21"
+		store          fs.FileStore
+		authenticator  ?Authenticator = none
+		// With `Explicit`, logins wait for `AUTH TLS`; with `Implicit`,
+		// every connection starts with the TLS handshake. Both need `tls`.
+		security       Security       = Security.Plain
+		// The certificate and TLS settings of FTPS.
+		tls            ?tls.Config    = none
+		// Sent when a client connects; newlines make it a multi-line reply.
+		banner         string         = "FTP server ready"
+		// Sent with a successful login; empty sends "Logged in".
+		welcome        string         = ""
+		// The IPv4 address PASV announces, for a server behind NAT; empty
+		// announces the address the client connected to.
+		passiveHost    string         = ""
+		// The ports passive data connections listen on, both included;
+		// 0 takes any free port.
+		passivePortMin int            = 0
+		passivePortMax int            = 0
+		// How long a control connection may wait for the next command.
+		idleTimeout    duration       = 300s
+		// How long each read or write of a transfer may wait, and how long
+		// a data connection may take to open.
+		timeout        duration       = 30s
+		// Connections served at once; one past it is told 421. 0 is no
+		// limit.
+		maxConnections int            = 0
+		backlog        int            = 128
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+
+		internal stats ServerStats = new ServerStats()
+		internal hosts Hosts       = new Hosts()
+
+		def new(store fs.FileStore, addr string = ":21") {
+			self.store = store
+			self.addr = addr
+		}
+
+		// Serves another site under a host name (RFC 7151 HOST): a client
+		// that names it before logging in sees `store` and logs in through
+		// `authenticator`, anonymous logins read-only when none is given.
+		// A client that sends no HOST gets the server's own `store` and
+		// `authenticator`; once any host is added, an unknown name is
+		// refused (504). Names compare without case.
+		//
+		// ```
+		// server.host("files.example.com", new fs.DiskStore("/srv/files"), users)
+		// ```
+		def host(name string, store fs.FileStore, authenticator ?Authenticator = none) {
+			hosts.add(name, store, authenticator)
+		}
+
+		// Binds `addr` and serves until `close`.
+		// Fails with PolicyDenied when the policy denies listening there,
+		// NetError when the address cannot be bound or an accept fails.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Accepts on the listener until it closes; each connection runs in
+		// its own task. Returns none after `close`.
+		// Fails with NetError when an accept fails for another reason, or
+		// when FTPS is asked for without a TLS config.
+		def serve(ln net.Listener) !none {
+			fail "ftp: Security.{security.value} needs a TLS config" when security != Security.Plain && tls is none
+			fail "ftp: server is already serving" when running
+			listener = ln
+			running = true
+			for running {
+				let failure ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				if maxConnections > 0 && open.len() >= maxConnections {
+					let refused net.Stream = accepted
+					writeFully(refused, "421 Too many connections\r\n".bytes(), 1s) onerror recover none
+					accepted.close() onerror recover none
+					continue
+				}
+				let session = new Session(self, stats, hosts, accepted)
+				track(session)
+				let task = async runSession(session)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with PolicyDenied or NetError when the address cannot be
+		// bound, and when FTPS is asked for without a TLS config.
+		def start() !none {
+			return none when running
+			fail "ftp: Security.{security.value} needs a TLS config" when security != Security.Plain && tls is none
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting and closes every
+		// connection, transfers in flight included. A second call does
+		// nothing. Never fails.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			for let s in takeSessions() {
+				s.end()
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed
+		// before `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// Connections open right now.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		internal def runSession(session Session) {
+			session.run()
+			untrack(session)
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		// Takes every open session off the list, for `close`.
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			open = []
+			stats.connectionsOpen.set(-float64(sessions.len()))
+			return sessions
+		}
+
+		// Binds `addr` once the `listen` permission allows `ftp://addr`
+		// (`ftps` with implicit TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("ftps", "ftp")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "ftp.Server({addr})"
+		}
+	}
 }

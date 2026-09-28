@@ -1,0 +1,412 @@
+partial module std.net.mail.smtp {
+	use (
+		std.bytes
+		std.io
+		std.formats.mail::(Message)
+		std.net
+		std.net.mail.smtp.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Client is an SMTP client (RFC 5321) for one connection: it greets
+	// with `EHLO`, upgrades with `STARTTLS`, logs in with `AUTH` and sends
+	// messages, using `PIPELINING`, `8BITMIME`, `SMTPUTF8`, `SIZE`,
+	// `CHUNKING` and `DSN` when the server offers them.
+	//
+	// ```
+	// let client = new smtp.Client(smtp.Security.StartTls)
+	// try client.connect("smtp.example.com:587")
+	// try client.login("alice", "s3cret")
+	// try client.send(message)
+	// try client.close()
+	// ```
+	type Client {
+		security  Security    = Security.StartTls
+		// The TLS settings of `STARTTLS` and `Implicit`; none verifies the
+		// server against the system roots.
+		tls       ?tls.Config = none
+		// The name given in `EHLO`; empty sends the machine's host name.
+		localName string      = ""
+		// How long each command may wait for its reply.
+		timeout   duration    = 30s
+
+		internal socket     ?net.Connection     = none
+		internal stream     ?net.Stream         = none
+		internal lines      ?LineReader         = none
+		internal host       string              = ""
+		internal greeting   string              = ""
+		internal extensions map<string, string>
+		internal secure     bool                = false
+
+		def new(security Security = Security.StartTls, timeout duration = 30s) {
+			self.security = security
+			self.timeout = timeout
+			extensions = map<string, string>{}
+		}
+
+		// Opens the connection, reads the greeting, sends `EHLO` (`HELO`
+		// when the server refuses it) and, with `StartTls`, upgrades. Fails
+		// when the server cannot be reached, answers with an error or, with
+		// `StartTls`, does not offer it.
+		def connect(addr string) !none {
+			fail protocolError("connect", "already connected") unless socket is none
+			let port = security == Security.Implicit ?? (465, security == Security.StartTls ?? (587, 25))
+			let target = net.withPort(addr, port)
+			let scheme = security == Security.Implicit ?? ("smtps", "smtp")
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", scheme + "://" + target)
+			host = hostOf(target)
+			let conn = try net.dialStream(target, timeout)
+			socket = conn
+			stream = conn
+			lines = new LineReader(conn)
+			handshake() onerror (err error) {
+				drop()
+				fail err
+			}
+			return none
+		}
+
+		internal def handshake() !none {
+			try upgrade() when security == Security.Implicit
+			let greet = try readReply(try reader(), timeout)
+			fail replyError("connect", greet) unless greet.code == 220
+			greeting = replyText(greet)
+			try hello()
+			if security == Security.StartTls {
+				fail protocolError("STARTTLS", "the server does not offer STARTTLS") unless hasExtension("STARTTLS")
+				try expect("STARTTLS", "STARTTLS", 220)
+				try upgrade()
+				// What a server offers may change once the connection is
+				// protected, and the session starts over (RFC 3207 §4.2).
+				try hello()
+			}
+			return none
+		}
+
+		// hello sends EHLO, or HELO when the server does not know it, and
+		// records the extensions offered.
+		internal def hello() !none {
+			let name = localName == "" ?? (defaultName(), localName)
+			let reply = try command("EHLO " + name)
+			if reply.code == 250 {
+				extensions = parseExtensions(reply)
+				return none
+			}
+			extensions = map<string, string>{}
+			reply = try command("HELO " + name)
+			fail replyError("HELO", reply) unless reply.code == 250
+			return none
+		}
+
+		// defaultName is the address literal of the local end.
+		internal def defaultName() string {
+			let conn = socket
+			return "[127.0.0.1]" when conn is none
+			return addressLiteral(conn.localAddr())
+		}
+
+		internal def upgrade() !none {
+			let conn = socket
+			fail protocolError("TLS", "not connected") when conn is none
+			let secured = try secureClient(conn, tls, host, timeout)
+			stream = secured
+			lines = new LineReader(secured)
+			secure = true
+			return none
+		}
+
+		// Logs in. `method` none picks the strongest mechanism the server
+		// offers; with `XOAuth2`, `password` is the access token. Fails when
+		// the server refuses the login or offers no mechanism.
+		def login(user string, password Secret<string>, method ?AuthMethod = none) !none {
+			let offered = orEmpty(extensions.get("AUTH")).upper().split(" ")
+			let chosen = method
+			if chosen is none {
+				for let candidate in [AuthMethod.CramMd5, AuthMethod.Plain, AuthMethod.Login] {
+					if offered.indexOf(candidate.value) >= 0 {
+						chosen = candidate
+						break
+					}
+				}
+			}
+			fail protocolError("AUTH", "the server offers no login mechanism this client knows") when chosen is none
+			let secret = password.reveal()
+			let reply = Reply{code: 0, enhanced: "", lines: []}
+			match chosen {
+				case AuthMethod.Plain:
+					reply = try command("AUTH PLAIN " + plainResponse(user, secret))
+				case AuthMethod.Login:
+					reply = try command("AUTH LOGIN")
+					reply = try command(b64(user)) when reply.code == 334
+					reply = try command(b64(secret)) when reply.code == 334
+				case AuthMethod.CramMd5:
+					reply = try command("AUTH CRAM-MD5")
+					if reply.code == 334 {
+						let challenge = try unb64(replyText(reply))
+						reply = try command(cramResponse(user, secret, challenge))
+					}
+				case AuthMethod.XOAuth2:
+					reply = try command("AUTH XOAUTH2 " + xoauth2Response(user, secret))
+					// A refused token comes back as a 334 carrying the error
+					// as JSON; an empty line asks for the final reply.
+					reply = try command("") when reply.code == 334
+			}
+			fail replyError("AUTH", reply) unless reply.code == 235
+			return none
+		}
+
+		// Sends `message`: the envelope sender is its `Sender:` or `From:`,
+		// the recipients its `To:`, `Cc:` and `Bcc:`, and `Bcc:` is left
+		// out of what is sent. Fails when the server refuses the sender, the
+		// message, or every recipient.
+		def send(message Message, notify Notify[] = [], ret ?Return = none) !Delivery {
+			let sender = try message.sender()
+			let from = sender is none ?? ("", sender.address)
+			if from == "" {
+				let authors = try message.from()
+				fail protocolError("send", "the message has no From address") when authors.len() == 0
+				from = authors[0].address
+			}
+			let to = try message.recipients()
+			let blind = message.header.values("Bcc")
+			message.header.remove("Bcc")
+			let data = message.bytes()
+			for let value in blind {
+				message.header.add("Bcc", value)
+			}
+			return try send(from, to, data, notify, ret)
+		}
+
+		// Sends `data`, a complete RFC 5322 message, from `from` to `to`.
+		// Fails when the server refuses the sender, the message, or every
+		// recipient.
+		def send(from string, to string[], data byte[], notify Notify[] = [], ret ?Return = none) !Delivery {
+			fail protocolError("send", "no recipients") when to.len() == 0
+			let limit = maxSize()
+			let most = limit is none ?? (int64(0), limit)
+			fail protocolError("send", "the message is {data.len()} bytes, the server takes {most}") when most > 0 && int64(data.len()) > most
+			let mail = try mailCommand(from, to, data, ret)
+			let rcpts string[] = []
+			for let rcpt in to {
+				rcpts.push(try rcptCommand(rcpt, notify))
+			}
+			let delivery = Delivery{accepted: [], rejected: []}
+			if hasExtension("PIPELINING") {
+				let batch = mail + "\r\n" + rcpts.join("\r\n") + "\r\n"
+				try writeFully(try output(), batch.bytes(), timeout)
+				let first = try readReply(try reader(), timeout)
+				let refused = first.code != 250
+				for let i = 0; i < to.len(); i++ {
+					let answer = try readReply(try reader(), timeout)
+					take(delivery, to[i], answer)
+				}
+				if refused {
+					resetQuietly()
+					fail replyError("MAIL", first)
+				}
+			} else {
+				try expect("MAIL", mail, 250)
+				for let i = 0; i < to.len(); i++ {
+					take(delivery, to[i], try command(rcpts[i]))
+				}
+			}
+			if delivery.accepted.len() == 0 {
+				resetQuietly()
+				fail delivery.rejected[0].error
+			}
+			try transmit(data)
+			return delivery
+		}
+
+		// Sends the message `data` reads until its end, from `from` to `to`.
+		// Fails when the server refuses the sender, the message, or every
+		// recipient, or when `data` fails.
+		def send(from string, to string[], data io.Reader, notify Notify[] = [], ret ?Return = none) !Delivery {
+			let buffer = new bytes.Buffer()
+			try buffer.readFrom(data)
+			return try send(from, to, buffer.bytes(), notify, ret)
+		}
+
+		// mailCommand is the MAIL line for a message: SIZE, BODY=8BITMIME,
+		// SMTPUTF8 and RET as the server and the message call for. Fails
+		// when the message needs an extension the server lacks.
+		internal def mailCommand(from string, to string[], data byte[], ret ?Return) !string {
+			let line = "MAIL FROM:<{from}>"
+			line += " SIZE={data.len()}" when hasExtension("SIZE")
+			if hasHighBytes(data) {
+				fail protocolError("send", "the message has 8-bit data and the server does not take 8BITMIME") unless hasExtension("8BITMIME")
+				line += " BODY=8BITMIME"
+			}
+			let international = !isASCII(from)
+			for let rcpt in to {
+				international = true unless isASCII(rcpt)
+			}
+			if international {
+				fail protocolError("send", "an address is not ASCII and the server does not take SMTPUTF8") unless hasExtension("SMTPUTF8")
+				line += " SMTPUTF8"
+			}
+			let returned = ret is none ?? ("", ret.value)
+			line += " RET=" + returned when returned != "" && hasExtension("DSN")
+			return line
+		}
+
+		// rcptCommand is the RCPT line for one recipient, with NOTIFY and
+		// ORCPT when DSN is asked for and offered.
+		internal def rcptCommand(rcpt string, notify Notify[]) !string {
+			fail protocolError("send", "line breaks in an address") when rcpt.contains("\r") || rcpt.contains("\n")
+			let line = "RCPT TO:<{rcpt}>"
+			if notify.len() > 0 && hasExtension("DSN") {
+				line += " NOTIFY=" + notifyParam(notify)
+				line += " ORCPT=rfc822;" + xtext(rcpt) when isASCII(rcpt)
+			}
+			return line
+		}
+
+		// take records a recipient's RCPT reply in a delivery.
+		internal def take(delivery Delivery, rcpt string, reply Reply) {
+			if reply.code := 250 || 251 {
+				delivery.accepted.push(rcpt)
+				return
+			}
+			delivery.rejected.push(Rejection{recipient: rcpt, error: replyError("RCPT " + rcpt, reply)})
+		}
+
+		// transmit sends the message data, with BDAT when the server offers
+		// CHUNKING, else with DATA and dot-stuffing. Fails when the server
+		// refuses the message.
+		internal def transmit(data byte[]) !none {
+			if hasExtension("CHUNKING") {
+				try writeFully(try output(), "BDAT {data.len()} LAST\r\n".bytes(), timeout)
+				try writeFully(try output(), data, timeout)
+				let reply = try readReply(try reader(), timeout)
+				fail replyError("BDAT", reply) unless reply.code == 250
+				return none
+			}
+			try expect("DATA", "DATA", 354)
+			try writeFully(try output(), dotStuffed(data), timeout)
+			let reply = try readReply(try reader(), timeout)
+			fail replyError("DATA", reply) unless reply.code == 250
+			return none
+		}
+
+		// Asks the server whether `address` is a mailbox (`VRFY`). Fails
+		// when the server says it is not or refuses to tell.
+		def verify(address string) !string {
+			let reply = try command("VRFY " + address)
+			fail replyError("VRFY", reply) unless reply.code := 250 || 251
+			return replyText(reply)
+		}
+
+		// Drops the message in progress (`RSET`). Fails when the connection
+		// is broken.
+		def reset() !none {
+			try expect("RSET", "RSET", 250)
+			return none
+		}
+
+		// Checks the connection is alive (`NOOP`). Fails when it is not.
+		def noop() !none {
+			try expect("NOOP", "NOOP", 250)
+			return none
+		}
+
+		// The greeting the server sent on connect.
+		def banner() string {
+			return greeting
+		}
+
+		// Whether the server offered `name` in its `EHLO` reply.
+		def hasExtension(name string) bool {
+			return extensions.hasKey(name.upper())
+		}
+
+		// The largest message the server takes (`SIZE`), none when it did
+		// not say.
+		def maxSize() ?int64 {
+			let size = orEmpty(extensions.get("SIZE"))
+			return none unless size != "" && size.isNumeric()
+			let limit = size.toInt<int64>()
+			return none when limit <= 0
+			return limit
+		}
+
+		// Whether the connection runs over TLS.
+		def isSecure() bool {
+			return secure
+		}
+
+		// Whether the client is connected.
+		def isOpen() bool {
+			return !(socket is none)
+		}
+
+		// Sends `QUIT` and closes the connection. Fails when the connection
+		// is already closed.
+		def close() !none {
+			fail protocolError("close", "not connected") when socket is none
+			command("QUIT") onerror recover Reply{code: 0, enhanced: "", lines: []}
+			drop()
+			return none
+		}
+
+		def dispose() {
+			return when socket is none
+			close() onerror recover none
+		}
+
+		// command sends one line and reads its reply.
+		internal def command(line string) !Reply {
+			fail protocolError("command", "line breaks in a command") when line.contains("\r") || line.contains("\n")
+			try writeFully(try output(), (line + "\r\n").bytes(), timeout)
+			return try readReply(try reader(), timeout)
+		}
+
+		// expect sends a command and fails unless the reply code is `code`.
+		internal def expect(op string, line string, code int) !Reply {
+			let reply = try command(line)
+			fail replyError(op, reply) unless reply.code == code
+			return reply
+		}
+
+		internal def resetQuietly() {
+			command("RSET") onerror recover Reply{code: 0, enhanced: "", lines: []}
+		}
+
+		internal def output() !net.Stream {
+			let s = stream
+			fail protocolError("command", "not connected") when s is none
+			return s
+		}
+
+		internal def reader() !LineReader {
+			let r = lines
+			fail protocolError("command", "not connected") when r is none
+			return r
+		}
+
+		// drop closes the connection without a word to the server.
+		internal def drop() {
+			let s = stream
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			let conn = socket
+			if !(conn is none) {
+				conn.close() onerror recover none
+			}
+			socket = none
+			stream = none
+			lines = none
+			secure = false
+			extensions = map<string, string>{}
+		}
+	}
+
+	// orEmpty is the text of an optional, empty when none.
+	internal def orEmpty(text ?string) string {
+		return "" when text is none
+		return text
+	}
+}

@@ -1,0 +1,781 @@
+internal partial module std.net.telnet.proto {
+	use (
+		std.data.compress.zlib
+		std.io
+		std.net
+		std.net.telnet::*
+		std.net.tls
+		std.time
+	)
+
+	// Engine is one end of a Telnet connection, client or server: it reads
+	// and parses the stream, answers commands, runs option negotiation
+	// (RFC 1143) and every option's subnegotiation, and writes data in the
+	// network virtual terminal's form. Reads come from one task; writes may
+	// come from any.
+	type Engine {
+		socket             net.Connection
+		stream             net.Stream
+		isServer           bool
+		timeout            duration
+		// Urgent data (Synch) only works on a plain TCP connection.
+		plainTCP           bool                  = true
+		local              map<int, OptionSide>
+		remote             map<int, OptionSide>
+		// Options this end agrees to enable on its side (asked with DO),
+		// and to let the peer enable (asked with WILL).
+		acceptLocal        map<int, bool>
+		acceptRemote       map<int, bool>
+		parser             Parser
+		nvtIn              NvtIn
+		nvtOut             NvtOut
+		// Decoded data waiting for the application.
+		ready              byte[]
+		// Erase Character and Erase Line that came when `ready` was empty:
+		// they apply to what the application already took (a line it is
+		// still building).
+		pendingErase       int                   = 0
+		pendingEraseLine   bool                  = false
+		// A Synch is under way: data is dropped up to the Data Mark.
+		synching           bool                  = false
+		// Timing marks sent and not answered yet.
+		atomic timingMarks int                   = 0
+		// Compression of what arrives (MCCP2 on a client, MCCP3 on a server)
+		// and of what is sent (the other way round).
+		inflater           ?zlib.Reader          = none
+		inflateSource      ?ReplaySource         = none
+		deflater           ?zlib.Writer          = none
+		// What the peer told about itself.
+		terminals          string[]
+		terminal           string                = ""
+		window             WindowSize
+		speed              string                = ""
+		display            string                = ""
+		environment        map<string, string>
+		charset            string                = ""
+		serverStatus       map<string, string[]>
+		// The peer asked for local flow control (TOGGLE-FLOW-CONTROL).
+		flowControl        bool                  = true
+		restartAny         bool                  = true
+		// What this end tells about itself (client side).
+		myTerminals        string[]              = ["xterm-256color"]
+		myTerminalAt       int                   = 0
+		myWindow           WindowSize
+		mySpeed            string                = "38400,38400"
+		myDisplay          string                = ""
+		myEnvironment      map<string, string>
+		myCharsets         string[]              = ["UTF-8"]
+		myStatus           map<string, string[]>
+		linemode           Linemode
+		signalHooks        SignalHook[]
+		resizeHooks        ResizeHook[]
+		gmcpHooks          GmcpHook[]
+		// Signals and GMCP messages that came before anyone listened (during
+		// the negotiation at the start of a session), for the first hook.
+		heldSignals        Signal[]
+		heldGmcp           string[]
+		atomic closed      bool                  = false
+
+		def new(socket net.Connection, stream net.Stream, isServer bool, timeout duration) {
+			self.socket = socket
+			self.stream = stream
+			self.isServer = isServer
+			self.timeout = timeout
+			linemode = new Linemode(isServer)
+		}
+
+		// side is the state of one side of an option, made on first use.
+		def localSide(option int) OptionSide {
+			let found = local.get(option)
+			return found unless found is none
+			let made = new OptionSide()
+			local[option] = made
+			return made
+		}
+
+		def remoteSide(option int) OptionSide {
+			let found = remote.get(option)
+			return found unless found is none
+			let made = new OptionSide()
+			remote[option] = made
+			return made
+		}
+
+		// localEnabled reports whether this end has an option on (it sent
+		// or answered WILL).
+		def localEnabled(option int) bool {
+			let found = local.get(option)
+			return !(found is none) && found.enabled()
+		}
+
+		// remoteEnabled reports whether the peer has an option on.
+		def remoteEnabled(option int) bool {
+			let found = remote.get(option)
+			return !(found is none) && found.enabled()
+		}
+
+		// sendRaw writes bytes as they are, through the output compressor
+		// when one runs. Fails when the connection does.
+		atomic def sendRaw(data byte[]) !none {
+			fail net.errorOf(net.ErrorCode.Closed, "write", "", "telnet connection is closed") when closed
+			let out = deflater
+			return try writeStream(stream, data, timeout) when out is none
+			try out.write(data)
+			return try out.flush()
+		}
+
+		// write sends application data in the network virtual terminal's
+		// form, or as it is once this end sends in BINARY. Fails when the
+		// connection does.
+		def write(data byte[]) !none {
+			return try sendRaw(nvtOut.encode(data, localEnabled(int(Option.Binary))))
+		}
+
+		// writeInput sends what a user typed: through the line editor while
+		// LINEMODE has this end edit (its echo goes to the data read back
+		// when the peer does not echo), else as `write` does.
+		// Fails when the connection does.
+		def writeInput(data byte[]) !none {
+			return try write(data) unless linemode.editing()
+			let echo = try linemode.edit(self, data)
+			ready = ready + echo unless remoteEnabled(int(Option.Echo))
+			return none
+		}
+
+		// sendCommand sends IAC and a command.
+		def sendCommand(code int) !none {
+			return try sendRaw([byte(IAC), byte(code)])
+		}
+
+		// sendSub sends a subnegotiation.
+		def sendSub(option int, body byte[]) !none {
+			return try sendRaw(subBytes(option, body))
+		}
+
+		// requestLocal asks to turn an option of this end on (WILL) or off.
+		def requestLocal(option int, enable bool) !none {
+			let side = localSide(option)
+			let verb = enable ?? (requestEnable(side, cmdWILL), requestDisable(side, cmdWONT))
+			return try sendRaw(negotiationBytes(verb, option)) unless verb == 0
+			return none
+		}
+
+		// requestRemote asks the peer to turn an option on (DO) or off.
+		def requestRemote(option int, enable bool) !none {
+			let side = remoteSide(option)
+			let verb = enable ?? (requestEnable(side, cmdDO), requestDisable(side, cmdDONT))
+			return try sendRaw(negotiationBytes(verb, option)) unless verb == 0
+			return none
+		}
+
+		// synch sends the Synch signal: IAC, then the Data Mark as TCP
+		// urgent data, so the peer drops what it has not read yet up to it
+		// (RFC 854). Over TLS or compression the mark goes inline.
+		def synch() !none {
+			if plainTCP && deflater is none {
+				try sendRaw([byte(IAC)])
+				return try socket.writeUrgent(byte(cmdDM))
+			}
+			return try sendCommand(cmdDM)
+		}
+
+		// sendSignal sends a Signal's command; Interrupt, Abort Output and
+		// Break are followed by a Synch, as RFC 854 has a user's
+		// interrupt flush what is under way.
+		def sendSignal(signal Signal) !none {
+			try sendCommand(signalCommand(signal))
+			try synch() when signal := Signal.Interrupt || Signal.AbortOutput || Signal.Break
+			return none
+		}
+
+		// timingMark sends DO TIMING-MARK and waits for the answer, which the
+		// peer sends once it has handled everything before it (RFC 860):
+		// whatever the peer sent earlier has been read when this returns.
+		// Fails when no answer comes within `wait`.
+		def timingMark(wait duration) !none {
+			timingMarks = timingMarks + 1
+			try sendRaw(negotiationBytes(cmdDO, int(Option.TimingMark)))
+			let limit = time.now() + wait
+			for timingMarks > 0 {
+				fail telnetError("no timing mark answer") when time.now().after(limit)
+				let left = limit - time.now()
+				let got = try fill(left)
+				fail net.errorOf(net.ErrorCode.Closed, "read", "", "connection closed") unless got
+			}
+			return none
+		}
+
+		// read copies decoded data into buf, reading the connection when
+		// none waits; 0 at the end of the stream. Fails when the connection
+		// does or the peer breaks the protocol.
+		def read(buf byte[], wait duration) !int {
+			return 0 when buf.len() == 0
+			for ready.len() == 0 {
+				let got = try fill(wait)
+				return 0 unless got
+			}
+			let n = ready.copy(buf)
+			ready = ready[n:].clone()
+			return n
+		}
+
+		// fill reads the connection once and handles what arrived; false at
+		// the end of the stream.
+		def fill(wait duration) !bool {
+			let raw = try readRaw(wait)
+			return false when raw.len() == 0
+			synching = true when plainTCP && !synching && socket.urgentPending()
+			try handleRaw(raw)
+			return true
+		}
+
+		// readRaw is the next bytes off the connection, decompressed when the
+		// peer compresses.
+		internal def readRaw(wait duration) !byte[] {
+			let buf byte[] = []
+			buf.len(8192)
+			let inflating = inflater
+			if inflating is none {
+				let n = try stream.read(buf, wait)
+				return buf[:n].clone()
+			}
+			let source = inflateSource
+			source.wait = wait unless source is none
+			let n = try inflating.read(buf)
+			if n == 0 {
+				// The compressed stream ended: plain bytes follow.
+				inflater = none
+				inflateSource = none
+				let more = try stream.read(buf, wait)
+				return buf[:more].clone()
+			}
+			return buf[:n].clone()
+		}
+
+		// handleRaw parses raw bytes and acts on what they hold. A
+		// subnegotiation that starts decompression hands the rest of the
+		// chunk to the decompressor.
+		internal def handleRaw(raw byte[]) !none {
+			let rest = raw
+			for rest.len() > 0 {
+				let stop = -1
+				stop = isServer ?? (int(Option.Mccp3), int(Option.Mccp2)) when inflater is none
+				let (events, used) = parser.feed(rest, stop)
+				for let e in events {
+					try handleEvent(e)
+				}
+				rest = rest[used:]
+				if rest.len() > 0 && !(inflater is none) {
+					// Compressed bytes arrived in the same read: decompress them.
+					let source = inflateSource
+					source.pending = rest.clone() unless source is none
+					let more = try readRaw(timeout)
+					rest = more
+				}
+			}
+			return none
+		}
+
+		internal def handleEvent(e Event) !none {
+			switch {
+				case e.kind == evData:
+					try handleData(e.data)
+				case e.kind == evCommand:
+					try handleCommand(e.code)
+				case e.kind == evNegotiation:
+					try handleNegotiation(e.code, e.option)
+				case e.kind == evSub:
+					try handleSub(e.option, e.data)
+			}
+			return none
+		}
+
+		internal def handleData(data byte[]) !none {
+			return none when synching
+			ready = ready + nvtIn.decode(data, remoteEnabled(int(Option.Binary)))
+			return none
+		}
+
+		internal def handleCommand(code int) !none {
+			switch {
+				case code == cmdDM:
+					synching = plainTCP && socket.urgentPending()
+					return none
+				case code == cmdEC:
+					try eraseChar()
+					return none
+				case code == cmdEL:
+					try eraseLine()
+					return none
+				case code := cmdNOP || cmdGA || cmdEOR:
+					return none
+			}
+			let signal = commandSignal(code)
+			return none when signal is none
+			// The hooks hear the signal before the answer goes out, so a peer
+			// that waits for the answer knows it was heard.
+			for let hook in signalHooks {
+				hook.fn(signal)
+			} empty {
+				heldSignals.push(signal)
+			}
+			switch {
+				case code == cmdAYT:
+					try write("\r\n[Yes]\r\n".bytes())
+				case code == cmdAO:
+					// RFC 854: the receiver of Abort Output answers with a
+					// Synch, so the peer drops output still in flight.
+					try synch()
+			}
+			return none
+		}
+
+		// eraseChar drops the last character not yet read (Erase Character);
+		// with none waiting, the reader erases from what it took.
+		internal def eraseChar() !none {
+			if ready.len() == 0 {
+				pendingErase++
+				return none
+			}
+			let last = ready[ready.len() - 1]
+			return none when last := byte(10) || byte(13)
+			ready = ready[:ready.len() - 1].clone()
+			return none
+		}
+
+		// eraseLine drops what was typed since the last line end (Erase Line);
+		// when that reaches back past what waits, the reader erases the rest.
+		internal def eraseLine() !none {
+			let i = ready.len()
+			let hasLineEnd = false
+			for let b in ready {
+				hasLineEnd = true when b := byte(10) || byte(13)
+			}
+			if !hasLineEnd {
+				pendingErase = 0
+				pendingEraseLine = true
+			}
+			for i > 0 && !(ready[i - 1] := byte(10) || byte(13)) {
+				i--
+			}
+			ready = ready[:i].clone()
+			return none
+		}
+
+		internal def handleNegotiation(verb int, option int) !none {
+			if option == int(Option.TimingMark) {
+				// A timing mark is answered, never kept on (RFC 860).
+				switch {
+					case verb == cmdDO:
+						return try sendRaw(negotiationBytes(cmdWILL, option))
+					case verb := cmdWILL || cmdWONT:
+						timingMarks = timingMarks - 1 when timingMarks > 0
+				}
+				return none
+			}
+			let outcome = Negotiation{}
+			let isLocal = verb := cmdDO || cmdDONT
+			switch {
+				case verb == cmdWILL:
+					let accept = acceptRemote.get(option)
+					outcome = receiveEnable(remoteSide(option), !(accept is none) && accept, cmdDO, cmdDONT)
+				case verb == cmdWONT:
+					outcome = receiveDisable(remoteSide(option), cmdDO, cmdDONT)
+				case verb == cmdDO:
+					let accept = acceptLocal.get(option)
+					outcome = receiveEnable(localSide(option), !(accept is none) && accept, cmdWILL, cmdWONT)
+				case verb == cmdDONT:
+					outcome = receiveDisable(localSide(option), cmdWILL, cmdWONT)
+			}
+			try sendRaw(negotiationBytes(outcome.send, option)) unless outcome.send == 0
+			try optionChanged(option, isLocal, outcome.enabled) when outcome.changed
+			return none
+		}
+
+		// optionChanged starts what an option does once it is on.
+		internal def optionChanged(option int, isLocal bool, enabled bool) !none {
+			if !enabled {
+				try linemode.disabled(self) when option == int(Option.Linemode)
+				return none
+			}
+			switch {
+				case isServer && !isLocal && (option := int(Option.TerminalType) || int(Option.TerminalSpeed) || int(Option.DisplayLocation)):
+					try sendSub(option, [byte(subSEND)])
+				case isServer && !isLocal && option == int(Option.Environment):
+					try sendSub(option, [byte(subSEND)])
+				case !isLocal && option == int(Option.Linemode):
+					try linemode.enabled(self)
+				case isLocal && option == int(Option.Linemode):
+					try linemode.enabled(self)
+				case !isServer && isLocal && option == int(Option.WindowSize):
+					try sendSub(option, nawsBody(myWindow))
+				case isServer && isLocal && option == int(Option.Mssp):
+					try sendSub(option, msspBody(myStatus))
+				case isServer && isLocal && option == int(Option.Mccp2):
+					try startCompressing(option)
+				case !isServer && !isLocal && option == int(Option.Mccp3):
+					try startCompressing(option)
+				case isServer && option == int(Option.Charset):
+					let offer = ";" + myCharsets.join(";")
+					try sendSub(option, [byte(charsetREQUEST)] + offer.bytes())
+			}
+			return none
+		}
+
+		// startCompressing sends the subnegotiation that starts compression
+		// and compresses everything after it.
+		internal def startCompressing(option int) !none {
+			return none unless deflater is none
+			try sendSub(option, [])
+			deflater = new zlib.Writer(new StreamSink(stream, timeout))
+			return none
+		}
+
+		// startInflating decompresses everything the peer sends from here on.
+		internal def startInflating() {
+			let source = new ReplaySource(stream, timeout)
+			inflateSource = source
+			inflater = new zlib.Reader(source)
+		}
+
+		internal def handleSub(option int, body byte[]) !none {
+			switch {
+				case option == int(Option.TerminalType):
+					return try terminalTypeSub(body)
+				case option == int(Option.WindowSize):
+					let size = parseNaws(body)
+					return none when size is none
+					window = size
+					for let hook in resizeHooks {
+						hook.fn(size)
+					}
+				case option == int(Option.TerminalSpeed):
+					return try textSub(option, body, mySpeed)
+				case option == int(Option.DisplayLocation):
+					return try textSub(option, body, myDisplay)
+				case option == int(Option.Environment):
+					return try environmentSub(body)
+				case option == int(Option.Status):
+					return try statusSub(body)
+				case option == int(Option.FlowControl):
+					return none when body.len() == 0
+					let c = int(body[0])
+					switch {
+						case c == flowOFF:
+							flowControl = false
+						case c == flowON:
+							flowControl = true
+						case c == flowRESTART_ANY:
+							restartAny = true
+						case c == flowRESTART_XON:
+							restartAny = false
+					}
+				case option == int(Option.Linemode):
+					return try linemode.sub(self, body)
+				case option == int(Option.Charset):
+					return try charsetSub(body)
+				case option == int(Option.Mssp):
+					serverStatus = parseMssp(body)
+				case option == int(Option.Gmcp):
+					let (message, json) = parseGmcp(body)
+					for let hook in gmcpHooks {
+						hook.fn(message, json)
+					} empty {
+						heldGmcp.push(message)
+						heldGmcp.push(json)
+						return none
+					}
+				case option == int(Option.Mccp2) && !isServer:
+					startInflating()
+				case option == int(Option.Mccp3) && isServer:
+					startInflating()
+			}
+			return none
+		}
+
+		// terminalTypeSub answers SEND with the next name of this end's
+		// list, the last repeated (RFC 1091); a server takes IS, and asks
+		// again until the names repeat, to learn every one.
+		internal def terminalTypeSub(body byte[]) !none {
+			return none when body.len() == 0
+			if int(body[0]) == subSEND && !isServer {
+				let name = myTerminals.len() == 0 ?? ("UNKNOWN", myTerminals[myTerminalAt])
+				myTerminalAt++ when myTerminalAt < myTerminals.len() - 1
+				return try sendSub(int(Option.TerminalType), textBody(subIS, name))
+			}
+			if int(body[0]) == subIS && isServer {
+				let name = string(body[1:])
+				terminal = name when terminal == ""
+				return none when terminals.includes(name) || terminals.len() >= 16
+				terminals.push(name)
+				return try sendSub(int(Option.TerminalType), [byte(subSEND)])
+			}
+			return none
+		}
+
+		// textSub answers SEND with `mine` (TSPEED, XDISPLOC) and takes IS.
+		internal def textSub(option int, body byte[], mine string) !none {
+			return none when body.len() == 0
+			return try sendSub(option, textBody(subIS, mine)) when int(body[0]) == subSEND && !isServer
+			if int(body[0]) == subIS && isServer {
+				let text = string(body[1:])
+				speed = text when option == int(Option.TerminalSpeed)
+				display = text when option == int(Option.DisplayLocation)
+			}
+			return none
+		}
+
+		// environmentSub answers SEND with the variables asked for (all when
+		// none are named) and takes IS and INFO (RFC 1572).
+		internal def environmentSub(body byte[]) !none {
+			return none when body.len() == 0
+			let verb = int(body[0])
+			let items = parseEnv(body[1:])
+			if verb == subSEND && !isServer {
+				let out EnvVar[] = []
+				for let item in items {
+					out.push(EnvVar{name: item.name, user: item.user, value: myEnvironment.get(item.name)})
+				} empty {
+					let names = myEnvironment.keys()
+					names.sort((a, b) => a.compare(b))
+					for let name in names {
+						out.push(EnvVar{name: name, user: !isWellKnownVar(name), value: myEnvironment.get(name)})
+					}
+				}
+				return try sendSub(int(Option.Environment), envBody(subIS, out))
+			}
+			if isServer && (verb := subIS || subINFO) {
+				for let item in items {
+					let value = item.value
+					if value is none {
+						environment.delete(item.name)
+					} else {
+						environment[item.name] = value
+					}
+				}
+			}
+			return none
+		}
+
+		// statusSub answers STATUS SEND with the options on, as WILL and DO
+		// pairs (RFC 859).
+		internal def statusSub(body byte[]) !none {
+			return none when body.len() == 0 || int(body[0]) != subSEND
+			let out byte[] = [byte(subIS)]
+			for let (option, side) in local {
+				if side.enabled() {
+					out.push(byte(cmdWILL))
+					out.push(byte(option))
+				}
+			}
+			for let (option, side) in remote {
+				if side.enabled() {
+					out.push(byte(cmdDO))
+					out.push(byte(option))
+				}
+			}
+			return try sendSub(int(Option.Status), out)
+		}
+
+		// charsetSub answers REQUEST with the first offered character set this
+		// end speaks, or REJECTED; takes ACCEPTED; refuses translation tables
+		// (RFC 2066).
+		internal def charsetSub(body byte[]) !none {
+			return none when body.len() == 0
+			let verb = int(body[0])
+			switch {
+				case verb == charsetREQUEST && body.len() > 2:
+					let text = string(body[1:])
+					let sep = text[:1]
+					for let offered in text[1:].split(sep) {
+						for let mine in myCharsets {
+							if mine.lower() == offered.lower() {
+								charset = mine
+								return try sendSub(int(Option.Charset), [byte(charsetACCEPTED)] + offered.bytes())
+							}
+						}
+					}
+					return try sendSub(int(Option.Charset), [byte(charsetREJECTED)])
+				case verb == charsetACCEPTED:
+					charset = string(body[1:])
+				case verb == charsetTTABLE_IS:
+					return try sendSub(int(Option.Charset), [byte(charsetTTABLE_REJECTED)])
+			}
+			return none
+		}
+
+		// takeErase is the Erase Character count and Erase Line flag that
+		// came with nothing waiting, cleared.
+		def takeErase() (int, bool) {
+			let out = (pendingErase, pendingEraseLine)
+			pendingErase = 0
+			pendingEraseLine = false
+			return out
+		}
+
+		// addSignalHook registers a signal hook; the first hears the signals
+		// held until then.
+		def addSignalHook(fn def (Signal)) {
+			signalHooks.push(new SignalHook(fn))
+			let held = heldSignals
+			heldSignals = []
+			for let s in held {
+				fn(s)
+			}
+		}
+
+		// addResizeHook registers a window size hook.
+		def addResizeHook(fn def (WindowSize)) {
+			resizeHooks.push(new ResizeHook(fn))
+		}
+
+		// addGmcpHook registers a GMCP hook; the first hears the messages held
+		// until then.
+		def addGmcpHook(fn def (string, string)) {
+			gmcpHooks.push(new GmcpHook(fn))
+			let held = heldGmcp
+			heldGmcp = []
+			for let i = 0; i + 1 < held.len(); i += 2 {
+				fn(held[i], held[i + 1])
+			}
+		}
+
+		// close ends the compressed stream, if any, and closes the connection.
+		def close() !none {
+			return none when closed
+			let out = deflater
+			if !(out is none) {
+				out.close() onerror recover none
+				deflater = none
+			}
+			closed = true
+			stream.close() onerror recover none
+			return try socket.close()
+		}
+	}
+
+	// serverTLS runs the TLS server handshake over an accepted connection.
+	// Fails when there is no config or the handshake fails.
+	def serverTLS(conn net.Connection, config ?tls.Config, timeout duration) !net.Stream {
+		fail telnetError("Security.Implicit needs a TLS config") when config is none
+		let secured = tls.server(conn, config)
+		try secured.handshake(timeout)
+		return secured
+	}
+
+	// clientTLS runs the TLS client handshake. Fails as the handshake does.
+	def clientTLS(conn net.Connection, config tls.Config, timeout duration) !net.Stream {
+		let secured = tls.client(conn, config)
+		try secured.handshake(timeout)
+		return secured
+	}
+
+	// clientConfig is the TLS config of a client connection to `host`: the
+	// caller's, else a fresh one, with the host as the server name when it
+	// names none.
+	def clientConfig(base ?tls.Config, host string) tls.Config {
+		let config = tls.Config{}
+		config = base unless base is none
+		config = tls.withServerName(config, host) when config.serverName == ""
+		return config
+	}
+
+	// withDefaultPort adds a port to an address that names none.
+	def withDefaultPort(addr string, port int) string {
+		if addr.startsWith("[") {
+			return addr when addr.contains("]:")
+			return "{addr}:{port}"
+		}
+		let colons = addr.count(":")
+		return addr when colons == 1
+		return "[{addr}]:{port}" when colons > 1
+		return "{addr}:{port}"
+	}
+
+	// hostOf is the host of a `host:port` address, without brackets.
+	def hostOf(addr string) string {
+		let a = net.parseAddress(addr) onerror recover new net.Address()
+		return a.host
+	}
+
+	// isWellKnownVar reports whether NEW-ENVIRON sends a variable as VAR
+	// (RFC 1572's well-known names) rather than USERVAR.
+	def isWellKnownVar(name string) bool {
+		return name := "USER" || "JOB" || "ACCT" || "PRINTER" || "SYSTEMTYPE" || "DISPLAY"
+	}
+
+	// writeStream writes all of data to a stream. Fails when a write does.
+	def writeStream(stream net.Stream, data byte[], timeout duration) !none {
+		let off = 0
+		for off < data.len() {
+			let n = try stream.write(data[off:], timeout)
+			fail net.errorOf(net.ErrorCode.Pipe, "write", "", "wrote nothing") when n <= 0
+			off += n
+		}
+		return none
+	}
+
+	// StreamSink is a net.Stream as an io.Writer, for the compressor.
+	type StreamSink {
+		stream  net.Stream
+		timeout duration
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			self.timeout = timeout
+		}
+
+		// Implements std.io.Writer. Fails when the stream does.
+		def write(buf byte[]) !int {
+			try writeStream(stream, buf, timeout)
+			return buf.len()
+		}
+	}
+
+	// ReplaySource feeds the decompressor: first the bytes that arrived in
+	// the same read as the start of compression, then the stream.
+	type ReplaySource {
+		stream  net.Stream
+		pending byte[]
+		wait    duration
+
+		def new(stream net.Stream, wait duration) {
+			self.stream = stream
+			self.wait = wait
+		}
+
+		// Implements std.io.Reader. Fails when the stream does.
+		def read(buf byte[]) !int {
+			if pending.len() > 0 {
+				let n = pending.copy(buf)
+				pending = pending[n:].clone()
+				return n
+			}
+			return try stream.read(buf, wait)
+		}
+	}
+
+	type SignalHook {
+		fn def (Signal)
+
+		def new(fn def (Signal)) {
+			self.fn = fn
+		}
+	}
+
+	type ResizeHook {
+		fn def (WindowSize)
+
+		def new(fn def (WindowSize)) {
+			self.fn = fn
+		}
+	}
+
+	type GmcpHook {
+		fn def (string, string)
+
+		def new(fn def (string, string)) {
+			self.fn = fn
+		}
+	}
+}

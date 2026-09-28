@@ -1,0 +1,1383 @@
+internal partial module std.net.mail.imap.proto {
+	use (
+		std.bytes
+		std.data.encoding
+		std.formats.mail
+		std.metrics
+		std.net
+		std.net.mail.imap::*
+		std.net.mail.wire::*
+		std.services::(metric)
+		std.time
+		std.time::(Time)
+	)
+
+	// ServerStats holds the metrics of IMAP servers, registered once per
+	// process and shared by every server.
+	type ServerStats {
+		@metric("net.imap.server.connections.open")
+		connectionsOpen metrics.Gauge
+		@metric("net.imap.server.connections.total")
+		connectionsTotal metrics.Counter
+		@metric("net.imap.server.logins.total")
+		logins metrics.Counter
+		@metric("net.imap.server.logins.failed")
+		loginFailures metrics.Counter
+		@metric("net.imap.server.commands.total")
+		commands metrics.Counter
+		@metric("net.imap.server.messages.appended")
+		appended metrics.Counter
+
+		def new() {}
+	}
+
+	// Hub tells the sessions of one server that a mailbox changed, so a
+	// session watching it (selected, or in IDLE) reports the change.
+	type Hub {
+		watchers map<string, Session[]>
+
+		def new() {
+			watchers = map<string, Session[]>{}
+		}
+
+		atomic def watch(key string, s Session) {
+			let list = watchers.get(key)
+			let kept Session[] = list is none ?? ([], list)
+			kept.push(s)
+			watchers[key] = kept
+		}
+
+		atomic def unwatch(key string, s Session) {
+			let list = watchers.get(key)
+			return when list is none
+			let kept Session[] = []
+			for let w in list {
+				kept.push(w) unless w == s
+			}
+			watchers[key] = kept
+		}
+
+		// changed marks every other watcher of `key` as out of date.
+		atomic def changed(key string, by Session) {
+			let list = watchers.get(key)
+			return when list is none
+			for let w in list {
+				w.dirty = true unless w == by
+			}
+		}
+	}
+
+	// Key is one parsed SEARCH key.
+	struct Key {
+		name string
+		arg  string
+		arg2 string
+		subs Key[]
+	}
+
+	// Session is one connection an IMAP `Server` serves.
+	type Session {
+		server    Server
+		stats     ServerStats
+		hub       Hub
+		socket    net.Connection
+		stream    net.Stream
+		lines     LineReader
+		closed    bool            = false
+		secured   bool            = false
+		user      string          = ""
+		account   ?Account        = none
+		utf8      bool            = false
+		rev2      bool            = false
+		condstore bool            = false
+		// The selected mailbox: its folder, name, messages as the client
+		// numbers them, and whether it is read-only.
+		folder    ?Folder         = none
+		name      string          = ""
+		readOnly  bool            = false
+		messages  StoredMessage[] = []
+		// Set by the hub when another session changed the mailbox.
+		dirty     bool            = false
+		// The UIDs saved by `SEARCH RETURN (SAVE)`, read back as `$`.
+		saved     int64[]         = []
+		tag       string          = "*"
+
+		def new(server Server, stats ServerStats, hub Hub, socket net.Connection) {
+			self.server = server
+			self.stats = stats
+			self.hub = hub
+			self.socket = socket
+			stream = socket
+			lines = new LineReader(socket, 65536)
+		}
+
+		// run serves the connection until it ends, then closes it.
+		def run() {
+			serve() onerror recover none
+			end()
+		}
+
+		// end closes the connection.
+		def end() {
+			return when closed
+			closed = true
+			leave()
+			stream.close() onerror recover none
+			socket.close() onerror recover none
+		}
+
+		// bye tells the client the server is going away, then ends.
+		def bye(text string) {
+			untagged("BYE " + text) onerror recover none
+			end()
+		}
+
+		internal def serve() !none {
+			try secureStream() when server.security == Security.Implicit
+			try untagged("OK [CAPABILITY " + capabilities().join(" ") + "] IMAP4rev2 server ready")
+			for !closed {
+				let line = readLogical(lines, server.idleTimeout, server.maxLiteral, def (size int64) !none { return try send("+ Ready for literal data") }) onerror (err error) {
+					bye("Autologout; idle for too long") when err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					fail err
+				}
+				stats.commands.inc()
+				try dispatch(line)
+			}
+			return none
+		}
+
+		internal def dispatch(line byte[]) !none {
+			let s = new Scanner(line)
+			tag = s.word()
+			s.skipSpaces()
+			let verb = s.word().upper()
+			return try send("* BAD Empty command") when tag == "" || verb == ""
+			let args = s.items() onerror (err error) {
+				recover [atom("\u0001bad")]
+			}
+			return try done("BAD", "", "Syntax error") when args.len() == 1 && args[0].text == "\u0001bad"
+			let failure ?error = none
+			handle(verb, args) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return none when failure is none
+			// Failures of the store become NO; the connection's own go up.
+			fail failure when failure is net.NetError
+			let code = ""
+			code = failure.response when failure is ImapError
+			return try done("NO", code, failure.message.trimPrefix("imap: "))
+		}
+
+		internal def handle(verb string, args Item[]) !none {
+			match verb {
+				case "CAPABILITY":
+					try untagged("CAPABILITY " + capabilities().join(" "))
+					return try ok("CAPABILITY completed")
+				case "NOOP", "CHECK":
+					try sync(true)
+					return try ok(verb + " completed")
+				case "LOGOUT":
+					try untagged("BYE Logging out")
+					try ok("LOGOUT completed")
+					end()
+					return none
+				case "ID":
+					try untagged("ID (\"name\" \"ADM\")")
+					return try ok("ID completed")
+			}
+			if account is none {
+				match verb {
+					case "STARTTLS":
+						return try startTls()
+					case "LOGIN":
+						return try login(args)
+					case "AUTHENTICATE":
+						return try authenticate(args)
+				}
+				return try done("BAD", "", "Log in first")
+			}
+			match verb {
+				case "ENABLE":
+					return try enable(args)
+				case "SELECT", "EXAMINE":
+					return try selectMailbox(args, verb == "EXAMINE")
+				case "CREATE":
+					try needArgs(args, 1)
+					try (try accountOf()).create(mailboxName(args[0]))
+					return try ok("CREATE completed")
+				case "DELETE":
+					return try deleteMailbox(args)
+				case "RENAME":
+					return try rename(args)
+				case "SUBSCRIBE", "UNSUBSCRIBE":
+					try needArgs(args, 1)
+					(try accountOf()).subscribe(mailboxName(args[0]), verb == "SUBSCRIBE")
+					return try ok(verb + " completed")
+				case "LIST", "LSUB":
+					return try list(args, verb == "LSUB")
+				case "NAMESPACE":
+					try untagged("NAMESPACE ((\"\" " + quote(try delimiter()) + ")) NIL NIL")
+					return try ok("NAMESPACE completed")
+				case "STATUS":
+					return try status(args)
+				case "APPEND":
+					return try append(args)
+				case "IDLE":
+					return try idle()
+			}
+			return try done("BAD", "", "No mailbox selected") when folder is none
+			match verb {
+				case "CLOSE":
+					try expunge(onlyUids = false, uids = [], quiet = true)
+					leave()
+					return try ok("CLOSE completed")
+				case "UNSELECT":
+					leave()
+					return try ok("UNSELECT completed")
+				case "EXPUNGE":
+					try expunge(onlyUids = false, uids = [], quiet = false)
+					return try ok("EXPUNGE completed")
+				case "SEARCH":
+					return try search(args, false)
+				case "FETCH":
+					return try fetch(args, false)
+				case "STORE":
+					return try store(args, false)
+				case "COPY":
+					return try copy(args, uid = false, move = false)
+				case "MOVE":
+					return try copy(args, uid = false, move = true)
+				case "UID":
+					return try uidCommand(args)
+			}
+			return try done("BAD", "", "Unknown command " + verb)
+		}
+
+		internal def uidCommand(args Item[]) !none {
+			try needArgs(args, 1)
+			let sub = args[0].text.upper()
+			let rest = args[1:]
+			match sub {
+				case "FETCH":
+					try fetch(rest, true)
+				case "SEARCH":
+					try search(rest, true)
+				case "STORE":
+					try store(rest, true)
+				case "COPY":
+					try copy(rest, uid = true, move = false)
+				case "MOVE":
+					try copy(rest, uid = true, move = true)
+				case "EXPUNGE":
+					try needArgs(rest, 1)
+					try expunge(onlyUids = true, uids = try uidsOf(rest[0].text), quiet = false)
+					try ok("UID EXPUNGE completed")
+				default:
+					try done("BAD", "", "Unknown UID command")
+			}
+			return none
+		}
+
+		internal def capabilities() string[] {
+			let caps = ["IMAP4rev2", "IMAP4rev1", "LITERAL+", "SASL-IR", "ENABLE", "IDLE", "MOVE", "UIDPLUS", "CONDSTORE", "ESEARCH", "SEARCHRES", "SPECIAL-USE", "LIST-EXTENDED", "LIST-STATUS", "NAMESPACE", "UNSELECT", "UTF8=ACCEPT", "ID", "STATUS=SIZE", "CHILDREN", "BINARY"]
+			if account is none {
+				caps.push("STARTTLS") when canStartTls()
+				if server.requireTls && !secured {
+					caps.push("LOGINDISABLED")
+				} else {
+					caps.push("AUTH=PLAIN")
+				}
+			}
+			return caps
+		}
+
+		// ---- replies -----------------------------------------------------------
+
+		internal def send(line string) !none {
+			return try writeFully(stream, (line + "\r\n").bytes(), server.timeout)
+		}
+
+		internal def untagged(text string) !none {
+			return try send("* " + text)
+		}
+
+		internal def ok(text string) !none {
+			return try done("OK", "", text)
+		}
+
+		// done completes the current command.
+		internal def done(status string, code string, text string) !none {
+			let bracket = code == "" ?? ("", "[" + code + "] ")
+			return try send("{tag} {status} {bracket}{text}")
+		}
+
+		internal def needArgs(args Item[], count int) !none {
+			fail ImapError{message: "imap: missing arguments", code: "BAD", status: "BAD", response: "", text: "missing arguments"} when args.len() < count
+			return none
+		}
+
+		internal def accountOf() !Account {
+			let a = account
+			fail protocolError("not logged in") when a is none
+			return a
+		}
+
+		internal def folderOf() !Folder {
+			let f = folder
+			fail protocolError("no mailbox selected") when f is none
+			return f
+		}
+
+		// mailboxName reads a mailbox argument: modified UTF-7 unless UTF-8
+		// was enabled, INBOX in any case.
+		internal def mailboxName(item Item) string {
+			let raw = textOf(item)
+			let decoded = utf8 ?? (raw, decodeName(raw))
+			return decoded.upper() == "INBOX" ?? ("INBOX", decoded)
+		}
+
+		internal def delimiter() !string {
+			for let m in try (try accountOf()).mailboxes() {
+				return m.delimiter unless m.delimiter == ""
+			}
+			return "/"
+		}
+
+		// ---- login ------------------------------------------------------------------
+
+		internal def canStartTls() bool {
+			return server.security == Security.StartTls && !secured && !(server.tls is none)
+		}
+
+		internal def startTls() !none {
+			return try done("BAD", "", "STARTTLS not offered") unless canStartTls()
+			try ok("Begin TLS negotiation now")
+			return try secureStream()
+		}
+
+		internal def secureStream() !none {
+			let config = server.tls
+			fail protocolError("the server has no TLS config") when config is none
+			stream = try secureServer(socket, config, server.timeout)
+			lines = new LineReader(stream, 65536)
+			secured = true
+			return none
+		}
+
+		internal def login(args Item[]) !none {
+			return try done("NO", "PRIVACYREQUIRED", "LOGIN disabled until STARTTLS") when server.requireTls && !secured
+			try needArgs(args, 2)
+			return try signIn(textOf(args[0]), textOf(args[1]))
+		}
+
+		internal def authenticate(args Item[]) !none {
+			try needArgs(args, 1)
+			return try done("NO", "PRIVACYREQUIRED", "Authentication disabled until STARTTLS") when server.requireTls && !secured
+			return try done("NO", "", "Unsupported mechanism") unless args[0].text.upper() == "PLAIN"
+			let response = args.len() > 1 ?? (textOf(args[1]), "")
+			if args.len() < 2 {
+				try send("+ ")
+				response = try lines.readLine(server.idleTimeout)
+			}
+			return try done("BAD", "", "Authentication cancelled") when response == "*"
+			let malformed = false
+			let fields = plainFields(response == "=" ?? ("", response)) onerror (e error) {
+				malformed = true
+				recover []
+			}
+			return try done("BAD", "", "Malformed PLAIN response") when malformed
+			return try signIn(fields[1], fields[2])
+		}
+
+		internal def signIn(name string, password string) !none {
+			let secret Secret<string> = password
+			let refused = false
+			let opened = loginAs(name, secret) onerror (e error) {
+				refused = true
+				recover none
+			}
+			if refused || opened is none {
+				stats.loginFailures.inc()
+				return try done("NO", "AUTHENTICATIONFAILED", "Invalid credentials")
+			}
+			account = opened
+			user = name
+			stats.logins.inc()
+			return try done("OK", "CAPABILITY " + capabilities().join(" "), "Logged in")
+		}
+
+		internal def loginAs(name string, secret Secret<string>) !?Account {
+			return try server.authenticator.login(name, secret)
+		}
+
+		internal def enable(args Item[]) !none {
+			let turned string[] = []
+			for let a in args {
+				let wanted = a.text.upper()
+				if wanted == "IMAP4REV2" {
+					rev2 = true
+					utf8 = true
+					turned.push("IMAP4rev2")
+				} else if wanted == "UTF8=ACCEPT" {
+					utf8 = true
+					turned.push("UTF8=ACCEPT")
+				} else if wanted == "CONDSTORE" {
+					condstore = true
+					turned.push("CONDSTORE")
+				}
+			}
+			try untagged("ENABLED" + (turned.len() == 0 ?? ("", " " + turned.join(" "))))
+			return try ok("ENABLE completed")
+		}
+
+		// ---- mailboxes --------------------------------------------------------------
+
+		internal def selectMailbox(args Item[], examine bool) !none {
+			try needArgs(args, 1)
+			leave()
+			let mailbox = mailboxName(args[0])
+			if args.len() > 1 && args[1].kind == ItemKind.List {
+				for let p in args[1].items {
+					condstore = true when p.text.upper() == "CONDSTORE"
+				}
+			}
+			let opened = try (try accountOf()).open(mailbox)
+			let st = try opened.status()
+			folder = opened
+			name = mailbox
+			readOnly = examine || st.readOnly
+			messages = try opened.messages()
+			dirty = false
+			hub.watch(key(), self)
+			try untagged("{messages.len()} EXISTS")
+			try untagged("0 RECENT") unless rev2
+			try untagged("FLAGS (" + st.flags.join(" ") + ")")
+			let permanent = readOnly ?? ("", st.permanentFlags.join(" "))
+			try untagged("OK [PERMANENTFLAGS (" + permanent + ")] Flags permitted")
+			try untagged("OK [UIDVALIDITY {st.uidValidity}] UIDs valid")
+			try untagged("OK [UIDNEXT {st.uidNext}] Predicted next UID")
+			if !rev2 {
+				for let i = 0; i < messages.len(); i++ {
+					if !hasFlag(messages[i].flags, "\\Seen") {
+						try untagged("OK [UNSEEN {i + 1}] First unseen")
+						break
+					}
+				}
+			}
+			try untagged("OK [HIGHESTMODSEQ {st.highestModSeq}] Highest") when condstore
+			try untagged("LIST () " + quote(try delimiter()) + " " + quotedArgument(encodeName(mailbox, utf8), utf8))
+			return try done("OK", readOnly ?? ("READ-ONLY", "READ-WRITE"), (examine ?? ("EXAMINE", "SELECT")) + " completed")
+		}
+
+		// leave drops the selected mailbox.
+		internal def leave() {
+			hub.unwatch(key(), self) unless folder is none
+			folder = none
+			name = ""
+			messages = []
+			saved = []
+		}
+
+		internal def key() string {
+			return user + "\u0001" + name
+		}
+
+		internal def deleteMailbox(args Item[]) !none {
+			try needArgs(args, 1)
+			let mailbox = mailboxName(args[0])
+			return try done("NO", "CANNOT", "INBOX cannot be deleted") when mailbox == "INBOX"
+			try (try accountOf()).delete(mailbox)
+			return try ok("DELETE completed")
+		}
+
+		internal def rename(args Item[]) !none {
+			try needArgs(args, 2)
+			let from = mailboxName(args[0])
+			let to = mailboxName(args[1])
+			let a = try accountOf()
+			if from != "INBOX" {
+				try a.rename(from, to)
+				return try ok("RENAME completed")
+			}
+			// Renaming INBOX moves its messages to a new mailbox and leaves
+			// INBOX empty (RFC 9051 §6.3.6).
+			try a.create(to)
+			let source = try a.open("INBOX")
+			let target = try a.open(to)
+			let moved int64[] = []
+			for let m in try source.messages() {
+				try target.append(try source.read(m.uid), withoutRecent(m.flags), m.internalDate)
+				moved.push(m.uid)
+			}
+			try source.expunge(moved)
+			hub.changed(user + "\u0001INBOX", self)
+			return try ok("RENAME completed")
+		}
+
+		internal def list(args Item[], lsub bool) !none {
+			let a = try accountOf()
+			let at = 0
+			let subscribedOnly = lsub
+			let specialOnly = false
+			let recursive = false
+			if args.len() > 0 && args[0].kind == ItemKind.List {
+				for let o in args[0].items {
+					let option = o.text.upper()
+					subscribedOnly = true when option == "SUBSCRIBED"
+					specialOnly = true when option == "SPECIAL-USE"
+					recursive = true when option == "RECURSIVEMATCH"
+				}
+				at = 1
+			}
+			try needArgs(args, at + 2)
+			let reference = mailboxName(args[at])
+			let patterns string[] = []
+			if args[at + 1].kind == ItemKind.List {
+				for let p in args[at + 1].items {
+					patterns.push(utf8 ?? (textOf(p), decodeName(textOf(p))))
+				}
+			} else {
+				let raw = textOf(args[at + 1])
+				patterns.push(utf8 ?? (raw, decodeName(raw)))
+			}
+			let returnSubscribed = subscribedOnly
+			let returnStatus Item[] = []
+			if args.len() > at + 3 && args[at + 2].text.upper() == "RETURN" {
+				for let r in args[at + 3].items {
+					returnSubscribed = true when r.text.upper() == "SUBSCRIBED"
+					returnStatus = r.items when r.kind == ItemKind.List
+				}
+				for let i = 0; i < args[at + 3].items.len(); i++ {
+					let r = args[at + 3].items[i]
+					returnStatus = args[at + 3].items[i + 1].items when r.text.upper() == "STATUS" && i + 1 < args[at + 3].items.len()
+				}
+			}
+			let verb = lsub ?? ("LSUB", "LIST")
+			let delim = try delimiter()
+			if patterns.len() == 1 && patterns[0] == "" {
+				try untagged(verb + " (\\Noselect) " + quote(delim) + " \"\"")
+				return try ok(verb + " completed")
+			}
+			let boxes = try a.mailboxes()
+			let subscribed = a.subscriptions()
+			for let m in boxes {
+				let full = m.name
+				let matched = false
+				for let p in patterns {
+					matched = true when wildcardMatch(reference + p, full, delim)
+				}
+				continue unless matched
+				let isSubscribed = subscribed.indexOf(full) >= 0
+				// RECURSIVEMATCH lists a parent whose children are subscribed
+				// with CHILDINFO (RFC 5258 §3.5).
+				let childInfo = false
+				if recursive && subscribedOnly && !isSubscribed {
+					for let other in subscribed {
+						childInfo = true when other.startsWith(full + delim)
+					}
+				}
+				continue when subscribedOnly && !isSubscribed && !childInfo
+				let attributes = m.attributes.clone()
+				let special = false
+				for let attr in attributes {
+					special = true when attr.lower() := "\\sent" || "\\trash" || "\\drafts" || "\\junk" || "\\archive" || "\\all" || "\\flagged"
+				}
+				continue when specialOnly && !special
+				let children = false
+				for let other in boxes {
+					children = true when other.name.startsWith(full + delim)
+				}
+				attributes.push(children ?? ("\\HasChildren", "\\HasNoChildren"))
+				attributes.push("\\Subscribed") when returnSubscribed && isSubscribed && !lsub
+				let extra = childInfo ?? (" (\"CHILDINFO\" (\"SUBSCRIBED\"))", "")
+				try untagged(verb + " (" + attributes.join(" ") + ") " + quote(delim) + " " + quotedArgument(encodeName(full, utf8), utf8) + extra)
+				if returnStatus.len() > 0 {
+					let opened = openQuietly(a, full)
+					if !(opened is none) {
+						try untagged("STATUS " + quotedArgument(encodeName(full, utf8), utf8) + " (" + try statusItems(opened, returnStatus) + ")")
+					}
+				}
+			}
+			return try ok(verb + " completed")
+		}
+
+		internal def status(args Item[]) !none {
+			try needArgs(args, 2)
+			let mailbox = mailboxName(args[0])
+			let opened = try (try accountOf()).open(mailbox)
+			try untagged("STATUS " + quotedArgument(encodeName(mailbox, utf8), utf8) + " (" + try statusItems(opened, args[1].items) + ")")
+			return try ok("STATUS completed")
+		}
+
+		internal def statusItems(f Folder, items Item[]) !string {
+			let st = try f.status()
+			let out string[] = []
+			for let it in items {
+				let item = it.text.upper()
+				match item {
+					case "MESSAGES":
+						out.push("MESSAGES {st.messages}")
+					case "UNSEEN":
+						out.push("UNSEEN {st.unseen}")
+					case "UIDNEXT":
+						out.push("UIDNEXT {st.uidNext}")
+					case "UIDVALIDITY":
+						out.push("UIDVALIDITY {st.uidValidity}")
+					case "HIGHESTMODSEQ":
+						out.push("HIGHESTMODSEQ {st.highestModSeq}")
+					case "SIZE":
+						out.push("SIZE {st.size}")
+					case "RECENT":
+						out.push("RECENT 0")
+					case "DELETED":
+						let deleted = 0
+						for let m in try f.messages() {
+							deleted++ when hasFlag(m.flags, "\\Deleted")
+						}
+						out.push("DELETED {deleted}")
+				}
+			}
+			return out.join(" ")
+		}
+
+		internal def append(args Item[]) !none {
+			try needArgs(args, 2)
+			let mailbox = mailboxName(args[0])
+			let flags string[] = []
+			let date = time.now()
+			let at = 1
+			if args[at].kind == ItemKind.List {
+				for let f in args[at].items {
+					flags.push(f.text)
+				}
+				at++
+			}
+			if at + 1 < args.len() && args[at].kind == ItemKind.Text {
+				date = try parseDateTime(args[at].text)
+				at++
+			}
+			try needArgs(args, at + 1)
+			let data = args[at].data
+			let target = (try accountOf()).open(mailbox) onerror (err error) {
+				fail ImapError{message: "imap: no mailbox " + mailbox, code: "TRYCREATE", status: "NO", response: "TRYCREATE", text: "No such mailbox"}
+			}
+			let uid = try target.append(data, withoutRecent(flags), date)
+			stats.appended.inc()
+			let st = try target.status()
+			hub.changed(user + "\u0001" + mailbox, self)
+			try sync(false) when mailbox == name
+			return try done("OK", "APPENDUID {st.uidValidity} {uid}", "APPEND completed")
+		}
+
+		// ---- the selected mailbox -----------------------------------------------------
+
+		// sync reports what changed since the view was taken: new messages
+		// (EXISTS), flag changes (FETCH) and, when `expunges` allows,
+		// removed messages (EXPUNGE).
+		internal def sync(expunges bool) !none {
+			let f = folder
+			return none when f is none
+			let fresh = try f.messages()
+			let byUid = map<int64, StoredMessage>{}
+			for let m in fresh {
+				byUid[m.uid] = m
+			}
+			if expunges {
+				for let i = messages.len() - 1; i >= 0; i-- {
+					continue when byUid.hasKey(messages[i].uid)
+					try untagged("{i + 1} EXPUNGE")
+					messages.remove(i)
+				}
+			}
+			let known = map<int64, int>{}
+			for let i = 0; i < messages.len(); i++ {
+				known[messages[i].uid] = i
+			}
+			for let i = 0; i < messages.len(); i++ {
+				let now = byUid.get(messages[i].uid)
+				continue when now is none
+				if now.flags.join(" ") != messages[i].flags.join(" ") {
+					messages[i] = now
+					let mod = condstore ?? (" MODSEQ ({now.modSeq})", "")
+					try untagged("{i + 1} FETCH (UID {now.uid} FLAGS (" + now.flags.join(" ") + "){mod})")
+				}
+			}
+			let before = messages.len()
+			for let m in fresh {
+				messages.push(m) unless known.hasKey(m.uid)
+			}
+			try untagged("{messages.len()} EXISTS") when messages.len() != before
+			dirty = false
+			return none
+		}
+
+		// indexesOf reads a sequence set (message numbers) or, with `uid`,
+		// a UID set into view indexes. `$` is the saved search result.
+		internal def indexesOf(set string, uid bool) !int[] {
+			let out int[] = []
+			if set == "$" {
+				for let i = 0; i < messages.len(); i++ {
+					out.push(i) when saved.indexOf(messages[i].uid) >= 0
+				}
+				return out
+			}
+			if uid {
+				let largest = messages.len() == 0 ?? (int64(0), messages[messages.len() - 1].uid)
+				let ranges = try parseRanges(set, largest)
+				for let i = 0; i < messages.len(); i++ {
+					out.push(i) when inRanges(ranges, messages[i].uid)
+				}
+				return out
+			}
+			let ranges = try parseRanges(set, int64(messages.len()))
+			for let r in ranges {
+				fail ImapError{message: "imap: no such message", code: "BAD", status: "BAD", response: "", text: "Invalid message sequence number"} when r.low < 1 || r.high > int64(messages.len())
+			}
+			for let i = 0; i < messages.len(); i++ {
+				out.push(i) when inRanges(ranges, int64(i + 1))
+			}
+			return out
+		}
+
+		internal def uidsOf(set string) !int64[] {
+			let out int64[] = []
+			for let i in try indexesOf(set, true) {
+				out.push(messages[i].uid)
+			}
+			return out
+		}
+
+		// ---- FETCH --------------------------------------------------------------------
+
+		internal def fetch(args Item[], uid bool) !none {
+			try needArgs(args, 2)
+			try sync(uid) when dirty
+			let indexes = try indexesOf(args[0].text, uid)
+			let items Item[] = args[1].kind == ItemKind.List ?? (args[1].items, [args[1]])
+			let names string[] = []
+			for let it in items {
+				let upper = it.text.upper()
+				match upper {
+					case "ALL":
+						names = names + ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE"]
+					case "FAST":
+						names = names + ["FLAGS", "INTERNALDATE", "RFC822.SIZE"]
+					case "FULL":
+						names = names + ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE", "BODY"]
+					default:
+						names.push(it.text)
+				}
+			}
+			if args.len() > 2 && args[2].kind == ItemKind.List {
+				// (CHANGEDSINCE n) restricts the answer and adds MODSEQ.
+				for let k = 0; k + 1 < args[2].items.len(); k += 2 {
+					if args[2].items[k].text.upper() == "CHANGEDSINCE" {
+						let since = numberOf(args[2].items[k + 1])
+						condstore = true
+						indexes = indexes.filter(i => messages[i].modSeq > since)
+						names.push("MODSEQ")
+					}
+				}
+			}
+			names.push("UID") when uid && names.filter(n => n.upper() == "UID").len() == 0
+			let f = try folderOf()
+			for let i in indexes {
+				try fetchOne(f, i, names)
+			}
+			return try ok((uid ?? ("UID ", "")) + "FETCH completed")
+		}
+
+		internal def fetchOne(f Folder, i int, names string[]) !none {
+			let m = messages[i]
+			let out = new bytes.Buffer()
+			try out.write("* {i + 1} FETCH (".bytes())
+			let whole byte[] = []
+			let loaded = false
+			let root ?Entity = none
+			let setSeen = false
+			let first = true
+			for let item in names {
+				let upper = item.upper()
+				if upper.startsWith("BODY[") || upper.startsWith("BODY.PEEK[") || upper.startsWith("BINARY[") || upper.startsWith("BINARY.PEEK[") || upper.startsWith("BINARY.SIZE[") || (upper := "RFC822" || "RFC822.HEADER" || "RFC822.TEXT" || "BODY" || "BODYSTRUCTURE" || "ENVELOPE") {
+					if !loaded {
+						whole = try f.read(m.uid)
+						root = entityOf(whole, 0)
+						loaded = true
+					}
+				}
+				let e = root
+				try out.write((first ?? ("", " ")).bytes())
+				first = false
+				match upper {
+					case "UID":
+						try out.write("UID {m.uid}".bytes())
+						continue
+					case "FLAGS":
+						try out.write(("FLAGS (" + m.flags.join(" ") + ")").bytes())
+						continue
+					case "INTERNALDATE":
+						try out.write(("INTERNALDATE " + quote(formatDateTime(m.internalDate))).bytes())
+						continue
+					case "RFC822.SIZE":
+						try out.write("RFC822.SIZE {m.size}".bytes())
+						continue
+					case "MODSEQ":
+						try out.write("MODSEQ ({m.modSeq})".bytes())
+						continue
+					case "ENVELOPE":
+						try out.write(("ENVELOPE " + envelopeOf(entityRoot(e).fields)).bytes())
+						continue
+					case "BODYSTRUCTURE":
+						try out.write(("BODYSTRUCTURE " + bodyStructure(entityRoot(e), true)).bytes())
+						continue
+					case "BODY":
+						try out.write(("BODY " + bodyStructure(entityRoot(e), false)).bytes())
+						continue
+					case "RFC822":
+						try out.write("RFC822 ".bytes())
+						try writeLiteral(out, whole)
+						setSeen = true
+						continue
+					case "RFC822.HEADER":
+						try out.write("RFC822.HEADER ".bytes())
+						try writeLiteral(out, entityRoot(e).header)
+						continue
+					case "RFC822.TEXT":
+						try out.write("RFC822.TEXT ".bytes())
+						try writeLiteral(out, entityRoot(e).body)
+						setSeen = true
+						continue
+				}
+				let open = item.indexOf("[")
+				let close = lastBracket(item)
+				fail ImapError{message: "imap: bad fetch item " + item, code: "BAD", status: "BAD", response: "", text: "Bad fetch item"} when open < 0 || close < open
+				let spec = item[open + 1:close]
+				let section = try parseSection(spec)
+				let window = item[close + 1:]
+				let data = sectionBytes(entityRoot(e), whole, section)
+				let label = upper.startsWith("BINARY") ?? ("BINARY", "BODY")
+				data = try decodedPart(entityRoot(e), section, data) when upper.startsWith("BINARY")
+				if upper.startsWith("BINARY.SIZE") {
+					try out.write("BINARY.SIZE[{spec}] {data.len()}".bytes())
+					continue
+				}
+				let origin = ""
+				if window.startsWith("<") && window.endsWith(">") {
+					let dot = window.indexOf(".")
+					let start = int(numberOf(atom(dot < 0 ?? (window[1:window.len() - 1], window[1:dot]))))
+					let count = dot < 0 ?? (data.len(), int(numberOf(atom(window[dot + 1:window.len() - 1]))))
+					start = start > data.len() ?? (data.len(), start)
+					let end = start + count > data.len() ?? (data.len(), start + count)
+					data = data.slice(start, end - start)
+					origin = "<{start}>"
+				}
+				try out.write("{label}[{spec}]{origin} ".bytes())
+				try writeLiteral(out, data)
+				setSeen = true unless upper.contains(".PEEK")
+			}
+			if setSeen && !readOnly && !hasFlag(m.flags, "\\Seen") {
+				let flags = m.flags.clone()
+				flags.push("\\Seen")
+				let mod = try f.setFlags(m.uid, flags)
+				messages[i] = StoredMessage{uid: m.uid, flags: flags, size: m.size, internalDate: m.internalDate, modSeq: mod}
+				try out.write((" FLAGS (" + flags.join(" ") + ")").bytes())
+				hub.changed(key(), self)
+			}
+			try out.write(")\r\n".bytes())
+			return try writeFully(stream, out.bytes(), server.timeout)
+		}
+
+		// entityRoot is the parsed message, which fetchOne loads before any
+		// item needs it.
+		internal def entityRoot(e ?Entity) Entity {
+			return new Entity([], [], new mail.Header()) when e is none
+			return e
+		}
+
+		internal def writeLiteral(out bytes.Buffer, data byte[]) !none {
+			let binary = data.indexOf(byte(0)) >= 0
+			let marker = literalMarker(data.len(), false).trimPrefix(" ")
+			try out.write(((binary ?? ("~", "")) + marker).bytes())
+			try out.write(data)
+			return none
+		}
+
+		// decodedPart undoes the transfer encoding of a leaf part for BINARY
+		// (RFC 3516). Fails with UNKNOWN-CTE for an encoding it cannot undo.
+		internal def decodedPart(root Entity, section Section, data byte[]) !byte[] {
+			let e = root
+			for let n in section.path {
+				let inner = e.inner
+				let host = inner is none ?? (e, inner)
+				e = host.parts.len() == 0 ?? (host, host.parts[n - 1 < host.parts.len() ?? (n - 1, 0)])
+			}
+			let cte = orEmpty(e.fields.raw("Content-Transfer-Encoding")).lower()
+			if cte == "base64" {
+				let clean byte[] = []
+				for let b in data {
+					clean.push(b) unless b := 0x20 || 0x09 || 0x0D || 0x0A
+				}
+				return encoding.base64decode(string(clean)) onerror (err error) {
+					fail ImapError{message: "imap: bad base64", code: "UNKNOWN-CTE", status: "NO", response: "UNKNOWN-CTE", text: "Cannot decode part"}
+				}
+			}
+			if cte == "quoted-printable" {
+				return encoding.quotedPrintableDecode(string(data)) onerror (err error) {
+					fail ImapError{message: "imap: bad quoted-printable", code: "UNKNOWN-CTE", status: "NO", response: "UNKNOWN-CTE", text: "Cannot decode part"}
+				}
+			}
+			fail ImapError{message: "imap: unknown encoding " + cte, code: "UNKNOWN-CTE", status: "NO", response: "UNKNOWN-CTE", text: "Unknown transfer encoding"} unless cte := "" || "7bit" || "8bit" || "binary"
+			return data
+		}
+
+		// ---- STORE ----------------------------------------------------------------------
+
+		internal def store(args Item[], uid bool) !none {
+			try needArgs(args, 3)
+			return try done("NO", "", "Mailbox is read-only") when readOnly
+			let indexes = try indexesOf(args[0].text, uid)
+			let at = 1
+			let unchangedSince int64 = -1
+			if args[at].kind == ItemKind.List {
+				let mods = args[at].items
+				for let k = 0; k + 1 < mods.len(); k += 2 {
+					unchangedSince = numberOf(mods[k + 1]) when mods[k].text.upper() == "UNCHANGEDSINCE"
+				}
+				condstore = true when unchangedSince >= 0
+				at++
+			}
+			try needArgs(args, at + 2)
+			let action = args[at].text.upper()
+			let silent = action.endsWith(".SILENT")
+			let mode = action.trimSuffix(".SILENT")
+			fail ImapError{message: "imap: bad STORE item", code: "BAD", status: "BAD", response: "", text: "Bad STORE item"} unless mode := "FLAGS" || "+FLAGS" || "-FLAGS"
+			let given string[] = []
+			let flagItems Item[] = args[at + 1].kind == ItemKind.List ?? (args[at + 1].items, args[at + 1:])
+			for let fl in flagItems {
+				given.push(fl.text) unless fl.text.lower() == "\\recent"
+			}
+			let f = try folderOf()
+			let modified int64[] = []
+			for let i in indexes {
+				let m = messages[i]
+				if unchangedSince >= 0 && m.modSeq > unchangedSince {
+					modified.push(uid ?? (m.uid, int64(i + 1)))
+					continue
+				}
+				let next string[] = []
+				match mode {
+					case "FLAGS":
+						next = given.clone()
+					case "+FLAGS":
+						next = m.flags.clone()
+						for let fl in given {
+							next.push(fl) unless hasFlag(next, fl)
+						}
+					default:
+						for let fl in m.flags {
+							next.push(fl) unless hasFlag(given, fl)
+						}
+				}
+				let mod = try f.setFlags(m.uid, next)
+				messages[i] = StoredMessage{uid: m.uid, flags: next, size: m.size, internalDate: m.internalDate, modSeq: mod}
+				if !silent || condstore {
+					let uidPart = uid ?? (" UID {m.uid}", "")
+					let modPart = condstore ?? (" MODSEQ ({mod})", "")
+					let flagPart = silent ?? ("", " FLAGS (" + next.join(" ") + ")")
+					try untagged("{i + 1} FETCH (" + (uidPart + flagPart + modPart).trimPrefix(" ") + ")")
+				}
+			}
+			hub.changed(key(), self)
+			let code = modified.len() > 0 ?? ("MODIFIED " + formatSet(modified), "")
+			return try done("OK", code, (uid ?? ("UID ", "")) + "STORE completed")
+		}
+
+		// ---- COPY, MOVE, EXPUNGE -----------------------------------------------------------
+
+		internal def copy(args Item[], uid bool, move bool) !none {
+			try needArgs(args, 2)
+			return try done("NO", "", "Mailbox is read-only") when move && readOnly
+			let indexes = try indexesOf(args[0].text, uid)
+			let targetName = mailboxName(args[1])
+			let target = (try accountOf()).open(targetName) onerror (err error) {
+				fail ImapError{message: "imap: no mailbox " + targetName, code: "TRYCREATE", status: "NO", response: "TRYCREATE", text: "No such mailbox"}
+			}
+			let f = try folderOf()
+			let from int64[] = []
+			let to int64[] = []
+			for let i in indexes {
+				let m = messages[i]
+				to.push(try target.append(try f.read(m.uid), withoutRecent(m.flags), m.internalDate))
+				from.push(m.uid)
+			}
+			let st = try target.status()
+			hub.changed(user + "\u0001" + targetName, self)
+			let code = from.len() == 0 ?? ("", "COPYUID {st.uidValidity} " + formatSet(from) + " " + formatSet(to))
+			let verb = move ?? ("MOVE", "COPY")
+			if move {
+				try untagged("OK [" + code + "] Moved") unless code == ""
+				try expunge(onlyUids = true, uids = from, quiet = false)
+				return try ok((uid ?? ("UID ", "")) + verb + " completed")
+			}
+			try sync(false) when targetName == name
+			return try done("OK", code, (uid ?? ("UID ", "")) + verb + " completed")
+		}
+
+		// expunge removes the messages flagged `\Deleted` (with `onlyUids`,
+		// only those among `uids`; with `quiet`, without EXPUNGE responses).
+		internal def expunge(onlyUids bool, uids int64[], quiet bool) !none {
+			return none when readOnly
+			let f = try folderOf()
+			let doomed int64[] = []
+			for let m in messages {
+				continue unless hasFlag(m.flags, "\\Deleted")
+				continue when onlyUids && uids.indexOf(m.uid) < 0
+				doomed.push(m.uid)
+			}
+			// A move expunges what it moved, flagged or not.
+			if onlyUids && uids.len() > 0 {
+				for let u in uids {
+					doomed.push(u) unless doomed.indexOf(u) >= 0
+				}
+			}
+			return none when doomed.len() == 0
+			try f.expunge(doomed)
+			for let i = messages.len() - 1; i >= 0; i-- {
+				continue unless doomed.indexOf(messages[i].uid) >= 0
+				try untagged("{i + 1} EXPUNGE") unless quiet
+				messages.remove(i)
+			}
+			hub.changed(key(), self)
+			return none
+		}
+
+		// ---- IDLE --------------------------------------------------------------------------
+
+		internal def idle() !none {
+			try send("+ idling")
+			try sync(true)
+			let started = time.now()
+			for {
+				fail net.errorOf(net.ErrorCode.TimedOut, "idle", "", "idle too long") when time.since(started) > server.idleTimeout
+				let timedOut = false
+				let line = lines.readLine(1s) onerror (err error) {
+					timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					fail err unless timedOut
+					recover ""
+				}
+				if timedOut {
+					try sync(true) when dirty
+					continue
+				}
+				return try ok("IDLE terminated") when line.trim().upper() == "DONE"
+				return try done("BAD", "", "Expected DONE")
+			}
+			return none
+		}
+
+		// ---- SEARCH --------------------------------------------------------------------------
+
+		internal def search(args Item[], uid bool) !none {
+			let at = 0
+			let returns string[] = []
+			let esearch = false
+			if args.len() > 1 && args[0].text.upper() == "RETURN" && args[1].kind == ItemKind.List {
+				esearch = true
+				for let r in args[1].items {
+					returns.push(r.text.upper())
+				}
+				returns = ["ALL"] when returns.len() == 0
+				at = 2
+			}
+			if args.len() > at + 1 && args[at].text.upper() == "CHARSET" {
+				let cs = args[at + 1].text.upper()
+				return try done("NO", "BADCHARSET (UTF-8 US-ASCII)", "Unsupported charset") unless cs := "UTF-8" || "US-ASCII"
+				at += 2
+			}
+			let keys Key[] = []
+			let rest = args[at:]
+			let pos = 0
+			for pos < rest.len() {
+				let (k, next) = try parseKey(rest, pos)
+				keys.push(k)
+				pos = next
+			}
+			let f = try folderOf()
+			let hits int64[] = []
+			let hitUids int64[] = []
+			for let i = 0; i < messages.len(); i++ {
+				let cache = new MessageCache(f, messages[i])
+				let all = true
+				for let k in keys {
+					if !(try matches(k, i, cache)) {
+						all = false
+						break
+					}
+				}
+				if all {
+					hits.push(uid ?? (messages[i].uid, int64(i + 1)))
+					hitUids.push(messages[i].uid)
+				}
+			}
+			if !esearch && !rev2 {
+				let numbers string[] = []
+				for let h in hits {
+					numbers.push("{h}")
+				}
+				try untagged("SEARCH" + (numbers.len() == 0 ?? ("", " " + numbers.join(" "))))
+				return try ok((uid ?? ("UID ", "")) + "SEARCH completed")
+			}
+			returns = ["ALL"] when returns.len() == 0
+			let out = "ESEARCH (TAG " + quote(tag) + ")" + (uid ?? (" UID", ""))
+			for let r in returns {
+				match r {
+					case "MIN":
+						out += " MIN {hits[0]}" when hits.len() > 0
+					case "MAX":
+						out += " MAX {hits[hits.len() - 1]}" when hits.len() > 0
+					case "COUNT":
+						out += " COUNT {hits.len()}"
+					case "ALL":
+						out += " ALL " + formatSet(hits) when hits.len() > 0
+					case "SAVE":
+						saved = hitUids
+				}
+			}
+			try untagged(out) unless returns.len() == 1 && returns[0] == "SAVE"
+			return try ok((uid ?? ("UID ", "")) + "SEARCH completed")
+		}
+
+		// parseKey reads the SEARCH key at `pos` and returns it with the
+		// position after it.
+		internal def parseKey(items Item[], pos int) !(Key, int) {
+			let bad = ImapError{message: "imap: bad search key", code: "BAD", status: "BAD", response: "", text: "Bad search key"}
+			fail bad when pos >= items.len()
+			let it = items[pos]
+			if it.kind == ItemKind.List {
+				let subs Key[] = []
+				let p = 0
+				for p < it.items.len() {
+					let (k, next) = try parseKey(it.items, p)
+					subs.push(k)
+					p = next
+				}
+				return (Key{name: "AND", arg: "", arg2: "", subs: subs}, pos + 1)
+			}
+			let word = it.text.upper()
+			match word {
+				case "NOT":
+					let (k, next) = try parseKey(items, pos + 1)
+					return (Key{name: "NOT", arg: "", arg2: "", subs: [k]}, next)
+				case "OR":
+					let (a, afterA) = try parseKey(items, pos + 1)
+					let (b, afterB) = try parseKey(items, afterA)
+					return (Key{name: "OR", arg: "", arg2: "", subs: [a, b]}, afterB)
+				case "ALL", "ANSWERED", "DELETED", "DRAFT", "FLAGGED", "SEEN", "UNANSWERED", "UNDELETED", "UNDRAFT", "UNFLAGGED", "UNSEEN", "NEW", "OLD", "RECENT":
+					return (Key{name: word, arg: "", arg2: "", subs: []}, pos + 1)
+				case "BCC", "BODY", "CC", "FROM", "SUBJECT", "TEXT", "TO", "KEYWORD", "UNKEYWORD", "BEFORE", "ON", "SINCE", "SENTBEFORE", "SENTON", "SENTSINCE", "LARGER", "SMALLER", "UID", "MODSEQ":
+					fail bad when pos + 1 >= items.len()
+					let value = textOf(items[pos + 1])
+					// MODSEQ may carry an entry name and type before the value.
+					return (Key{name: word, arg: textOf(items[pos + 3]), arg2: "", subs: []}, pos + 4) when word == "MODSEQ" && pos + 3 < items.len() && items[pos + 1].kind == ItemKind.Text
+					return (Key{name: word, arg: value, arg2: "", subs: []}, pos + 2)
+				case "HEADER":
+					fail bad when pos + 2 >= items.len()
+					return (Key{name: word, arg: textOf(items[pos + 1]), arg2: textOf(items[pos + 2]), subs: []}, pos + 3)
+			}
+			// Anything else must be a sequence set.
+			fail bad unless word == "$" || word.split(",").filter(p => p.split(":").filter(n => !(n == "*" || n.isNumeric())).len() > 0).len() == 0
+			return (Key{name: "SET", arg: it.text, arg2: "", subs: []}, pos + 1)
+		}
+
+		// matches evaluates a key against message `i`.
+		internal def matches(k Key, i int, cache MessageCache) !bool {
+			let m = messages[i]
+			match k.name {
+				case "AND":
+					for let s in k.subs {
+						return false unless try matches(s, i, cache)
+					}
+					return true
+				case "NOT":
+					return !(try matches(k.subs[0], i, cache))
+				case "OR":
+					return (try matches(k.subs[0], i, cache)) || (try matches(k.subs[1], i, cache))
+				case "ALL", "OLD":
+					return true
+				case "NEW", "RECENT":
+					return false
+				case "ANSWERED":
+					return hasFlag(m.flags, "\\Answered")
+				case "DELETED":
+					return hasFlag(m.flags, "\\Deleted")
+				case "DRAFT":
+					return hasFlag(m.flags, "\\Draft")
+				case "FLAGGED":
+					return hasFlag(m.flags, "\\Flagged")
+				case "SEEN":
+					return hasFlag(m.flags, "\\Seen")
+				case "UNANSWERED":
+					return !hasFlag(m.flags, "\\Answered")
+				case "UNDELETED":
+					return !hasFlag(m.flags, "\\Deleted")
+				case "UNDRAFT":
+					return !hasFlag(m.flags, "\\Draft")
+				case "UNFLAGGED":
+					return !hasFlag(m.flags, "\\Flagged")
+				case "UNSEEN":
+					return !hasFlag(m.flags, "\\Seen")
+				case "KEYWORD":
+					return hasFlag(m.flags, k.arg)
+				case "UNKEYWORD":
+					return !hasFlag(m.flags, k.arg)
+				case "LARGER":
+					return m.size > numberOf(atom(k.arg))
+				case "SMALLER":
+					return m.size < numberOf(atom(k.arg))
+				case "MODSEQ":
+					return m.modSeq >= numberOf(atom(k.arg))
+				case "UID":
+					return saved.indexOf(m.uid) >= 0 when k.arg == "$"
+					let largest = messages[messages.len() - 1].uid
+					return inRanges(try parseRanges(k.arg, largest), m.uid)
+				case "SET":
+					return saved.indexOf(m.uid) >= 0 when k.arg == "$"
+					return inRanges(try parseRanges(k.arg, int64(messages.len())), int64(i + 1))
+				case "BEFORE", "ON", "SINCE":
+					return try dateMatches(k.name, dayStart(m.internalDate), try dayOf(k.arg))
+				case "SENTBEFORE", "SENTON", "SENTSINCE":
+					let sent = (try cache.fields()).date("Date") onerror recover m.internalDate
+					return try dateMatches(k.name.trimPrefix("SENT"), dayStart(sent), try dayOf(k.arg))
+				case "HEADER":
+					let values = (try cache.fields()).values(k.arg)
+					return values.len() > 0 when k.arg2 == ""
+					for let v in values {
+						return true when v.lower().contains(k.arg2.lower())
+					}
+					return false
+				case "BCC", "CC", "FROM", "SUBJECT", "TO":
+					let field = k.name == "BCC" ?? ("Bcc", k.name.capitalize())
+					for let v in (try cache.fields()).values(field) {
+						return true when v.lower().contains(k.arg.lower())
+					}
+					return false
+				case "BODY":
+					return string(try cache.body()).lower().contains(k.arg.lower())
+				case "TEXT":
+					return string(try cache.whole()).lower().contains(k.arg.lower()) || (try cache.fields()).str().lower().contains(k.arg.lower())
+			}
+			return false
+		}
+
+		internal def dateMatches(kind string, day Time, want Time) !bool {
+			match kind {
+				case "BEFORE":
+					return day.unixNs() < want.unixNs()
+				case "ON":
+					return day.unixNs() == want.unixNs()
+			}
+			return day.unixNs() >= want.unixNs()
+		}
+	}
+
+	// MessageCache loads a message's content once for the SEARCH keys that
+	// need it.
+	type MessageCache {
+		folder  Folder
+		message StoredMessage
+		data    byte[]        = []
+		loaded  bool          = false
+		entity  ?Entity       = none
+
+		def new(folder Folder, message StoredMessage) {
+			self.folder = folder
+			self.message = message
+		}
+
+		def whole() !byte[] {
+			if !loaded {
+				data = try folder.read(message.uid)
+				entity = entityOf(data, 0)
+				loaded = true
+			}
+			return data
+		}
+
+		def fields() !mail.Header {
+			try whole()
+			let e = entity
+			return new mail.Header() when e is none
+			return e.fields
+		}
+
+		def body() !byte[] {
+			try whole()
+			let e = entity
+			return [] when e is none
+			return e.body
+		}
+	}
+
+	// lastBracket is the index of the last `]` in text, -1 when none.
+	def lastBracket(text string) int {
+		let at = -1
+		for let i = 0; i < text.len(); i++ {
+			at = i when text[i] == ']'
+		}
+		return at
+	}
+
+	// openQuietly opens a mailbox, none when it cannot be opened.
+	def openQuietly(a Account, mailbox string) ?Folder {
+		return tryOpen(a, mailbox) onerror recover none
+	}
+
+	def tryOpen(a Account, mailbox string) !?Folder {
+		return try a.open(mailbox)
+	}
+
+	// dayStart is midnight UTC of the day of `t`.
+	def dayStart(t Time) Time {
+		let ns = t.unixNs()
+		let day int64 = 86400 * 1000000000
+		return time.fromUnixNs(ns - ((ns % day) + day) % day)
+	}
+
+	// hasFlag reports a flag in a list, without regard to case.
+	def hasFlag(flags string[], flag string) bool {
+		let want = flag.lower()
+		for let f in flags {
+			return true when f.lower() == want
+		}
+		return false
+	}
+
+	// withoutRecent drops the `\Recent` flag no client may set.
+	def withoutRecent(flags string[]) string[] {
+		return flags.filter(f => f.lower() != "\\recent")
+	}
+
+	// wildcardMatch matches a mailbox name against a LIST pattern: `*`
+	// matches anything, `%` anything but the delimiter.
+	def wildcardMatch(pattern string, name string, delim string) bool {
+		return name == "" when pattern == ""
+		let c = pattern[0]
+		if c == '*' {
+			for let i = 0; i <= name.len(); i++ {
+				return true when wildcardMatch(pattern[1:], name[i:], delim)
+			}
+			return false
+		}
+		if c == '%' {
+			for let i = 0; i <= name.len(); i++ {
+				return true when wildcardMatch(pattern[1:], name[i:], delim)
+				return false when i < name.len() && string(name[i]) == delim
+			}
+			return false
+		}
+		return false when name == ""
+		let same = pattern[0] == name[0] || (pattern.upper().startsWith("INBOX") && name.upper().startsWith("INBOX") && string(pattern[0]).upper() == string(name[0]).upper())
+		return same && wildcardMatch(pattern[1:], name[1:], delim)
+	}
+}

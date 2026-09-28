@@ -1,0 +1,773 @@
+partial module std.net.mail.imap {
+	use (
+		std.formats.mail
+		std.formats.mail::(Message)
+		std.io
+		std.net
+		std.net.mail.imap.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+		std.time
+		std.time::(Time)
+	)
+
+	// Client is an IMAP client (IMAP4rev2, RFC 9051, falling back to
+	// IMAP4rev1, RFC 3501) for one connection. Messages are named by UID;
+	// sequence numbers never reach the API. It uses the extensions the
+	// server offers: `IDLE`, `MOVE`, `UIDPLUS`, `CONDSTORE`, `ESEARCH`,
+	// `LITERAL+`, `SASL-IR`, `SPECIAL-USE`, `ENABLE`, `UNSELECT`,
+	// `UTF8=ACCEPT`, `STATUS=SIZE`.
+	//
+	// ```
+	// let client = new imap.Client(imap.Security.Implicit)
+	// try client.connect("imap.example.com")
+	// try client.login("alice", "s3cret")
+	// try client.open("INBOX")
+	// for let uid in try client.search(new imap.Search().unseen()) {
+	//     let message = try client.message(uid)
+	// }
+	// try client.close()
+	// ```
+	type Client {
+		security Security    = Security.StartTls
+		// The TLS settings of `STARTTLS` and `Implicit`; none verifies the
+		// server against the system roots.
+		tls      ?tls.Config = none
+		// How long each command may wait for its completion.
+		timeout  duration    = 60s
+
+		internal socket       ?net.Connection = none
+		internal stream       ?net.Stream     = none
+		internal lines        ?LineReader     = none
+		internal host         string          = ""
+		internal greeting     string          = ""
+		internal capabilities string[]        = []
+		internal secure       bool            = false
+		internal utf8         bool            = false
+		internal condstore    bool            = false
+		internal tagCount     int             = 0
+		internal selected     string          = ""
+		internal readOnly     bool            = false
+		internal pending      Update[]        = []
+
+		def new(security Security = Security.StartTls, timeout duration = 60s) {
+			self.security = security
+			self.timeout = timeout
+		}
+
+		// Opens the connection (port 143, 993 with `Implicit`), reads the
+		// greeting and capabilities and, with `StartTls`, upgrades. Fails
+		// when the server cannot be reached, refuses the connection
+		// (`BYE`), or does not offer STARTTLS when it is asked for.
+		def connect(addr string) !none {
+			fail protocolError("already connected") unless socket is none
+			let target = net.withPort(addr, security == Security.Implicit ?? (993, 143))
+			let scheme = security == Security.Implicit ?? ("imaps", "imap")
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", scheme + "://" + target)
+			host = hostOf(target)
+			let conn = try net.dialStream(target, timeout)
+			socket = conn
+			stream = conn
+			lines = new LineReader(conn, 65536)
+			handshake() onerror (err error) {
+				drop()
+				fail err
+			}
+			return none
+		}
+
+		internal def handshake() !none {
+			try upgrade() when security == Security.Implicit
+			let greet = try readResponse()
+			fail statusError("connect", greet) unless greet.status := "OK" || "PREAUTH"
+			greeting = greet.text
+			takeCapabilities(greet)
+			try refreshCapabilities() when capabilities.len() == 0
+			if security == Security.StartTls {
+				fail protocolError("the server does not offer STARTTLS") unless hasCapability("STARTTLS")
+				try must("STARTTLS", "STARTTLS")
+				try upgrade()
+				// Capabilities learnt before TLS are forgotten (RFC 9051 §6.2.1).
+				try refreshCapabilities()
+			}
+			return none
+		}
+
+		internal def upgrade() !none {
+			let conn = socket
+			fail protocolError("not connected") when conn is none
+			let secured = try secureClient(conn, tls, host, timeout)
+			stream = secured
+			lines = new LineReader(secured, 65536)
+			secure = true
+			return none
+		}
+
+		// Logs in. `method` none picks `AUTHENTICATE PLAIN` when offered,
+		// else `LOGIN`; with `XOAuth2`, `password` is the access token.
+		// Fails when the server refuses the login.
+		def login(user string, password Secret<string>, method ?AuthMethod = none) !none {
+			let chosen = AuthMethod.Login
+			if method is none {
+				chosen = AuthMethod.Plain when hasCapability("AUTH=PLAIN")
+			} else {
+				chosen = method
+			}
+			let secret = password.reveal()
+			let (done, _) = try exchangeLogin(chosen, user, secret)
+			fail statusError("login", done) unless done.status == "OK"
+			if !takeCapabilities(done) {
+				try refreshCapabilities()
+			}
+			try enableExtensions()
+			return none
+		}
+
+		internal def exchangeLogin(chosen AuthMethod, user string, secret string) !(Response, Response[]) {
+			match chosen {
+				case AuthMethod.Login:
+					fail protocolError("the server disabled LOGIN (LOGINDISABLED)") when hasCapability("LOGINDISABLED")
+					return try exec("LOGIN " + quotedArgument(user, utf8) + " " + quotedArgument(secret, utf8))
+				case AuthMethod.Plain:
+					return try authenticate("PLAIN", plainResponse(user, secret))
+				case AuthMethod.XOAuth2:
+					return try authenticate("XOAUTH2", xoauth2Response(user, secret))
+			}
+			fail "unreachable"
+		}
+
+		// authenticate runs AUTHENTICATE with one response, inline with
+		// SASL-IR, else after the server's `+`.
+		internal def authenticate(mechanism string, response string) !(Response, Response[]) {
+			let tag = nextTag()
+			let inline = hasCapability("SASL-IR")
+			let line = "{tag} AUTHENTICATE {mechanism}" + (inline ?? (" " + response, ""))
+			try writeFully(try output(), (line + "\r\n").bytes(), timeout)
+			let untagged Response[] = []
+			let sent = inline
+			for {
+				let r = try readResponse()
+				if r.tag == "+" {
+					// A second challenge carries the error of a refused
+					// XOAUTH2 token; an empty line asks for the final answer.
+					let answer = sent ?? ("", response)
+					sent = true
+					try writeFully(try output(), (answer + "\r\n").bytes(), timeout)
+					continue
+				}
+				return (r, untagged) when r.tag == tag
+				untagged.push(r)
+			}
+			fail "unreachable"
+		}
+
+		// enableExtensions turns on what the client understands and the
+		// server offers (RFC 5161).
+		internal def enableExtensions() !none {
+			return none unless hasCapability("ENABLE")
+			let wanted string[] = []
+			wanted.push("IMAP4rev2") when hasCapability("IMAP4rev2")
+			wanted.push("UTF8=ACCEPT") when hasCapability("UTF8=ACCEPT")
+			wanted.push("CONDSTORE") when hasCapability("CONDSTORE")
+			return none when wanted.len() == 0
+			let (done, untagged) = try exec("ENABLE " + wanted.join(" "))
+			return none unless done.status == "OK"
+			for let r in untagged {
+				continue unless r.items.len() > 0 && r.items[0].text.upper() == "ENABLED"
+				for let it in r.items[1:] {
+					let name = it.text.upper()
+					utf8 = true when name := "UTF8=ACCEPT" || "IMAP4REV2"
+					condstore = true when name == "CONDSTORE"
+				}
+			}
+			return none
+		}
+
+		// Whether the server offers capability `name` (`IDLE`, `MOVE`,
+		// `AUTH=PLAIN`).
+		def hasCapability(name string) bool {
+			return capabilities.indexOf(name.upper()) >= 0
+		}
+
+		// The mailboxes matching `pattern` under `reference` (`*` matches
+		// across levels, `%` within one). Fails when the server refuses it.
+		def mailboxes(pattern string = "*", reference string = "") !Mailbox[] {
+			let extra = hasCapability("SPECIAL-USE") && (hasCapability("LIST-EXTENDED") || hasCapability("IMAP4rev2")) ?? (" RETURN (SPECIAL-USE)", "")
+			let untagged = try must("LIST", "LIST " + quotedArgument(encodeName(reference, utf8), utf8) + " " + quotedArgument(encodeName(pattern, utf8), utf8) + extra)
+			let out Mailbox[] = []
+			for let r in untagged {
+				continue unless r.items.len() >= 4 && r.items[0].text.upper() == "LIST"
+				let attributes string[] = []
+				for let a in r.items[1].items {
+					attributes.push(a.text)
+				}
+				let name = textOf(r.items[3])
+				out.push(Mailbox{name: utf8 ?? (name, decodeName(name)), delimiter: textOf(r.items[2]), attributes: attributes})
+			}
+			return out
+		}
+
+		// The mailbox with special use `attribute` (`\Sent`, `\Trash`), none
+		// when the server marks none. Fails when listing fails.
+		def specialUse(attribute string) !?Mailbox {
+			for let m in try mailboxes() {
+				for let a in m.attributes {
+					return m when a.lower() == attribute.lower()
+				}
+			}
+			return none
+		}
+
+		// Creates a mailbox. Fails when it exists or cannot be made.
+		def create(name string) !none {
+			try must("CREATE", "CREATE " + mailboxArg(name))
+			return none
+		}
+
+		// Deletes a mailbox. Fails when it does not exist or cannot be
+		// removed.
+		def delete(name string) !none {
+			try must("DELETE", "DELETE " + mailboxArg(name))
+			return none
+		}
+
+		// Renames a mailbox. Fails when `from` does not exist or `to` does.
+		def rename(from string, to string) !none {
+			try must("RENAME", "RENAME " + mailboxArg(from) + " " + mailboxArg(to))
+			return none
+		}
+
+		// Adds `name` to the subscribed mailboxes. Fails when refused.
+		def subscribe(name string) !none {
+			try must("SUBSCRIBE", "SUBSCRIBE " + mailboxArg(name))
+			return none
+		}
+
+		// Removes `name` from the subscribed mailboxes. Fails when refused.
+		def unsubscribe(name string) !none {
+			try must("UNSUBSCRIBE", "UNSUBSCRIBE " + mailboxArg(name))
+			return none
+		}
+
+		// The counts of a mailbox without selecting it (`STATUS`). Fails
+		// when it does not exist.
+		def status(name string) !MailboxStatus {
+			let items = ["MESSAGES", "UNSEEN", "UIDNEXT", "UIDVALIDITY"]
+			items.push("HIGHESTMODSEQ") when hasCapability("CONDSTORE")
+			items.push("SIZE") when hasCapability("STATUS=SIZE")
+			let untagged = try must("STATUS", "STATUS " + mailboxArg(name) + " (" + items.join(" ") + ")")
+			let result = emptyStatus()
+			for let r in untagged {
+				continue unless r.items.len() >= 3 && r.items[0].text.upper() == "STATUS"
+				let list = r.items[2]
+				for let i = 0; i + 1 < list.items.len(); i += 2 {
+					let v = numberOf(list.items[i + 1])
+					match list.items[i].text.upper() {
+						case "MESSAGES":
+							result.messages = int(v)
+						case "UNSEEN":
+							result.unseen = int(v)
+						case "UIDNEXT":
+							result.uidNext = v
+						case "UIDVALIDITY":
+							result.uidValidity = v
+						case "HIGHESTMODSEQ":
+							result.highestModSeq = v
+						case "SIZE":
+							result.size = v
+					}
+				}
+			}
+			return result
+		}
+
+		// Opens (selects) a mailbox for the message commands; `readOnly` uses
+		// `EXAMINE`, which never changes flags. Fails when it does not
+		// exist or cannot be selected.
+		def open(name string, readOnly bool = false) !MailboxStatus {
+			let verb = readOnly ?? ("EXAMINE", "SELECT")
+			let options = condstore ?? (" (CONDSTORE)", "")
+			selected = ""
+			pending = []
+			let (done, untagged) = try exec(verb + " " + mailboxArg(name) + options)
+			fail statusError(verb, done) unless done.status == "OK"
+			let result = emptyStatus()
+			for let r in untagged {
+				if r.status == "OK" {
+					let arg = r.codeArgs.len() > 0 ?? (r.codeArgs[0], nilItem())
+					match r.code {
+						case "UIDNEXT":
+							result.uidNext = numberOf(arg)
+						case "UIDVALIDITY":
+							result.uidValidity = numberOf(arg)
+						case "HIGHESTMODSEQ":
+							result.highestModSeq = numberOf(arg)
+						case "PERMANENTFLAGS":
+							result.permanentFlags = flagsOf(arg)
+					}
+					continue
+				}
+				continue unless r.items.len() >= 2
+				if r.items[1].text.upper() == "EXISTS" {
+					result.messages = int(numberOf(r.items[0]))
+				} else if r.items[0].text.upper() == "FLAGS" {
+					result.flags = flagsOf(r.items[1])
+				}
+			}
+			result.readOnly = readOnly || done.code == "READ-ONLY"
+			selected = name
+			self.readOnly = result.readOnly
+			pending = []
+			return result
+		}
+
+		// Leaves the selected mailbox without expunging (`UNSELECT`, else
+		// `CLOSE` on a read-only selection). Fails when none is selected.
+		def unselect() !none {
+			try needSelected()
+			if hasCapability("UNSELECT") {
+				try must("UNSELECT", "UNSELECT")
+			} else if readOnly {
+				try must("CLOSE", "CLOSE")
+			} else {
+				// Selecting a mailbox that cannot exist deselects without an
+				// expunge (RFC 3691 §1).
+				try exec("EXAMINE " + quote("adm-no-such-mailbox-" + time.now().unixNs().str()))
+			}
+			selected = ""
+			pending = []
+			return none
+		}
+
+		// The UIDs of the selected mailbox's messages matching `condition`,
+		// ascending. Fails when none is selected or the server refuses it.
+		def search(condition Search) !int64[] {
+			try needSelected()
+			let text = condition.str()
+			let charset = hasHighBytes(text.bytes()) && !utf8 ?? ("CHARSET UTF-8 ", "")
+			let returning = hasCapability("ESEARCH") || hasCapability("IMAP4rev2") ?? ("RETURN (ALL) ", "")
+			let untagged = try must("SEARCH", "UID SEARCH " + returning + charset + text)
+			let out int64[] = []
+			for let r in untagged {
+				continue unless r.items.len() >= 1
+				let head = r.items[0].text.upper()
+				if head == "SEARCH" {
+					for let it in r.items[1:] {
+						out.push(numberOf(it)) when isNumber(it)
+					}
+				} else if head == "ESEARCH" {
+					for let i = 1; i + 1 < r.items.len(); i++ {
+						out = out + try parseSet(r.items[i + 1].text, 0) when r.items[i].text.upper() == "ALL"
+					}
+				}
+			}
+			out.sort((a, b) => a < b)
+			return out
+		}
+
+		// The summaries of `uids`, in UID order; UIDs that are gone are
+		// left out. Fails when none is selected.
+		def summaries(uids int64[]) !Summary[] {
+			try needSelected()
+			return [] when uids.len() == 0
+			let modseq = condstore ?? (" MODSEQ", "")
+			let untagged = try fetch("UID FETCH " + formatSet(uids) + " (UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE" + modseq + ")")
+			let out Summary[] = []
+			for let pairs in untagged {
+				let envelope = pairs.get("ENVELOPE")
+				let uid = pairs.get("UID")
+				continue when uid is none || envelope is none
+				let e = envelope.items
+				let dateText = e.len() > 0 ?? (textOf(e[0]), "")
+				let date ?Time = none
+				if dateText != "" {
+					date = time.parseMailDate(dateText) onerror recover time.fromUnixNs(0)
+				}
+				let arrived = pairs.get("INTERNALDATE")
+				let size = pairs.get("RFC822.SIZE")
+				let flags = pairs.get("FLAGS")
+				let mod = pairs.get("MODSEQ")
+				out.push(Summary{
+					uid:          numberOf(uid),
+					flags:        flags is none ?? ([], flagsOf(flags)),
+					size:         size is none ?? (int64(0), numberOf(size)),
+					internalDate: arrived is none ?? (time.fromUnixNs(0), parseDateTime(textOf(arrived)) onerror recover time.fromUnixNs(0)),
+					date:         date,
+					subject:      e.len() > 1 ?? (decodeWordsOf(textOf(e[1])), ""),
+					from:         e.len() > 2 ?? (addressesOf(e[2]), []),
+					to:           e.len() > 5 ?? (addressesOf(e[5]), []),
+					cc:           e.len() > 6 ?? (addressesOf(e[6]), []),
+					inReplyTo:    e.len() > 8 ?? (textOf(e[8]), ""),
+					messageId:    e.len() > 9 ?? (textOf(e[9]), ""),
+					modSeq:       mod is none || mod.items.len() == 0 ?? (int64(0), numberOf(mod.items[0])),
+				})
+			}
+			out.sort((a, b) => a.uid < b.uid)
+			return out
+		}
+
+		// Message `uid`, whole. Does not set `\Seen` (`BODY.PEEK`). Fails
+		// when it is gone or does not parse.
+		def message(uid int64) !Message {
+			return try mail.parse(try content(uid))
+		}
+
+		// Writes message `uid` as stored to `writer`, without setting
+		// `\Seen`. Fails when it is gone or `writer` fails.
+		def retrieve(uid int64, writer io.Writer) !none {
+			try writer.write(try content(uid))
+			return none
+		}
+
+		internal def content(uid int64) !byte[] {
+			try needSelected()
+			for let pairs in try fetch("UID FETCH {uid} (UID BODY.PEEK[])") {
+				let body = pairs.get("BODY[]")
+				let got = pairs.get("UID")
+				continue when body is none || got is none
+				return body.data when numberOf(got) == uid
+			}
+			fail ImapError{message: "imap: no message with UID {uid}", code: "NONEXISTENT", status: "NO", response: "NONEXISTENT", text: "no such message"}
+		}
+
+		// Adds `flags` to messages `uids`. Fails when none is selected or it
+		// is read-only.
+		def addFlags(uids int64[], flags string[]) !none {
+			return try store(uids, "+FLAGS.SILENT", flags)
+		}
+
+		// Removes `flags` from messages `uids`. Fails as `addFlags` does.
+		def removeFlags(uids int64[], flags string[]) !none {
+			return try store(uids, "-FLAGS.SILENT", flags)
+		}
+
+		// Replaces the flags of messages `uids`. Fails as `addFlags` does.
+		def setFlags(uids int64[], flags string[]) !none {
+			return try store(uids, "FLAGS.SILENT", flags)
+		}
+
+		internal def store(uids int64[], action string, flags string[]) !none {
+			try needSelected()
+			return none when uids.len() == 0
+			try must("STORE", "UID STORE " + formatSet(uids) + " " + action + " (" + flags.join(" ") + ")")
+			return none
+		}
+
+		// Copies messages `uids` to mailbox `to` and returns their UIDs
+		// there (UIDPLUS; empty without it). Fails when `to` does not exist
+		// (`TRYCREATE` in the error's `response`).
+		def copy(uids int64[], to string) !int64[] {
+			try needSelected()
+			return [] when uids.len() == 0
+			let (done, untagged) = try exec("UID COPY " + formatSet(uids) + " " + mailboxArg(to))
+			fail statusError("COPY", done) unless done.status == "OK"
+			return try copied(done, untagged)
+		}
+
+		// Moves messages `uids` to mailbox `to` (`MOVE`, else copy, flag
+		// `\Deleted` and expunge them) and returns their UIDs there. Fails
+		// as `copy` does.
+		def move(uids int64[], to string) !int64[] {
+			try needSelected()
+			return [] when uids.len() == 0
+			if hasCapability("MOVE") {
+				let (done, untagged) = try exec("UID MOVE " + formatSet(uids) + " " + mailboxArg(to))
+				fail statusError("MOVE", done) unless done.status == "OK"
+				return try copied(done, untagged)
+			}
+			let targets = try copy(uids, to)
+			try addFlags(uids, [Flag.Deleted.value])
+			try expunge(uids)
+			return targets
+		}
+
+		// copied reads the destination UIDs of a COPYUID code, in the order
+		// of the source UIDs.
+		internal def copied(done Response, untagged Response[]) !int64[] {
+			let codes Response[] = [done]
+			codes = codes + untagged
+			for let r in codes {
+				continue unless r.code == "COPYUID" && r.codeArgs.len() == 3
+				return try parseSet(r.codeArgs[2].text, 0)
+			}
+			return []
+		}
+
+		// Removes the messages flagged `\Deleted`: only those among `uids`
+		// when given (UIDPLUS), else all. Fails when none is selected.
+		def expunge(uids int64[] = []) !none {
+			try needSelected()
+			if uids.len() > 0 && hasCapability("UIDPLUS") {
+				try must("EXPUNGE", "UID EXPUNGE " + formatSet(uids))
+			} else {
+				try must("EXPUNGE", "EXPUNGE")
+			}
+			return none
+		}
+
+		// Adds `message` to mailbox `to` with `flags` and arrival time
+		// `date` (now when none), and returns its UID (UIDPLUS; 0 without
+		// it). Fails when `to` does not exist or the server refuses it.
+		def append(to string, message Message, flags string[] = [], date ?Time = none) !int64 {
+			let data = message.bytes()
+			let stamp = date is none ?? ("", " " + quote(formatDateTime(date)))
+			let marker = literalMarker(data.len(), false).trimPrefix(" ")
+			let line = "APPEND " + mailboxArg(to) + " (" + flags.join(" ") + ")" + stamp + " " + marker
+			let (done, _) = try execBytes(line.bytes() + data)
+			fail statusError("APPEND", done) unless done.status == "OK"
+			return done.code == "APPENDUID" && done.codeArgs.len() == 2 ?? (numberOf(done.codeArgs[1]), int64(0))
+		}
+
+		// Waits for changes to the selected mailbox (`IDLE`, else `NOOP`
+		// polls) and returns them once some arrive or `timeout` passes;
+		// RFC 9051 advises re-issuing IDLE within 29 minutes. Fails when
+		// none is selected or the connection breaks.
+		def idle(timeout duration = 29m) !Update[] {
+			try needSelected()
+			return takeUpdates() when pending.len() > 0
+			if !hasCapability("IDLE") {
+				let started = time.now()
+				for time.since(started) < timeout {
+					let found = try noop()
+					return found when found.len() > 0
+					let left = timeout - time.since(started)
+					time.sleep(left < 30s ?? (left, 30s))
+				}
+				return []
+			}
+			let tag = nextTag()
+			try writeFully(try output(), "{tag} IDLE\r\n".bytes(), self.timeout)
+			let r = try readResponse()
+			fail statusError("IDLE", r) unless r.tag == "+"
+			let started = time.now()
+			for pending.len() == 0 {
+				let left = timeout - time.since(started)
+				break when left <= 0s
+				let timedOut = false
+				let line = readLogical(try reader(), left, 1 << 30, none) onerror (err error) {
+					timedOut = true when err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					fail err unless timedOut
+					recover []
+				}
+				break when timedOut
+				note(try parseResponse(line), false)
+			}
+			try writeFully(try output(), "DONE\r\n".bytes(), self.timeout)
+			for {
+				let done = try readResponse()
+				if done.tag == tag {
+					fail statusError("IDLE", done) unless done.status == "OK"
+					break
+				}
+				note(done, false)
+			}
+			return takeUpdates()
+		}
+
+		// Keeps the connection alive and returns the changes the server
+		// reports (`NOOP`). Fails when the connection breaks.
+		def noop() !Update[] {
+			try must("NOOP", "NOOP")
+			return takeUpdates()
+		}
+
+		// The greeting the server sent on connect.
+		def banner() string {
+			return greeting
+		}
+
+		// Whether the connection runs over TLS.
+		def isSecure() bool {
+			return secure
+		}
+
+		// Whether the client is connected.
+		def isOpen() bool {
+			return !(socket is none)
+		}
+
+		// Logs out and closes the connection. Fails when it is already
+		// closed.
+		def close() !none {
+			fail protocolError("not connected") when socket is none
+			exec("LOGOUT") onerror recover (Response{tag: "", status: "", code: "", codeArgs: [], text: "", items: []}, [])
+			drop()
+			return none
+		}
+
+		def dispose() {
+			return when socket is none
+			close() onerror recover none
+		}
+
+		// ---- plumbing ----------------------------------------------------------------
+
+		internal def nextTag() string {
+			tagCount++
+			return "A{tagCount}"
+		}
+
+		internal def mailboxArg(name string) string {
+			return quotedArgument(encodeName(name, utf8), utf8)
+		}
+
+		internal def needSelected() !none {
+			fail protocolError("no mailbox is open") when selected == ""
+			return none
+		}
+
+		internal def emptyStatus() MailboxStatus {
+			return MailboxStatus{messages: 0, unseen: 0, uidNext: 0, uidValidity: 0, highestModSeq: 0, size: 0, flags: [], permanentFlags: [], readOnly: false}
+		}
+
+		// takeCapabilities reads a `[CAPABILITY ...]` code, false when the
+		// response has none.
+		internal def takeCapabilities(r Response) bool {
+			return false unless r.code == "CAPABILITY"
+			capabilities = []
+			for let it in r.codeArgs {
+				capabilities.push(it.text.upper())
+			}
+			return true
+		}
+
+		internal def refreshCapabilities() !none {
+			for let r in try must("CAPABILITY", "CAPABILITY") {
+				continue unless r.items.len() > 0 && r.items[0].text.upper() == "CAPABILITY"
+				capabilities = []
+				for let it in r.items[1:] {
+					capabilities.push(it.text.upper())
+				}
+			}
+			return none
+		}
+
+		// must runs a command and fails unless it completes with OK.
+		internal def must(op string, line string) !Response[] {
+			let (done, untagged) = try exec(line)
+			fail statusError(op, done) unless done.status == "OK"
+			return untagged
+		}
+
+		// fetch runs a FETCH and returns the key/value pairs of its FETCH
+		// responses.
+		internal def fetch(line string) !map<string, Item>[] {
+			let (done, untagged) = try execBytes(line.bytes(), true)
+			fail statusError("FETCH", done) unless done.status == "OK"
+			let out map<string, Item>[] = []
+			for let r in untagged {
+				continue unless r.items.len() >= 3 && r.items[1].text.upper() == "FETCH"
+				out.push(fetchPairs(r.items[2]))
+			}
+			return out
+		}
+
+		internal def exec(line string) !(Response, Response[]) {
+			return try execBytes(line.bytes())
+		}
+
+		// execBytes sends a tagged command, waiting for `+` before each
+		// synchronizing literal, and reads until its completion. Untagged
+		// changes to the mailbox are kept for `idle`/`noop`; with
+		// `fetching`, FETCH responses are left to the caller.
+		internal def execBytes(line byte[], fetching bool = false) !(Response, Response[]) {
+			let tag = nextTag()
+			let full = (tag + " ").bytes() + line + "\r\n".bytes()
+			let untagged Response[] = []
+			for let piece in chunks(full, hasCapability("LITERAL+")) {
+				try writeFully(try output(), piece.data, timeout)
+				continue unless piece.wait
+				for {
+					let r = try readResponse()
+					break when r.tag == "+"
+					return (r, untagged) when r.tag == tag
+					note(r, fetching)
+					untagged.push(r)
+				}
+			}
+			for {
+				let r = try readResponse()
+				return (r, untagged) when r.tag == tag
+				note(r, fetching)
+				untagged.push(r)
+			}
+			fail "unreachable"
+		}
+
+		// note keeps an untagged change to the selected mailbox.
+		internal def note(r Response, fetching bool) {
+			if r.status == "BYE" {
+				selected = ""
+				return
+			}
+			return unless r.items.len() >= 2
+			let second = r.items[1].text.upper()
+			if second == "EXISTS" {
+				pending.push(Update{kind: UpdateKind.Exists, sequence: int(numberOf(r.items[0])), uid: 0, flags: []})
+			} else if second == "EXPUNGE" {
+				pending.push(Update{kind: UpdateKind.Expunge, sequence: int(numberOf(r.items[0])), uid: 0, flags: []})
+			} else if second == "FETCH" && !fetching && r.items.len() >= 3 {
+				let pairs = fetchPairs(r.items[2])
+				let flags = pairs.get("FLAGS")
+				let uid = pairs.get("UID")
+				pending.push(Update{kind: UpdateKind.Flags, sequence: int(numberOf(r.items[0])), uid: uid is none ?? (int64(0), numberOf(uid)), flags: flagsOf(flags)}) unless flags is none
+			} else if r.items[0].text.upper() == "VANISHED" {
+				let set = r.items[r.items.len() - 1].text
+				for let uid in parseSet(set, 0) onerror recover [] {
+					pending.push(Update{kind: UpdateKind.Expunge, sequence: 0, uid: uid, flags: []})
+				}
+			}
+		}
+
+		internal def takeUpdates() Update[] {
+			let out = pending
+			pending = []
+			return out
+		}
+
+		internal def readResponse() !Response {
+			return try parseResponse(try readLogical(try reader(), timeout, 1 << 30, none))
+		}
+
+		internal def output() !net.Stream {
+			let s = stream
+			fail protocolError("not connected") when s is none
+			return s
+		}
+
+		internal def reader() !LineReader {
+			let r = lines
+			fail protocolError("not connected") when r is none
+			return r
+		}
+
+		internal def drop() {
+			let s = stream
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			let conn = socket
+			if !(conn is none) {
+				conn.close() onerror recover none
+			}
+			socket = none
+			stream = none
+			lines = none
+			secure = false
+			selected = ""
+			capabilities = []
+			utf8 = false
+			condstore = false
+		}
+	}
+
+	// flagsOf reads a parenthesised flag list.
+	internal def flagsOf(list Item) string[] {
+		let out string[] = []
+		for let it in list.items {
+			out.push(it.text)
+		}
+		return out
+	}
+}

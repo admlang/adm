@@ -1,0 +1,858 @@
+internal partial module std.formats.video.h264 {
+	use (
+		std.formats.video::*
+		std.formats.video.hardware::*
+	)
+
+	// H264Decoder turns NAL units into pictures: it keeps the parameter
+	// sets, finds where pictures start and end, drives the slice decoder
+	// and the deblocking filter, and hands out frames in display order.
+	type H264Decoder {
+		spsById          map<int, H264Sps>
+		ppsById          map<int, H264Pps>
+		spsSerial        int
+		// Build of the x264 encoder named in the stream's SEI, -1 when none
+		// does: builds before 151 coded two 4:4:4 details wrongly, which the
+		// decoder then imitates.
+		x264Build        int               = -1
+		// The picture size the container declares, 0 when it declares none:
+		// cameras that code 1088 lines without cropping declare 1080.
+		trackWidth       int
+		trackHeight      int
+		// Recovery: what the pictures decoded so far recovered by (the
+		// bits of `H264Picture.recovered`), the frame_num that completes a
+		// pending recovery point (-1 for none), the recovery_frame_cnt of
+		// the SEI before the next picture (-1 for none), and whether the
+		// stream has shown an IDR picture or a recovery point.
+		frameRecovered   int
+		recoveryFrame    int               = -1
+		seiRecovery      int               = -1
+		validRecovery    bool
+		hasRecoveryPoint bool
+		sps              H264Sps
+		pps              H264Pps
+		haveSps          bool
+		dpb              H264Dpb
+		slice            H264SliceDecoder
+		deblock          H264Deblock
+		bits             H264Bits
+		rbsp             byte[]
+		hdr              H264SliceHeader
+		first            H264SliceHeader
+		cur              H264Picture
+		// What the slices of the current picture decode into: `cur` itself,
+		// or one field of it.
+		curView          H264Picture
+		// The structure of the current picture (1 top field, 2 bottom field,
+		// 3 frame), and whether it is the second field of `cur`.
+		curStructure     int
+		secondField      bool
+		// A frame whose first field is decoded, waiting for its second.
+		pairFrame        ?H264Picture      = none
+		hasCur           bool
+		curSps           H264Sps
+		sliceParams      int[]
+		// Whether the deblocking task runs for the current picture.
+		deblocking       bool
+		// Bytes of the NAL length prefix for avcC streams, 0 for Annex B.
+		lengthSize       int
+		// Annex B bytes not yet split into NAL units, and the time of the
+		// packet the first of them came from.
+		pending          byte[]
+		pendingLen       int
+		// Where the NAL unit being gathered starts (its start code), -1
+		// before the first start code, and where the search for the next
+		// one resumes.
+		pendingPos       int               = -1
+		scanFrom         int
+		pendingPts       duration
+		pendingLength    duration
+		// The packet time the latest picture took: a second picture starting
+		// with the same time gets one computed from the frame rate instead.
+		usedPts          duration
+		haveUsedPts      bool
+		lastTime         duration
+		haveTime         bool
+		frames           VideoFrame[]
+		// The GPU the pictures decode on while it takes them.
+		hw               H264Hardware
+		// Set when the GPU failed: the pictures it held are gone, so the
+		// next picture starts over as at a random access point.
+		hwLost           bool
+		// The escaped bytes of the slice NAL unit being decoded.
+		nalRaw           byte[]
+		nalRawStart      int
+		nalRawEnd        int
+
+		def new() {
+			spsById = map<int, H264Sps>{}
+			ppsById = map<int, H264Pps>{}
+			sps = new H264Sps()
+			pps = new H264Pps()
+			curSps = sps
+			dpb = new H264Dpb()
+			slice = new H264SliceDecoder()
+			deblock = new H264Deblock()
+			slice.deblock = deblock
+			bits = new H264Bits()
+			rbsp = h264Bytes(4096)
+			hdr = new H264SliceHeader()
+			first = new H264SliceHeader()
+			cur = new H264Picture()
+			curView = cur
+			sliceParams = int[]
+			pending = h264Bytes(0)
+			frames = VideoFrame[]
+			hw = new H264Hardware()
+			nalRaw = pending
+		}
+
+		// Reads an avcC record: the NAL length size and the parameter sets.
+		// An empty record selects Annex B. Fails on a malformed record or
+		// parameter sets this decoder does not support.
+		def configure(config byte[]) !none {
+			if config.len() == 0 {
+				lengthSize = 0
+				return none
+			}
+			if config[0] != byte(1) {
+				// Not an avcC record: AVI and others keep Annex B parameter
+				// sets there, or bytes of no use.
+				lengthSize = 0
+				try packet(config, 0s, 0s)
+				return none
+			}
+			fail "h264: avcC record too short" when config.len() < 7
+			lengthSize = (int(config[4]) & 3) + 1
+			let p = 6
+			let count = int(config[5]) & 31
+			for let pass = 0; pass < 2; pass++ {
+				for let i = 0; i < count; i++ {
+					fail "h264: truncated avcC record" when p + 2 > config.len()
+					let n = (int(config[p]) << 8) | int(config[p + 1])
+					p += 2
+					fail "h264: truncated avcC record" when p + n > config.len()
+					try nal(config, p, p + n, 0s, false, 0s)
+					p += n
+				}
+				if pass == 0 {
+					break when p >= config.len()
+					count = int(config[p])
+					p++
+				}
+			}
+			return none
+		}
+
+		// Decodes the NAL units of one packet. Fails on a malformed or
+		// unsupported stream.
+		def packet(data byte[], pts duration, length duration) !none {
+			if lengthSize > 0 {
+				let p = 0
+				for p + lengthSize <= data.len() {
+					let n = 0
+					for let k = 0; k < lengthSize; k++ {
+						n = (n << 8) | int(data[p + k])
+					}
+					p += lengthSize
+					if n > data.len() - p {
+						// A file cut short: decode what arrived of the last
+						// unit, and give up its picture if that fails.
+						nal(data, p, data.len(), pts, true, length) onerror (err error) {
+							hasCur = false
+							recover none
+						}
+						break
+					}
+					try nal(data, p, p + n, pts, true, length)
+					p += n
+				}
+				try finishPicture()
+				return none
+			}
+			// Annex B: append, then decode every NAL unit whose end is known.
+			if pendingPos > 0 && pendingLen + data.len() > pending.len() {
+				pending[pendingPos:pendingLen].copy(pending)
+				pendingLen -= pendingPos
+				scanFrom -= pendingPos
+				pendingPos = 0
+			}
+			let need = pendingLen + data.len()
+			if pending.len() < need {
+				let grown = h264Bytes(need + need / 2 + 64)
+				pending[0:pendingLen].copy(grown)
+				pending = grown
+			}
+			data.copy(pending[pendingLen:])
+			pendingLen = need
+			if pendingPos < 0 {
+				let start = h264FindStart(pending, scanFrom, pendingLen)
+				if start < 0 {
+					// Keep the last bytes, which may begin a start code.
+					if pendingLen > 3 {
+						pending[pendingLen - 3:pendingLen].copy(pending)
+						pendingLen = 3
+					}
+					scanFrom = 0
+					return none
+				}
+				pendingPos = start
+				scanFrom = start + 3
+				pendingPts = pts
+				pendingLength = length
+			}
+			for {
+				let next = h264FindStart(pending, scanFrom, pendingLen)
+				if next < 0 {
+					// A start code may straddle the end of this packet.
+					scanFrom = pendingLen - 2
+					scanFrom = pendingPos + 3 when scanFrom < pendingPos + 3
+					break
+				}
+				let from = pendingPos + 3
+				let end = next
+				for end > from && pending[end - 1] == byte(0) {
+					end--
+				}
+				if end > from {
+					try nal(pending, from, end, pendingPts, true, pendingLength)
+				}
+				pendingPos = next
+				scanFrom = next + 3
+				pendingPts = pts
+				pendingLength = length
+			}
+			return none
+		}
+
+		// Decodes what is left and shows every remaining picture. Fails on a
+		// malformed stream.
+		def flush() !none {
+			if lengthSize == 0 && pendingPos >= 0 {
+				let from = pendingPos + 3
+				let end = pendingLen
+				for end > from && pending[end - 1] == byte(0) {
+					end--
+				}
+				if end > from {
+					try nal(pending, from, end, pendingPts, true, pendingLength)
+				}
+			}
+			pendingLen = 0
+			pendingPos = -1
+			scanFrom = 0
+			try finishPicture()
+			// A first field without its second is not shown.
+			let waiting = pairFrame
+			pairFrame = none
+			if !(waiting is none) {
+				let w H264Picture = waiting
+				w.pairing = false
+				w.needOutput = false
+			}
+			dpb.flushOutput()
+			drain()
+			// What follows (after a seek, say) starts without references.
+			dpb.clear()
+			dpb.prevPocMsb = 0
+			dpb.prevPocLsb = 0
+			dpb.prevFrameNumOffset = 0
+			haveUsedPts = false
+			return none
+		}
+
+		// The frames decoded so far, handed over once.
+		def take() VideoFrame[] {
+			let out = frames
+			frames = VideoFrame[]
+			return out
+		}
+
+		// Grows the RBSP buffer to hold a NAL unit of `n` bytes.
+		def ensureRbsp(n int) {
+			rbsp = h264Bytes(n + n / 2 + 64) when rbsp.len() < n + 8
+		}
+
+		// Handles one NAL unit at data[start:end].
+		def nal(data byte[], start int, end int, pts duration, hasPts bool, length duration) !none {
+			return none when end <= start
+			let head = int(data[start])
+			fail "h264: forbidden_zero_bit set" when (head & 0x80) != 0
+			let refIdc = (head >> 5) & 3
+			let t = head & 31
+			if t := 1 || 5 {
+				ensureRbsp(end - start)
+				let n = h264Unescape(data, start + 1, end, rbsp)
+				nalRaw = data
+				nalRawStart = start
+				nalRawEnd = end
+				try sliceNal(n, t, refIdc, pts, hasPts, length)
+				return none
+			}
+			if t := 7 || 8 {
+				try finishPicture()
+				ensureRbsp(end - start)
+				let n = h264Unescape(data, start + 1, end, rbsp)
+				bits.reset(rbsp, n)
+				if t == 7 {
+					let s = try h264ParseSps(bits)
+					spsById[s.id] = s
+					spsSerial++
+				} else {
+					let p = try h264ParsePps(bits, spsById)
+					ppsById[p.id] = p
+				}
+				return none
+			}
+			if t == 6 {
+				try finishPicture()
+				ensureRbsp(end - start)
+				let n = h264Unescape(data, start + 1, end, rbsp)
+				readSei(n)
+				return none
+			}
+			if t == 9 || t == 10 || t == 11 || (t >= 14 && t <= 18) {
+				try finishPicture()
+				return none
+			}
+			// Data partitions (Extended profile) are skipped: the pictures
+			// they carry are not decoded, the others are.
+			return none
+		}
+
+		// Reads the x264 build out of the unregistered user data of the SEI
+		// NAL unit now in `rbsp[:n]`.
+		def readSei(n int) {
+			let at = 0
+			for at + 2 <= n {
+				let kind = 0
+				for at < n && rbsp[at] == 0xFF {
+					kind += 255
+					at++
+				}
+				return when at >= n
+				kind += int(rbsp[at])
+				at++
+				let size = 0
+				for at < n && rbsp[at] == 0xFF {
+					size += 255
+					at++
+				}
+				return when at >= n
+				size += int(rbsp[at])
+				at++
+				return when at + size > n
+				if kind == 6 && size > 0 {
+					// recovery_frame_cnt, the first field: ue(v).
+					let r = new H264Bits()
+					r.reset(rbsp[at:at + size].concat(byte[0, 0, 0, 0, 0, 0, 0, 0]), size)
+					seiRecovery = r.ue()
+				}
+				if kind == 5 && size > 16 && rbsp[at:at + 16].equals(h264X264Uuid) {
+					let text = string(rbsp[at + 16:at + size])
+					if text.startsWith("x264 - core ") {
+						let digits = ""
+						for let (_, ch) in text[12:] {
+							break unless ch >= '0' && ch <= '9'
+							digits += string(ch)
+						}
+						let build = digits.toInt<int>()
+						x264Build = build > 0 ?? (build, 67)
+					}
+				}
+				at += size
+			}
+		}
+
+		// Decodes the slice NAL unit now in `rbsp[:n]`, starting a new picture
+		// when it begins one. Fails on a malformed or unsupported slice.
+		def sliceNal(n int, t int, refIdc int, pts duration, hasPts bool, length duration) !none {
+			let h = hdr
+			h.nalType = t
+			h.nalRefIdc = refIdc
+			h.idr = t == 5
+			bits.reset(rbsp, n)
+			try h264ParseSliceStart(bits, h)
+			// A stream joined midway (a broadcast) sends slices before the
+			// parameter sets they use: those are dropped.
+			let p = ppsById.get(h.ppsId)
+			return none when p is none
+			let s = spsById.get(p.spsId)
+			return none when s is none
+			try h264CheckSupported(s)
+			try h264ParseSliceRest(bits, h, s, p)
+			return none when h.redundantPicCnt > 0
+			if hasCur && startsPicture(h) {
+				try finishPicture()
+			}
+			if !hasCur {
+				let fresh = hasPts && !(haveUsedPts && pts == usedPts)
+				try startPicture(h, s, p, pts, fresh, length)
+				if hasPts {
+					usedPts = pts
+					haveUsedPts = true
+				}
+			}
+			p.prepare(s, spsSerial)
+			dpb.buildLists(cur, h, s)
+			let num = curView.addSlice()
+			if hw.active() && cur.surface >= 0 {
+				hw.describe(h, s, p, cur, curStructure, secondField, dpb) when num == 0
+				hw.add(h, p, nalRaw, nalRawStart, nalRawEnd, dpb)
+				return none
+			}
+			if num == 0 {
+				// The picture's first slice: its rows are filtered by a task
+				// of their own as they are decoded. The grids and the slice
+				// parameters it reads are sized now, so they do not move
+				// while it reads them.
+				slice.resize(curView.widthMbs, curView.heightMbs)
+				let need = 5 * (curView.widthMbs * curView.heightMbs + 1)
+				sliceParams.len(need) when sliceParams.len() < need
+				deblock.start(curView, slice.qpGrid, slice.nzc, slice.cbpGrid, sliceParams, s.chromaFormat, s.mbAdaptive && curStructure == 3)
+				deblocking = true
+			}
+			fail "h264: more slices than macroblocks" when num * 5 + 5 > sliceParams.len()
+			sliceParams[num * 5] = h.disableDeblocking
+			sliceParams[num * 5 + 1] = h.alphaOffset
+			sliceParams[num * 5 + 2] = h.betaOffset
+			sliceParams[num * 5 + 3] = p.chromaQpOffset
+			sliceParams[num * 5 + 4] = p.secondChromaQpOffset
+			slice.oldX264 = x264Build >= 0 && x264Build < 151
+			try slice.decode(h, s, p, curView, rbsp, n, num, dpb.list0, dpb.count0, dpb.list1, dpb.count1)
+			return none
+		}
+
+		// Whether slice header `h` begins a new picture rather than
+		// continuing the current one.
+		def startsPicture(h H264SliceHeader) bool {
+			let f = first
+			return true when h.firstMb == 0
+			return true when h.frameNum != f.frameNum || h.ppsId != f.ppsId
+			return true when (h.nalRefIdc == 0) != (f.nalRefIdc == 0)
+			return true when h.idr != f.idr || (h.idr && h.idrPicId != f.idrPicId)
+			return true when h.pocLsb != f.pocLsb || h.deltaPocBottom != f.deltaPocBottom
+			return true when h.deltaPoc0 != f.deltaPoc0 || h.deltaPoc1 != f.deltaPoc1
+			return true when h.fieldPic != f.fieldPic || h.bottomField != f.bottomField
+			return false
+		}
+
+		// Sets up the buffer and the order count of a new picture. Fails when the
+		// stream cannot go on.
+		def startPicture(h H264SliceHeader, s H264Sps, p H264Pps, pts duration, hasPts bool, length duration) !none {
+			let st = h.structure()
+			// The second field of the frame waiting for one: same frame_num,
+			// the other parity.
+			let waiting = pairFrame
+			pairFrame = none
+			if !(waiting is none) {
+				let w H264Picture = waiting
+				w.pairing = false
+				if st != 3 && (w.fields & st) == 0 && w.frameNum == h.frameNum && haveSps && s.widthMbs == sps.widthMbs && s.heightMbs == sps.heightMbs {
+					cur = w
+					curView = w.field(st)
+					curStructure = st
+					secondField = true
+					curSps = s
+					hasCur = true
+					cur.intra = cur.intra && h.isI()
+					markRecovery(cur, h, s)
+					dpb.computePoc(cur, h, s)
+					prepareView(h)
+					let keep = first
+					first = hdr
+					hdr = keep
+					return none
+				}
+				// No second field came: half a picture is not shown, but
+				// stays a reference if it is one.
+				w.needOutput = false
+			}
+			if !haveSps || s.widthMbs != sps.widthMbs || s.heightMbs != sps.heightMbs || s.chromaFormat != sps.chromaFormat || s.bitDepthLuma != sps.bitDepthLuma {
+				dpb.flushOutput()
+				drain()
+				dpb.clear()
+			}
+			if hwLost {
+				// The GPU held the references: start over from the next
+				// random access point.
+				hwLost = false
+				dpb.clear()
+				frameRecovered = 0
+				recoveryFrame = -1
+			}
+			sps = s
+			pps = p
+			haveSps = true
+			configureDpb(s)
+			dpb.flushOutput() when h.idr
+			drain()
+			// A decoder opens only on a picture that needs no reference the
+			// software decoded before it.
+			hw.configure(s, dpb.size, dpb.frames.len() == 0 || h.idr)
+			dpb.fillGap(h, s)
+			let pic = dpb.acquire(s)
+			if hw.active() {
+				pic.surface = hw.freeSurface(dpb, none)
+				hwAbandon("h264: every GPU picture buffer is in use") when pic.surface < 0
+			}
+			if s.chromaFormat == 0 {
+				pic.fillChroma(1 << (s.bitDepthLuma - 1))
+			}
+			pic.frameNum = h.frameNum
+			pic.idr = h.idr
+			pic.intra = h.isI()
+			pic.asFields = st != 3
+			markRecovery(pic, h, s)
+			pic.pts = pts
+			pic.hasPts = hasPts
+			pic.length = length
+			dpb.computePoc(pic, h, s)
+			cur = pic
+			curView = st == 3 ?? (pic, pic.field(st))
+			curStructure = st
+			secondField = false
+			curSps = s
+			hasCur = true
+			prepareView(h)
+			// The first header decides the picture's marking.
+			let keep = first
+			first = hdr
+			hdr = keep
+			return none
+		}
+
+		// Readies the field view the slices decode into: a fresh start of its
+		// grids, its order count and uid.
+		def prepareView(h H264SliceHeader) {
+			return when curStructure == 3
+			let v = curView
+			v.sliceOfMb.fill(-1)
+			v.numSlices = 0
+			v.poc = curStructure == 1 ?? (cur.topPoc, cur.bottomPoc)
+			v.topPoc = v.poc
+			v.bottomPoc = v.poc
+			v.uid = cur.uid + curStructure
+			v.frameNum = cur.frameNum
+		}
+
+		// Hands a frame whose decoding is over to the buffer for showing.
+		def showFrame(pic H264Picture) {
+			pic.needOutput = true
+			dpb.store(pic)
+			drain()
+		}
+
+		// Marks why the picture about to be decoded may be shown: an IDR
+		// picture, or the one a recovery point SEI names.
+		def markRecovery(pic H264Picture, h H264SliceHeader, s H264Sps) {
+			let mask = (1 << s.log2MaxFrameNum) - 1
+			if seiRecovery >= 0 {
+				hasRecoveryPoint = true
+				validRecovery = true when h.frameNum != seiRecovery || !h.isI()
+				if recoveryFrame < 0 || ((recoveryFrame - h.frameNum) & mask) > seiRecovery {
+					recoveryFrame = validRecovery ?? ((h.frameNum + seiRecovery) & mask, h.frameNum)
+				}
+				seiRecovery = -1
+			}
+			if h.idr {
+				hasRecoveryPoint = true
+				pic.recovered = pic.recovered | 1
+				frameRecovered = frameRecovered | 1
+			}
+			if recoveryFrame == h.frameNum && h.nalRefIdc != 0 {
+				recoveryFrame = -1
+				pic.recovered = pic.recovered | 2
+			}
+			pic.recovered = pic.recovered | frameRecovered
+		}
+
+		// Takes an intra picture that few references can precede for a
+		// random access point the stream does not mark.
+		def guessRandomAccess(pic H264Picture) {
+			return unless pic.intra
+			let long = 0
+			let short = 0
+			for let (_, p) in dpb.frames {
+				long++ when p.ref == h264RefLong
+				short++ when p.ref == h264RefShort
+			}
+			return when long > 0
+			let refs0 = 0
+			let refs1 = 0
+			for let (_, p) in ppsById {
+				refs0 = p.numRefIdxL0Default when p.numRefIdxL0Default > refs0
+				refs1 = p.numRefIdxL1Default when p.numRefIdxL1Default > refs1
+			}
+			let reorders = dpb.reorder > 0
+			let few = short <= 2 || (refs0 <= 2 && refs1 <= 1 && reorders) || (refs0 <= 1 && refs1 <= 1)
+			return unless few && refs0 <= 2 + (hasRecoveryPoint ?? (0, 2))
+			pic.recovered = pic.recovered | 4
+			frameRecovered = frameRecovered | 4 unless reorders
+		}
+
+		// Sizes the picture buffer and the reordering depth for `s`.
+		def configureDpb(s H264Sps) {
+			dpb.maxFrameNum = 1 << s.log2MaxFrameNum
+			let mbs = s.widthMbs * s.heightMbs
+			let maxMbs = 0
+			for let i = 0; i + 1 < h264LevelDpbMbs.len(); i += 2 {
+				maxMbs = h264LevelDpbMbs[i + 1] when h264LevelDpbMbs[i] == s.level
+			}
+			maxMbs = 396 when s.level == 11 && (s.constraintFlags & 0x10) != 0 && s.profile != 100
+			let size = maxMbs > 0 ?? (maxMbs / mbs, 16)
+			size = size > 16 ?? (16, size)
+			size = s.maxDecFrameBuffering when s.maxDecFrameBuffering >= 0
+			size = s.maxNumRefFrames when size < s.maxNumRefFrames
+			size = 1 when size < 1
+			let reorder = s.maxNumReorderFrames >= 0 ?? (s.maxNumReorderFrames, size)
+			reorder = size when reorder > size
+			dpb.size = size
+			dpb.reorder = reorder
+		}
+
+		// Deblocks and marks the current picture and stores it for reference and
+		// output.
+		def finishPicture() !none {
+			return none unless hasCur
+			hasCur = false
+			let pic = cur
+			let s = curSps
+			if hw.active() && pic.surface >= 0 {
+				hw.submit() onerror (err error) {
+					hwAbandon("{err}")
+				}
+			}
+			if deblocking {
+				deblock.complete()
+				deblocking = false
+			}
+			dpb.mark(pic, first, s, secondField)
+			guessRandomAccess(pic)
+			dpb.finishPoc(pic, first)
+			if pic.mmco5 {
+				dpb.flushOutput()
+				drain()
+			}
+			pic.fields = pic.fields | curStructure
+			if curStructure != 3 && !secondField {
+				// The first field: kept, and a reference for the second.
+				pic.pairing = true
+				pairFrame = pic
+				dpb.store(pic)
+				drain()
+				return none
+			}
+			showFrame(pic)
+			return none
+		}
+
+		// The length of one frame from the stream timing, or 1/25 s.
+		def frameLength() duration {
+			let s = curSps
+			return duration(int64(2 * s.numUnitsInTick) * 1000000000 / int64(s.timeScale)) when s.numUnitsInTick > 0 && s.timeScale > 0
+			return 40ms
+		}
+
+		// Turns the pictures the buffer has released into frames, leaving
+		// out those decoded before the stream recovered.
+		def drain() {
+			for let p in dpb.ready {
+				frameRecovered = frameRecovered | p.recovered
+				p.recovered = p.recovered | (frameRecovered & 2)
+				continue when p.recovered == 0
+				let frame = toFrame(p)
+				frames.push(frame) unless frame is none
+			}
+			dpb.ready = H264Picture[]
+		}
+
+		// Gives up the GPU after `reason`: the stream goes on in software
+		// from its next random access point, and the pictures the GPU held
+		// are not shown.
+		def hwAbandon(reason string) {
+			hw.abandon(reason)
+			hwLost = true
+		}
+
+		// What the GPU does with the pictures: see `H264.hardware`.
+		def hardware() VideoHardware {
+			let encoding = hwEncodes(hwCodecH264)
+			let open = hw.session
+			return VideoHardware{decoding: true, encoding: encoding, name: hwName(open.backend), device: open.device, reason: ""} unless open is none
+			return VideoHardware{decoding: false, encoding: encoding, name: "", device: "", reason: hw.why} when hw.disabled || haveSps
+			// Nothing decoded yet: what the parameter sets promise.
+			let s = new H264Sps()
+			s.profile = 100
+			s.widthMbs = (trackWidth + 15) >> 4
+			s.heightMbs = (trackHeight + 15) >> 4
+			for let (_, known) in spsById {
+				s = known
+				break
+			}
+			let refused = hw.refusal(s)
+			return VideoHardware{decoding: false, encoding: encoding, name: "", device: "", reason: refused} when refused != ""
+			let choice = hwProbe(hwCodecH264, s.profile, 1, 8, s.widthMbs * 16, s.heightMbs * 16)
+			return VideoHardware{decoding: false, encoding: encoding, name: "", device: "", reason: hwLastError()} when choice is none
+			return VideoHardware{decoding: true, encoding: encoding, name: choice.name, device: choice.device, reason: ""}
+		}
+
+		// The cropped planes of `p` as a frame, with its time and colour
+		// matrix; none when the GPU held the picture and failed.
+		def toFrame(p H264Picture) ?VideoFrame {
+			let s = curSps
+			let mono = s.chromaFormat == 0
+			let sx = (s.chromaFormat := 1 || 2) ?? (1, 0)
+			let sy = s.chromaFormat == 1 ?? (1, 0)
+			let (left, top, w, h) = h264Crop(s)
+			// The container's size within the last macroblock, when the
+			// stream crops nothing from the top or left.
+			if trackWidth > 0 && trackHeight > 0 && s.cropLeft == 0 && s.cropTop == 0 {
+				if (trackWidth + 15) >> 4 == (w + 15) >> 4 && (trackHeight + 15) >> 4 == (h + 15) >> 4 && trackWidth <= w && trackHeight <= h {
+					w = trackWidth
+					h = trackHeight
+				}
+			}
+			let cw = mono ?? (0, w >> sx)
+			let ch = mono ?? (0, h >> sy)
+			// Deeper samples take two bytes each, little-endian.
+			let size = p.depth == 8 ?? (1, 2)
+			let y = byte[]
+			let u = byte[]
+			let v = byte[]
+			let yo = top * p.stride + left
+			let co = (top >> sy) * p.chromaStride + (left >> sx)
+			let kept ?GpuPicture = none
+			if p.surface >= 0 {
+				return none unless hw.active()
+				if hw.gpuOutput {
+					kept = hw.keep(p.surface, left, top, w, h)
+				} else {
+					let planes = hw.download(p.surface, left, top, w, h) onerror (err error) {
+						hwAbandon("{err}")
+						return none
+					}
+					(y, u, v) = planes
+				}
+			} else if p.depth == 8 {
+				y = h264Bytes(w * h)
+				u = h264Bytes(cw * ch)
+				v = h264Bytes(cw * ch)
+				let pl = p.samples8
+				for let j = 0; j < h; j++ {
+					let o = yo + j * p.stride
+					pl.y[o:o + w].copy(y[j * w:])
+				}
+				for let j = 0; j < ch; j++ {
+					let o = co + j * p.chromaStride
+					pl.u[o:o + cw].copy(u[j * cw:])
+					pl.v[o:o + cw].copy(v[j * cw:])
+				}
+			} else {
+				y = h264Bytes(w * h * size)
+				u = h264Bytes(cw * ch * size)
+				v = h264Bytes(cw * ch * size)
+				let pl = p.samples16
+				h264Put16(pl.y, yo, p.stride, w, h, y)
+				h264Put16(pl.u, co, p.chromaStride, cw, ch, u)
+				h264Put16(pl.v, co, p.chromaStride, cw, ch, v)
+			}
+			let step = p.length > 0s ?? (p.length, frameLength())
+			let time = p.pts
+			time = haveTime ?? (lastTime + step, 0s) unless p.hasPts
+			lastTime = time
+			haveTime = true
+			let m = s.matrixCoefficients
+			let matrix = 601
+			if m == 1 {
+				matrix = 709
+			} else if m != 5 && m != 6 && h >= 720 {
+				matrix = 709
+			}
+			return VideoFrame{
+				width:     uint32(w),
+				height:    uint32(h),
+				y:         y,
+				u:         u,
+				v:         v,
+				yStride:   w * size,
+				uvStride:  cw * size,
+				time:      time,
+				length:    step,
+				keyframe:  p.idr,
+				matrix:    matrix,
+				chroma:    h264ChromaLayout(s.chromaFormat),
+				fullRange: s.fullRange,
+				bitDepth:  p.depth,
+				onGpu:     !(kept is none),
+				gpu:       kept
+			}
+		}
+	}
+
+	// The UUID x264 marks its version string with in SEI user data.
+	const h264X264Uuid = byte[0xDC, 0x45, 0xE9, 0xBD, 0xE6, 0xD9, 0x48, 0xB7, 0x96, 0x2C, 0xD8, 0x20, 0xD9, 0x23, 0xEE, 0xEF]
+
+	// The visible rectangle of the pictures of `s`: left, top, width and
+	// height in luma samples. A crop that leaves nothing, or reaches past
+	// the picture, is ignored.
+	def h264Crop(s H264Sps) (int, int, int, int) {
+		// Crop units follow the chroma subsampling and field coding.
+		let unitX = (s.chromaFormat := 1 || 2) ?? (2, 1)
+		let unitY = (s.chromaFormat == 1 ?? (2, 1)) * (s.frameMbsOnly ?? (1, 2))
+		let fw = s.widthMbs * 16
+		let fh = s.heightMbs * 16
+		let left = s.cropLeft * unitX
+		let top = s.cropTop * unitY
+		let w = fw - (s.cropLeft + s.cropRight) * unitX
+		let h = fh - (s.cropTop + s.cropBottom) * unitY
+		if w <= 0 || left + w > fw {
+			left = 0
+			w = fw
+		}
+		if h <= 0 || top + h > fh {
+			top = 0
+			h = fh
+		}
+		return (left, top, w, h)
+	}
+
+	// The frame layout of a `chroma_format_idc`.
+	def h264ChromaLayout(format int) ChromaLayout {
+		match format {
+			case 0:
+				return ChromaLayout.Mono
+			case 2:
+				return ChromaLayout.Yuv422
+			case 3:
+				return ChromaLayout.Yuv444
+		}
+		return ChromaLayout.Yuv420
+	}
+
+	// Writes the `w` x `h` samples at `off` of a 16-bit plane to `out`, two
+	// bytes each, little-endian.
+	def h264Put16(plane uint16[], off int, stride int, w int, h int, out byte[]) {
+		let k = 0
+		for let j = 0; j < h; j++ {
+			let o = off + j * stride
+			for let i = 0; i < w; i++ {
+				let v = int(plane[o + i])
+				out[k] = byte(v & 255)
+				out[k + 1] = byte(v >> 8)
+				k += 2
+			}
+		}
+	}
+
+	// Fails for the sequence features this decoder leaves out.
+	def h264CheckSupported(s H264Sps) !none {
+		expects {
+			assert !s.separatePlanes onerror fail "h264: 4:4:4 coded as separate colour planes is not supported"
+			assert s.bitDepthLuma <= 14 onerror fail "h264: bit depth {s.bitDepthLuma} is not supported"
+			// A frame has one sample depth, as ffmpeg decodes it.
+			assert s.chromaFormat == 0 || s.bitDepthChroma == s.bitDepthLuma onerror fail "h264: luma and chroma of different bit depths are not supported"
+		}
+		return none
+	}
+}

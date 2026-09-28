@@ -1,0 +1,442 @@
+internal partial module std.net.mail.smtp.proto {
+	use (
+		std.bytes
+		std.net
+		std.net.mail.smtp::*
+		std.net.mail.wire::*
+		std.time
+	)
+
+	// Session is one connection a `Server` serves, from the greeting to
+	// QUIT or a dropped connection.
+	type Session {
+		server  Server
+		stats   ServerStats
+		socket  net.Connection
+		stream  net.Stream
+		lines   LineReader
+		closed  bool           = false
+		// The client's EHLO or HELO name, empty before it greeted.
+		helo    string         = ""
+		esmtp   bool           = false
+		secured bool           = false
+		user    string         = ""
+		// The transaction in progress: MAIL taken, recipients so far.
+		inMail  bool           = false
+		from    string         = ""
+		to      string[]       = []
+		utf8    bool           = false
+		envid   string         = ""
+		// BDAT chunks of the message so far, and whether one failed.
+		chunks  bytes.Buffer
+		chunked bool           = false
+		tooBig  bool           = false
+
+		def new(server Server, stats ServerStats, socket net.Connection) {
+			self.server = server
+			self.stats = stats
+			self.socket = socket
+			stream = socket
+			lines = new LineReader(socket)
+			chunks = new bytes.Buffer()
+		}
+
+		// run serves the connection until it ends, then closes it.
+		def run() {
+			serve() onerror recover none
+			end()
+		}
+
+		// end closes the connection; a read in progress fails and `run`
+		// returns.
+		def end() {
+			return when closed
+			closed = true
+			stream.close() onerror recover none
+			socket.close() onerror recover none
+		}
+
+		internal def serve() !none {
+			try secure() when server.security == Security.Implicit
+			try reply(220, "", hostname() + " " + server.banner)
+			for !closed {
+				let line = lines.readLine(server.idleTimeout) onerror (err error) {
+					reply(421, "4.4.2", hostname() + " closing: idle or broken connection") onerror recover none
+					fail err
+				}
+				let space = line.indexOf(" ")
+				let verb = space < 0 ?? (line.upper(), line[:space].upper())
+				let arg = space < 0 ?? ("", line[space + 1:])
+				try handle(verb, arg)
+			}
+			return none
+		}
+
+		internal def handle(verb string, arg string) !none {
+			match verb {
+				case "EHLO":
+					return try hello(arg, true)
+				case "HELO":
+					return try hello(arg, false)
+				case "MAIL":
+					return try mail(arg)
+				case "RCPT":
+					return try rcpt(arg)
+				case "DATA":
+					return try data()
+				case "BDAT":
+					return try bdat(arg)
+				case "RSET":
+					clear()
+					return try reply(250, "2.0.0", "OK")
+				case "NOOP":
+					return try reply(250, "2.0.0", "OK")
+				case "QUIT":
+					try reply(221, "2.0.0", hostname() + " closing connection")
+					end()
+					return none
+				case "VRFY":
+					return try reply(252, "2.5.0", "Cannot VRFY user, but will accept message and attempt delivery")
+				case "EXPN":
+					return try reply(502, "5.5.1", "EXPN not supported")
+				case "HELP":
+					return try reply(214, "2.0.0", "Commands: EHLO HELO MAIL RCPT DATA BDAT RSET NOOP QUIT VRFY HELP STARTTLS AUTH")
+				case "STARTTLS":
+					return try startTls()
+				case "AUTH":
+					return try auth(arg)
+			}
+			return try reply(500, "5.5.2", "Command not recognized")
+		}
+
+		// ---- greeting and transactions ----------------------------------------
+
+		internal def hello(arg string, extended bool) !none {
+			let name = arg.trim()
+			return try reply(501, "5.5.4", "Syntax: {extended ?? ("EHLO", "HELO")} hostname") when name == ""
+			clear()
+			helo = name
+			esmtp = extended
+			return try reply(250, "", "{hostname()} Hello {name}") unless extended
+			let offered string[] = ["{hostname()} Hello {name}", "PIPELINING", "8BITMIME", "SMTPUTF8", "CHUNKING", "DSN", "ENHANCEDSTATUSCODES"]
+			offered.push(server.maxMessageSize > 0 ?? ("SIZE {server.maxMessageSize}", "SIZE"))
+			offered.push("STARTTLS") when canStartTls()
+			offered.push("AUTH PLAIN LOGIN") when canAuth()
+			return try replyLines(250, "", offered)
+		}
+
+		internal def canStartTls() bool {
+			return server.security == Security.StartTls && !secured && !(server.tls is none)
+		}
+
+		internal def canAuth() bool {
+			return !(server.authenticator is none) && user == "" && (secured || !server.requireTls)
+		}
+
+		internal def mail(arg string) !none {
+			return try reply(503, "5.5.1", "Send EHLO or HELO first") when helo == ""
+			return try reply(503, "5.5.1", "Nested MAIL command") when inMail
+			return try reply(530, "5.7.0", "Must issue a STARTTLS command first") when server.requireTls && !secured
+			return try reply(530, "5.7.0", "Authentication required") when server.requireAuth && user == ""
+			let bad = false
+			let parsed = parsePath(arg, "FROM") onerror (err error) {
+				bad = true
+				recover ("", map<string, string>{})
+			}
+			return try reply(501, "5.5.4", "Syntax: MAIL FROM:<address>") when bad
+			let (path, params) = parsed
+			return try reply(553, "5.1.7", "Bad sender address") unless path == "" || isMailbox(path)
+			let wantsUtf8 = false
+			let givenId = ""
+			for let (name, value) in params {
+				match name {
+					case "SIZE":
+						return try reply(501, "5.5.4", "Bad SIZE") unless value.isNumeric()
+						return try reply(552, "5.3.4", "Message size exceeds fixed limit") when server.maxMessageSize > 0 && value.toInt<int64>() > server.maxMessageSize
+					case "BODY":
+						return try reply(501, "5.5.4", "Bad BODY") unless value.upper() := "7BIT" || "8BITMIME"
+					case "SMTPUTF8":
+						wantsUtf8 = true
+					case "RET":
+						return try reply(501, "5.5.4", "Bad RET") unless value.upper() := "FULL" || "HDRS"
+					case "ENVID":
+						givenId = unxtext(value)
+					case "AUTH":
+						continue
+					default:
+						return try reply(555, "5.5.4", "Unsupported parameter {name}")
+				}
+			}
+			return try reply(553, "5.6.7", "Non-ASCII address needs SMTPUTF8") unless wantsUtf8 || isASCII(path)
+			inMail = true
+			from = path
+			to = []
+			utf8 = wantsUtf8
+			envid = givenId
+			return try reply(250, "2.1.0", "Sender OK")
+		}
+
+		internal def rcpt(arg string) !none {
+			return try reply(503, "5.5.1", "Need MAIL command") unless inMail
+			let bad = false
+			let parsed = parsePath(arg, "TO") onerror (err error) {
+				bad = true
+				recover ("", map<string, string>{})
+			}
+			return try reply(501, "5.5.4", "Syntax: RCPT TO:<address>") when bad
+			let (path, params) = parsed
+			return try reply(553, "5.1.3", "Bad recipient address") unless isMailbox(path) || path.lower() == "postmaster"
+			return try reply(553, "5.6.7", "Non-ASCII address needs SMTPUTF8") unless utf8 || isASCII(path)
+			for let (name, value) in params {
+				match name {
+					case "NOTIFY":
+						for let v in value.upper().split(",") {
+							return try reply(501, "5.5.4", "Bad NOTIFY") unless v := "NEVER" || "SUCCESS" || "FAILURE" || "DELAY"
+						}
+					case "ORCPT":
+						continue
+					default:
+						return try reply(555, "5.5.4", "Unsupported parameter {name}")
+				}
+			}
+			return try reply(452, "4.5.3", "Too many recipients") when server.maxRecipients > 0 && to.len() >= server.maxRecipients
+			let handler = server.handler
+			if handler is RecipientFilter {
+				let refused ?error = none
+				handler.recipient(envelope(), path) onerror (err error) {
+					refused = err
+					recover none
+				}
+				if !(refused is none) {
+					stats.recipientsRejected.inc()
+					return try replyWith(failureReply(refused, 550, "5.1.1", "Mailbox unavailable"))
+				}
+			}
+			to.push(path)
+			return try reply(250, "2.1.5", "Recipient OK")
+		}
+
+		internal def data() !none {
+			return try reply(503, "5.5.1", "Need MAIL command") unless inMail
+			return try reply(503, "5.5.1", "Need RCPT command") when to.len() == 0
+			return try reply(503, "5.5.1", "DATA after BDAT") when chunked
+			try reply(354, "", "End data with <CR><LF>.<CR><LF>")
+			let body = new bytes.Buffer()
+			let size int64 = 0
+			let over = false
+			for {
+				let line = try lines.readLine(server.timeout)
+				break when line == "."
+				let text = line.startsWith(".") ?? (line[1:], line)
+				let raw = (text + "\r\n").bytes()
+				size += int64(raw.len())
+				stats.bytesIn.update(float64(raw.len()))
+				over = true when server.maxMessageSize > 0 && size > server.maxMessageSize
+				continue when over
+				try body.write(raw)
+			}
+			if over {
+				clear()
+				stats.messagesRejected.inc()
+				return try reply(552, "5.3.4", "Message size exceeds fixed limit")
+			}
+			return try deliver(body.bytes())
+		}
+
+		internal def bdat(arg string) !none {
+			let words = arg.trim().split(" ").filter(w => w != "")
+			return try reply(501, "5.5.4", "Syntax: BDAT size [LAST]") unless words.len() >= 1 && words.len() <= 2 && words[0].isNumeric()
+			let last = words.len() == 2 && words[1].upper() == "LAST"
+			return try reply(501, "5.5.4", "Syntax: BDAT size [LAST]") when words.len() == 2 && !last
+			let count = words[0].toInt<int>()
+			// The chunk follows at once; it is read even when refused, so
+			// the next command lines up.
+			let chunk = try lines.readBytes(count, server.timeout)
+			stats.bytesIn.update(float64(count))
+			return try reply(503, "5.5.1", "Need MAIL command") unless inMail
+			if to.len() == 0 {
+				clear()
+				return try reply(503, "5.5.1", "Need RCPT command")
+			}
+			chunked = true
+			tooBig = true when server.maxMessageSize > 0 && int64(chunks.len() + count) > server.maxMessageSize
+			try chunks.write(chunk) unless tooBig
+			return try reply(250, "2.0.0", "{count} octets received") unless last
+			if tooBig {
+				clear()
+				stats.messagesRejected.inc()
+				return try reply(552, "5.3.4", "Message size exceeds fixed limit")
+			}
+			return try deliver(chunks.bytes())
+		}
+
+		// deliver hands a received message to the handler, a `Received:`
+		// field in front, and answers the client.
+		internal def deliver(message byte[]) !none {
+			let traced = new bytes.Buffer()
+			try traced.write(receivedField().bytes())
+			try traced.write(message)
+			let envelope = envelope()
+			clear()
+			let failure ?error = none
+			server.handler.deliver(envelope, traced) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				stats.messagesRejected.inc()
+				return try replyWith(failureReply(failure, 451, "4.3.0", "Message not accepted"))
+			}
+			stats.messagesAccepted.inc()
+			return try reply(250, "2.0.0", "Message accepted")
+		}
+
+		// receivedField is the trace field of RFC 5321 §4.4 for the message
+		// in progress.
+		internal def receivedField() string {
+			let peer = addressLiteral(socket.remoteAddr())
+			let proto = utf8 ?? ("UTF8SMTP", esmtp ?? ("ESMTP", "SMTP"))
+			proto += "S" when secured && esmtp
+			proto += "A" when user != "" && esmtp
+			let forPart = to.len() == 1 ?? ("\r\n\tfor <{to[0]}>", "")
+			return "Received: from {helo} ({peer})\r\n\tby {hostname()} with {proto}{forPart};\r\n\t{time.formatMailDate(time.now())}\r\n"
+		}
+
+		internal def envelope() Envelope {
+			return Envelope{from: from, to: to.clone(), helo: helo, user: user, secure: secured, utf8: utf8, envelopeId: envid}
+		}
+
+		// clear drops the transaction in progress.
+		internal def clear() {
+			inMail = false
+			from = ""
+			to = []
+			utf8 = false
+			envid = ""
+			chunks = new bytes.Buffer()
+			chunked = false
+			tooBig = false
+		}
+
+		// ---- STARTTLS and AUTH ------------------------------------------------
+
+		internal def startTls() !none {
+			return try reply(502, "5.5.1", "STARTTLS not offered") unless canStartTls()
+			try reply(220, "2.0.0", "Ready to start TLS")
+			try secure()
+			// Everything learnt before the handshake is forgotten (RFC 3207
+			// §4.2); lines pipelined after STARTTLS were dropped with the
+			// old reader.
+			clear()
+			helo = ""
+			esmtp = false
+			return none
+		}
+
+		internal def secure() !none {
+			let config = server.tls
+			fail protocolError("TLS", "the server has no TLS config") when config is none
+			stream = try secureServer(socket, config, server.timeout)
+			lines = new LineReader(stream)
+			secured = true
+			return none
+		}
+
+		internal def auth(arg string) !none {
+			return try reply(503, "5.5.1", "Send EHLO first") unless esmtp
+			return try reply(503, "5.5.1", "Already authenticated") when user != ""
+			return try reply(503, "5.5.1", "AUTH not allowed during a transaction") when inMail
+			return try reply(502, "5.5.1", "AUTH not offered") when server.authenticator is none
+			return try reply(538, "5.7.11", "Encryption required for requested authentication mechanism") when server.requireTls && !secured
+			let words = arg.trim().split(" ").filter(w => w != "")
+			return try reply(501, "5.5.4", "Syntax: AUTH mechanism [initial-response]") unless words.len() >= 1 && words.len() <= 2
+			let mechanism = words[0].upper()
+			let initial = words.len() == 2 ?? (words[1], "")
+			let name = ""
+			let password = ""
+			if mechanism == "PLAIN" {
+				let response = initial
+				if response == "" {
+					try reply(334, "", "")
+					response = try lines.readLine(server.timeout)
+				}
+				return try reply(501, "5.0.0", "Authentication cancelled") when response == "*"
+				let malformed = false
+				let parts = plainFields(response == "=" ?? ("", response)) onerror (err error) {
+					malformed = true
+					recover []
+				}
+				return try reply(501, "5.5.2", "Malformed PLAIN response") when malformed
+				name = parts[1]
+				password = parts[2]
+			} else if mechanism == "LOGIN" {
+				let first = initial
+				if first == "" {
+					try reply(334, "", b64("Username:"))
+					first = try lines.readLine(server.timeout)
+				}
+				return try reply(501, "5.0.0", "Authentication cancelled") when first == "*"
+				try reply(334, "", b64("Password:"))
+				let second = try lines.readLine(server.timeout)
+				return try reply(501, "5.0.0", "Authentication cancelled") when second == "*"
+				let malformed = false
+				name = unb64(first) onerror (err error) {
+					malformed = true
+					recover ""
+				}
+				password = unb64(second) onerror (err error) {
+					malformed = true
+					recover ""
+				}
+				return try reply(501, "5.5.2", "Malformed LOGIN response") when malformed
+			} else {
+				return try reply(504, "5.5.4", "Unrecognized authentication mechanism")
+			}
+			let authenticator = server.authenticator
+			return try reply(502, "5.5.1", "AUTH not offered") when authenticator is none
+			let refused = false
+			let secret Secret<string> = password
+			authenticator.login(name, secret) onerror (err error) {
+				refused = true
+				recover none
+			}
+			if refused {
+				stats.loginFailures.inc()
+				return try reply(535, "5.7.8", "Authentication credentials invalid")
+			}
+			stats.logins.inc()
+			user = name
+			return try reply(235, "2.7.0", "Authentication successful")
+		}
+
+		// ---- replies -------------------------------------------------------------
+
+		// reply writes a one-line reply; `enhanced` goes in front of the
+		// text when it is set.
+		def reply(code int, enhanced string, text string) !none {
+			return try replyLines(code, enhanced, [text])
+		}
+
+		internal def replyWith(r Reply) !none {
+			return try replyLines(r.code, r.enhanced, r.lines)
+		}
+
+		// replyLines writes a reply of several lines, `code-` on all but the
+		// last.
+		internal def replyLines(code int, enhanced string, rows string[]) !none {
+			let out = ""
+			let prefix = enhanced == "" ?? ("", enhanced + " ")
+			for let i = 0; i < rows.len(); i++ {
+				let sep = i == rows.len() - 1 ?? (" ", "-")
+				out += "{code}{sep}{prefix}{rows[i]}\r\n"
+			}
+			return try writeFully(stream, out.bytes(), server.timeout)
+		}
+
+		// hostname is the name the server gives itself.
+		internal def hostname() string {
+			return server.hostname unless server.hostname == ""
+			return addressLiteral(socket.localAddr())
+		}
+	}
+}

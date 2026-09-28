@@ -1,0 +1,598 @@
+internal partial module std.formats.archive.sevenzip {
+	use (
+		std.io
+		std.bytes
+		std.os
+		std.crypto.hash
+		std.crypto.cipher
+		std.data.compress.bzip2
+		std.data.compress.flate
+		std.data.compress.lzma
+		std.data.compress.xz.filters
+		std.formats.archive::*
+		std.formats.archive.stream::*
+	)
+
+	// Reads the signature header and the (possibly encoded) header of the 7z
+	// archive in src. Fails when it is not a 7z archive, a checksum does not
+	// match, the header is corrupt, or it is encrypted and the password is
+	// missing or wrong.
+	def readHeader(src Source, password string) !SevenZipHeader {
+		expects {
+			assert src.size() >= signatureSize onerror fail "7z: data too short to be a 7z archive"
+		}
+		let sig = try src.bytesAt(0, signatureSize)
+		fail "7z: not a 7z archive" unless hasSignature(sig)
+		fail "7z: unsupported format version" when sig[6] != 0
+		fail "7z: start header CRC mismatch" when hash.crc32(sig[12:32]) != uint32(le32(sig, 8))
+		let nextOffset = le64(sig, 12)
+		let nextSize = le64(sig, 20)
+		let header = new SevenZipHeader()
+		return header when nextSize == 0
+		fail "7z: header lies outside the archive" when nextOffset < 0 || nextSize < 0 || signatureSize + nextOffset + nextSize > src.size()
+		let hb = try src.bytesAt(signatureSize + nextOffset, nextSize)
+		fail "7z: header CRC mismatch" when hash.crc32(hb) != uint32(le32(sig, 28))
+		for let round = 0; round < 4; round++ {
+			let r = new HeaderReader(hb)
+			let id = try r.number()
+			if id == idEncodedHeader {
+				let packed = new SevenZipHeader()
+				try packed.readStreamsInfo(r)
+				fail "7z: encoded header has no folder" when packed.folders.len() == 0
+				let f = packed.folders[0]
+				let out = readAll(try folderReader(src, packed, 0, password)) onerror (e error) {
+					fail "7z: wrong password" when f.encrypted()
+					fail e
+				}
+				fail "7z: encoded header is shorter than declared" when out.len() != f.size()
+				fail f.encrypted() ?? ("7z: wrong password", "7z: header CRC mismatch") when f.hasCRC && hash.crc32(out) != f.crc
+				hb = out
+				continue
+			}
+			fail "7z: invalid header" when id != idHeader
+			try readMainHeader(r, header)
+			try header.mapFiles()
+			return header
+		}
+		fail "7z: header nested too deeply"
+	}
+
+	def readMainHeader(r HeaderReader, header SevenZipHeader) !none {
+		let id = try r.number()
+		if id == idArchiveProps {
+			for {
+				let t = try r.number()
+				break when t == idEnd
+				try r.skip(try r.number())
+			}
+			id = try r.number()
+		}
+		if id == idAdditionalStream {
+			try new SevenZipHeader().readStreamsInfo(r)
+			id = try r.number()
+		}
+		if id == idMainStreams {
+			try header.readStreamsInfo(r)
+			id = try r.number()
+		}
+		if id == idFilesInfo {
+			try header.readFilesInfo(r)
+			id = try r.number()
+		}
+		fail "7z: invalid header" when id != idEnd
+	}
+
+	// A reader of a folder's output. Fails when a coder is unsupported or
+	// encrypted without a password.
+	def folderReader(src Source, header SevenZipHeader, index int, password string) !io.Reader {
+		let f = header.folders[index]
+		let offsets int[] = []
+		let at = signatureSize + header.packPos
+		for let i = 0; i < f.firstPack; i++ {
+			at += header.packSizes[i]
+		}
+		for let i = 0; i < f.packed.len(); i++ {
+			fail "7z: missing pack stream" when f.firstPack + i >= header.packSizes.len()
+			offsets.push(at)
+			at += header.packSizes[f.firstPack + i]
+		}
+		fail "7z: pack streams lie outside the archive" when at > src.size()
+		let r = try outStream(src, header, f, offsets, f.mainOut(), password, 0)
+		return new LimitReader(r, f.size())
+	}
+
+	def outStream(src Source, header SevenZipHeader, f Folder, offsets int[], out int, password string, depth int) !io.Reader {
+		expects {
+			assert depth <= 32 onerror fail "7z: coder graph too deep"
+		}
+		let firstOut = 0
+		let firstIn = 0
+		let c = -1
+		for let i = 0; i < f.coders.len(); i++ {
+			if out < firstOut + f.coders[i].numOut {
+				c = i
+				break
+			}
+			firstOut += f.coders[i].numOut
+			firstIn += f.coders[i].numIn
+		}
+		fail "7z: invalid coder graph" when c < 0
+		let coder = f.coders[c]
+		let method = methodName(coder.id)
+		let size = f.unpackSizes[out]
+		if method == "bcj2" && coder.numIn == 4 && coder.numOut == 1 {
+			let ins io.Reader[] = []
+			for let k = 0; k < 4; k++ {
+				ins.push(try inStream(src, header, f, offsets, firstIn + k, password, depth))
+			}
+			return new Bcj2Reader(ins[0], ins[1], ins[2], ins[3], size)
+		}
+		fail "7z: coders with several streams are not supported" when coder.numIn != 1 || coder.numOut != 1
+		let input = try inStream(src, header, f, offsets, firstIn, password, depth)
+		let props = coder.props
+		match method {
+			case "copy":
+				return input
+			case "lzma":
+				return new lzma.Reader(input, props, int64(size))
+			case "lzma2":
+				return new lzma.Reader2(input, props, int64(size))
+			case "delta":
+				return new filters.DeltaReader(input, (props.len() > 0) ?? (int(props[0]) + 1, 1))
+			case "bcj":
+				return new filters.X86Reader(input)
+			case "deflate":
+				return new flate.Reader(input)
+			case "bzip2":
+				return new bzip2.Reader(input)
+			case "aes":
+				fail "7z: the archive is encrypted; a password is needed" when password.isEmpty()
+				return try newAesReader(input, props, password, size)
+		}
+		fail "7z: unsupported method " + coder.id.hex()
+	}
+
+	// The reader feeding coder input stream `index`: another coder's output
+	// or a packed stream.
+	def inStream(src Source, header SevenZipHeader, f Folder, offsets int[], index int, password string, depth int) !io.Reader {
+		let bound = f.bindIn.indexOf(index)
+		return try outStream(src, header, f, offsets, f.bindOut[bound], password, depth + 1) when bound >= 0
+		let p = f.packed.indexOf(index)
+		fail "7z: invalid coder graph" when p < 0
+		return src.reader(offsets[p], header.packSizes[f.firstPack + p])
+	}
+
+	// A byte-at-a-time view of a reader, filled a chunk at a time.
+	type ByteSource {
+		r   io.Reader
+		buf byte[]
+		pos int
+		end int
+
+		def new(r io.Reader) {
+			self.r = r
+			buf.len(64 * 1024)
+		}
+
+		// The next byte, -1 at the end. Fails when the reader does.
+		def next() !int {
+			if pos >= end {
+				end = try r.read(buf)
+				pos = 0
+				return -1 when end <= 0
+			}
+			let b = buf[pos]
+			pos++
+			return int(b)
+		}
+
+		// The next byte. Fails at the end or when the reader fails.
+		def must() !int {
+			let b = try next()
+			fail "7z: bcj2 stream ended early" when b < 0
+			return b
+		}
+	}
+
+	// Undoes the BCJ2 x86 branch filter: CALL and JMP targets travel in their
+	// own streams, and a range-coded stream says which branches were
+	// converted.
+	type Bcj2Reader {
+		main     ByteSource
+		call     ByteSource
+		jump     ByteSource
+		rc       ByteSource
+		probs    uint16[]
+		range    uint32
+		code     uint32
+		started  bool
+		prevByte int
+		written  int
+		left     int
+		// Converted target bytes not handed out yet.
+		pending  byte[]
+		pendPos  int
+
+		def new(main io.Reader, call io.Reader, jump io.Reader, rc io.Reader, size int) {
+			self.main = new ByteSource(main)
+			self.call = new ByteSource(call)
+			self.jump = new ByteSource(jump)
+			self.rc = new ByteSource(rc)
+			probs.len(258)
+			probs.fill(1024)
+			left = size
+			pending.len(4)
+			pendPos = 4
+		}
+
+		def bit(i int) !int {
+			let p = uint32(probs[i])
+			let bound = (range >> 11) * p
+			let b = 0
+			if code < bound {
+				range = bound
+				probs[i] = uint16(p + ((2048 - p) >> 5))
+			} else {
+				range -= bound
+				code -= bound
+				probs[i] = uint16(p - (p >> 5))
+				b = 1
+			}
+			if range < 0x1000000 {
+				range <<= 8
+				code = (code << 8) | uint32(try rc.must())
+			}
+			return b
+		}
+
+		// Implements std.io.Reader. Fails when a stream ends early or the
+		// underlying readers fail.
+		def read(p byte[]) !int {
+			if !started {
+				started = true
+				range = 0xFFFFFFFF
+				for let i = 0; i < 5; i++ {
+					code = (code << 8) | uint32(try rc.must())
+				}
+			}
+			let n = 0
+			for n < p.len() && left > 0 {
+				if pendPos < 4 {
+					p[n] = pending[pendPos]
+					pendPos++
+					n++
+					left--
+					continue
+				}
+				let b = try main.next()
+				fail "7z: bcj2 main stream ended early" when b < 0
+				p[n] = byte(b)
+				n++
+				left--
+				written++
+				let isJump = (b & 0xFE) == 0xE8 || (prevByte == 0x0F && (b & 0xF0) == 0x80)
+				if !isJump {
+					prevByte = b
+					continue
+				}
+				let index = (b == 0xE8) ?? (prevByte, (b == 0xE9) ?? (256, 257))
+				if (try bit(index)) == 1 {
+					let s = (b == 0xE8) ?? (call, jump)
+					let src = uint32(0)
+					for let k = 0; k < 4; k++ {
+						src = (src << 8) | uint32(try s.must())
+					}
+					let dest = src - uint32(written + 4)
+					pending[0] = byte(dest)
+					pending[1] = byte(dest >> 8)
+					pending[2] = byte(dest >> 16)
+					pending[3] = byte(dest >> 24)
+					pendPos = 0
+					written += 4
+					prevByte = int(dest >> 24)
+				} else {
+					prevByte = b
+				}
+			}
+			return n
+		}
+	}
+
+	// Decrypts 7z AES-256-CBC data: the key is SHA-256 applied 2^n times
+	// over the salt, the UTF-16LE password and a counter.
+	type AesReader {
+		r      io.Reader
+		block  cipher.AES
+		prev   byte[]
+		chunk  byte[]
+		plain  byte[]
+		head   int
+		filled int
+		left   int
+
+		def new(r io.Reader, key byte[], iv byte[], size int) {
+			self.r = r
+			block = new cipher.AES(key)
+			prev = iv
+			chunk.len(64 * 1024)
+			plain.len(64 * 1024)
+			left = size
+		}
+
+		// Implements std.io.Reader. Fails when the data is not whole blocks or
+		// the underlying reader fails.
+		def read(p byte[]) !int {
+			return 0 when left <= 0 || p.len() == 0
+			if head >= filled {
+				let want = (left + 15) / 16 * 16
+				want = chunk.len() when want > chunk.len()
+				let got = try readUpTo(r, chunk[0:want])
+				fail "7z: encrypted data ended early" when got == 0 || got % 16 != 0
+				let tmp byte[] = []
+				tmp.len(16)
+				for let i = 0; i < got; i += 16 {
+					block.decryptBlock(tmp, chunk[i:i + 16])
+					for let k = 0; k < 16; k++ {
+						plain[i + k] = tmp[k] ^ prev[k]
+					}
+					prev = chunk[i:i + 16].clone()
+				}
+				head = 0
+				filled = got
+			}
+			let n = filled - head
+			n = p.len() when p.len() < n
+			n = left when left < n
+			(plain[head:head + n]).copy(p)
+			head += n
+			left -= n
+			return n
+		}
+	}
+
+	// A decrypting reader for the AES coder properties. Fails when they are
+	// malformed.
+	def newAesReader(input io.Reader, props byte[], password string, size int) !AesReader {
+		expects {
+			assert props.len() >= 1 onerror fail "7z: invalid AES properties"
+		}
+		let b0 = int(props[0])
+		let power = b0 & 0x3F
+		let salt byte[] = []
+		let iv byte[] = []
+		if b0 & 0xC0 != 0 {
+			fail "7z: invalid AES properties" when props.len() < 2
+			let b1 = int(props[1])
+			let saltSize = ((b0 >> 7) & 1) + (b1 >> 4)
+			let ivSize = ((b0 >> 6) & 1) + (b1 & 0x0F)
+			fail "7z: invalid AES properties" when props.len() < 2 + saltSize + ivSize
+			salt = props[2:2 + saltSize]
+			iv = props[2 + saltSize:2 + saltSize + ivSize].clone()
+		}
+		for iv.len() < 16 {
+			iv.push(0)
+		}
+		let key = deriveKey(salt, password.utf16(bytes.Endian.Little), power)
+		return new AesReader(input, key, iv, size)
+	}
+
+	// The 7z AES key of a salt, password and cycle power.
+	def deriveKey(salt byte[], pw byte[], power int) byte[] {
+		if power == 0x3F {
+			let key = salt + pw
+			key.len(32)
+			return key
+		}
+		let sha = new hash.SHA256()
+		let unit = salt.len() + pw.len() + 8
+		let perBatch = 4096
+		let batch byte[] = []
+		batch.len(unit * perBatch)
+		let rounds = 1 << power
+		let counter = 0
+		for counter < rounds {
+			let n = rounds - counter
+			n = perBatch when n > perBatch
+			let at = 0
+			for let i = 0; i < n; i++ {
+				(salt).copy(batch[at:])
+				at += salt.len()
+				(pw).copy(batch[at:])
+				at += pw.len()
+				let c = counter + i
+				for let k = 0; k < 8; k++ {
+					batch[at + k] = byte(c >> (8 * k))
+				}
+				at += 8
+			}
+			sha.write(batch[0:at])
+			counter += n
+		}
+		return sha.hash()
+	}
+
+	// The shared decoding position inside one folder, so reading a solid
+	// folder's files in order decodes it once.
+	type FolderCursor {
+		folder int
+		reader io.Reader
+		pos    int
+		ticket int
+
+		def new() {
+			folder = -1
+			reader = new bytes.Reader([])
+		}
+	}
+
+	// Reads one file's bytes out of its folder and checks its CRC at the end.
+	type EntryReader {
+		cursor FolderCursor
+		ticket int
+		left   int
+		crc    hash.CRC32
+		want   uint32
+		verify bool
+		secret bool
+
+		def new(cursor FolderCursor, size int, want uint32, verify bool, secret bool) {
+			self.cursor = cursor
+			ticket = cursor.ticket
+			left = size
+			self.want = want
+			self.verify = verify
+			self.secret = secret
+			crc = new hash.CRC32()
+		}
+
+		// Implements std.io.Reader. Fails when a later `open` of the same
+		// folder took the stream over, the data is corrupt or truncated, or
+		// the CRC does not match.
+		def read(p byte[]) !int {
+			return 0 when left <= 0 || p.len() == 0
+			fail "7z: this entry's reader was superseded by a later open" when cursor.ticket != ticket
+			let room = p.len()
+			room = left when left < room
+			let n = cursor.reader.read(p[0:room]) onerror (e error) {
+				fail "7z: wrong password or corrupt data" when secret
+				fail e
+			}
+			fail "7z: entry data ended early" when n <= 0
+			crc.write(p[0:n])
+			left -= n
+			cursor.pos += n
+			if left == 0 && verify {
+				fail secret ?? ("7z: wrong password or corrupt data", "7z: CRC mismatch") when (crc.checksum ^ 0xFFFFFFFF) != want
+			}
+			return n
+		}
+	}
+
+	// A 7z archive over random-access bytes.
+	type SevenZipArchive {
+		src      Source
+		header   SevenZipHeader
+		password string
+		list     Entry[]
+		// Index into header.files of each entry.
+		records  int[]
+		cursor   FolderCursor
+
+		def new(src Source, header SevenZipHeader, password string) {
+			self.src = src
+			self.header = header
+			self.password = password
+			list = []
+			records = []
+			cursor = new FolderCursor()
+			for let (i, f) in header.files {
+				continue when f.isAnti
+				list.push(toEntry(f))
+				records.push(i)
+			}
+			for let (k, e) in list {
+				continue unless isLinkMode(e.mode)
+				let target = readLink(e) onerror recover ""
+				list[k].linkTarget = target
+			}
+		}
+
+		def readLink(e Entry) !string {
+			return string(try readAll(try open(e)))
+		}
+
+		def toEntry(f FileRecord) Entry {
+			let mode = os.FileMode(0o644)
+			if f.hasAttrib && f.attrib & 0x8000 != 0 {
+				mode = fromUnixMode(f.attrib >> 16)
+			} else if f.hasAttrib && f.attrib & 0x01 != 0 {
+				mode = os.FileMode(0o444)
+			}
+			if f.isDir {
+				let perm = int(mode) & 0o777
+				perm = 0o755 when perm := 0o644 || 0o444 || 0
+				mode = os.FileMode(int(os.FileMode.Dir) | perm)
+			}
+			let attrs = map<string, string>{}
+			let method = ""
+			let packed = 0
+			let encrypted = false
+			if f.folder >= 0 {
+				let folder = header.folders[f.folder]
+				attrs["7z.solidBlock"] = "{f.folder}"
+				let names string[] = []
+				for let c in folder.coders {
+					let name = methodName(c.id)
+					names.push(name.isEmpty() ?? (c.id.hex().lower(), name))
+				}
+				method = names.join("+")
+				encrypted = folder.encrypted()
+				if folder.substreams == 1 {
+					for let i = 0; i < folder.packed.len(); i++ {
+						packed += header.packSizes[folder.firstPack + i]
+					}
+				}
+			}
+			attrs["7z.attributes"] = "{f.attrib}" when f.hasAttrib
+			return Entry{
+				name: f.name,
+				mode: mode,
+				crc32: f.hasCRC ?? (f.crc, uint32(0)),
+				size: uint64(f.size),
+				compressedSize: uint64(packed),
+				modTime: fileTime(f.mtime),
+				accessTime: fileTime(f.atime),
+				createTime: fileTime(f.ctime),
+				encrypted: encrypted,
+				method: method,
+				attributes: attrs,
+			}
+		}
+
+		// close implements io.Closer: closes the file the archive was read from.
+		def close() !none {
+			return src.close()
+		}
+
+		def entries() Entry[] {
+			return list
+		}
+
+		def entry(name string) ?Entry {
+			for let e in list {
+				return e when e.name == name
+			}
+			return none
+		}
+
+		def open(entry Entry) !io.Reader {
+			let k = -1
+			for let (i, e) in list {
+				if e.name == entry.name {
+					k = i
+					break
+				}
+			}
+			fail "7z: no entry named " + entry.name when k < 0
+			let f = header.files[records[k]]
+			return new bytes.Reader([]) unless f.hasStream
+			if cursor.folder != f.folder || cursor.pos > f.offset {
+				cursor.reader = try folderReader(src, header, f.folder, password)
+				cursor.folder = f.folder
+				cursor.pos = 0
+			}
+			try discard(cursor.reader, f.offset - cursor.pos)
+			cursor.pos = f.offset
+			cursor.ticket++
+			return new EntryReader(cursor, f.size, f.crc, f.hasCRC, header.folders[f.folder].encrypted())
+		}
+
+		def extract(dir string, opts ExtractOptions = ExtractOptions{}) !int {
+			return extractAll(self, dir, opts)
+		}
+
+		def extract(entry Entry, dir string, opts ExtractOptions = ExtractOptions{}) !none {
+			return extractEntry(self, entry, dir, opts)
+		}
+	}
+}

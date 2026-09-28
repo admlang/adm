@@ -1,0 +1,266 @@
+partial module std.net.syslog {
+	use (
+		std.net
+		std.net.syslog.wire::*
+		std.net.tls
+		std.os
+		std.services::(Policy)
+	)
+
+	// Handler takes the messages a `Server` receives.
+	interface Handler {
+		// Called once per message with the address it came from (the socket
+		// path's peer, often empty, over `Transport.Unix`). Syslog has no
+		// replies: a failure is counted and dropped.
+		def receive(message Message, from net.Address) !none
+	}
+
+	// Server is a syslog collector on one transport: UDP datagrams, TCP or
+	// TLS streams (one task per connection, framing detected per message:
+	// a digit starts octet counting, else the message runs to LF), or a
+	// Unix datagram socket, acting as the local daemon. A message that
+	// does not parse is still delivered, its whole text as `text`
+	// (RFC 5424 §8.1 relays it unchanged). Implements `net.Server`.
+	//
+	// ```
+	// let server = new syslog.Server(new Archive(), ":514", syslog.Transport.Udp)
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr           string      = ":514"
+		transport      Transport   = Transport.Udp
+		handler        Handler
+		// The certificate and TLS settings of `Transport.Tls`.
+		tls            ?tls.Config = none
+		// The longest message taken; a longer one is cut (UDP, Unix) or
+		// ends the connection (TCP, TLS). RFC 5425 requires 2048, allows
+		// more.
+		maxMessageSize int         = 8192
+		// How long a stream connection may stay silent.
+		idleTimeout    duration    = 300s
+		// Stream connections served at once; one past it is closed. 0 is
+		// no limit.
+		maxConnections int         = 0
+		backlog        int         = 128
+
+		internal listener       ?net.Listener = none
+		internal datagrams      ?net.Socket   = none
+		internal atomic running bool          = false
+		internal atomic open    net.Stream[]  = []
+		internal stats          ServerStats   = new ServerStats()
+
+		def new(handler Handler, addr string = ":514", transport Transport = Transport.Udp) {
+			self.handler = handler
+			self.addr = addr
+			self.transport = transport
+		}
+
+		// Listens on `addr` and serves until `close`. Fails when the address
+		// cannot be bound.
+		def listenAndServe() !none {
+			try bind()
+			return try serveBound()
+		}
+
+		// Listens on `addr` and serves in the background. Fails when the
+		// address cannot be bound, or `Transport.Tls` has no `tls`.
+		def start() !none {
+			return none when running
+			try bind()
+			let task = async serveQuietly()
+			task.keepAlive()
+			return none
+		}
+
+		// Stops receiving and closes every open connection. Fails when the
+		// socket cannot be closed.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				try ln.close()
+			}
+			let d = datagrams
+			datagrams = none
+			if !(d is none) {
+				try d.close()
+			}
+			for let s in takeStreams() {
+				s.close() onerror recover none
+			}
+			return none
+		}
+
+		// The address the server listens on.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			let d = datagrams
+			return d.localAddr() unless d is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// The stream connections open now; 0 for datagram transports.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		// bind opens the socket of the transport once the `listen`
+		// permission allows `syslog://addr` (`syslog-tls` for TLS).
+		internal def bind() !none {
+			fail syslogError("NotConnected", "Transport.Tls needs a TLS config") when transport == Transport.Tls && tls is none
+			fail syslogError("NotConnected", "the server is already serving") when running
+			if transport == Transport.Unix {
+				os.remove(addr) onerror recover none
+				let sock = try net.socket(net.SocketDomain.Unix, net.SocketType.Datagram)
+				try sock.bind(addr)
+				datagrams = sock
+				running = true
+				return none
+			}
+			let scheme = transport == Transport.Tls ?? ("syslog-tls", "syslog")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			if transport == Transport.Udp {
+				let sock = try net.socket(domain, net.SocketType.Datagram)
+				sock.setReuseAddr(true) onerror recover none
+				try sock.bind(addr)
+				datagrams = sock
+				running = true
+				return none
+			}
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			listener = try sock.listen(backlog)
+			running = true
+			return none
+		}
+
+		internal def serveQuietly() {
+			serveBound() onerror recover none
+		}
+
+		// serveBound receives until `close`.
+		internal def serveBound() !none {
+			let d = datagrams
+			return try serveDatagrams(d) unless d is none
+			let ln = listener
+			fail syslogError("NotConnected", "not bound") when ln is none
+			for running {
+				let failure ?error = none
+				let accepted = acceptOne(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running || (maxConnections > 0 && open.len() >= maxConnections) {
+					accepted.close() onerror recover none
+					continue
+				}
+				let task = async serveStream(accepted)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		internal def acceptOne(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		// serveDatagrams takes one message per datagram, a longer one cut.
+		internal def serveDatagrams(sock net.Socket) !none {
+			let buf byte[] = []
+			buf.len(maxMessageSize)
+			for running {
+				let failure ?error = none
+				let (n, from) = sock.readFrom(buf, 1s) onerror (err error) {
+					failure = err
+					recover (0, new net.Address())
+				}
+				if !(failure is none) {
+					return none unless running
+					continue when failure is net.NetError && failure.kind == net.ErrorCode.TimedOut
+					fail failure
+				}
+				stats.bytesIn.update(float64(n))
+				deliver(string(cutUTF8(buf[:n], n)), from)
+			}
+			return none
+		}
+
+		// serveStream reads frames off one connection until it ends.
+		internal def serveStream(conn net.Connection) {
+			let stream net.Stream = conn
+			if transport == Transport.Tls {
+				let config = tls
+				if config is none {
+					conn.close() onerror recover none
+					return
+				}
+				let refused = false
+				let secured = secureServer(conn, config, idleTimeout) onerror (err error) {
+					refused = true
+					recover conn
+				}
+				if refused {
+					conn.close() onerror recover none
+					return
+				}
+				stream = secured
+			}
+			track(stream)
+			let from = conn.remoteAddr()
+			let frames = new FrameReader(stream, maxMessageSize)
+			for running {
+				let failed = false
+				let text = frames.next(idleTimeout) onerror (err error) {
+					failed = true
+					recover ""
+				}
+				break when failed
+				stats.bytesIn.update(float64(text.len()))
+				deliver(text, from)
+			}
+			untrack(stream)
+			stream.close() onerror recover none
+			conn.close() onerror recover none
+		}
+
+		internal def deliver(text string, from net.Address) {
+			let m = received(text, stats)
+			handler.receive(m, from) onerror (err error) {
+				stats.failures.inc()
+				recover none
+			}
+		}
+
+		internal atomic def track(stream net.Stream) {
+			open.push(stream)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(stream net.Stream) {
+			let kept net.Stream[] = []
+			for let s in open {
+				kept.push(s) unless s == stream
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeStreams() net.Stream[] {
+			let streams = open
+			open = []
+			stats.connectionsOpen.set(-float64(streams.len()))
+			return streams
+		}
+	}
+}

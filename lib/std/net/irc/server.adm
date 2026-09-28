@@ -1,4 +1,254 @@
 partial module std.net.irc {
-	// Server is the IRC server; it has no members yet.
-	type Server {}
+	use (
+		std.net
+		std.net.irc.proto::*
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Server is an IRC server (RFC 1459, 2810-2813 for clients, with the
+	// IRCv3 capabilities): nicknames, channels with their modes, topics
+	// and ban, exception and invite lists, private messages, operators,
+	// and SASL logins through `authenticator`. It is one server: it links
+	// with no others. One task serves each connection. Implements
+	// `net.Server`: `start` returns at once and `close` stops it;
+	// `listenAndServe` is the blocking form, `serve` the form over a
+	// listener the caller made.
+	//
+	// ```
+	// let server = new irc.Server("irc.example.com", ":6667")
+	// server.motd = "Welcome to the example network"
+	// server.addOperator("admin", "s3cret")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		// The server's name, the source of its replies.
+		name            string                      = "irc.local"
+		addr            string                      = ":6667"
+		// The network name ISUPPORT announces.
+		network         string                      = "ADMnet"
+		// With `Tls`, every connection starts with the TLS handshake;
+		// it needs `tls`.
+		security        Security                    = Security.Plain
+		tls             ?tls.Config                 = none
+		// The password PASS must give before registration; none takes
+		// any client.
+		password        ?Secret<string>             = none
+		// Decides SASL logins; none offers no `sasl` capability.
+		authenticator   ?Authenticator              = none
+		// OPER names and their passwords.
+		operators       map<string, Secret<string>>
+		// The message of the day; newlines split it into lines.
+		motd            string                      = ""
+		// The text of WHOIS, LINKS and INFO about the server.
+		info            string                      = "ADM IRC server"
+		// ADMIN: who runs the server and how to reach them.
+		administrator   string                      = ""
+		adminEmail      string                      = ""
+		caseMapping     CaseMapping                 = CaseMapping.Rfc1459
+		// How long a client may stay quiet before it is sent a PING.
+		pingInterval    duration                    = 90s
+		// How long a PING may go unanswered, and an unregistered client
+		// may take to register, before the connection is closed.
+		pingTimeout     duration                    = 120s
+		// How long each write to a client may wait, and the TLS handshake.
+		timeout         duration                    = 30s
+		// Holds back a client that sends faster than one message every two
+		// seconds after a burst (RFC 1459 §8.10). Operators are exempt.
+		floodControl    bool                        = true
+		// Lines queued to one client before it is cut off ("SendQ
+		// exceeded").
+		sendQueue       int                         = 1024
+		// Connections served at once; one past it is told ERROR. 0 is no
+		// limit.
+		maxConnections  int                         = 0
+		backlog         int                         = 128
+		nickLength      int                         = 30
+		userLength      int                         = 16
+		realNameLength  int                         = 200
+		channelLength   int                         = 50
+		topicLength     int                         = 390
+		kickLength      int                         = 390
+		awayLength      int                         = 390
+		// Channels one user may be in.
+		maxChannels     int                         = 50
+		// Targets of one PRIVMSG or NOTICE.
+		maxTargets      int                         = 4
+		// Mode changes with an argument in one MODE.
+		maxModes        int                         = 4
+		// Entries of each ban, exception and invite list.
+		maxList         int                         = 100
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+
+		internal stats ServerStats = new ServerStats()
+		internal hub   ?Hub        = none
+
+		def new(name string = "irc.local", addr string = ":6667") {
+			self.name = name
+			self.addr = addr
+		}
+
+		// Lets `OPER name password` make a user an IRC operator.
+		def addOperator(name string, password Secret<string>) {
+			operators[name] = password
+		}
+
+		// Binds `addr` and serves until `close`.
+		// Fails with PolicyDenied when the policy denies listening there,
+		// NetError when the address cannot be bound or an accept fails.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Accepts on the listener until it closes; each connection runs in
+		// its own task. Returns none after `close`.
+		// Fails with NetError when an accept fails for another reason, or
+		// when TLS is asked for without a TLS config.
+		def serve(ln net.Listener) !none {
+			fail "irc: Security.Tls needs a TLS config" when security == Security.Tls && tls is none
+			fail "irc: server is already serving" when running
+			listener = ln
+			running = true
+			let shared = theHub()
+			for running {
+				let failure ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				if maxConnections > 0 && open.len() >= maxConnections {
+					let refused net.Stream = accepted
+					writeFully(refused, "ERROR :Closing Link: too many connections\r\n".bytes(), 1s) onerror recover none
+					accepted.close() onerror recover none
+					continue
+				}
+				let session = new Session(self, shared, stats, accepted, sendQueue)
+				track(session)
+				let task = async runSession(session)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with PolicyDenied or NetError when the address cannot be
+		// bound, and when TLS is asked for without a TLS config.
+		def start() !none {
+			return none when running
+			fail "irc: Security.Tls needs a TLS config" when security == Security.Tls && tls is none
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting and closes every
+		// connection, each client told ERROR first. A second call does
+		// nothing. Never fails.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			for let s in takeSessions() {
+				s.end("Server shutting down")
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed
+		// before `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// Connections open right now, registered or not.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		// Users registered right now.
+		def userCount() int {
+			let h = hub
+			return 0 when h is none
+			return h.userCount()
+		}
+
+		internal atomic def theHub() Hub {
+			let h = hub
+			return h unless h is none
+			let made = new Hub(self, stats)
+			hub = made
+			return made
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		internal def runSession(session Session) {
+			session.run()
+			untrack(session)
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			return sessions
+		}
+
+		// Binds `addr` once the `listen` permission allows `irc://addr`
+		// (`ircs` with TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Tls ?? ("ircs", "irc")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "irc.Server({name} {addr})"
+		}
+	}
 }

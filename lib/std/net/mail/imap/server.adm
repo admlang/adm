@@ -1,0 +1,259 @@
+partial module std.net.mail.imap {
+	use (
+		std.net
+		std.net.mail.imap.proto::*
+		std.net.mail.wire::*
+		std.net.tls
+		std.services::(Policy)
+		std.time::(Time)
+	)
+
+	// StoredMessage is what a `Folder` knows of one message without its
+	// content.
+	struct StoredMessage {
+		uid          int64
+		flags        string[]
+		size         int64
+		internalDate Time
+		modSeq       int64
+	}
+
+	// Folder is one mailbox as a `Server` serves it. UIDs grow as messages
+	// arrive and are never reused while `uidValidity` stays the same.
+	interface Folder {
+		// The counts and UID state. Fails when the store cannot be read.
+		def status() !MailboxStatus
+
+		// The messages in UID order. Fails when the store cannot be read.
+		def messages() !StoredMessage[]
+
+		// Message `uid` as stored. Fails when it is gone.
+		def read(uid int64) !byte[]
+
+		// Replaces the flags of message `uid` and returns its new
+		// modification sequence. Fails when it is gone.
+		def setFlags(uid int64, flags string[]) !int64
+
+		// Stores a message and returns its UID. Fails when the store is
+		// full (a `NO [OVERQUOTA]` reply) or cannot be written.
+		def append(data byte[], flags string[], internalDate Time) !int64
+
+		// Removes messages `uids`. Fails when one cannot be removed.
+		def expunge(uids int64[]) !none
+	}
+
+	// Account is one user's mailboxes as a `Server` serves them.
+	interface Account {
+		// Every mailbox. Fails when the store cannot be read.
+		def mailboxes() !Mailbox[]
+
+		// The mailbox `name`. Fails when it does not exist (a
+		// `NO [NONEXISTENT]` reply).
+		def open(name string) !Folder
+
+		// Creates mailbox `name`. Fails when it exists or cannot be made.
+		def create(name string) !none
+
+		// Deletes mailbox `name`. Fails when it does not exist.
+		def delete(name string) !none
+
+		// Renames mailbox `from` to `to`. Fails when `from` does not exist
+		// or `to` does.
+		def rename(from string, to string) !none
+
+		// The subscribed mailbox names.
+		def subscriptions() string[]
+
+		// Adds or removes `name` from the subscriptions.
+		def subscribe(name string, subscribed bool)
+	}
+
+	// Authenticator decides the logins of a `Server` and hands over the
+	// user's account.
+	interface Authenticator {
+		// Fails when the user or the password is wrong; the client is told
+		// `NO [AUTHENTICATIONFAILED]`, not why.
+		def login(user string, password Secret<string>) !Account
+	}
+
+	// Server is an IMAP4rev2 server (RFC 9051, answering IMAP4rev1 clients
+	// too), one task per connection, over the accounts its
+	// `authenticator` hands out. It does the protocol work itself: sequence
+	// numbers, searching (parsing messages as needed), fetch sections,
+	// flag changes with CONDSTORE, and pushing changes other sessions make
+	// during IDLE. It offers `IDLE`, `MOVE`, `UIDPLUS`, `CONDSTORE`,
+	// `ENABLE`, `LITERAL+`, `SPECIAL-USE`, `UNSELECT`, `ID`,
+	// `AUTH=PLAIN`, and `STARTTLS` with `tls`. Implements `net.Server`.
+	//
+	// ```
+	// let server = new imap.Server(users, ":143")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr           string        = ":143"
+		authenticator  Authenticator
+		// With `StartTls`, the server offers `STARTTLS`; with `Implicit`,
+		// every connection starts with the TLS handshake. Both need `tls`.
+		security       Security      = Security.Plain
+		tls            ?tls.Config   = none
+		// Refuse logins until the session runs over TLS
+		// (`LOGINDISABLED`).
+		requireTls     bool          = false
+		// How long a connection may wait for the next command; RFC 9051
+		// asks for at least 30 minutes.
+		idleTimeout    duration      = 30m
+		// How long each write may wait.
+		timeout        duration      = 60s
+		// The largest literal (an APPEND's message) taken, in bytes.
+		maxLiteral     int64         = 64 * 1024 * 1024
+		// Connections served at once; one past it is told `BYE`. 0 is no
+		// limit.
+		maxConnections int           = 0
+		backlog        int           = 128
+
+		internal listener       ?net.Listener = none
+		internal atomic running bool          = false
+		internal atomic open    Session[]     = []
+		internal stats          ServerStats   = new ServerStats()
+		internal hub            Hub           = new Hub()
+
+		def new(authenticator Authenticator, addr string = ":143") {
+			self.authenticator = authenticator
+			self.addr = addr
+		}
+
+		// Listens on `addr` and serves until `close`. Fails when the address
+		// cannot be bound.
+		def listenAndServe() !none {
+			try checkConfig()
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Listens on `addr` and serves in the background. Fails when the
+		// address cannot be bound.
+		def start() !none {
+			return none when running
+			try checkConfig()
+			let ln = try bind()
+			listener = ln
+			let task = async serveQuietly(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Stops accepting and closes every open connection with `BYE`.
+		// Fails when the listener cannot be closed.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				try ln.close()
+			}
+			for let s in takeSessions() {
+				s.bye("Server shutting down")
+			}
+			return none
+		}
+
+		// The address the server listens on.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// The connections open now.
+		def connectionCount() int {
+			return open.len()
+		}
+
+		internal def checkConfig() !none {
+			fail protocolError("Security.{security.value} needs a TLS config") when security != Security.Plain && tls is none
+			return none
+		}
+
+		internal def serveQuietly(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		// serve accepts on `ln` until `close`, one task per connection.
+		internal def serve(ln net.Listener) !none {
+			fail protocolError("the server is already serving") when running
+			listener = ln
+			running = true
+			for running {
+				let failure ?error = none
+				let accepted = acceptOne(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return none unless running
+					fail failure
+				}
+				continue when accepted is none
+				if !running {
+					accepted.close() onerror recover none
+					return none
+				}
+				if maxConnections > 0 && open.len() >= maxConnections {
+					let refused net.Stream = accepted
+					writeFully(refused, "* BYE Too many connections\r\n".bytes(), 1s) onerror recover none
+					accepted.close() onerror recover none
+					continue
+				}
+				let session = new Session(self, stats, hub, accepted)
+				track(session)
+				let task = async runSession(session)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		internal def acceptOne(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def runSession(session Session) {
+			session.run()
+			untrack(session)
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+			stats.connectionsOpen.inc()
+			stats.connectionsTotal.inc()
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			stats.connectionsOpen.dec() when kept.len() < open.len()
+			open = kept
+		}
+
+		internal atomic def takeSessions() Session[] {
+			let sessions = open
+			open = []
+			stats.connectionsOpen.set(-float64(sessions.len()))
+			return sessions
+		}
+
+		// bind listens on `addr` once the `listen` permission allows
+		// `imap://addr` (`imaps` with implicit TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("imaps", "imap")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+	}
+}

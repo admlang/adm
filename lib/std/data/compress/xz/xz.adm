@@ -1,0 +1,284 @@
+partial module std.data.compress.xz {
+	use (
+		std.io
+		std.bytes
+		std.crypto.hash
+		std.data.compress.lzma
+		std.data.compress.xz.container::*
+		std.data.compress.xz.filters::*
+	)
+
+	// Reader decompresses .xz data read from an io.Reader. Concatenated
+	// streams and stream padding are read as one stream. Blocks may use the
+	// LZMA2, delta and x86 filters; their CRC32, CRC64 and SHA-256 checks
+	// and every stream index are verified.
+	type Reader {
+		internal br         bytes.BinaryReader
+		internal chain      io.Reader
+		internal checkId    int
+		internal crc32      hash.CRC32
+		internal crc64      hash.CRC64
+		internal sha256     hash.SHA256
+		internal inBlock    bool
+		internal inStream   bool
+		internal started    bool
+		internal done       bool
+		// The current block: where its data starts, its header size and the
+		// sizes its header declares (-1 when absent).
+		internal dataStart  int64
+		internal headerSize int
+		internal declPacked int64
+		internal declSize   int64
+		internal unpacked   int64
+		// Unpadded and uncompressed size of each block of this stream, for
+		// the index check.
+		internal records    int64[]
+		// The index bytes read so far, for its CRC.
+		internal seen       byte[]
+
+		def new(r io.Reader) {
+			br = new bytes.BinaryReader(r)
+			chain = br
+			crc32 = new hash.CRC32()
+			crc64 = new hash.CRC64()
+			sha256 = new hash.SHA256()
+		}
+
+		// reset starts reading new .xz data from r.
+		def reset(r io.Reader) {
+			br.reset(r)
+			chain = br
+			inBlock = false
+			inStream = false
+			started = false
+			done = false
+			records = []
+		}
+
+		// read decompresses into p and returns how many bytes it produced, 0 at
+		// the end. Fails when the data is not .xz, is corrupt or truncated,
+		// uses a filter other than LZMA2, delta and x86, a check does not
+		// match, or the underlying reader fails.
+		def read(p byte[]) !int {
+			return 0 when done || p.len() == 0
+			for {
+				if !inBlock {
+					if !inStream {
+						if !(try startStream()) {
+							done = true
+							return 0
+						}
+						continue
+					}
+					if !(try startBlock()) {
+						continue
+					}
+				}
+				let n = try chain.read(p)
+				if n > 0 {
+					unpacked += int64(n)
+					fail "xz: block is larger than its header says" when declSize >= 0 && unpacked > declSize
+					feed(p[0:n])
+					return n
+				}
+				try endBlock()
+			}
+			return 0
+		}
+
+		// close releases the decompressor; it does not close the underlying
+		// reader. Fails when the data ended inside a stream.
+		def close() !none {
+			fail "xz: stream ended unfinished" when started && !done && (inStream || inBlock)
+			return none
+		}
+
+		internal def feed(b byte[]) {
+			match checkId {
+				case 1:
+					crc32.write(b)
+				case 4:
+					crc64.write(b)
+				case 10:
+					sha256.write(b)
+				default:
+			}
+		}
+
+		// Reads a stream header, after any stream padding. Returns false at
+		// the end of the input once a stream has been read.
+		internal def startStream() !bool {
+			let header byte[] = []
+			header.len(12)
+			if started {
+				// Stream padding comes in groups of four zero bytes.
+				for {
+					let got = try readUpTo(header[0:4])
+					return false when got == 0
+					fail "xz: invalid stream padding" when got < 4
+					break unless header[0] == 0 && header[1] == 0 && header[2] == 0 && header[3] == 0
+				}
+				fail "xz: truncated stream header" when (try readUpTo(header[4:12])) < 8
+			} else {
+				fail "xz: not an xz stream" when (try readUpTo(header)) < 12
+			}
+			fail "xz: not an xz stream" unless header[0] == 0xFD && header[1] == 0x37 && header[2] == 0x7A && header[3] == 0x58 && header[4] == 0x5A && header[5] == 0x00
+			fail "xz: unsupported stream flags" when header[6] != 0 || header[7] > 0x0F
+			fail "xz: stream header CRC mismatch" when hash.crc32(header[6:8]) != le32(header, 8)
+			checkId = int(header[7])
+			started = true
+			inStream = true
+			records = []
+			return true
+		}
+
+		// Reads a block header and sets up its filter chain. Returns false
+		// when the index came instead, after reading it and the stream
+		// footer.
+		internal def startBlock() !bool {
+			let sizeByte = try br.readByte()
+			if sizeByte == 0 {
+				try readIndex()
+				inStream = false
+				return false
+			}
+			headerSize = (int(sizeByte) + 1) * 4
+			let header byte[] = []
+			header.len(headerSize)
+			header[0] = sizeByte
+			fail "xz: truncated block header" when (try readUpTo(header[1:])) < headerSize - 1
+			fail "xz: block header CRC mismatch" when hash.crc32(header[0:headerSize - 4]) != le32(header, headerSize - 4)
+			let flags = int(header[1])
+			fail "xz: unsupported block flags" when flags & 0x3C != 0
+			let at = 2
+			declPacked = -1
+			declSize = -1
+			if flags & 0x40 != 0 {
+				let (v, next) = try varint(header, at)
+				declPacked = v
+				at = next
+			}
+			if flags & 0x80 != 0 {
+				let (v, next) = try varint(header, at)
+				declSize = v
+				at = next
+			}
+			let ids int64[] = []
+			let props byte[][] = []
+			for let i = 0; i <= flags & 3; i++ {
+				let (id, a) = try varint(header, at)
+				let (size, b) = try varint(header, a)
+				fail "xz: corrupt block header" when b + int(size) > headerSize - 4
+				ids.push(id)
+				props.push(header[b:b + int(size)])
+				at = b + int(size)
+			}
+			for let i = at; i < headerSize - 4; i++ {
+				fail "xz: corrupt block header" when header[i] != 0
+			}
+			let last = ids.len() - 1
+			fail "xz: the last filter must be LZMA2" when ids[last] != 0x21 || props[last].len() != 1
+			try lzma2DictSize(props[last][0])
+			let r io.Reader = new lzma.Reader2(br, props[last], declSize)
+			for let i = last - 1; i >= 0; i-- {
+				let pr = props[i]
+				if ids[i] == 0x03 && pr.len() == 1 {
+					r = new DeltaReader(r, int(pr[0]) + 1)
+				} else if ids[i] == 0x04 && (pr.len() == 0 || pr.len() == 4) {
+					let start = (pr.len() == 4) ?? (le32(pr, 0), uint32(0))
+					r = new X86Reader(r, start)
+				} else {
+					fail "xz: unsupported filter 0x" + uint64(ids[i]).hex()
+				}
+			}
+			chain = r
+			dataStart = int64(br.totalRead())
+			unpacked = 0
+			crc32.reset()
+			crc64.reset()
+			sha256.reset()
+			inBlock = true
+			return true
+		}
+
+		// Checks the block's sizes, padding and check value.
+		internal def endBlock() !none {
+			inBlock = false
+			chain = br
+			let packed = int64(br.totalRead()) - dataStart
+			fail "xz: block compressed size mismatch" when declPacked >= 0 && packed != declPacked
+			fail "xz: block size mismatch" when declSize >= 0 && unpacked != declSize
+			let pad = int((4 - packed % 4) % 4)
+			for let i = 0; i < pad; i++ {
+				fail "xz: invalid block padding" when (try br.readByte()) != 0
+			}
+			let size = checkSize(checkId)
+			let stored = try br.read(size)
+			let expected byte[] = []
+			match checkId {
+				case 1:
+					expected = le(uint64(crc32.checksum ^ 0xFFFFFFFF), 4)
+				case 4:
+					expected = le(crc64.checksum ^ 0xFFFFFFFFFFFFFFFF, 8)
+				case 10:
+					expected = sha256.hash()
+				default:
+					expected = stored
+			}
+			fail "xz: block check mismatch" unless stored.equals(expected)
+			records.push(int64(headerSize) + packed + int64(size), unpacked)
+		}
+
+		// Reads the index, whose indicator byte was just read, compares it
+		// with the blocks just read, then reads the stream footer.
+		internal def readIndex() !none {
+			seen = [0]
+			let count = try indexVarint()
+			fail "xz: index does not match the blocks" when count * 2 != int64(records.len())
+			for let i = int64(0); i < count; i++ {
+				let unpadded = try indexVarint()
+				let size = try indexVarint()
+				fail "xz: index does not match the blocks" when unpadded != records[int(i * 2)] || size != records[int(i * 2 + 1)]
+			}
+			for seen.len() % 4 != 0 {
+				let b = try br.readByte()
+				fail "xz: invalid index padding" when b != 0
+				seen.push(b)
+			}
+			let crc = try br.read(4)
+			fail "xz: index CRC mismatch" when hash.crc32(seen) != le32(crc, 0)
+			let footer = try br.read(12)
+			fail "xz: invalid stream footer" unless footer[10] == 0x59 && footer[11] == 0x5A
+			fail "xz: stream footer CRC mismatch" when hash.crc32(footer[4:10]) != le32(footer, 0)
+			fail "xz: stream footer does not match the header" when int(footer[8]) != 0 || int(footer[9]) != checkId
+			let backward = (int64(le32(footer, 4)) + 1) * 4
+			fail "xz: stream footer does not match the index" when backward != int64(seen.len() + 4)
+		}
+
+		// Fills b as far as the input goes and returns how much it read.
+		// Fails when the underlying reader does.
+		internal def readUpTo(b byte[]) !int {
+			let got = 0
+			for got < b.len() {
+				let n = try br.read(b[got:])
+				break when n <= 0
+				got += n
+			}
+			return got
+		}
+
+		internal def indexVarint() !int64 {
+			let v = int64(0)
+			for let i = 0; i < 9; i++ {
+				let b = try br.readByte()
+				seen.push(b)
+				v |= int64(b & 0x7F) << (7 * i)
+				if b & 0x80 == 0 {
+					fail "xz: invalid number" when b == 0 && i > 0
+					return v
+				}
+			}
+			fail "xz: invalid number"
+		}
+	}
+}

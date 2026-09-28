@@ -1,0 +1,654 @@
+internal partial module std.data.compress.lzma.core {
+	use std.io
+
+	const (
+		matchMaxLen      = 273
+		// LZMA2 chunk limits: 2 MiB of input, 64 KiB of output.
+		chunkMaxUnpacked = 1 << 21
+		chunkMaxPacked   = 1 << 16
+	)
+
+	// Encoder settings: dictionary size, hash chain depth, the match length
+	// that ends a search early, and whether to look one byte ahead before
+	// taking a match.
+	struct EncoderPreset {
+		dictSize int
+		depth    int
+		niceLen  int
+		lazy     bool
+	}
+
+	// The settings of a level from 1 (fastest) to 9 (smallest output).
+	def preset(level int) EncoderPreset {
+		let l = level
+		l = 6 when l < 1 || l > 9
+		return EncoderPreset{dictSize: 1 << (19 + l), depth: 4 * l, niceLen: 32, lazy: false} when l <= 2
+		return EncoderPreset{dictSize: 1 << 22, depth: 8 * l, niceLen: 64, lazy: true} when l <= 5
+		return EncoderPreset{dictSize: 1 << 23, depth: 16 * l, niceLen: 128, lazy: true} when l <= 7
+		return EncoderPreset{dictSize: 1 << 24, depth: 32 * l, niceLen: matchMaxLen, lazy: true}
+	}
+
+	// RangeEncoder writes range-coded bits into an in-memory buffer.
+	type RangeEncoder {
+		out       byte[]
+		n         int
+		low       uint64
+		range     uint32
+		cache     int
+		cacheSize int
+
+		def new() {
+			out.len(chunkMaxPacked + 1024)
+			reset()
+		}
+
+		def reset() {
+			n = 0
+			low = 0
+			range = 0xFFFFFFFF
+			cache = 0
+			cacheSize = 1
+		}
+
+		// Bytes the coder has produced or committed to, including those a
+		// flush would still write.
+		def pending() int {
+			return n + cacheSize + 4
+		}
+
+		def emit(b int) {
+			out.len(out.len() * 2) when n >= out.len()
+			out[n] = byte(b)
+			n++
+		}
+
+		def shiftLow() {
+			if low < 0xFF000000 || low >= 0x100000000 {
+				let carry = int(low >> 32)
+				let temp = cache
+				for {
+					emit((temp + carry) & 0xFF)
+					temp = 0xFF
+					cacheSize--
+					break when cacheSize == 0
+				}
+				cache = int((low >> 24) & 0xFF)
+			}
+			cacheSize++
+			low = (low & 0x00FFFFFF) << 8
+		}
+
+		def bit(probs uint16[], i int, b int) {
+			let p = uint32(probs[i])
+			let bound = (range >> 11) * p
+			if b == 0 {
+				range = bound
+				probs[i] = uint16(p + ((2048 - p) >> 5))
+			} else {
+				low += uint64(bound)
+				range -= bound
+				probs[i] = uint16(p - (p >> 5))
+			}
+			for range < 0x1000000 {
+				range <<= 8
+				shiftLow()
+			}
+		}
+
+		def direct(v uint32, numBits int) {
+			for let i = numBits - 1; i >= 0; i-- {
+				range >>= 1
+				low += uint64(range) when (v >> uint32(i)) & 1 == 1
+				for range < 0x1000000 {
+					range <<= 8
+					shiftLow()
+				}
+			}
+		}
+
+		// Writes out everything; the coder must be reset before reuse.
+		def flush() {
+			for let i = 0; i < 5; i++ {
+				shiftLow()
+			}
+		}
+	}
+
+	// LzmaEncoder turns bytes into LZMA symbols with a hash chain match
+	// finder and a greedy parse, looking one byte ahead when the preset
+	// asks. The containers feed it with `append` and drive `encode`.
+	type LzmaEncoder {
+		rc       RangeEncoder
+		probs    uint16[]
+		lc       int
+		lp       int
+		pb       int
+		settings EncoderPreset
+
+		// Window: buf[i] holds the byte at absolute position bufStart + i.
+		buf       byte[]
+		bufStart  int
+		// Next position to encode, and the end of the data appended.
+		pos       int
+		end       int
+		// Start of the history matches may reach into.
+		histStart int
+		hashBits  int
+		head      uint32[]
+		chain     uint32[]
+		// Positions up to here are in the hash chains.
+		hashed    int
+
+		state int
+		reps  int[]
+
+		def new(settings EncoderPreset) {
+			self.settings = settings
+			rc = new RangeEncoder()
+			lc = 3
+			lp = 0
+			pb = 2
+			probs.len(probLiteral + (0x300 << (lc + lp)))
+			hashBits = 16
+			for (1 << hashBits) < settings.dictSize / 4 && hashBits < 20 {
+				hashBits++
+			}
+			head.len(1 << hashBits)
+			head.fill(0)
+			chain.len(settings.dictSize)
+			buf.len(settings.dictSize + 2 * chunkMaxUnpacked)
+			reps = [0, 0, 0, 0]
+			resetState()
+		}
+
+		// The LZMA properties byte.
+		def propsByte() int {
+			return (pb * 5 + lp) * 9 + lc
+		}
+
+		def resetState() {
+			let n = probLiteral + (0x300 << (lc + lp))
+			for let i = 0; i < n; i++ {
+				probs[i] = probInit
+			}
+			state = 0
+			reps[0] = 0
+			reps[1] = 0
+			reps[2] = 0
+			reps[3] = 0
+		}
+
+		// Adds input bytes behind what was appended before, sliding the
+		// window when it is full. Returns how many were taken.
+		def append(p byte[]) int {
+			if end - bufStart == buf.len() {
+				let keep = pos - settings.dictSize
+				keep = histStart when keep < histStart
+				keep = bufStart when keep < bufStart
+				let drop = keep - bufStart
+				if drop > 0 {
+					(buf[drop:end - bufStart]).copy(buf[0:end - keep])
+					bufStart = keep
+				}
+			}
+			let room = buf.len() - (end - bufStart)
+			let k = p.len()
+			k = room when room < k
+			(p[0:k]).copy(buf[end - bufStart:end - bufStart + k])
+			end += k
+			return k
+		}
+
+		def at(p int) byte {
+			return buf[p - bufStart]
+		}
+
+		def hash(p int) int {
+			let i = p - bufStart
+			let h = (uint32(buf[i]) | uint32(buf[i + 1]) << 8 | uint32(buf[i + 2]) << 16) * 0x9E3779B1
+			return int(h >> uint32(32 - hashBits))
+		}
+
+		// Adds positions up to `upTo` to the hash chains.
+		def insert(upTo int) {
+			let limit = upTo
+			limit = end - 2 when limit > end - 2
+			for hashed < limit {
+				let h = hash(hashed)
+				chain[hashed % settings.dictSize] = head[h]
+				head[h] = uint32(hashed)
+				hashed++
+			}
+		}
+
+		// Length of the match between positions a and b, at most max.
+		def matchLen(a int, b int, max int) int {
+			let i = a - bufStart
+			let j = b - bufStart
+			let n = 0
+			for n < max && buf[i + n] == buf[j + n] {
+				n++
+			}
+			return n
+		}
+
+		// The longest match at p within `max` bytes, as (length, distance),
+		// length 0 when none of at least 3 bytes exists.
+		def findMatch(p int, max int) (int, int) {
+			return (0, 0) when max < 3 || p + 2 >= end
+			insert(p)
+			let bestLen = 0
+			let bestDist = 0
+			let floor = p - settings.dictSize + 1
+			floor = histStart when floor < histStart
+			floor = bufStart when floor < bufStart
+			let cand = p - int(uint32(p) - head[hash(p)])
+			let lastDelta = 0
+			for let depth = 0; depth < settings.depth; depth++ {
+				let delta = p - cand
+				break when delta <= lastDelta || cand < floor
+				lastDelta = delta
+				if buf[cand - bufStart + bestLen] == buf[p - bufStart + bestLen] {
+					let l = matchLen(cand, p, max)
+					if l > bestLen {
+						bestLen = l
+						bestDist = delta - 1
+						break when l >= settings.niceLen || l == max
+					}
+				}
+				cand = cand - int(uint32(cand) - chain[cand % settings.dictSize])
+			}
+			return (0, 0) when bestLen < 3
+			return (0, 0) when bestLen == 3 && bestDist >= 0x8000
+			return (bestLen, bestDist)
+		}
+
+		// The longest repeat match at p: (length, which rep).
+		def findRep(p int, max int) (int, int) {
+			let best = 0
+			let which = 0
+			for let r = 0; r < 4; r++ {
+				let src = p - reps[r] - 1
+				continue when src < histStart || src < bufStart
+				let l = matchLen(src, p, max)
+				if l > best {
+					best = l
+					which = r
+				}
+			}
+			return (best, which)
+		}
+
+		// Encodes from pos up to `limit`, the range coder output staying under
+		// `maxPacked` bytes. `final` says no more input follows `end`.
+		def encode(limit int, maxPacked int) {
+			for pos < limit && rc.pending() + 64 < maxPacked {
+				let max = limit - pos
+				max = matchMaxLen when max > matchMaxLen
+				let posState = pos & ((1 << pb) - 1)
+				let (repLen, rep) = findRep(pos, max)
+				if repLen >= settings.niceLen {
+					encodeRep(rep, repLen, posState)
+					continue
+				}
+				let (len, dist) = findMatch(pos, max)
+				if repLen >= 2 && repLen + 1 >= len {
+					encodeRep(rep, repLen, posState)
+					continue
+				}
+				if len >= 3 {
+					if settings.lazy && len < settings.niceLen && pos + 1 < limit {
+						let next = max
+						next = limit - pos - 1 when next > limit - pos - 1
+						let (len2, dist2) = findMatch(pos + 1, next)
+						if len2 > len + 1 || (len2 == len + 1 && dist2 < dist) {
+							encodeLiteral(posState)
+							continue
+						}
+					}
+					encodeMatch(len, dist, posState)
+					continue
+				}
+				if repLen == 1 && rep == 0 {
+					encodeShortRep(posState)
+					continue
+				}
+				encodeLiteral(posState)
+			}
+		}
+
+		def encodeLiteral(posState int) {
+			rc.bit(probs, probIsMatch + (state << 4) + posState, 0)
+			let prev = 0
+			prev = int(at(pos - 1)) when pos > histStart
+			let base = probLiteral + 0x300 * (((pos & ((1 << lp) - 1)) << lc) + (prev >> (8 - lc)))
+			let b = int(at(pos))
+			let sym = 1
+			if state >= 7 {
+				let mb = int(at(pos - reps[0] - 1))
+				let offset = 0x100
+				for let i = 7; i >= 0; i-- {
+					let bit = (b >> i) & 1
+					mb <<= 1
+					let matchBit = mb & offset
+					rc.bit(probs, base + offset + matchBit + sym, bit)
+					sym = (sym << 1) | bit
+					if bit == 1 {
+						offset &= matchBit
+					} else {
+						offset &= ~matchBit
+					}
+				}
+			} else {
+				for let i = 7; i >= 0; i-- {
+					let bit = (b >> i) & 1
+					rc.bit(probs, base + sym, bit)
+					sym = (sym << 1) | bit
+				}
+			}
+			state = (state < 4) ?? (0, (state < 10) ?? (state - 3, state - 6))
+			pos++
+		}
+
+		def encodeShortRep(posState int) {
+			rc.bit(probs, probIsMatch + (state << 4) + posState, 1)
+			rc.bit(probs, probIsRep + state, 1)
+			rc.bit(probs, probIsRepG0 + state, 0)
+			rc.bit(probs, probIsRep0Long + (state << 4) + posState, 0)
+			state = (state < 7) ?? (9, 11)
+			pos++
+		}
+
+		def encodeRep(rep int, len int, posState int) {
+			rc.bit(probs, probIsMatch + (state << 4) + posState, 1)
+			rc.bit(probs, probIsRep + state, 1)
+			if rep == 0 {
+				rc.bit(probs, probIsRepG0 + state, 0)
+				rc.bit(probs, probIsRep0Long + (state << 4) + posState, 1)
+			} else {
+				rc.bit(probs, probIsRepG0 + state, 1)
+				let dist = reps[rep]
+				if rep == 1 {
+					rc.bit(probs, probIsRepG1 + state, 0)
+				} else {
+					rc.bit(probs, probIsRepG1 + state, 1)
+					rc.bit(probs, probIsRepG2 + state, rep - 2)
+					reps[3] = reps[2] when rep == 3
+					reps[2] = reps[1]
+				}
+				reps[1] = reps[0]
+				reps[0] = dist
+			}
+			encodeLength(probRepLen, len, posState)
+			state = (state < 7) ?? (8, 11)
+			pos += len
+		}
+
+		def encodeMatch(len int, dist int, posState int) {
+			rc.bit(probs, probIsMatch + (state << 4) + posState, 1)
+			rc.bit(probs, probIsRep + state, 0)
+			encodeLength(probLen, len, posState)
+			encodeDistance(dist, len)
+			reps[3] = reps[2]
+			reps[2] = reps[1]
+			reps[1] = reps[0]
+			reps[0] = dist
+			state = (state < 7) ?? (7, 10)
+			pos += len
+		}
+
+		// Writes the end-of-payload marker.
+		def encodeEnd() {
+			let posState = pos & ((1 << pb) - 1)
+			rc.bit(probs, probIsMatch + (state << 4) + posState, 1)
+			rc.bit(probs, probIsRep + state, 0)
+			encodeLength(probLen, matchMinLen, posState)
+			encodeDistance(0xFFFFFFFF, matchMinLen)
+		}
+
+		def encodeLength(base int, len int, posState int) {
+			let l = len - matchMinLen
+			if l < 8 {
+				rc.bit(probs, base, 0)
+				tree(base + lenLow + (posState << 3), 3, l)
+			} else if l < 16 {
+				rc.bit(probs, base, 1)
+				rc.bit(probs, base + 1, 0)
+				tree(base + lenMid + (posState << 3), 3, l - 8)
+			} else {
+				rc.bit(probs, base, 1)
+				rc.bit(probs, base + 1, 1)
+				tree(base + lenHigh, 8, l - 16)
+			}
+		}
+
+		def encodeDistance(dist int, len int) {
+			let lenState = len - matchMinLen
+			lenState = 3 when lenState > 3
+			let d = uint32(dist)
+			let slot = 0
+			if d < 4 {
+				slot = int(d)
+			} else {
+				let n = 31
+				for (d >> uint32(n)) & 1 == 0 {
+					n--
+				}
+				slot = 2 * n + int((d >> uint32(n - 1)) & 1)
+			}
+			tree(probPosSlot + (lenState << 6), 6, slot)
+			return when slot < 4
+			let footer = (slot >> 1) - 1
+			let base = uint32((2 | (slot & 1)) << footer)
+			let reduced = d - base
+			if slot < endPosModel {
+				reverseTree(probSpecPos + int(base) - slot - 1, footer, int(reduced))
+				return
+			}
+			rc.direct(reduced >> 4, footer - 4)
+			reverseTree(probAlign, 4, int(reduced & 15))
+		}
+
+		def tree(base int, numBits int, v int) {
+			let m = 1
+			for let i = numBits - 1; i >= 0; i-- {
+				let b = (v >> i) & 1
+				rc.bit(probs, base + m, b)
+				m = (m << 1) | b
+			}
+		}
+
+		def reverseTree(base int, numBits int, v int) {
+			let m = 1
+			for let i = 0; i < numBits; i++ {
+				let b = (v >> i) & 1
+				rc.bit(probs, base + m, b)
+				m = (m << 1) | b
+			}
+		}
+	}
+
+	// Lzma2Encoder writes LZMA2 chunks to an io.Writer.
+	type Lzma2Encoder {
+		enc       LzmaEncoder
+		w         io.Writer
+		// Bytes written to w.
+		written   int64
+		first     bool
+		needProps bool
+		needReset bool
+		header    byte[]
+
+		def new(w io.Writer, settings EncoderPreset) {
+			self.w = w
+			enc = new LzmaEncoder(settings)
+			first = true
+			needProps = true
+			header.len(6)
+		}
+
+		// The LZMA2 properties byte of the dictionary size.
+		def propsByte() byte {
+			let d = enc.settings.dictSize
+			for let bits = 0; bits < 40; bits++ {
+				return byte(bits) when (2 | (bits & 1)) << (bits / 2 + 11) >= d
+			}
+			return 40
+		}
+
+		def out(b byte[]) !none {
+			try w.write(b)
+			written += int64(b.len())
+		}
+
+		// Takes input, writing every chunk that fills up. Fails when the
+		// writer does.
+		def write(p byte[]) !none {
+			let off = 0
+			for off < p.len() {
+				off += enc.append(p[off:])
+				for enc.end - enc.pos >= chunkMaxUnpacked + matchMaxLen {
+					try chunk(enc.pos + chunkMaxUnpacked)
+				}
+			}
+		}
+
+		// Writes chunks for everything appended. Fails when the writer does.
+		def flush() !none {
+			for enc.pos < enc.end {
+				let limit = enc.pos + chunkMaxUnpacked
+				limit = enc.end when limit > enc.end
+				try chunk(limit)
+			}
+		}
+
+		// Writes the pending chunks and the end marker. Fails when the writer
+		// does.
+		def close() !none {
+			try flush()
+			try out(byte[0])
+		}
+
+		// Encodes one chunk of at most `limit - pos` bytes.
+		def chunk(limit int) !none {
+			let start = enc.pos
+			enc.resetState() when needReset
+			enc.rc.reset()
+			enc.encode(limit, chunkMaxPacked)
+			enc.rc.flush()
+			let unpacked = enc.pos - start
+			let packed = enc.rc.n
+			if packed >= unpacked {
+				try stored(start, enc.pos)
+				needReset = true
+				return none
+			}
+			let mode = 0
+			if first {
+				mode = 3
+			} else if needProps {
+				mode = 2
+			} else if needReset {
+				mode = 1
+			}
+			let u = unpacked - 1
+			let c = packed - 1
+			header[0] = byte(0x80 | (mode << 5) | (u >> 16))
+			header[1] = byte(u >> 8)
+			header[2] = byte(u)
+			header[3] = byte(c >> 8)
+			header[4] = byte(c)
+			let hlen = 5
+			if mode >= 2 {
+				header[5] = byte(enc.propsByte())
+				hlen = 6
+			}
+			try out(header[0:hlen])
+			try out(enc.rc.out[0:packed])
+			first = false
+			needProps = false
+			needReset = false
+		}
+
+		// Writes the bytes from `from` to `to` as stored chunks.
+		def stored(from int, to int) !none {
+			let p = from
+			for p < to {
+				let n = to - p
+				n = 1 << 16 when n > 1 << 16
+				header[0] = byte(first ?? (1, 2))
+				header[1] = byte((n - 1) >> 8)
+				header[2] = byte(n - 1)
+				try out(header[0:3])
+				try out(enc.buf[p - enc.bufStart:p - enc.bufStart + n])
+				first = false
+				p += n
+			}
+		}
+	}
+
+	// LzmaAloneEncoder writes a .lzma file: the header with an unknown size,
+	// then one range-coded stream ended by the end marker.
+	type LzmaAloneEncoder {
+		enc     LzmaEncoder
+		w       io.Writer
+		started bool
+
+		def new(w io.Writer, settings EncoderPreset) {
+			self.w = w
+			enc = new LzmaEncoder(settings)
+		}
+
+		def header() !none {
+			return none when started
+			started = true
+			let h byte[] = []
+			h.len(13)
+			h[0] = byte(enc.propsByte())
+			let d = enc.settings.dictSize
+			for let i = 0; i < 4; i++ {
+				h[1 + i] = byte(d >> (8 * i))
+			}
+			for let i = 5; i < 13; i++ {
+				h[i] = 0xFF
+			}
+			try w.write(h)
+		}
+
+		// Moves the finished range coder bytes to the writer, keeping the
+		// ones a carry may still change.
+		def drain() !none {
+			if enc.rc.n > 0 {
+				try w.write(enc.rc.out[0:enc.rc.n])
+				enc.rc.n = 0
+			}
+		}
+
+		// Takes input, encoding all but the last bytes, which may still
+		// extend a match. Fails when the writer does.
+		def write(p byte[]) !none {
+			try header()
+			let off = 0
+			for off < p.len() {
+				off += enc.append(p[off:])
+				for enc.end - enc.pos > matchMaxLen {
+					enc.encode(enc.end - matchMaxLen, chunkMaxPacked)
+					try drain()
+				}
+			}
+		}
+
+		// Encodes the rest, the end marker and the coder flush. Fails when the
+		// writer does.
+		def close() !none {
+			try header()
+			for enc.pos < enc.end {
+				enc.encode(enc.end, chunkMaxPacked)
+				try drain()
+			}
+			enc.encodeEnd()
+			enc.rc.flush()
+			try drain()
+		}
+	}
+}

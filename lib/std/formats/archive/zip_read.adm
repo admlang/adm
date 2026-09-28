@@ -1,0 +1,535 @@
+internal partial module std.formats.archive.zip {
+	use (
+		std.io
+		std.bytes
+		std.os
+		std.time
+		std.data.compress.flate
+		std.data.encoding.codepages
+		std.data.compress.bzip2
+		std.data.compress.lzma
+		std.data.compress.xz
+		std.crypto.hash
+		std.formats.archive::*
+		std.formats.archive.stream::*
+	)
+
+	const (
+		sigLocal       = 0x04034b50
+		sigCentral     = 0x02014b50
+		sigEnd         = 0x06054b50
+		sigEnd64       = 0x06064b50
+		sigLocator64   = 0x07064b50
+		sigDescriptor  = 0x08074b50
+		methodStore    = 0
+		methodDeflate  = 8
+		methodBzip2    = 12
+		methodLzma     = 14
+		methodXz       = 95
+		methodAES      = 99
+		flagEncrypted  = 0x1
+		flagDescriptor = 0x8
+		flagUTF8       = 0x800
+		max16          = 0xFFFF
+		max32          = 0xFFFFFFFF
+	)
+
+	// What the central directory says about one entry, beyond the shared
+	// Entry: where its bytes are and how they are stored.
+	type ZipRecord {
+		entry        Entry
+		flags        int
+		// The method field as written: 99 for AES-encrypted entries.
+		method       int
+		// The compression under AES; `method` otherwise.
+		actualMethod int
+		// Absolute offset of the local header.
+		offset       int
+		packed       int
+		size         int
+		crc          int
+		dosTime      int
+		// AES key strength 1, 2 or 3 and vendor version 1 or 2; 0 when not AES.
+		aesStrength  int
+		aesVersion   int
+
+		def new() {}
+	}
+
+	// A zip archive opened over random-access bytes.
+	type ZipArchive {
+		src     Source
+		records ZipRecord[]
+		list    Entry[]
+		opts    ReadOptions
+		comment string
+
+		def new(src Source, opts ReadOptions) {
+			self.src = src
+			self.opts = opts
+			records = []
+			list = []
+		}
+
+		// close implements io.Closer: closes the file the archive was read from.
+		def close() !none {
+			return src.close()
+		}
+
+		def entries() Entry[] {
+			return list
+		}
+
+		def entry(name string) ?Entry {
+			for let e in list {
+				return e when e.name == name
+			}
+			return none
+		}
+
+		def open(entry Entry) !io.Reader {
+			let record = try find(entry)
+			return openRecord(record)
+		}
+
+		def extract(dir string, opts ExtractOptions = ExtractOptions{}) !int {
+			return extractAll(self, dir, opts)
+		}
+
+		def extract(entry Entry, dir string, opts ExtractOptions = ExtractOptions{}) !none {
+			return extractEntry(self, entry, dir, opts)
+		}
+
+		// The record an entry came from: by name, then by stored size and CRC
+		// when several entries share the name.
+		def find(entry Entry) !ZipRecord {
+			let found ?ZipRecord = none
+			for let r in records {
+				continue unless r.entry.name == entry.name
+				return r when r.entry.compressedSize == entry.compressedSize && r.entry.crc32 == entry.crc32
+				found = r when found is none
+			}
+			fail "zip: no entry named " + entry.name when found is none
+			return found
+		}
+
+		// The target path a symlink record stores as its content. Fails when
+		// the content cannot be read.
+		def linkTarget(record ZipRecord) !string {
+			let reader = try openRecord(record)
+			return string(try readAll(reader))
+		}
+
+		// Reader over one record's decoded bytes.
+		def openRecord(record ZipRecord) !io.Reader {
+			let header = try src.bytesAt(record.offset, 30)
+			fail "zip: missing local header for " + record.entry.name when le32(header, 0) != sigLocal
+			let start = record.offset + 30 + le16(header, 26) + le16(header, 28)
+			fail "zip: entry " + record.entry.name + " runs past the end of the archive" when start + record.packed > src.size()
+			if opts.strict {
+				fail "zip: local header of " + record.entry.name + " disagrees with the central directory" when le16(header, 8) != record.method
+			}
+			let raw io.Reader = src.reader(start, record.packed)
+			let packed = record.packed
+			let checkCrc = true
+			if record.flags & flagEncrypted != 0 {
+				fail "zip: " + record.entry.name + " is encrypted; a password is needed" when opts.password.isEmpty()
+				if record.method == methodAES {
+					let saltLen = aesSaltLength(record.aesStrength)
+					fail "zip: " + record.entry.name + " has an unknown AES strength" when saltLen == 0
+					let dataLen = packed - saltLen - 2 - 10
+					fail "zip: " + record.entry.name + " is too short for AES" when dataLen < 0
+					let head = try src.bytesAt(start, saltLen + 2)
+					let keys = try deriveAesKeys(opts.password, head[0:saltLen], record.aesStrength)
+					fail "zip: wrong password for " + record.entry.name unless keys.verifier.equals(head[saltLen:saltLen + 2])
+					let body = src.reader(start + saltLen + 2, dataLen)
+					let authCode = try src.bytesAt(start + saltLen + 2 + dataLen, 10)
+					raw = new AesReader(body, keys, authCode, record.entry.name, dataLen)
+					packed = dataLen
+					checkCrc = record.aesVersion != 2
+				} else {
+					fail "zip: " + record.entry.name + " is too short for its encryption header" when packed < 12
+					let cipher = new ZipCrypto(opts.password)
+					let head = try src.bytesAt(start, 12)
+					cipher.decrypt(head)
+					let expected = record.flags & flagDescriptor != 0 ?? ((record.dosTime >> 8) & 0xFF, (record.crc >> 24) & 0xFF)
+					fail "zip: wrong password for " + record.entry.name when int(head[11]) != expected
+					raw = new ZipCryptoReader(src.reader(start + 12, packed - 12), cipher)
+					packed -= 12
+				}
+			}
+			let decoded io.Reader = raw
+			let method = record.actualMethod
+			if method == methodDeflate {
+				decoded = new flate.Reader(raw)
+			} else if method == methodBzip2 {
+				decoded = new bzip2.Reader(raw)
+			} else if method == methodLzma {
+				// Version (2 bytes), properties size (2 bytes), then the
+				// properties; the size is known from the directory.
+				let head byte[]
+				head.len(4)
+				try io.readFull(raw, head)
+				let props byte[]
+				props.len(int(head[2]) | int(head[3]) << 8)
+				try io.readFull(raw, props)
+				decoded = new lzma.Reader(raw, props, int64(record.size))
+			} else if method == methodXz {
+				decoded = new xz.Reader(raw)
+			} else if method != methodStore {
+				fail "zip: " + record.entry.name + " uses compression method {method}, which is not supported"
+			}
+			return new CrcReader(decoded, record.size, uint32(record.crc), checkCrc, record.entry.name)
+		}
+	}
+
+	// Parses the central directory of a zip held in `src`. Fails when the data
+	// is not a zip archive or its directory is damaged.
+	def readZip(src Source, opts ReadOptions) !ZipArchive {
+		let encoding = opts.encoding.lower().replace("-", "").replace("_", "")
+		fail "zip: unsupported name encoding " + opts.encoding unless encoding := "" || "utf8" || "cp437" || "ibm437" || "latin1" || "iso88591"
+
+		let arc = new ZipArchive(src, opts)
+		let size = src.size()
+		fail "zip: data too short to be a zip archive" when size < 22
+		let tailLen = size < 22 + 65535 ?? (size, 22 + 65535)
+		let tail = try src.bytesAt(size - tailLen, tailLen)
+		let endAt = -1
+		for let i = tailLen - 22; i >= 0; i-- {
+			if int(tail[i]) == 0x50 && le32(tail, i) == sigEnd {
+				endAt = i
+				break
+			}
+		}
+		fail "zip: end of central directory not found" when endAt < 0
+		let count = le16(tail, endAt + 10)
+		let dirSize = le32(tail, endAt + 12)
+		let dirOffset = le32(tail, endAt + 16)
+		let commentLen = le16(tail, endAt + 20)
+		let commentEnd = endAt + 22 + commentLen
+		commentEnd = tailLen when commentEnd > tailLen
+		arc.comment = decodeName(tail[endAt + 22:commentEnd], false, encoding)
+		let directoryEnd = size - tailLen + endAt
+
+		if count == max16 || dirSize == max32 || dirOffset == max32 {
+			let locatorAt = directoryEnd - 20
+			if locatorAt >= 0 {
+				let locator = try src.bytesAt(locatorAt, 20)
+				if le32(locator, 0) == sigLocator64 {
+					let end64At = le64(locator, 8)
+					let end64 = try src.bytesAt(end64At, 56)
+					fail "zip: bad zip64 end of central directory" when le32(end64, 0) != sigEnd64
+					count = le64(end64, 32)
+					dirSize = le64(end64, 40)
+					dirOffset = le64(end64, 48)
+					directoryEnd = end64At
+				}
+			}
+		}
+
+		// Data prepended to the archive (a self-extractor stub) shifts every
+		// offset by the same amount.
+		let base = directoryEnd - dirSize - dirOffset
+		base = 0 when base < 0
+		if base > 0 {
+			let probe = src.bytesAt(dirOffset, 4) onerror recover byte[]
+			base = 0 when probe.len() == 4 && le32(probe, 0) == sigCentral
+		}
+		fail "zip: central directory lies outside the data" when base + dirOffset + dirSize > size
+		let dir = try src.bytesAt(base + dirOffset, dirSize)
+
+		let at = 0
+		for let n = 0; n < count; n++ {
+			fail "zip: central directory is truncated" when at + 46 > dir.len()
+			fail "zip: bad central directory entry" when le32(dir, at) != sigCentral
+			let record = try parseCentral(dir, at, base, encoding)
+			at += 46 + le16(dir, at + 28) + le16(dir, at + 30) + le16(dir, at + 32)
+			arc.records.push(record)
+		}
+
+		for let r in arc.records {
+			if isLinkMode(r.entry.mode) && (r.flags & flagEncrypted == 0 || !opts.password.isEmpty()) {
+				r.entry.linkTarget = arc.linkTarget(r) onerror recover ""
+			}
+			arc.list.push(r.entry)
+		}
+		return arc
+	}
+
+	// One central directory header at `at`. Fails when it is truncated.
+	def parseCentral(dir byte[], at int, base int, encoding string) !ZipRecord {
+		let r = new ZipRecord()
+		let madeBy = le16(dir, at + 4)
+		r.flags = le16(dir, at + 8)
+		r.method = le16(dir, at + 10)
+		r.actualMethod = r.method
+		let dosTime = le16(dir, at + 12)
+		let dosDate = le16(dir, at + 14)
+		r.dosTime = dosTime
+		r.crc = le32(dir, at + 16)
+		r.packed = le32(dir, at + 20)
+		r.size = le32(dir, at + 24)
+		let nameLen = le16(dir, at + 28)
+		let extraLen = le16(dir, at + 30)
+		let commentLen = le16(dir, at + 32)
+		let external = le32(dir, at + 38)
+		r.offset = le32(dir, at + 42)
+		let nameAt = at + 46
+		let extraAt = nameAt + nameLen
+		let commentAt = extraAt + extraLen
+		fail "zip: central directory is truncated" when commentAt + commentLen > dir.len()
+
+		let rawName = dir[nameAt:extraAt]
+		let utf8 = r.flags & flagUTF8 != 0
+		let entry = Entry{
+			name: decodeName(rawName, utf8, encoding),
+			comment: decodeName(dir[commentAt:commentAt + commentLen], utf8, encoding),
+			crc32: uint32(r.crc),
+			modTime: dosToTime(dosDate, dosTime),
+			encrypted: r.flags & flagEncrypted != 0,
+			attributes: map<string, string>{},
+		}
+		entry.attributes["zip.externalAttrs"] = "{external}"
+
+		// Extra fields.
+		let x = extraAt
+		let extraEnd = extraAt + extraLen
+		for x + 4 <= extraEnd {
+			let id = le16(dir, x)
+			let len = le16(dir, x + 2)
+			let d = x + 4
+			break when d + len > extraEnd
+			match id {
+				case 0x0001:
+					let p = d
+					if r.size == max32 && p + 8 <= d + len {
+						r.size = le64(dir, p)
+						p += 8
+					}
+					if r.packed == max32 && p + 8 <= d + len {
+						r.packed = le64(dir, p)
+						p += 8
+					}
+					if r.offset == max32 && p + 8 <= d + len {
+						r.offset = le64(dir, p)
+						p += 8
+					}
+				case 0x5455:
+					entry.modTime = unixTime(signed32(le32(dir, d + 1))) when len >= 5 && int(dir[d]) & 1 != 0
+				case 0x5855:
+					if len >= 8 {
+						entry.accessTime = unixTime(signed32(le32(dir, d)))
+						entry.modTime = unixTime(signed32(le32(dir, d + 4)))
+					}
+					if len >= 12 {
+						entry.attributes["zip.uid"] = "{le16(dir, d + 8)}"
+						entry.attributes["zip.gid"] = "{le16(dir, d + 10)}"
+					}
+				case 0x7875:
+					if len >= 3 && int(dir[d]) == 1 {
+						let uidLen = int(dir[d + 1])
+						if d + 2 + uidLen < d + len {
+							entry.attributes["zip.uid"] = "{leVar(dir, d + 2, uidLen)}"
+							let gidLen = int(dir[d + 2 + uidLen])
+							entry.attributes["zip.gid"] = "{leVar(dir, d + 3 + uidLen, gidLen)}" when d + 3 + uidLen + gidLen <= d + len
+						}
+					}
+				case 0x000a:
+					// NTFS: 4 reserved bytes, then tagged attributes; tag 1
+					// holds the three FILETIMEs.
+					let p = d + 4
+					for p + 4 <= d + len {
+						let tag = le16(dir, p)
+						let size = le16(dir, p + 2)
+						if tag == 1 && size >= 24 && p + 28 <= d + len {
+							entry.modTime = fileTime(le64(dir, p + 4))
+							entry.accessTime = fileTime(le64(dir, p + 12))
+							entry.createTime = fileTime(le64(dir, p + 20))
+						}
+						p += 4 + size
+					}
+				case 0x7075:
+					entry.name = string(dir[d + 5:d + len]) when len >= 5 && int(dir[d]) == 1 && le32(dir, d + 1) == int(hash.crc32(rawName))
+				case 0x9901:
+					if len >= 7 {
+						r.aesVersion = le16(dir, d)
+						r.aesStrength = int(dir[d + 4])
+						r.actualMethod = le16(dir, d + 5)
+					}
+			}
+			x = d + len
+		}
+
+		// Unix hosts keep st_mode in the high half of the external attributes;
+		// everything else has only the MS-DOS attribute byte.
+		let host = madeBy >> 8
+		let unix = (external >> 16) & 0xFFFF
+		if (host := 3 || 19) && unix != 0 {
+			entry.mode = fromUnixMode(unix)
+		} else if external & 0x10 != 0 {
+			entry.mode = os.FileMode(int(os.FileMode.Dir) | 0o755)
+		} else {
+			entry.mode = os.FileMode(external & 0x01 != 0 ?? (0o444, 0o644))
+		}
+		entry.mode = os.FileMode(int(os.FileMode.Dir) | (int(entry.mode) & 0o777 | 0o700)) when entry.name.endsWith("/") && !isDirMode(entry.mode)
+		entry.method = methodName(r.actualMethod)
+		entry.size = uint64(r.size)
+		entry.compressedSize = uint64(r.packed)
+		r.offset += base
+		r.entry = entry
+		return r
+	}
+
+	// The lowercase name of a zip compression method.
+	def methodName(method int) string {
+		match method {
+			case 0:
+				return "store"
+			case 8:
+				return "deflate"
+			case 9:
+				return "deflate64"
+			case 12:
+				return "bzip2"
+			case 14:
+				return "lzma"
+			case 93:
+				return "zstd"
+			case 95:
+				return "xz"
+			case 98:
+				return "ppmd"
+		}
+		return "method{method}"
+	}
+
+	// A little-endian unsigned integer of `len` bytes (at most 8).
+	def leVar(b byte[], at int, len int) int {
+		let v = 0
+		for let i = len - 1; i >= 0; i-- {
+			v = (v << 8) | int(b[at + i])
+		}
+		return v
+	}
+
+	// A 32-bit field read as a signed value.
+	def signed32(v int) int {
+		return v >= 0x80000000 ?? (v - 0x100000000, v)
+	}
+
+	// A Windows FILETIME (100 ns ticks since 1601) as a Time.
+	def fileTime(ticks int) time.Time {
+		return time.fromUnixNs(int64(ticks - 116444736000000000) * 100)
+	}
+
+	// Days from 1970-01-01 to the given civil date.
+	def daysFromCivil(year int, month int, day int) int {
+		let y = month <= 2 ?? (year - 1, year)
+		let era = (y >= 0 ?? (y, y - 399)) / 400
+		let yoe = y - era * 400
+		let mp = (month + 9) % 12
+		let doy = (153 * mp + 2) / 5 + day - 1
+		let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+		return era * 146097 + doe - 719468
+	}
+
+	// An MS-DOS date and time, read as UTC.
+	def dosToTime(date int, clock int) time.Time {
+		return time.fromUnixNs(0) when date == 0
+		let year = 1980 + (date >> 9)
+		let month = (date >> 5) & 0xF
+		let day = date & 0x1F
+		month = 1 when month < 1 || month > 12
+		day = 1 when day < 1
+		let secs = daysFromCivil(year, month, day) * 86400 + (clock >> 11) * 3600 + ((clock >> 5) & 0x3F) * 60 + (clock & 0x1F) * 2
+		return unixTime(secs)
+	}
+
+	// The MS-DOS (date, time) of an instant in UTC, clamped to 1980..2107.
+	def timeToDos(t time.Time) (int, int) {
+		let year = t.year()
+		return (0x21, 0) when year < 1980
+		return ((127 << 9) | (12 << 5) | 31, (23 << 11) | (59 << 5) | 29) when year > 2107
+		let date = ((year - 1980) << 9) | (t.month() << 5) | t.day()
+		let clock = (t.hour() << 11) | (t.minute() << 5) | (t.second() / 2)
+		return (date, clock)
+	}
+
+	// Entry names and comments: UTF-8 when flagged or asked for, the chosen
+	// legacy code page otherwise. With no encoding given, text that is valid
+	// UTF-8 is read as such and anything else as code page 437.
+	def decodeName(raw byte[], utf8 bool, encoding string) string {
+		return "" when raw.len() == 0
+		let ascii = true
+		for let i = 0; i < raw.len(); i++ {
+			if int(raw[i]) >= 0x80 {
+				ascii = false
+				break
+			}
+		}
+		return string(raw) when ascii || utf8 || encoding == "utf8"
+		if encoding == "" {
+			let text = string(raw)
+			return text when text.isUTF8()
+		}
+		let latin = encoding := "latin1" || "iso88591"
+		return codepages.decode(raw, latin ?? (codepages.CodePage.Latin1, codepages.CodePage.CP437))
+	}
+
+	// Checks an entry's decoded bytes against its recorded size and CRC-32 and
+	// never reads past the size.
+	type CrcReader {
+		src       io.Reader
+		size      int
+		want      uint32
+		verifyCrc bool
+		name      string
+		seen      int
+		done      bool
+		crc       hash.CRC32
+
+		def new(src io.Reader, size int, want uint32, verifyCrc bool, name string) {
+			self.src = src
+			self.size = size
+			self.want = want
+			self.verifyCrc = verifyCrc
+			self.name = name
+			crc = new hash.CRC32()
+		}
+
+		// read implements io.Reader. Fails when the data is shorter than
+		// recorded, its CRC-32 does not match, or the source fails.
+		def read(buf byte[]) !int {
+			let left = size - seen
+			if left <= 0 {
+				try verify()
+				return 0
+			}
+			let take = buf.len() < left ?? (buf.len(), left)
+			return 0 when take == 0
+			let n = try src.read(buf[0:take])
+			fail "zip: entry " + name + " is truncated" when n <= 0
+			crc.write(buf[0:n])
+			seen += n
+			try verify() when seen == size
+			return n
+		}
+
+		// Runs the source to its end, so layers that check at the end of their
+		// input (the AES authentication code) do, then compares the CRC-32.
+		def verify() !none {
+			return none when done
+			done = true
+			let rest byte[]
+			rest.len(64)
+			for {
+				let n = try src.read(rest)
+				break when n <= 0
+			}
+			return none unless verifyCrc
+			let got = crc.checksum ^ 0xFFFFFFFF
+			fail "zip: CRC-32 mismatch in " + name when got != want
+			return none
+		}
+	}
+}

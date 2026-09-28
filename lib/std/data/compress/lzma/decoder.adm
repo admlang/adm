@@ -1,0 +1,389 @@
+internal partial module std.data.compress.lzma.core {
+	use std.io
+
+	// Offsets of the probability groups inside one uint16 array.
+	const (
+		probIsMatch    = 0
+		probIsRep      = 192
+		probIsRepG0    = 204
+		probIsRepG1    = 216
+		probIsRepG2    = 228
+		probIsRep0Long = 240
+		probPosSlot    = 432
+		probSpecPos    = 688
+		probAlign      = 802
+		probLen        = 818
+		probRepLen     = 1332
+		probLiteral    = 1846
+		lenLow         = 2
+		lenMid         = 130
+		lenHigh        = 258
+		probInit       = 1024
+		matchMinLen    = 2
+		endPosModel    = 14
+		numStates      = 12
+		minDictSize    = 4096
+	)
+
+	// LzmaDecoder decodes LZMA symbols from an Input into a sliding
+	// dictionary. The containers drive it: `decode` fills the dictionary up
+	// to a limit, `flush` hands the new bytes out.
+	type LzmaDecoder {
+		input  Input
+		probs  uint16[]
+		lc     int
+		lp     int
+		pb     int
+		lpMask int
+		pbMask int
+
+		// Range coder.
+		range uint32
+		code  uint32
+
+		// Dictionary: `pos` is where the next byte goes, `start` the first
+		// byte not handed out yet, `full` how many bytes are valid history.
+		dict     byte[]
+		dictSize int
+		pos      int
+		start    int
+		full     int
+		total    int64
+
+		state     int
+		rep0      uint32
+		rep1      uint32
+		rep2      uint32
+		rep3      uint32
+		// Bytes of the last match not copied yet.
+		pending   int
+		// Set once the end-of-payload marker was decoded.
+		sawMarker bool
+
+		def new(input Input) {
+			self.input = input
+		}
+
+		// Sets lc/lp/pb from the packed properties byte. Fails when it is out
+		// of range.
+		def useProps(props int) !none {
+			expects {
+				assert props < 9 * 5 * 5 onerror fail "lzma: invalid properties"
+			}
+			useProps(props % 9, (props / 9) % 5, props / 45)
+		}
+
+		def useProps(lc int, lp int, pb int) {
+			self.lc = lc
+			self.lp = lp
+			self.pb = pb
+			lpMask = (1 << lp) - 1
+			pbMask = (1 << pb) - 1
+			let n = probLiteral + (0x300 << (lc + lp))
+			probs.len(n) when probs.len() < n
+		}
+
+		// Allocates the dictionary; `sizeHint` is the total output when
+		// known (-1 otherwise), so small payloads do not reserve a large
+		// dictionary.
+		def allocDict(size int, sizeHint int64) {
+			let n = size
+			n = minDictSize when n < minDictSize
+			if sizeHint >= 0 && sizeHint < int64(n) {
+				n = int(sizeHint)
+				n = minDictSize when n < minDictSize
+			}
+			dictSize = n
+			// The buffer grows on demand up to the dictionary size.
+			let initial = n
+			initial = 1 << 20 when initial > 1 << 20
+			dict.len(initial) when dict.len() < initial
+			resetDict()
+		}
+
+		def resetDict() {
+			pos = 0
+			start = 0
+			full = 0
+			total = 0
+			pending = 0
+		}
+
+		// Resets the coder state and every probability.
+		def resetState() {
+			let n = probLiteral + (0x300 << (lc + lp))
+			for let i = 0; i < n; i++ {
+				probs[i] = probInit
+			}
+			state = 0
+			rep0 = 0
+			rep1 = 0
+			rep2 = 0
+			rep3 = 0
+			pending = 0
+			sawMarker = false
+		}
+
+		// Starts the range coder. Fails when the first byte is not zero.
+		def rcInit() !none {
+			fail "lzma: corrupt range coder header" when input.next() != 0
+			code = 0
+			range = 0xFFFFFFFF
+			for let i = 0; i < 4; i++ {
+				code = (code << 8) | uint32(input.next())
+			}
+			try input.verify()
+			fail "lzma: corrupt range coder header" when code == range
+		}
+
+		// Whether the range coder ended cleanly, as it does after the last
+		// symbol of a chunk or stream.
+		def rcFinished() bool {
+			return code == 0
+		}
+
+		def bit(i int) int {
+			let p = uint32(probs[i])
+			let bound = (range >> 11) * p
+			let b = 0
+			if code < bound {
+				range = bound
+				probs[i] = uint16(p + ((2048 - p) >> 5))
+			} else {
+				range -= bound
+				code -= bound
+				probs[i] = uint16(p - (p >> 5))
+				b = 1
+			}
+			if range < 0x1000000 {
+				range <<= 8
+				code = (code << 8) | uint32(input.next())
+			}
+			return b
+		}
+
+		def tree(base int, numBits int) int {
+			let m = 1
+			for let i = 0; i < numBits; i++ {
+				m = (m << 1) + bit(base + m)
+			}
+			return m - (1 << numBits)
+		}
+
+		def reverseTree(base int, numBits int) int {
+			let m = 1
+			let sym = 0
+			for let i = 0; i < numBits; i++ {
+				let b = bit(base + m)
+				m = (m << 1) + b
+				sym |= b << i
+			}
+			return sym
+		}
+
+		def direct(numBits int) uint32 {
+			let result = uint32(0)
+			for let i = 0; i < numBits; i++ {
+				range >>= 1
+				let b = uint32(0)
+				if code >= range {
+					code -= range
+					b = 1
+				}
+				result = (result << 1) | b
+				if range < 0x1000000 {
+					range <<= 8
+					code = (code << 8) | uint32(input.next())
+				}
+			}
+			return result
+		}
+
+		def length(base int, posState int) int {
+			return matchMinLen + tree(base + lenLow + (posState << 3), 3) when bit(base) == 0
+			return matchMinLen + 8 + tree(base + lenMid + (posState << 3), 3) when bit(base + 1) == 0
+			return matchMinLen + 16 + tree(base + lenHigh, 8)
+		}
+
+		def distance(len int) uint32 {
+			let lenState = len - matchMinLen
+			lenState = 3 when lenState > 3
+			let slot = tree(probPosSlot + (lenState << 6), 6)
+			return uint32(slot) when slot < 4
+			let numDirect = (slot >> 1) - 1
+			let dist = uint32((2 | (slot & 1)) << numDirect)
+			return dist + uint32(reverseTree(probSpecPos + int(dist) - slot - 1, numDirect)) when slot < endPosModel
+			dist += direct(numDirect - 4) << 4
+			return dist + uint32(reverseTree(probAlign, 4))
+		}
+
+		// The byte `dist + 1` positions back.
+		def back(dist uint32) byte {
+			let i = pos - int(dist) - 1
+			i += dictSize when i < 0
+			return dict[i]
+		}
+
+		def putByte(b byte) {
+			dict[pos] = b
+			pos++
+			full++ when full < dictSize
+			total++
+		}
+
+		// Copies up to `pending` bytes of the current match, stopping at
+		// `limit`.
+		def copyMatch(limit int) {
+			let n = pending
+			n = limit - pos when limit - pos < n
+			let src = pos - int(rep0) - 1
+			src += dictSize when src < 0
+			pending -= n
+			total += int64(n)
+			if src + n <= dictSize && (src + n <= pos || src >= pos + n) {
+				(dict[src:src + n]).copy(dict[pos:pos + n])
+				pos += n
+				full = (full + n > dictSize) ?? (dictSize, full + n)
+				return
+			}
+			for let i = 0; i < n; i++ {
+				dict[pos] = dict[src]
+				pos++
+				src++
+				src = 0 when src == dictSize
+			}
+			full = (full + n > dictSize) ?? (dictSize, full + n)
+		}
+
+		// Decodes symbols until the dictionary reaches `limit` or `budget`
+		// more bytes were produced. Stops early at an end marker when
+		// `allowMarker` is set. Fails on corrupt data or when the input ends.
+		def decode(limit int, budget int64, allowMarker bool) !none {
+			let end = limit
+			end = pos + int(budget) when budget >= 0 && int64(end - pos) > budget
+			copyMatch(end) when pending > 0
+			for pos < end {
+				let posState = int(total) & pbMask
+				let s = state
+				if bit(probIsMatch + (s << 4) + posState) == 0 {
+					// Literal.
+					let prev = 0
+					prev = int(back(0)) when full > 0
+					let base = probLiteral + 0x300 * (((int(total) & lpMask) << lc) + (prev >> (8 - lc)))
+					let sym = 1
+					if s >= 7 {
+						let matchByte = int(back(rep0))
+						let offset = 0x100
+						for sym < 0x100 {
+							matchByte <<= 1
+							let matchBit = matchByte & offset
+							let b = bit(base + offset + matchBit + sym)
+							sym = (sym << 1) | b
+							if b == 1 {
+								offset &= matchBit
+							} else {
+								offset &= ~matchBit
+							}
+						}
+					} else {
+						for sym < 0x100 {
+							sym = (sym << 1) | bit(base + sym)
+						}
+					}
+					putByte(byte(sym))
+					state = (s < 4) ?? (0, (s < 10) ?? (s - 3, s - 6))
+					continue
+				}
+				let len = 0
+				if bit(probIsRep + s) == 0 {
+					len = length(probLen, posState)
+					state = (s < 7) ?? (7, 10)
+					let dist = distance(len)
+					if dist == 0xFFFFFFFF {
+						try input.verify()
+						fail "lzma: unexpected end marker" unless allowMarker
+						sawMarker = true
+						return none
+					}
+					rep3 = rep2
+					rep2 = rep1
+					rep1 = rep0
+					rep0 = dist
+				} else {
+					fail "lzma: corrupt data" when full == 0
+					if bit(probIsRepG0 + s) == 0 {
+						if bit(probIsRep0Long + (s << 4) + posState) == 0 {
+							state = (s < 7) ?? (9, 11)
+							putByte(back(rep0))
+							continue
+						}
+					} else {
+						let dist = uint32(0)
+						if bit(probIsRepG1 + s) == 0 {
+							dist = rep1
+						} else {
+							if bit(probIsRepG2 + s) == 0 {
+								dist = rep2
+							} else {
+								dist = rep3
+								rep3 = rep2
+							}
+							rep2 = rep1
+						}
+						rep1 = rep0
+						rep0 = dist
+					}
+					len = length(probRepLen, posState)
+					state = (s < 7) ?? (8, 11)
+				}
+				if int64(rep0) >= int64(full) {
+					try input.verify()
+					fail "lzma: match distance beyond the dictionary"
+				}
+				pending = len
+				copyMatch(end)
+			}
+			try input.verify()
+		}
+
+		// Copies an uncompressed run of n bytes from the input into the
+		// dictionary, up to `limit`; returns how many were copied. Fails when
+		// the input ends.
+		def copyStored(limit int, n int) !int {
+			let k = n
+			k = limit - pos when limit - pos < k
+			try input.readFull(dict[pos:pos + k])
+			pos += k
+			total += int64(k)
+			full = (full + k > dictSize) ?? (dictSize, full + k)
+			return k
+		}
+
+		// Copies decoded bytes not handed out yet into p from index n and
+		// returns the new index; wraps the dictionary once all of it was
+		// handed out.
+		def flush(p byte[], n int) int {
+			let k = (dict[start:pos]).copy(p[n:])
+			start += k
+			if start == dictSize && pos == dictSize {
+				start = 0
+				pos = 0
+			}
+			return n + k
+		}
+
+		// The furthest the dictionary may be filled for a read that has room
+		// for `room` more bytes.
+		def limitFor(room int) int {
+			let l = start + room
+			l = dictSize when l > dictSize
+			if l > dict.len() {
+				let grown = dict.len() * 2
+				grown = l when grown < l
+				grown = dictSize when grown > dictSize
+				dict.len(grown)
+			}
+			return l
+		}
+	}
+}
