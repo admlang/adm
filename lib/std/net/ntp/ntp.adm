@@ -1,0 +1,189 @@
+partial module std.net.ntp {
+	use (
+		std.data.encoding::(hexdecode)
+		std.errors
+		std.os
+		std.time
+	)
+
+	// NTP and SNTP (RFC 5905, RFC 4330): `Client` asks one server what
+	// time it is, `Clock` follows several servers the way ntpd does (clock
+	// filter, selection, clustering, combining) and gives the corrected
+	// time, `Server` answers clients from the local clock or from a
+	// `Clock`. Symmetric keys (MD5, SHA-1, AES-128-CMAC) authenticate
+	// either side.
+	//
+	// ```
+	// let answer = try new ntp.Client("pool.ntp.org").query()
+	// println("local clock is off by {answer.offset}")
+	// ```
+
+	// Leap is a server's leap second warning for the end of the current
+	// UTC day, or `Unsynchronized` when its clock is not set.
+	enum Leap {
+		None = 0,
+		AddSecond = 1,
+		DeleteSecond = 2,
+		Unsynchronized = 3
+	}
+
+	// KeyAlgorithm is the digest of a symmetric key: the MD5 and SHA-1
+	// digests over key and packet of RFC 5905, or AES-128-CMAC (RFC 8573).
+	enum KeyAlgorithm {
+		MD5,
+		SHA1,
+		AES128CMAC
+	}
+
+	// Key is a symmetric key both ends know by `id`.
+	struct Key {
+		id        int64
+		algorithm KeyAlgorithm   = KeyAlgorithm.AES128CMAC
+		secret    Secret<byte[]>
+	}
+
+	// A key from text: ASCII as given, or `HEX:` followed by hex digits
+	// (the chrony and ntpd key file forms). Fails on bad hex, or an
+	// AES-128-CMAC key that is not 16 bytes.
+	def key(id int64, algorithm KeyAlgorithm, secret string) !Key {
+		let raw = secret.bytes()
+		if secret.startsWith("HEX:") {
+			raw = hexdecode(secret[4:]) onerror (err error) {
+				fail NtpError{message: "ntp: bad hex key", code: "config", cause: err}
+			}
+		}
+		fail NtpError{message: "ntp: an AES-128-CMAC key has 16 bytes, not {raw.len()}", code: "config"} when algorithm == KeyAlgorithm.AES128CMAC && raw.len() != 16
+		return Key{id: id, algorithm: algorithm, secret: raw}
+	}
+
+	// The keys of a chrony or ntpd key file: one `id type secret` per
+	// line, `#` comments. Types: MD5 or M, SHA1, AES128 or AES128CMAC; a
+	// 40-character secret is hex in ntpd's form. Fails on a line it cannot
+	// read.
+	def parseKeys(text string) !Key[] {
+		let out Key[] = []
+		for let raw in text.split("\n") {
+			let line = raw
+			let hash = line.indexOf("#")
+			line = line[:hash] when hash >= 0
+			let fields = line.trim().split(" ").filter(f => f != "")
+			continue when fields.len() == 0
+			fail NtpError{message: "ntp: bad key line \"{raw.trim()}\"", code: "config"} when fields.len() < 3 || !fields[0].isNumeric()
+			let kind = fields[1].upper()
+			let algorithm = KeyAlgorithm.MD5
+			switch {
+				case kind == "MD5" || kind == "M":
+					algorithm = KeyAlgorithm.MD5
+				case kind == "SHA1":
+					algorithm = KeyAlgorithm.SHA1
+				case kind == "AES128" || kind == "AES128CMAC" || kind == "AES-128-CMAC":
+					algorithm = KeyAlgorithm.AES128CMAC
+				default:
+					fail NtpError{message: "ntp: unsupported key type {fields[1]}", code: "config"}
+			}
+			let secret = fields[2]
+			// ntpd writes 40 hex digits for keys longer than 20 characters.
+			secret = "HEX:" + secret when !secret.startsWith("HEX:") && !secret.startsWith("ASCII:") && secret.len() == 40 && isHex(secret)
+			secret = secret[6:] when secret.startsWith("ASCII:")
+			out.push(try key(fields[0].toInt<int64>(), algorithm, secret))
+		}
+		return out
+	}
+
+	// parseKeys of a key file. Fails when the file cannot be read or a
+	// line cannot be parsed.
+	def loadKeys(path string) !Key[] {
+		return try parseKeys(string(try os.readFile(path)))
+	}
+
+	// Response is one server's answer, as the client measured it.
+	struct Response {
+		// Who answered (`host:port`).
+		server         string
+		// How far the local clock is behind the server: add it to the
+		// local time to get the server's.
+		offset         duration  = 0s
+		// The round trip, less the server's own processing time.
+		delay          duration  = 0s
+		// The server's time when the answer arrived (local time plus
+		// `offset`).
+		serverTime     time.Time
+		stratum        int       = 0
+		leap           Leap      = Leap.None
+		version        int       = 4
+		// log2 of the server's clock precision in seconds (-20 is about a
+		// microsecond).
+		precision      int       = 0
+		// The server's round trip and dispersion to its primary reference.
+		rootDelay      duration  = 0s
+		rootDispersion duration  = 0s
+		// Four letters (GPS, PPS, LOCL...) at stratum 1, else the upstream
+		// server's IPv4 address or IPv6 hash as dotted numbers.
+		referenceId    string    = ""
+		// When the server's clock was last set.
+		referenceTime  time.Time
+		// Whether a MAC under the client's key checked out.
+		authenticated  bool      = false
+	}
+
+	// The worst error the answer may carry: half the root delay plus the
+	// root dispersion, plus half this exchange's delay (RFC 5905 §11.2).
+	def rootDistance(r Response) duration {
+		return duration((int64(r.rootDelay) + int64(r.delay)) / 2) + r.rootDispersion
+	}
+
+	// SourceState is where the selection left a `Clock`'s server.
+	enum SourceState {
+		// The system peer: the clock follows it first.
+		Selected,
+		// Survived selection and clustering; combined into the offset.
+		Candidate,
+		// Its interval does not overlap the majority's.
+		Falseticker,
+		// Dropped by clustering for its jitter.
+		Outlier,
+		// Answers, but cannot be used (unsynchronized, too far, or a
+		// Kiss-o'-Death).
+		Unusable,
+		// No answer to the last eight polls.
+		Unreachable
+	}
+
+	// Source is one of a `Clock`'s servers, as its last selection saw it.
+	struct Source {
+		server      string
+		state       SourceState = SourceState.Unreachable
+		stratum     int         = 0
+		offset      duration    = 0s
+		delay       duration    = 0s
+		// Root mean square of the offset differences in the filter.
+		jitter      duration    = 0s
+		dispersion  duration    = 0s
+		// Which of the last eight polls were answered, newest in bit 0.
+		reach       int         = 0
+		// log2 of the seconds between polls.
+		poll        int         = 6
+		referenceId string      = ""
+		// The last failure or kiss code ("RATE", "DENY"...), "" when none.
+		lastError   string      = ""
+	}
+
+	// NtpError is the payload of an NTP failure. `code` is `timeout`,
+	// `protocol`, `unsynchronized`, `kiss` (with `kiss` set to the
+	// server's code), `auth`, `config` or `closed`.
+	struct NtpError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		// The Kiss-o'-Death code ("RATE", "DENY", "RSTR"...), "" when none.
+		kiss    string            = ""
+	}
+
+	internal def isHex(s string) bool {
+		for let c in s.lower() {
+			return false unless (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		}
+		return true
+	}
+}

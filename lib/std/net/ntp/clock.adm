@@ -1,0 +1,503 @@
+partial module std.net.ntp {
+	use (
+		std.crypto.hash::(Hash, digest)
+		std.net
+		std.net.ntp.proto::*
+		std.net.tls
+		std.net.udp
+		std.services::(Policy)
+		std.time
+	)
+
+	// Clock follows several NTP servers the way ntpd does (RFC 5905): each
+	// server's answers go through the clock filter, Marzullo's
+	// intersection throws out falsetickers, clustering drops outliers, and
+	// the survivors' offsets are combined by their root distance. `now()`
+	// is the local clock corrected by that offset and by the drift
+	// measured between polls; the operating system clock is left alone.
+	// Polls back off from 2^minPoll to 2^maxPoll seconds while answers
+	// agree. A `Server` can serve a `Clock`'s time to others.
+	//
+	// ```
+	// let clock = new ntp.Clock(["time.cloudflare.com", "time.google.com", "ntp.ubuntu.com"])
+	// try clock.sync()
+	// clock.start()
+	// println("{clock.now()} (off by {clock.offset()})")
+	// ```
+	type Clock {
+		// Servers, each followed at its first address.
+		servers                          string[] = []
+		// Pool names, each expanded to up to `poolSize` addresses.
+		pools                            string[] = []
+		poolSize                         int      = 4
+		// Signs requests and requires signed answers from every server.
+		key                              ?Key     = none
+		version                          int      = 4
+		// log2 of the shortest and longest seconds between polls.
+		minPoll                          int      = 6
+		maxPoll                          int      = 10
+		// Exchanges per server in `sync` and at start, `burstInterval`
+		// apart.
+		burst                            int      = 4
+		burstInterval                    duration = 2s
+		// How long to wait for each answer.
+		timeout                          duration = 2s
+		// Network Time Security for every server (see `Client.nts`): a key
+		// exchange with each first, and only authenticated answers count.
+		nts                              bool     = false
+		ntsPort                          int      = 4460
+		// TLS settings for the key exchanges; none verifies each server
+		// against the system roots under its name.
+		tls                              ?tls.Config = none
+		internal peers                   Peer[]   = []
+		internal broadcasts              ?udp.Server = none
+		internal atomic listening        bool     = false
+		internal atomic running          bool     = false
+		internal atomic synced           bool     = false
+		internal atomic baseOffset       float    = 0.0
+		internal atomic baseAt           float    = 0.0
+		internal atomic frequency        float    = 0.0
+		internal atomic jitterNow        float    = 0.0
+		internal atomic system           PeerInfo = PeerInfo{}
+		internal atomic systemPeer       string   = ""
+		internal atomic systemDelay      float    = 0.0
+		internal atomic systemDispersion float    = 0.0
+
+		def new(servers string[]) {
+			self.servers = servers
+		}
+
+		// A clock on one server.
+		def new(server string) {
+			servers = [server]
+		}
+
+		// A clock on pool.ntp.org.
+		def new() {
+			pools = ["pool.ntp.org"]
+		}
+
+		// Polls every server `burst` times now and selects. Fails with
+		// NtpError `unsynchronized` when no majority of servers agrees
+		// (or none answers), with PolicyDenied when the policy denies a
+		// server, or when a name does not resolve.
+		def sync() !none {
+			try resolvePeers()
+			for let i = 0; i < burst; i++ {
+				time.sleep(burstInterval) when i > 0
+				for let p in peersNow() {
+					pollPeer(p)
+				}
+			}
+			update()
+			fail NtpError{message: "ntp: no majority of servers agrees on the time", code: "unsynchronized"} unless synced
+			return none
+		}
+
+		// Polls every server once now and selects again, for a caller that
+		// keeps its own schedule. Never fails: an unanswered poll counts
+		// against the server's reach.
+		def poll() {
+			for let p in peersNow() {
+				pollPeer(p)
+			}
+			update()
+		}
+
+		// Keeps polling in the background until `close`: a burst first
+		// unless `sync` already ran, then each server at its own poll
+		// interval. Fails as `sync` does when a name does not resolve or
+		// the policy denies a server; unanswered polls only count against
+		// reach.
+		def start() !none {
+			return none when running
+			try resolvePeers()
+			running = true
+			let task = async pollForever(!synced)
+			task.keepAlive()
+			return none
+		}
+
+		// Stops polling and listening. The last offset stays in use. Never
+		// fails.
+		def close() !none {
+			running = false
+			listening = false
+			let b = broadcasts
+			broadcasts = none
+			if !(b is none) {
+				b.close() onerror recover none
+			}
+			return none
+		}
+
+		// Follows servers that broadcast (RFC 5905 broadcast client):
+		// listens on `addr` and takes each sender as a server. A sender's
+		// first broadcast is calibrated by one client-mode exchange with
+		// it, which measures the delay; later broadcasts give offset =
+		// T3 − T4 + delay/2 and go through the same filter and selection
+		// as polled servers. With `key` set only broadcasts signed with it
+		// count. Fails with PolicyDenied or NetError when `addr` cannot be
+		// bound.
+		def listenBroadcasts(addr string = ":123") !none {
+			return none when listening
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "ntp://" + addr)
+			let s = new udp.Server(addr)
+			try s.start()
+			broadcasts = s
+			listening = true
+			let task = async hearBroadcasts(s)
+			task.keepAlive()
+			return none
+		}
+
+		// The address broadcasts are heard on, once listening.
+		def broadcastAddress() net.Address {
+			let b = broadcasts
+			return b is none ?? (new net.Address(), b.address())
+		}
+
+		internal def hearBroadcasts(s udp.Server) {
+			let buf byte[] = []
+			buf.len(2048)
+			for listening {
+				let failed = false
+				let (n, from) = s.recv(buf, 1s) onerror (err error) {
+					failed = true
+					recover (0, new net.Address())
+				}
+				continue when failed || n < 48
+				let arrived = time.now()
+				let arrivedMono = monoSeconds()
+				let data = buf[:n].clone()
+				let p = decodePacket(data) onerror recover Packet{mode: 0}
+				continue unless p.mode == modeBroadcast && p.leap != 3 && p.stratum > 0 && p.stratum < maxStratum
+				let k = key
+				continue unless k is none || macValid(k, data, p)
+				heardBroadcast(from.str(), p, arrived, arrivedMono)
+			}
+		}
+
+		// One broadcast from `sender`: a calibration exchange first, then
+		// a sample from the broadcast itself.
+		internal def heardBroadcast(sender string, p Packet, arrived time.Time, arrivedMono float) {
+			let peer = broadcastPeer(sender)
+			if peer.broadcastDelay < 0.0 {
+				let failed ?error = none
+				let m = exchange(sender, version, key, timeout) onerror (err error) {
+					failed = err
+					recover Measured{packet: Packet{}, arrived: time.now()}
+				}
+				record(peer, m, failed)
+				peer.broadcastDelay = m.delay when failed is none
+				update()
+				return
+			}
+			let offset = stampDiff(p.transmit, stampOf(arrived)) + peer.broadcastDelay / 2.0
+			let dispersion = precisionSeconds(localPrecision) + precisionSeconds(p.precision)
+			record(peer, Measured{packet: p, offset: offset, delay: peer.broadcastDelay, dispersion: dispersion, at: arrivedMono, arrived: arrived, authenticated: !(key is none)}, none)
+			update()
+		}
+
+		// The peer of a broadcasting server, added on its first broadcast.
+		internal atomic def broadcastPeer(sender string) Peer {
+			for let p in peers {
+				return p when p.address == sender
+			}
+			let made = new Peer(sender)
+			made.poll = minPoll
+			made.broadcaster = true
+			peers.push(made)
+			return made
+		}
+
+		// The corrected time: the local clock plus the combined offset and
+		// the drift since the last update. The local time while not
+		// synchronized.
+		def now() time.Time {
+			return time.now() + offset()
+		}
+
+		// How far the local clock is behind the servers' time.
+		def offset() duration {
+			return 0s unless synced
+			let elapsed = monoSeconds() - baseAt
+			return secondsToDuration(baseOffset + frequency * elapsed)
+		}
+
+		// The local clock's drift the clock measured, in parts per million
+		// (positive when it runs slow).
+		def drift() float {
+			return frequency * 1000000.0
+		}
+
+		// Whether a majority of servers agreed at the last update.
+		def synchronized() bool {
+			return synced
+		}
+
+		// Waits until the clock is synchronized. Fails with NtpError
+		// `timeout` when `limit` passes first.
+		def waitSynchronized(limit duration) !none {
+			let deadline = time.now() + limit
+			for !synced {
+				fail NtpError{message: "ntp: not synchronized within {limit}", code: "timeout"} when time.now() > deadline
+				time.sleep(50ms)
+			}
+			return none
+		}
+
+		// Every server with its filter's figures and selection's verdict.
+		def sources() Source[] {
+			let out Source[] = []
+			for let p in peersNow() {
+				out.push(Source{
+					server:      p.address,
+					state:       sourceStateOf(p.state),
+					stratum:     p.info.stratum,
+					offset:      secondsToDuration(p.offset),
+					delay:       secondsToDuration(p.delay),
+					jitter:      secondsToDuration(p.jitter),
+					dispersion:  secondsToDuration(p.dispersion),
+					reach:       p.reach,
+					poll:        p.poll,
+					referenceId: referenceText(p.info.stratum, p.info.referenceId),
+					lastError:   p.lastError,
+				})
+			}
+			return out
+		}
+
+		// The clock's stratum: one more than the selected server's, 16
+		// while not synchronized.
+		def stratum() int {
+			return 16 unless synced
+			return system.stratum + 1
+		}
+
+		// The selected server's leap warning; `Unsynchronized` while not
+		// synchronized.
+		def leap() Leap {
+			return Leap.Unsynchronized unless synced
+			return leapOf(system.leap)
+		}
+
+		// Round trip to the primary reference through the selected server.
+		def rootDelay() duration {
+			return secondsToDuration(system.rootDelay + systemDelay)
+		}
+
+		// The error bound to the primary reference (RFC 5905 §11.3).
+		def rootDispersion() duration {
+			return secondsToDuration(system.rootDispersion + systemDispersion + jitterNow + (baseOffset < 0.0 ?? (-baseOffset, baseOffset)))
+		}
+
+		// The selected server as an NTP reference id: its IPv4 address, or
+		// the first four bytes of the MD5 of its IPv6 address, dotted.
+		def referenceId() string {
+			return "" unless synced
+			return referenceText(2, referenceBytes(systemPeer))
+		}
+
+		// When the clock last updated from its servers.
+		def referenceTime() time.Time {
+			return time.now() - secondsToDuration(monoSeconds() - baseAt)
+		}
+
+		// ---- internals ----
+
+		internal def resolvePeers() !none {
+			return none when peersNow().len() > 0
+			let found Peer[] = []
+			for let s in servers {
+				let target = try resolveTarget(s)
+				try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "ntp://" + target)
+				let p = new Peer(target)
+				p.name = s
+				found.push(p)
+			}
+			for let name in pools {
+				for let target in try resolveAll(name, poolSize) {
+					try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "ntp://" + target)
+					let p = new Peer(target)
+					p.name = name
+					found.push(p)
+				}
+			}
+			fail NtpError{message: "ntp: no servers", code: "config"} when found.len() == 0
+			for let p in found {
+				p.poll = minPoll
+			}
+			adoptPeers(found)
+			return none
+		}
+
+		internal atomic def peersNow() Peer[] {
+			return peers
+		}
+
+		internal atomic def adoptPeers(found Peer[]) {
+			peers = found when peers.len() == 0
+		}
+
+		// One exchange with one server, into its filter.
+		internal def pollPeer(p Peer) {
+			return when p.banned || p.broadcaster
+			let failed ?error = none
+			let session = nts ?? (peerSession(p) onerror (err error) {
+				failed = err
+				recover none
+			}, none)
+			if !(failed is none) {
+				record(p, Measured{packet: Packet{}, arrived: time.now()}, failed)
+				return
+			}
+			let m = exchange(p.address, version, key, timeout, session) onerror (err error) {
+				failed = err
+				recover Measured{packet: Packet{}, arrived: time.now()}
+			}
+			let err = failed
+			// An NTS NAK or no cookies left: a new key exchange next time.
+			p.session = none when !(err is none) && err is NtpError && err.code == "nts"
+			record(p, m, failed)
+		}
+
+		// The NTS session with a server, a key exchange with it first when
+		// there is none. Fails when the key exchange does.
+		internal def peerSession(p Peer) !?NtsSession {
+			let s = p.session
+			return s unless s is none
+			let named = net.parseAddress(net.withPort(p.name == "" ?? (p.address, p.name), 123)) onerror recover new net.Address()
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "ntske://" + net.withPort(named.host, ntsPort))
+			let made = try ntsKeyExchange(named.host, ntsPort, tls, timeout)
+			p.session = made
+			return made
+		}
+
+		internal atomic def record(p Peer, m Measured, failed ?error) {
+			let err = failed
+			if !(err is none) {
+				p.polled(false)
+				p.lastError = err.message
+				if err is NtpError && err.code == "kiss" {
+					p.lastError = err.kiss
+					// RATE: slow down; DENY and RSTR: stop asking.
+					p.banned = err.kiss := "DENY" || "RSTR"
+					p.poll = p.poll + 1 when p.poll < maxPoll
+				}
+				return
+			}
+			p.polled(true)
+			p.lastError = ""
+			let packet = m.packet
+			p.info = PeerInfo{stratum: packet.stratum, leap: packet.leap, precision: packet.precision, rootDelay: packet.rootDelay, rootDispersion: packet.rootDispersion, referenceId: packet.referenceId, reference: packet.reference}
+			let before = p.offset
+			let hadSamples = p.samples.len() > 0
+			p.add(Sample{offset: m.offset, delay: m.delay, dispersion: m.dispersion, at: m.at}, m.at)
+			// Answers that agree let the poll interval grow; a jump shrinks it.
+			let change = p.offset - before
+			change = -change when change < 0.0
+			if hadSamples && change > 4.0 * p.jitter + 0.001 {
+				p.poll = p.poll - 1 when p.poll > minPoll
+			} else if hadSamples {
+				p.poll = p.poll + 1 when p.poll < maxPoll
+			}
+		}
+
+		// Selection over every server, and the new offset and drift.
+		internal atomic def update() {
+			let now = monoSeconds()
+			let sel = selectPeers(peers, now)
+			if sel.survivors.len() == 0 {
+				synced = false
+				return
+			}
+			let best = sel.survivors[0]
+			if synced {
+				let span = now - baseAt
+				if span > 1.0 {
+					let predicted = baseOffset + frequency * span
+					let residual = sel.offset - predicted
+					let next = frequency + residual / span / 4.0
+					next = 0.0005 when next > 0.0005
+					next = -0.0005 when next < -0.0005
+					frequency = next
+				}
+			}
+			baseOffset = sel.offset
+			baseAt = now
+			jitterNow = sel.jitter
+			system = best.info
+			systemPeer = best.address
+			systemDelay = best.delay
+			systemDispersion = best.dispersion + phi * (now - best.updated)
+			synced = true
+		}
+
+		internal def pollForever(burstFirst bool) {
+			if burstFirst {
+				for let i = 0; i < burst && running; i++ {
+					time.sleep(burstInterval) when i > 0
+					for let p in peersNow() {
+						pollPeer(p)
+					}
+					update()
+				}
+			}
+			let due map<string, float> = map<string, float>{}
+			for running {
+				let now = monoSeconds()
+				let polled = false
+				for let p in peersNow() {
+					let at = due.get(p.address)
+					if at is none {
+						due[p.address] = now + float(int64(1) << p.poll)
+						continue
+					}
+					continue when now < at
+					pollPeer(p)
+					polled = true
+					due[p.address] = monoSeconds() + float(int64(1) << p.poll)
+				}
+				update() when polled
+				time.sleep(1s)
+			}
+		}
+
+		// Names the clock and its servers.
+		def str() string {
+			return "ntp.Clock({(servers + pools).join(", ")})"
+		}
+	}
+
+	internal def sourceStateOf(state int) SourceState {
+		return SourceState.Selected when state == 0
+		return SourceState.Candidate when state == 1
+		return SourceState.Falseticker when state == 2
+		return SourceState.Outlier when state == 3
+		return SourceState.Unusable when state == 4
+		return SourceState.Unreachable
+	}
+
+	// The reference id of an upstream server (RFC 5905 §7.3): its IPv4
+	// address, or the first four bytes of the MD5 of its IPv6 address.
+	internal def referenceBytes(target string) byte[] {
+		let host = target
+		if host.startsWith("[") {
+			host = host[1:host.indexOf("]")]
+		} else if host.split(":").len() == 2 {
+			host = host.split(":")[0]
+		}
+		if !host.contains(":") {
+			let parts = host.split(".")
+			if parts.len() == 4 {
+				let out byte[] = []
+				for let part in parts {
+					out.push(byte(part.toInt<int>()))
+				}
+				return out
+			}
+		}
+		return digest(Hash.MD5, host.bytes())[:4]
+	}
+}

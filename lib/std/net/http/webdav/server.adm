@@ -1,4 +1,1875 @@
 partial module std.net.http.webdav {
-	// Server is the WebDAV server; it has no members yet.
-	type Server {}
+	use (
+		std.bytes
+		std.crypto::(UUID)
+		std.data.encoding::(XML, XMLNode, XMLNodeKind, htmlEncode)
+		std.formats
+		std.fs
+		std.io
+		std.metrics
+		std.net.http::(Context, Method, serveContent)
+		std.net.http.webdav.proto::*
+		std.services::(metric)
+		std.time
+	)
+
+	// Server serves an `fs.FileStore` as a WebDAV share (RFC 4918 class 1
+	// and 2): GET/HEAD with ranges and conditionals, PUT, DELETE, MKCOL,
+	// COPY, MOVE, PROPFIND (every live property, dead properties, depth
+	// 0, 1 and infinity), PROPPATCH, LOCK and UNLOCK with exclusive and
+	// shared write locks, and the `If` header. Implements `http.Handler`:
+	// mount it under `prefix` and wrap it in `http.basicAuth` to ask for
+	// credentials.
+	//
+	// ```
+	// let dav = new webdav.Server(new fs.DiskStore("/srv/share"), "/dav")
+	// let mux = new http.ServeMux()
+	// mux.handle("/dav/", dav)
+	// try new http.Server(":8080", mux).listenAndServe()
+	// ```
+	type Server {
+		store fs.FileStore
+		// The URL path the share is mounted at ("" for the root); hrefs
+		// in answers start with it.
+		prefix string = ""
+		// Refuse every change (405 to PUT, DELETE, MKCOL, MOVE, PROPPATCH,
+		// LOCK...).
+		readOnly bool = false
+		// An HTML listing for GET on a collection; 405 otherwise.
+		listDirectories bool = true
+		// The longest lock a client may take; also the timeout of an
+		// `Infinite` request.
+		maxLockTimeout duration = 24h
+		// Bytes the share may hold (RFC 4331), 0 for no quota: a PUT that
+		// would pass it is refused with 507, and collections report
+		// `quota-used-bytes` and `quota-available-bytes`.
+		quota int64 = 0
+		// Access control (RFC 3744): when on, each request is checked
+		// against the ACLs of the resources it touches, for the user the
+		// authentication middleware named (`ctx.user`). A resource's
+		// entries (`setAcl`, or a client's ACL request) come before those
+		// it inherits from the collections above it; the user who created
+		// a resource owns it and holds every privilege on it.
+		accessControl bool = false
+		// The entries of the share's root until some are set: every
+		// authenticated user may do anything.
+		rootAcl Ace[] = [Ace{principal: "authenticated", privileges: [Privilege.All]}]
+		// The store path the principals (users and groups) appear at when
+		// access control is on; it hides whatever the store holds there.
+		principalPath string = "/principals"
+		internal changes ChangeLog
+		internal acls AclTable
+		internal principals Principals
+		internal orders OrderTable
+		internal locks LockTable
+		internal dead DeadProps
+		@metric("net.webdav.server.requests")
+		internal requests metrics.Counter
+
+		def new(store fs.FileStore, prefix string = "") {
+			self.store = store
+			self.prefix = prefix.trimSuffix("/")
+			locks = new LockTable()
+			dead = new DeadProps()
+			changes = new ChangeLog()
+			orders = new OrderTable()
+			acls = new AclTable()
+			principals = new Principals()
+		}
+
+		// A share of a directory on disk.
+		def new(root string, prefix string = "") {
+			self.store = new fs.DiskStore(root)
+			self.prefix = prefix.trimSuffix("/")
+			locks = new LockTable()
+			dead = new DeadProps()
+			changes = new ChangeLog()
+			orders = new OrderTable()
+			acls = new AclTable()
+			principals = new Principals()
+		}
+
+		// The URL of a user, for `Ace.principal` and group members.
+		def userURL(name string) string {
+			return principalBase() + "/users/" + name
+		}
+
+		// The URL of a group.
+		def groupURL(name string) string {
+			return principalBase() + "/groups/" + name
+		}
+
+		// Makes a user known before they sign in (users who sign in are
+		// known from then on), with the name clients show.
+		def addUser(name string, displayName string = "") {
+			principals.addUser(name, displayName)
+		}
+
+		// Adds or replaces a group: `members` are `userURL`s and
+		// `groupURL`s.
+		def addGroup(name string, members string[], displayName string = "") {
+			principals.addGroup(name, displayName, members)
+		}
+
+		// Sets the entries of a resource's own ACL (store path). The
+		// entries it inherits stay.
+		def setAcl(path string, aces Ace[]) {
+			acls.set(cleanStorePath(path), aces)
+		}
+
+		// The ACL that decides for a resource (store path): the owner's
+		// protected entry, the resource's own entries, then those it
+		// inherits from each collection above it.
+		def acl(path string) Ace[] {
+			let clean = cleanStorePath(path)
+			let out Ace[] = []
+			out.push(Ace{principal: "owner", privileges: [Privilege.All], protected: true}) when acls.ownerOf(clean) != ""
+			let own = acls.own(clean)
+			if !(own is none) {
+				out = out + own
+			} else if clean == "/" {
+				out = out + rootAcl
+			}
+			let above = clean
+			for above != "/" {
+				above = parentOf(above)
+				let held = acls.own(above)
+				let aces = held is none ?? (above == "/" ?? (rootAcl, Ace[]), held)
+				for let a in aces {
+					out.push(Ace{principal: a.principal, privileges: a.privileges, grant: a.grant, invert: a.invert, protected: a.protected, inherited: hrefOf(prefix, above, true)})
+				}
+			}
+			return out
+		}
+
+		// The locks held right now.
+		def activeLocks() Lock[] {
+			return locks.all()
+		}
+
+		// Implements http.Handler. Fails when the response write does.
+		def serve(ctx Context) !none {
+			requests.inc()
+			let req = ctx.request
+			let method = req.method == Method.Other ?? (req.rawMethod.upper(), req.method.value)
+			let found = pathOfHref(req.url.path, prefix)
+			return try ctx.error(404) when found is none
+			let path string = found
+			ctx.setHeader("DAV", accessControl ?? ("1, 2, access-control, ordered-collections, extended-mkcol", "1, 2, ordered-collections, extended-mkcol"))
+			let writes = method := "PUT" || "DELETE" || "MKCOL" || "MOVE" || "COPY" || "PROPPATCH" || "LOCK" || "UNLOCK" || "ORDERPATCH" || "ACL" || "POST"
+			return try ctx.error(405) when readOnly && writes && method != "COPY"
+			if accessControl {
+				let asker = askerOf(ctx)
+				return try principalRequest(ctx, method, path, asker) when within(path, principalPath)
+				return none unless try permitted(ctx, method, path, asker)
+			}
+			switch {
+				case method == "OPTIONS":
+					return try options(ctx)
+				case method := "GET" || "HEAD":
+					return try get(ctx, path)
+				case method == "PUT":
+					return try put(ctx, path)
+				case method == "DELETE":
+					return try delete(ctx, path)
+				case method == "MKCOL":
+					return try mkcol(ctx, path)
+				case method == "COPY" || method == "MOVE":
+					return try copyOrMove(ctx, path, method == "MOVE")
+				case method == "PROPFIND":
+					return try propfind(ctx, path)
+				case method == "PROPPATCH":
+					return try proppatch(ctx, path)
+				case method == "LOCK":
+					return try lock(ctx, path)
+				case method == "UNLOCK":
+					return try unlock(ctx, path)
+				case method == "REPORT":
+					return try report(ctx, path)
+				case method == "ORDERPATCH":
+					return try orderpatch(ctx, path)
+				case method == "SEARCH":
+					return try search(ctx, path)
+				case method == "POST":
+					return try addMember(ctx, path)
+				case method == "ACL" && accessControl:
+					return try aclRequest(ctx, path)
+				default:
+					ctx.setHeader("Allow", allowed())
+					return try ctx.error(405)
+			}
+			return none
+		}
+
+		internal def allowed() string {
+			return "OPTIONS, GET, HEAD, PROPFIND, REPORT, SEARCH" when readOnly
+			return "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, PROPFIND, PROPPATCH, LOCK, UNLOCK, REPORT, ORDERPATCH, SEARCH, POST, ACL" when accessControl
+			return "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, PROPFIND, PROPPATCH, LOCK, UNLOCK, REPORT, ORDERPATCH, SEARCH, POST"
+		}
+
+		internal def options(ctx Context) !none {
+			ctx.setHeader("Allow", allowed())
+			ctx.setHeader("MS-Author-Via", "DAV")
+			ctx.setHeader("DASL", "<DAV:basicsearch>")
+			ctx.setHeader("Content-Length", "0")
+			return try ctx.noContent(200)
+		}
+
+		internal def statOrNone(path string) ?fs.FileEntry {
+			return statOf(path) onerror recover none
+		}
+
+		internal def statOf(path string) !?fs.FileEntry {
+			return try store.stat(path)
+		}
+
+		// The strong entity tag of a file: size and modification time.
+		internal def etagOf(e fs.FileEntry) string {
+			return "\"{e.size.hex()}-{e.modified.unixNs().hex()}\""
+		}
+
+		// ---- GET, HEAD ----
+
+		internal def get(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			if entry.kind == fs.FileKind.Dir {
+				return try ctx.error(405) unless listDirectories
+				return try listing(ctx, path)
+			}
+			let reader = try store.open(path, int64(0))
+			ctx.response.headers.set("ETag", etagOf(entry))
+			let failed ?error = none
+			serveContent(ctx, path, entry.modified, int(entry.size), reader) onerror (err error) {
+				failed = err
+				recover none
+			}
+			reader.close() onerror recover none
+			fail failed unless failed is none
+			return none
+		}
+
+		internal def listing(ctx Context, path string) !none {
+			let out = new bytes.Buffer()
+			let title = htmlEncode(path)
+			try out.writeString("<!doctype html><meta charset=\"utf-8\"><title>{title}</title><h1>{title}</h1><ul>")
+			if path != "/" {
+				try out.writeString("<li><a href=\"{hrefOf(prefix, parentOf(path), true)}\">..</a></li>")
+			}
+			let entries = try store.list(path)
+			entries.sort((a, b) => a.name < b.name)
+			for let e in entries {
+				let dir = e.kind == fs.FileKind.Dir
+				let label = htmlEncode(e.name) + (dir ?? ("/", ""))
+				try out.writeString("<li><a href=\"{hrefOf(prefix, path + "/" + e.name, dir)}\">{label}</a></li>")
+			}
+			try out.writeString("</ul>")
+			return try ctx.html(200, string(out.bytes()))
+		}
+
+		// ---- PUT ----
+
+		internal def put(ctx Context, path string) !none {
+			return try ctx.error(400, "Content-Range is not supported on PUT") when ctx.header("Content-Range") != ""
+			let entry = statOrNone(path)
+			return try ctx.error(405) when !(entry is none) && entry.kind == fs.FileKind.Dir
+			let parent = statOrNone(parentOf(path))
+			return try ctx.error(409) when parent is none || parent.kind != fs.FileKind.Dir
+			return none unless try admit(ctx, path, entry, false)
+			let spot = try positionFor(ctx, path)
+			return none when spot is none && ctx.response.status >= 400
+			if quota > 0 {
+				let incoming = ctx.request.contentLength
+				let used = usedBytes("/") - (entry is none ?? (int64(0), entry.size))
+				if incoming >= 0 && used + incoming > quota {
+					return try ctx.blob(507, "application/xml; charset=utf-8", davError("quota-not-exceeded"))
+				}
+			}
+			let writer = try store.create(path, false)
+			let body = ctx.request.body
+			let failed ?error = none
+			if !(body is none) {
+				io.copy(body, writer) onerror (err error) {
+					failed = err
+					recover 0
+				}
+			}
+			if !(failed is none) {
+				writer.close() onerror recover none
+				fail failed
+			}
+			try writer.close()
+			changes.record(path, false)
+			claim(ctx, path) when entry is none
+			try placeMember(path, spot, entry is none)
+			if quota > 0 && usedBytes("/") > quota {
+				// A body of unknown length that went past the quota.
+				store.remove(path) onerror recover none
+				changes.record(path, true)
+				return try ctx.blob(507, "application/xml; charset=utf-8", davError("quota-not-exceeded"))
+			}
+			let fresh = statOrNone(path)
+			ctx.setHeader("ETag", etagOf(fresh)) unless fresh is none
+			return try ctx.noContent(entry is none ?? (201, 204))
+		}
+
+		// ---- DELETE ----
+
+		internal def delete(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			return try ctx.error(403) when path == "/"
+			return none unless try admit(ctx, path, entry, true)
+			recordTree(path, entry, true)
+			try removeTree(path, entry)
+			locks.dropUnder(path)
+			dead.dropUnder(path)
+			orders.dropUnder(path)
+			orders.drop(parentOf(path), baseName(path))
+			acls.dropUnder(path)
+			return try ctx.noContent(204)
+		}
+
+		internal def removeTree(path string, entry fs.FileEntry) !none {
+			return try store.remove(path) when entry.kind != fs.FileKind.Dir
+			for let child in try store.list(path) {
+				try removeTree(joinPath(path, child.name), child)
+			}
+			return try store.removeDir(path)
+		}
+
+		// ---- MKCOL ----
+
+		internal def mkcol(ctx Context, path string) !none {
+			let body = try ctx.bytes()
+			// Extended MKCOL (RFC 5689): a `mkcol` body sets properties
+			// as the collection is made.
+			let setting XMLNode[] = []
+			if body.len() > 0 {
+				let root = new XML().parse(body) onerror recover new XMLNode("")
+				return try ctx.error(415) unless root.namespace == davNamespace && root.localName == "mkcol"
+				for let op in root.elements("set", davNamespace) {
+					let prop = op.child("prop", davNamespace)
+					setting = setting + prop.elements() unless prop is none
+				}
+			}
+			return try ctx.error(405) unless statOrNone(path) is none
+			let parent = statOrNone(parentOf(path))
+			return try ctx.error(409) when parent is none || parent.kind != fs.FileKind.Dir
+			return none unless try admit(ctx, path, none, false)
+			let ordering = ctx.header("Ordering-Type").trim()
+			let spot = try positionFor(ctx, path)
+			return none when spot is none && ctx.response.status >= 400
+			if setting.len() > 0 {
+				// Every property must be settable, or nothing is made.
+				let refused = setting.filter(p => !mkcolSettable(p))
+				if refused.len() > 0 {
+					let failed = PropStat{status: 403}
+					let dependent = PropStat{status: 424}
+					for let p in setting {
+						if refused.includes(p) {
+							failed.props.push(emptyLike(p))
+						} else {
+							dependent.props.push(emptyLike(p))
+						}
+					}
+					let answer = mkcolResponse([failed, dependent].filter(ps => ps.props.len() > 0))
+					return try ctx.blob(403, "application/xml; charset=utf-8", answer)
+				}
+			}
+			try store.makeDir(path)
+			for let p in setting {
+				dead.put(path, p) unless p.namespace == davNamespace
+			}
+			changes.record(path, false)
+			orders.setType(path, ordering) when ordering != ""
+			claim(ctx, path)
+			try placeMember(path, spot, true)
+			if setting.len() > 0 {
+				let done = PropStat{status: 200}
+				for let p in setting {
+					done.props.push(emptyLike(p))
+				}
+				return try ctx.blob(201, "application/xml; charset=utf-8", mkcolResponse([done]))
+			}
+			return try ctx.noContent(201)
+		}
+
+		// Whether extended MKCOL may set a property: any dead one, and a
+		// `resourcetype` naming a plain collection.
+		internal def mkcolSettable(p XMLNode) bool {
+			return true unless p.namespace == davNamespace
+			return false unless p.localName == "resourcetype"
+			let kinds = p.elements()
+			return kinds.len() == 1 && kinds[0].namespace == davNamespace && kinds[0].localName == "collection"
+		}
+
+		// Reads the `Prefer` header (RFC 8144): whether the client asked
+		// for `return=minimal` and for `depth-noroot`.
+		internal def preferences(ctx Context) (bool, bool) {
+			let minimal = false
+			let noroot = false
+			for let value in ctx.request.headers.values("Prefer") {
+				for let token in value.split(",") {
+					let t = token.split(";")[0].trim().lower()
+					minimal = true when t == "return=minimal"
+					noroot = true when t == "depth-noroot"
+				}
+			}
+			return (minimal, noroot)
+		}
+
+		// Answers a multistatus, honouring `Prefer: return=minimal` (the
+		// 404 propstats left out) and `depth-noroot` (the first response,
+		// the request's own resource, left out when `rooted`).
+		internal def answerMultistatus(ctx Context, responses DavResponse[], rooted bool, extra XMLNode[] = []) !none {
+			let (minimal, noroot) = preferences(ctx)
+			let applied string[] = []
+			let out = responses
+			if noroot && rooted && out.len() > 0 {
+				out = out[1:].clone()
+				applied.push("depth-noroot")
+			}
+			if minimal {
+				for let r in out {
+					r.propstats = r.propstats.filter(ps => ps.status != 404)
+				}
+				applied.push("return=minimal")
+			}
+			ctx.setHeader("Vary", "Prefer")
+			ctx.setHeader("Preference-Applied", applied.join(", ")) when applied.len() > 0
+			return try ctx.blob(207, "application/xml; charset=utf-8", multistatus(out, extra))
+		}
+
+		// ---- POST ----
+
+		// POST to a collection's `add-member` URL (RFC 5995): a new member
+		// with a name the server picks (the body's type gives the
+		// extension), answered 201 with its `Location`.
+		internal def addMember(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			if entry.kind != fs.FileKind.Dir || ctx.request.url.rawQuery != "add-member" {
+				ctx.setHeader("Allow", allowed())
+				return try ctx.error(405)
+			}
+			let extensions = formats.extensionsByType(ctx.header("Content-Type"))
+			let name = new UUID().str() + (extensions.len() > 0 ?? (extensions[0], ""))
+			let member = joinPath(path, name)
+			ctx.setHeader("Location", hrefOf(prefix, member, false))
+			return try put(ctx, member)
+		}
+
+		// ---- COPY, MOVE ----
+
+		internal def copyOrMove(ctx Context, path string, move bool) !none {
+			let source = statOrNone(path)
+			return try ctx.error(404) when source is none
+			let destination = ctx.header("Destination")
+			return try ctx.error(400, "Destination is missing") when destination == ""
+			// Another server's URL: RFC 4918 §9.8.4 asks for 502.
+			let host = ctx.request.host
+			if destination.contains("://") && host != "" {
+				let afterScheme = destination[destination.indexOf("://") + 3:]
+				let slash = afterScheme.indexOf("/")
+				let destHost = slash < 0 ?? (afterScheme, afterScheme[:slash])
+				return try ctx.error(502) unless destHost.lower() == host.lower()
+			}
+			let found = pathOfHref(destination, prefix)
+			return try ctx.error(502) when found is none
+			let target string = found
+			return try ctx.error(403) when target == path
+			return try ctx.error(403) when source.kind == fs.FileKind.Dir && within(target, path)
+			let depthText = ctx.header("Depth").trim().lower()
+			return try ctx.error(400, "MOVE of a collection needs Depth: infinity") when move && depthText != "" && depthText != "infinity"
+			return try ctx.error(400, "Depth must be 0 or infinity") unless depthText := "" || "0" || "infinity"
+			let overwrite = ctx.header("Overwrite").trim().upper() != "F"
+			let existing = statOrNone(target)
+			return try ctx.error(412) when !(existing is none) && !overwrite
+			let parent = statOrNone(parentOf(target))
+			return try ctx.error(409) when parent is none || parent.kind != fs.FileKind.Dir
+			if move {
+				return none unless try admit(ctx, path, source, true)
+			}
+			return none unless try admit(ctx, target, existing, true)
+			if !(existing is none) {
+				recordTree(target, existing, true)
+				try removeTree(target, existing)
+				locks.dropUnder(target)
+				dead.dropUnder(target)
+				acls.dropUnder(target)
+			}
+			let spot = try positionFor(ctx, target)
+			return none when spot is none && ctx.response.status >= 400
+			recordTree(path, source, true) when move
+			if move {
+				try store.rename(path, target)
+				locks.dropUnder(path)
+				dead.carry(path, target, false)
+			} else if source.kind == fs.FileKind.Dir && depthText == "0" {
+				try store.makeDir(target)
+				dead.carry(path, target, true)
+			} else {
+				try fs.copy(store, path, store, target)
+				dead.carry(path, target, true)
+			}
+			let copied = statOrNone(target)
+			recordTree(target, copied, false) unless copied is none
+			if move {
+				orders.carry(path, target, false)
+				orders.drop(parentOf(path), baseName(path))
+				acls.carry(path, target)
+			} else {
+				orders.carry(path, target, true)
+				claim(ctx, target)
+			}
+			try placeMember(target, spot, existing is none)
+			return try ctx.noContent(existing is none ?? (201, 204))
+		}
+
+		// ---- PROPFIND ----
+
+		internal def propfind(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			let depthText = ctx.header("Depth").trim().lower()
+			let depth = depthText == "0" ?? (0, depthText == "1" ?? (1, -1))
+			let body = try ctx.bytes()
+			// No body means allprop (RFC 4918 §9.1).
+			let mode = "allprop"
+			let wanted XMLNode[] = []
+			if body.len() > 0 {
+				let root = new XML().parse(body) onerror (err error) {
+					recover new XMLNode("")
+				}
+				return try ctx.error(400, "the PROPFIND body is not a propfind") unless root.localName == "propfind" && root.namespace == davNamespace
+				if !(root.child("propname", davNamespace) is none) {
+					mode = "propname"
+				} else if root.child("allprop", davNamespace) is none {
+					let prop = root.child("prop", davNamespace)
+					return try ctx.error(400, "the propfind names nothing") when prop is none
+					mode = "prop"
+					wanted = prop.elements()
+				} else {
+					let include = root.child("include", davNamespace)
+					wanted = include.elements() unless include is none
+				}
+			}
+			let responses DavResponse[] = []
+			try describe(path, entry, depth, mode, wanted, responses, askerOf(ctx))
+			return try answerMultistatus(ctx, responses, depth != 0 && entry.kind == fs.FileKind.Dir)
+		}
+
+		internal def describe(path string, entry fs.FileEntry, depth int, mode string, wanted XMLNode[], out DavResponse[], asker Asker) !none {
+			if !can(asker, path, Privilege.Read) {
+				out.push(DavResponse{href: hrefOf(prefix, path, entry.kind == fs.FileKind.Dir), status: 403})
+				return none
+			}
+			out.push(responseFor(path, entry, mode, wanted, asker))
+			return none unless entry.kind == fs.FileKind.Dir && depth != 0
+			for let child in try orderedChildren(path) {
+				let childPath = joinPath(path, child.name)
+				try describe(childPath, child, depth == 1 ?? (0, -1), mode, wanted, out, asker)
+			}
+			return none
+		}
+
+		// A collection's members in its order (RFC 3648): as set for a
+		// custom-ordered one, by name otherwise.
+		internal def orderedChildren(path string) !fs.FileEntry[] {
+			let children = try store.list(path)
+			let byName = map<string, fs.FileEntry>{}
+			let names string[] = []
+			for let c in children {
+				byName[c.name] = c
+				names.push(c.name)
+			}
+			let out fs.FileEntry[] = []
+			for let n in orders.arrange(path, names) {
+				out.push(byName[n])
+			}
+			return out
+		}
+
+		// The `Position` of a request that adds `path` to its collection,
+		// checked (RFC 3648 §6): a position into an unordered collection
+		// or relative to a non-member answers 409 and gives none (the
+		// caller stops); no header gives none with nothing answered.
+		internal def positionFor(ctx Context, path string) !?Position {
+			let header = ctx.header("Position")
+			return none when header == ""
+			let parsed = parsePosition(header)
+			if parsed is none {
+				try ctx.error(400, "bad Position header")
+				return none
+			}
+			let dir = parentOf(path)
+			if orders.typeOf(dir) == orderingUnordered {
+				try ctx.blob(409, "application/xml; charset=utf-8", davError("collection-must-be-ordered"))
+				return none
+			}
+			if parsed.kind := "before" || "after" {
+				let segmentEntry = statOrNone(joinPath(dir, parsed.segment))
+				if segmentEntry is none || parsed.segment == baseName(path) {
+					try ctx.blob(409, "application/xml; charset=utf-8", davError("segment-must-identify-member"))
+					return none
+				}
+			}
+			return parsed
+		}
+
+		// Places a new or moved member in its collection's order: at
+		// `where`, or last when it is new and no position was asked.
+		internal def placeMember(path string, spot ?Position, fresh bool) !none {
+			let dir = parentOf(path)
+			return none when orders.typeOf(dir) == orderingUnordered
+			return none when spot is none && !fresh
+			let members = (try store.list(dir)).mapElem<string>(e => e.name)
+			return try orders.place(dir, baseName(path), spot is none ?? (Position{kind: "last"}, spot), members)
+		}
+
+		// ---- ORDERPATCH ----
+
+		// ORDERPATCH (RFC 3648 §7): the ordering type and member positions
+		// of a collection, member by member; members that cannot be placed
+		// are listed in a 207 with 409 (the rest are placed).
+		internal def orderpatch(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			return try ctx.error(409) unless entry.kind == fs.FileKind.Dir
+			return none unless try admit(ctx, path, entry, false)
+			let root = new XML().parse(try ctx.bytes()) onerror recover new XMLNode("")
+			return try ctx.error(400, "the body is not an orderpatch") unless root.namespace == davNamespace && root.localName == "orderpatch"
+			let typeNode = root.child("ordering-type", davNamespace)
+			if !(typeNode is none) {
+				let href = typeNode.child("href", davNamespace)
+				orders.setType(path, href is none ?? (orderingUnordered, href.text().trim()))
+			}
+			let failed DavResponse[] = []
+			for let m in root.elements() {
+				continue unless m.namespace == davNamespace && m.localName == "order-member"
+				let segment = m.child("segment", davNamespace)
+				let pos = m.child("position", davNamespace)
+				continue when segment is none || pos is none
+				let name = segment.text().trim()
+				let spot = Position{}
+				for let p in pos.elements() {
+					spot.kind = p.localName
+					let seg = p.child("segment", davNamespace)
+					spot.segment = seg.text().trim() unless seg is none
+				}
+				let memberPath = joinPath(path, name)
+				let member = statOrNone(memberPath)
+				let problem = orders.typeOf(path) == orderingUnordered ?? ("collection-must-be-ordered", "")
+				problem = "segment-must-identify-member" when problem == "" && member is none
+				if problem == "" {
+					let members = (try store.list(path)).mapElem<string>(e => e.name)
+					orders.place(path, name, spot, members) onerror (err error) {
+						problem = "segment-must-identify-member"
+						recover none
+					}
+				}
+				if problem != "" {
+					failed.push(DavResponse{href: hrefOf(prefix, memberPath, !(member is none) && member.kind == fs.FileKind.Dir), status: 409})
+				}
+			}
+			changes.record(path, false)
+			return try ctx.blob(207, "application/xml; charset=utf-8", multistatus(failed)) when failed.len() > 0
+			return try ctx.noContent(200)
+		}
+
+		internal def responseFor(path string, entry fs.FileEntry, mode string, wanted XMLNode[], asker Asker) DavResponse {
+			let dir = entry.kind == fs.FileKind.Dir
+			let r = DavResponse{href: hrefOf(prefix, path, dir)}
+			let found = PropStat{status: 200}
+			if mode == "propname" {
+				let names = liveNames(dir) + namedOnly(dir)
+				for let name in names {
+					found.props.push(davNode(name))
+				}
+				for let p in dead.of(path) {
+					found.props.push(emptyLike(p))
+				}
+				r.propstats.push(found)
+				return r
+			}
+			let missing = PropStat{status: 404}
+			if mode == "allprop" {
+				for let name in liveNames(dir) {
+					// lockdiscovery and supportedlock are listed by allprop
+					// in RFC 4918; so are the rest.
+					let live = liveProperty(path, entry, name, asker)
+					found.props.push(live) unless live is none
+				}
+				for let p in dead.of(path) {
+					found.props.push(p)
+				}
+			}
+			let forbidden = PropStat{status: 403}
+			for let w in wanted {
+				if !readable(asker, path, w) {
+					forbidden.props.push(emptyLike(w))
+					continue
+				}
+				let value = propertyOf(path, entry, w, asker)
+				if value is none {
+					missing.props.push(emptyLike(w))
+				} else if mode != "allprop" || w.namespace != davNamespace {
+					found.props.push(value)
+				}
+			}
+			r.propstats.push(found) when found.props.len() > 0 || (missing.props.len() == 0 && forbidden.props.len() == 0)
+			r.propstats.push(missing) when missing.props.len() > 0
+			r.propstats.push(forbidden) when forbidden.props.len() > 0
+			return r
+		}
+
+		// Whether `asker` may read a property: `acl` needs read-acl and
+		// `current-user-privilege-set` read-current-user-privilege-set
+		// (RFC 3744 §5.4–5.5).
+		internal def readable(asker Asker, path string, name XMLNode) bool {
+			return true unless accessControl && name.namespace == davNamespace
+			return can(asker, path, Privilege.ReadAcl) when name.localName == "acl"
+			return can(asker, path, Privilege.ReadCurrentUserPrivilegeSet) when name.localName == "current-user-privilege-set"
+			return true
+		}
+
+		// A property by name: live in DAV:, else dead.
+		internal def propertyOf(path string, entry fs.FileEntry, name XMLNode, asker Asker) ?XMLNode {
+			if name.namespace == davNamespace {
+				let live = liveProperty(path, entry, name.localName, asker)
+				return live unless live is none
+			}
+			return dead.find(path, name.namespace, name.localName)
+		}
+
+		// Live properties returned only when asked for by name (not by
+		// allprop): RFC 6578's sync-token, RFC 3253's
+		// supported-report-set, RFC 4331's quotas.
+		internal def namedOnly(dir bool) string[] {
+			let names string[] = []
+			if dir {
+				names = ["sync-token", "supported-report-set", "supported-query-grammar-set", "add-member", "quota-used-bytes"]
+				names.push("quota-available-bytes") when quota > 0
+			}
+			// RFC 3744 §5 and RFC 5397.
+			names = names + ["owner", "group", "supported-privilege-set", "current-user-privilege-set", "acl", "acl-restrictions", "inherited-acl-set", "principal-collection-set", "current-user-principal"] when accessControl
+			return names
+		}
+
+		internal def liveNames(dir bool) string[] {
+			let common = ["creationdate", "displayname", "getlastmodified", "resourcetype", "supportedlock", "lockdiscovery"]
+			return common + ["ordering-type"] when dir
+			return common + ["getcontentlength", "getcontenttype", "getetag"]
+		}
+
+		internal def liveProperty(path string, entry fs.FileEntry, name string, asker Asker) ?XMLNode {
+			let dir = entry.kind == fs.FileKind.Dir
+			if accessControl {
+				let control = aclProperty(path, name, asker)
+				return control unless control is none
+			}
+			switch {
+				case name == "creationdate":
+					return davText(name, entry.modified.str())
+				case name == "displayname":
+					return davText(name, path == "/" ?? ("", entry.name))
+				case name == "getlastmodified":
+					return davText(name, time.formatHTTPDate(entry.modified))
+				case name == "resourcetype":
+					let n = davNode(name)
+					n.add(davNode("collection")) when dir
+					return n
+				case name == "supportedlock":
+					let n = davNode(name)
+					for let scope in ["exclusive", "shared"] {
+						let lockentry = n.add(davNode("lockentry"))
+						lockentry.add(davNode("lockscope")).add(davNode(scope))
+						lockentry.add(davNode("locktype")).add(davNode("write"))
+					}
+					return n
+				case name == "lockdiscovery":
+					return discovery(locks.covering(path))
+				case name == "getcontentlength" && !dir:
+					return davText(name, entry.size.str())
+				case name == "getcontenttype" && !dir:
+					let byName = formats.typeByName(entry.name)
+					return davText(name, byName is none ?? ("application/octet-stream", byName))
+				case name == "getetag" && !dir:
+					return davText(name, etagOf(entry))
+				case name == "ordering-type" && dir:
+					let n = davNode(name)
+					n.add(davText("href", orders.typeOf(path)))
+					return n
+				case name == "add-member" && dir:
+					let n = davNode(name)
+					n.add(davText("href", hrefOf(prefix, path, true) + "?add-member"))
+					return n
+				case name == "supported-query-grammar-set" && dir:
+					let n = davNode(name)
+					n.add(davNode("supported-query-grammar")).add(davNode("grammar")).add(davNode("basicsearch"))
+					return n
+				case name == "sync-token" && dir:
+					return davText(name, changes.token())
+				case name == "supported-report-set" && dir:
+					let n = davNode(name)
+					let reports = ["sync-collection"]
+					reports = reports + ["acl-principal-prop-set", "principal-match", "principal-property-search", "principal-search-property-set", "expand-property"] when accessControl
+					for let report in reports {
+						n.add(davNode("supported-report")).add(davNode("report")).add(davNode(report))
+					}
+					return n
+				case name == "quota-used-bytes" && dir:
+					return davText(name, usedBytes(path).str())
+				case name == "quota-available-bytes" && dir && quota > 0:
+					let left = quota - usedBytes("/")
+					return davText(name, (left < 0 ?? (int64(0), left)).str())
+			}
+			return none
+		}
+
+		// The bytes of the files under `path`.
+		internal def usedBytes(path string) int64 {
+			let entry = statOrNone(path)
+			return int64(0) when entry is none
+			return entry.size when entry.kind != fs.FileKind.Dir
+			let total = int64(0)
+			for let child in store.list(path) onerror recover fs.FileEntry[] {
+				total += child.kind == fs.FileKind.Dir ?? (usedBytes(joinPath(path, child.name)), child.size)
+			}
+			return total
+		}
+
+		// Records `path` and what lies under it as changed or removed, for
+		// sync-collection.
+		internal def recordTree(path string, entry fs.FileEntry, removed bool) {
+			if entry.kind == fs.FileKind.Dir {
+				for let child in store.list(path) onerror recover fs.FileEntry[] {
+					recordTree(joinPath(path, child.name), child, removed)
+				}
+			}
+			changes.record(path, removed)
+		}
+
+		// ---- REPORT ----
+
+		// REPORT (RFC 3253 §3.6) with the reports this server knows:
+		// sync-collection (RFC 6578). Another report is refused with 403
+		// and DAV:supported-report.
+		internal def report(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			let body = try ctx.bytes()
+			let root = new XML().parse(body) onerror recover new XMLNode("")
+			if root.namespace == davNamespace && root.localName == "sync-collection" {
+				return try syncCollection(ctx, path, entry, root)
+			}
+			if accessControl && root.namespace == davNamespace && (root.localName := "acl-principal-prop-set" || "principal-match" || "principal-property-search" || "principal-search-property-set" || "expand-property") {
+				return try aclReport(ctx, path, root, askerOf(ctx))
+			}
+			return try ctx.blob(403, "application/xml; charset=utf-8", davError("supported-report"))
+		}
+
+		// sync-collection (RFC 6578 §3): every member with no token, else
+		// what changed since the token (removed members as 404), within
+		// `sync-level` 1 or infinite, at most `nresults`, and the new
+		// token.
+		internal def syncCollection(ctx Context, path string, entry fs.FileEntry, root XMLNode) !none {
+			let asker = askerOf(ctx)
+			return try ctx.blob(403, "application/xml; charset=utf-8", davError("sync-collection-not-supported")) unless entry.kind == fs.FileKind.Dir
+			let tokenNode = root.child("sync-token", davNamespace)
+			let token = tokenNode is none ?? ("", tokenNode.text().trim())
+			let levelNode = root.child("sync-level", davNamespace)
+			let level = levelNode is none ?? ("1", levelNode.text().trim())
+			return try ctx.error(400, "sync-level must be 1 or infinite") unless level := "1" || "infinite"
+			let deep = level == "infinite"
+			let propNode = root.child("prop", davNamespace)
+			let wanted = propNode is none ?? (XMLNode[], propNode.elements())
+			let limit = -1
+			let limitNode = root.child("limit", davNamespace)
+			if !(limitNode is none) {
+				let n = limitNode.child("nresults", davNamespace)
+				limit = n.text().trim().toInt<int>() unless n is none
+			}
+			let responses DavResponse[] = []
+			let newToken = changes.token()
+			if token == "" {
+				let members DavResponse[] = []
+				try describe(path, entry, deep ?? (-1, 1), "prop", wanted, members, asker)
+				// The collection itself is not a member.
+				for let i = 1; i < members.len(); i++ {
+					responses.push(members[i])
+				}
+				return try ctx.blob(507, "application/xml; charset=utf-8", davError("number-of-matches-within-limits")) when limit >= 0 && responses.len() > limit
+			} else {
+				let from = changes.seqOf(token)
+				return try ctx.blob(403, "application/xml; charset=utf-8", davError("valid-sync-token")) when from < 0
+				// The latest change of each path, in the order they came.
+				let latest map<string, Change> = map<string, Change>{}
+				let order string[] = []
+				for let c in changes.since(from) {
+					continue unless c.path != path && within(c.path, path)
+					continue unless deep || parentOf(c.path) == path
+					order.push(c.path) unless latest.hasKey(c.path)
+					latest[c.path] = c
+				}
+				let sorted = order.sort((a, b) => latest[a].seq < latest[b].seq)
+				let truncated = limit >= 0 && sorted.len() > limit
+				if truncated {
+					sorted = sorted[:limit].clone()
+					newToken = changes.tokenAt(latest[sorted[sorted.len() - 1]].seq) when sorted.len() > 0
+					newToken = token when sorted.len() == 0
+				}
+				for let p in sorted {
+					let current = statOrNone(p)
+					if latest[p].removed || current is none {
+						responses.push(DavResponse{href: hrefOf(prefix, p, false), status: 404})
+					} else {
+						continue unless can(asker, p, Privilege.Read)
+						responses.push(responseFor(p, current, "prop", wanted, asker))
+					}
+				}
+				if truncated {
+					responses.push(DavResponse{href: hrefOf(prefix, path, true), status: 507})
+				}
+			}
+			return try answerMultistatus(ctx, responses, false, [davText("sync-token", newToken)])
+		}
+
+		// ---- SEARCH ----
+
+		// SEARCH (RFC 5323): a `DAV:basicsearch` over the scopes it names
+		// (207 with a response per match, and a 507 for this URI when
+		// `nresults` cut the matches), or the query schema.
+		internal def search(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			let root = new XML().parse(try ctx.bytes()) onerror recover new XMLNode("")
+			let here = hrefOf(prefix, path, entry.kind == fs.FileKind.Dir)
+			if root.namespace == davNamespace && root.localName == "query-schema-discovery" {
+				return try ctx.blob(422, "application/xml; charset=utf-8", davError("search-grammar-discovery-supported")) when root.child("basicsearch", davNamespace) is none
+				let schema = davNode("query-schema")
+				schema.add(basicSearchSchema(liveNames(true) + liveNames(false) + namedOnly(true)))
+				return try ctx.blob(207, "application/xml; charset=utf-8", multistatus([DavResponse{href: here, status: 200, extra: [schema]}]))
+			}
+			let (parsed, problem) = parseSearch(root, path, prefix)
+			if !(problem is none) {
+				return try ctx.blob(problem.status, "application/xml; charset=utf-8", davError(problem.condition)) when problem.condition != ""
+				return try ctx.error(problem.status, problem.message)
+			}
+			return try ctx.error(400) when parsed is none
+			let query = parsed
+			// Every scope must exist (RFC 5323 §2.4.1).
+			let invalid DavResponse[] = []
+			for let s in query.scopes {
+				let scopePath = s.path
+				if scopePath is none || statOrNone(scopePath) is none {
+					invalid.push(DavResponse{href: s.href, status: 404})
+				}
+			}
+			if invalid.len() > 0 {
+				let err = davNode("error")
+				err.set("xmlns:D", davNamespace)
+				let condition = err.add(davNode("search-scope-valid"))
+				for let r in invalid {
+					let resp = condition.add(davNode("response"))
+					resp.add(davText("href", r.href))
+					resp.add(davText("status", statusLine(404)))
+				}
+				return try ctx.blob(409, "application/xml; charset=utf-8", document(err))
+			}
+			let asker = askerOf(ctx)
+			let seen = map<string, bool>{}
+			let subjects SearchSubject[] = []
+			let entries = map<string, fs.FileEntry>{}
+			for let s in query.scopes {
+				let scopePath = s.path
+				continue when scopePath is none
+				let paths string[] = []
+				let found fs.FileEntry[] = []
+				try gather(scopePath, statOrNone(scopePath), s.depth, paths, found)
+				for let i = 0; i < paths.len(); i++ {
+					let p = paths[i]
+					let e = found[i]
+					continue when seen.hasKey(p)
+					seen[p] = true
+					continue unless can(asker, p, Privilege.Read)
+					entries[p] = e
+					let subject = new SearchSubject(p, e.kind == fs.FileKind.Dir, (n XMLNode) => propertyOf(p, e, n, asker), () => contentOf(p))
+					let cond = query.condition
+					continue unless cond is none || evaluate(cond, subject) == Truth.True
+					subjects.push(subject)
+				}
+			}
+			if query.orders.len() > 0 {
+				let keys = query.orders
+				subjects = subjects.sort((a, b) => compareResults(keys, a, b) < 0)
+			}
+			let truncated = query.limit >= 0 && subjects.len() > query.limit
+			subjects = subjects[:query.limit].clone() when truncated
+			let responses DavResponse[] = []
+			for let subject in subjects {
+				responses.push(responseFor(subject.path, entries[subject.path], query.mode, query.wanted, asker))
+			}
+			responses.push(DavResponse{href: here, status: 507}) when truncated
+			return try answerMultistatus(ctx, responses, false)
+		}
+
+		// `path` and what lies below it to `depth` (-1 for all), in
+		// collection order.
+		internal def gather(path string, entry ?fs.FileEntry, depth int, paths string[], out fs.FileEntry[]) !none {
+			return none when entry is none
+			paths.push(path)
+			out.push(entry)
+			return none unless entry.kind == fs.FileKind.Dir && depth != 0
+			for let child in try orderedChildren(path) {
+				try gather(joinPath(path, child.name), child, depth == 1 ?? (0, -1), paths, out)
+			}
+			return none
+		}
+
+		// A file's content as text, for `DAV:contains`; none when it
+		// cannot be read.
+		internal def contentOf(path string) ?string {
+			let reader = store.open(path, int64(0)) onerror (err error) {
+				return none
+			}
+			let data = io.readAll(reader) onerror recover byte[]
+			reader.close() onerror recover none
+			return string(data)
+		}
+
+		// ---- PROPPATCH ----
+
+		internal def proppatch(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			return none unless try admit(ctx, path, entry, false)
+			let body = try ctx.bytes()
+			let root = new XML().parse(body) onerror (err error) {
+				recover new XMLNode("")
+			}
+			return try ctx.error(400, "the PROPPATCH body is not a propertyupdate") unless root.localName == "propertyupdate" && root.namespace == davNamespace
+			// Every instruction in order; any refusal fails them all
+			// (RFC 4918 §9.2).
+			let changes (bool, XMLNode)[] = []
+			let refused XMLNode[] = []
+			for let op in root.elements() {
+				continue unless op.namespace == davNamespace
+				continue unless op.localName := "set" || "remove"
+				let prop = op.child("prop", davNamespace)
+				continue when prop is none
+				for let p in prop.elements() {
+					let set = op.localName == "set"
+					if p.namespace == davNamespace && !isSettable(p) {
+						refused.push(p)
+						continue
+					}
+					changes.push((set, p))
+				}
+			}
+			let response = DavResponse{href: hrefOf(prefix, path, entry.kind == fs.FileKind.Dir)}
+			if refused.len() > 0 {
+				let forbidden = PropStat{status: 403}
+				for let p in refused {
+					forbidden.props.push(emptyLike(p))
+				}
+				let dependent = PropStat{status: 424}
+				for let (_, change) in changes {
+					let (_, p) = change
+					dependent.props.push(emptyLike(p))
+				}
+				response.propstats.push(forbidden)
+				response.propstats.push(dependent) when dependent.props.len() > 0
+				return try ctx.blob(207, "application/xml; charset=utf-8", multistatus([response]))
+			}
+			let done = PropStat{status: 200}
+			for let (_, change) in changes {
+				let (set, p) = change
+				if p.namespace == davNamespace {
+					// Win32LastModifiedTime and getlastmodified set the
+					// modification time through the store.
+					let stamp = time.parseHTTPDate(p.text().trim()) onerror recover time.now()
+					store.touch(path, stamp) onerror recover none
+				} else if set {
+					dead.put(path, p)
+				} else {
+					dead.drop(path, p.namespace, p.localName)
+				}
+				done.props.push(emptyLike(p))
+			}
+			response.propstats.push(done)
+			self.changes.record(path, false)
+			let (minimal, _) = preferences(ctx)
+			if minimal {
+				// Everything was set: nothing to report (RFC 8144 §3.2).
+				ctx.setHeader("Preference-Applied", "return=minimal")
+				return try ctx.noContent(200)
+			}
+			return try ctx.blob(207, "application/xml; charset=utf-8", multistatus([response]))
+		}
+
+		// Live properties a client may set: the modification time.
+		internal def isSettable(p XMLNode) bool {
+			return p.localName == "getlastmodified"
+		}
+
+		// ---- LOCK, UNLOCK ----
+
+		internal def lock(ctx Context, path string) !none {
+			let timeout = lockTimeout(ctx.header("Timeout"))
+			let body = try ctx.bytes()
+			if body.len() == 0 {
+				// A refresh: the token in the If header.
+				let lists = parseIf(ctx.header("If")) onerror recover []
+				for let token in submittedTokens(lists) {
+					let owned = locks.covering(path).filter(l => l.token == token)
+					continue when owned.len() == 0
+					let refreshed = locks.refresh(token, timeout)
+					continue when refreshed is none
+					return try answerLock(ctx, 200, [refreshed])
+				}
+				return try ctx.error(412)
+			}
+			let root = new XML().parse(body) onerror (err error) {
+				recover new XMLNode("")
+			}
+			return try ctx.error(400, "the LOCK body is not a lockinfo") unless root.localName == "lockinfo" && root.namespace == davNamespace
+			let scope = root.child("lockscope", davNamespace)
+			let exclusive = scope is none || !(scope.child("exclusive", davNamespace) is none)
+			let ownerNode = root.child("owner", davNamespace)
+			let owner = ""
+			if !(ownerNode is none) {
+				let inner = ""
+				for let c in ownerNode.children {
+					inner += c.kind == XMLNodeKind.Text ?? (htmlEncode(c.content), standalone(c).str())
+				}
+				owner = inner
+			}
+			let depthText = ctx.header("Depth").trim().lower()
+			return try ctx.error(400, "Depth must be 0 or infinity") unless depthText := "" || "0" || "infinity"
+			let depth = depthText == "0" ?? (0, -1)
+			let entry = statOrNone(path)
+			if entry is none {
+				// A lock on an unmapped URL creates an empty resource (RFC
+				// 4918 §7.3).
+				let parent = statOrNone(parentOf(path))
+				return try ctx.error(409) when parent is none || parent.kind != fs.FileKind.Dir
+			}
+			// Locks the request already holds do not conflict with a new
+			// shared one; the If header proves which.
+			return none unless try conditionsHold(ctx, path, entry)
+			let taken = locks.take(path, exclusive, depth, owner, timeout)
+			return try ctx.error(423) when taken is none
+			let status = 200
+			if entry is none {
+				let writer = try store.create(path, false)
+				try writer.close()
+				changes.record(path, false)
+				claim(ctx, path)
+				status = 201
+			}
+			if accessControl {
+				let asker = askerOf(ctx)
+				acls.setLocker(taken.token, asker.principals.len() > 0 ?? (asker.principals[0], ""))
+			}
+			ctx.setHeader("Lock-Token", "<{taken.token}>")
+			return try answerLock(ctx, status, [taken])
+		}
+
+		internal def answerLock(ctx Context, status int, held Lock[]) !none {
+			let prop = davNode("prop")
+			prop.set("xmlns:D", davNamespace)
+			prop.add(discovery(held))
+			return try ctx.blob(status, "application/xml; charset=utf-8", document(prop))
+		}
+
+		internal def unlock(ctx Context, path string) !none {
+			let raw = ctx.header("Lock-Token").trim()
+			return try ctx.error(400, "Lock-Token is missing") when raw == ""
+			let token = raw.trimPrefix("<").trimSuffix(">")
+			let owned = locks.covering(path).filter(l => l.token == token)
+			return try ctx.error(409) when owned.len() == 0
+			if accessControl {
+				// Another principal's lock needs the unlock privilege
+				// (RFC 3744 §3.5).
+				let asker = askerOf(ctx)
+				let locker = acls.lockerOf(token)
+				if (locker == "" || !asker.principals.includes(locker)) && !can(asker, path, Privilege.Unlock) {
+					return try ctx.blob(403, "application/xml; charset=utf-8", needPrivileges([hrefOf(prefix, path, false)], [Privilege.Unlock]))
+				}
+			}
+			locks.release(token)
+			acls.setLocker(token, "")
+			return try ctx.noContent(204)
+		}
+
+		// The lockdiscovery element of some locks.
+		internal def discovery(held Lock[]) XMLNode {
+			let n = davNode("lockdiscovery")
+			for let l in held {
+				let active = n.add(davNode("activelock"))
+				active.add(davNode("locktype")).add(davNode("write"))
+				active.add(davNode("lockscope")).add(davNode(l.exclusive ?? ("exclusive", "shared")))
+				active.add(davText("depth", l.depth == 0 ?? ("0", "infinity")))
+				if l.owner != "" {
+					let owner = active.add(davNode("owner"))
+					let parsed = new XML().parse("<o>{l.owner}</o>") onerror recover new XMLNode("o")
+					for let c in parsed.children {
+						if c.kind == XMLNodeKind.Text {
+							owner.add(c.content)
+						} else {
+							owner.add(standalone(c))
+						}
+					}
+				}
+				active.add(davText("timeout", l.timeout == 0s ?? ("Infinite", "Second-{int64(l.timeout) / 1000000000}")))
+				active.add(davNode("locktoken")).add(davText("href", l.token))
+				active.add(davNode("lockroot")).add(davText("href", hrefOf(prefix, l.path, false)))
+			}
+			return n
+		}
+
+		// The timeout a `Timeout` header asks for, capped at
+		// `maxLockTimeout`.
+		internal def lockTimeout(header string) duration {
+			for let part in header.split(",") {
+				let p = part.trim()
+				return maxLockTimeout when p.lower() == "infinite"
+				if p.startsWith("Second-") && p[7:].isNumeric() {
+					let asked = duration(p[7:].toInt<int64>() * 1000000000)
+					return asked < maxLockTimeout ?? (asked, maxLockTimeout)
+				}
+			}
+			return 3600s < maxLockTimeout ?? (3600s, maxLockTimeout)
+		}
+
+		// ---- conditions ----
+
+		// Checks a change to `path` (and, with `deep`, everything under
+		// it) against the `If` header and the locks: answers 412 when the
+		// header's conditions fail, 423 when a lock the request does not
+		// hold covers the change, and returns false; true to go on.
+		internal def admit(ctx Context, path string, entry ?fs.FileEntry, deep bool) !bool {
+			return false unless try conditionsHold(ctx, path, entry)
+			let submitted = submittedTokens(parseIf(ctx.header("If")) onerror recover[])
+			let affected = deep ?? (locks.covering(path) + locks.under(path), locks.covering(path))
+			for let l in affected {
+				if !submitted.includes(l.token) {
+					try ctx.error(423)
+					return false
+				}
+			}
+			return true
+		}
+
+		// Checks the `If` header alone: answers 400 when it is malformed,
+		// 412 when no list holds, and returns false; true to go on.
+		internal def conditionsHold(ctx Context, path string, entry ?fs.FileEntry) !bool {
+			let header = ctx.header("If")
+			return true when header.trim() == ""
+			let malformed = false
+			let lists = parseIf(header) onerror (err error) {
+				malformed = true
+				recover []
+			}
+			if malformed || lists.len() == 0 {
+				try ctx.error(400, "malformed If header")
+				return false
+			}
+			if !ifHolds(lists, path, entry) {
+				try ctx.error(412)
+				return false
+			}
+			return true
+		}
+
+		// Whether any list of the `If` header holds (RFC 4918 §10.4): all
+		// its conditions true for its resource.
+		internal def ifHolds(lists IfList[], path string, entry ?fs.FileEntry) bool {
+			for let list in lists {
+				let target = path
+				let targetEntry = entry
+				if list.resource != "" {
+					let named = pathOfHref(list.resource, prefix)
+					continue when named is none
+					target = named
+					targetEntry = statOrNone(target)
+				}
+				let tokens = locks.covering(target).mapElem<string>(l => l.token)
+				let etag = targetEntry is none ?? ("", etagOf(targetEntry))
+				let holds = true
+				for let c in list.conditions {
+					let met = c.token != "" ?? (tokens.includes(c.token), etag != "" && c.etag.trimPrefix("W/") == etag)
+					met = !met when c.negated
+					if !met {
+						holds = false
+						break
+					}
+				}
+				return true when holds
+			}
+			return false
+		}
+
+		// ---- Access control (RFC 3744) ----
+
+		// The URL the principals live under, without a trailing slash.
+		internal def principalBase() string {
+			return hrefOf(prefix, cleanStorePath(principalPath), false).trimSuffix("/")
+		}
+
+		// Who sent the request: the user the authentication middleware
+		// named, with the groups they belong to.
+		internal def askerOf(ctx Context) Asker {
+			return Asker{} unless accessControl && ctx.authenticated
+			let who = ctx.user
+			let name = who is none ?? ("", "{who}")
+			principals.meet(name) when name != ""
+			return principals.askerFor(principalBase(), true, name)
+		}
+
+		// Makes the requesting user the owner of a resource they created.
+		internal def claim(ctx Context, path string) {
+			return unless accessControl
+			let asker = askerOf(ctx)
+			acls.setOwner(path, asker.principals[0]) when asker.principals.len() > 0
+		}
+
+		// Whether `asker` holds `privilege` on `path` (always, with access
+		// control off).
+		internal def can(asker Asker, path string, privilege Privilege) bool {
+			return true unless accessControl
+			return aclAllows(acl(path), privilege, asker, acls.ownerOf(path), "")
+		}
+
+		// Checks the privileges a request needs (RFC 3744 Appendix B);
+		// answers 403 with `need-privileges` and returns false when one is
+		// missing.
+		internal def permitted(ctx Context, method string, path string, asker Asker) !bool {
+			let paths string[] = []
+			let needed Privilege[] = []
+			let entry = statOrNone(path)
+			let parent = parentOf(path)
+			switch {
+				case method := "GET" || "HEAD" || "PROPFIND" || "REPORT" || "SEARCH":
+					if !(entry is none) {
+						paths.push(path)
+						needed.push(Privilege.Read)
+					}
+				case method == "PUT" || method == "LOCK":
+					paths.push(entry is none ?? (parent, path))
+					needed.push(entry is none ?? (Privilege.Bind, Privilege.WriteContent))
+				case method == "MKCOL":
+					paths.push(parent)
+					needed.push(Privilege.Bind)
+				case method == "POST":
+					paths.push(path)
+					needed.push(Privilege.Bind)
+				case method == "DELETE":
+					paths.push(parent)
+					needed.push(Privilege.Unbind)
+					if !(entry is none) && entry.kind == fs.FileKind.Dir {
+						// Removing members needs unbind on each collection
+						// that holds some.
+						let under string[] = []
+						let found fs.FileEntry[] = []
+						try gather(path, entry, -1, under, found)
+						for let i = 0; i < under.len(); i++ {
+							if found[i].kind == fs.FileKind.Dir {
+								paths.push(under[i])
+								needed.push(Privilege.Unbind)
+							}
+						}
+					}
+				case method == "PROPPATCH" || method == "ORDERPATCH":
+					paths.push(path)
+					needed.push(Privilege.WriteProperties)
+				case method == "ACL":
+					paths.push(path)
+					needed.push(Privilege.WriteAcl)
+				case method == "COPY" || method == "MOVE":
+					let named = pathOfHref(ctx.header("Destination"), prefix)
+					if !(named is none) {
+						let target = named
+						let existing = statOrNone(target)
+						if method == "COPY" {
+							paths.push(path)
+							needed.push(Privilege.Read)
+						} else {
+							paths.push(parent)
+							needed.push(Privilege.Unbind)
+						}
+						if !(existing is none) {
+							if method == "COPY" {
+								paths.push(target)
+								needed.push(Privilege.WriteContent)
+								paths.push(target)
+								needed.push(Privilege.WriteProperties)
+							} else {
+								paths.push(parentOf(target))
+								needed.push(Privilege.Unbind)
+							}
+						}
+						if existing is none || method == "MOVE" {
+							paths.push(parentOf(target))
+							needed.push(Privilege.Bind)
+						}
+					}
+			}
+			let deniedHrefs string[] = []
+			let denied Privilege[] = []
+			for let i = 0; i < paths.len(); i++ {
+				continue when can(asker, paths[i], needed[i])
+				let e = statOrNone(paths[i])
+				deniedHrefs.push(hrefOf(prefix, paths[i], !(e is none) && e.kind == fs.FileKind.Dir))
+				denied.push(needed[i])
+			}
+			return true when denied.len() == 0
+			try ctx.blob(403, "application/xml; charset=utf-8", needPrivileges(deniedHrefs, denied))
+			return false
+		}
+
+		// The access control properties of a resource (RFC 3744 §5, RFC
+		// 5397); none for another name.
+		internal def aclProperty(path string, name string, asker Asker) ?XMLNode {
+			switch {
+				case name == "owner":
+					let n = davNode(name)
+					let owner = acls.ownerOf(path)
+					n.add(davText("href", owner)) when owner != ""
+					return n
+				case name == "group":
+					// No group owns a resource here.
+					return davNode(name)
+				case name == "supported-privilege-set":
+					return supportedPrivilegeSet()
+				case name == "current-user-privilege-set":
+					return privilegeSet(heldPrivileges(acl(path), asker, acls.ownerOf(path), ""))
+				case name == "acl":
+					return aclNode(acl(path))
+				case name == "acl-restrictions":
+					return davNode(name)
+				case name == "inherited-acl-set":
+					let n = davNode(name)
+					let above = path
+					for above != "/" {
+						above = parentOf(above)
+						n.add(davText("href", hrefOf(prefix, above, true)))
+					}
+					return n
+				case name == "principal-collection-set":
+					let n = davNode(name)
+					n.add(davText("href", principalBase() + "/"))
+					return n
+				case name == "current-user-principal":
+					return currentUserPrincipal(asker)
+			}
+			return none
+		}
+
+		internal def currentUserPrincipal(asker Asker) XMLNode {
+			let n = davNode("current-user-principal")
+			if asker.principals.len() > 0 {
+				n.add(davText("href", asker.principals[0]))
+			} else {
+				n.add(davNode("unauthenticated"))
+			}
+			return n
+		}
+
+		// ACL (RFC 3744 §8.1): replaces the resource's own entries.
+		internal def aclRequest(ctx Context, path string) !none {
+			let entry = statOrNone(path)
+			return try ctx.error(404) when entry is none
+			return none unless try admit(ctx, path, entry, false)
+			let root = new XML().parse(try ctx.bytes()) onerror recover new XMLNode("")
+			return try ctx.error(400, "the ACL body is not an acl") unless root.namespace == davNamespace && root.localName == "acl"
+			let aces Ace[] = []
+			let refuse = def (condition string) !none {
+				return try ctx.blob(403, "application/xml; charset=utf-8", davError(condition))
+			}
+			for let node in root.elements("ace", davNamespace) {
+				return try refuse("no-protected-ace-conflict") unless node.child("protected", davNamespace) is none
+				return try refuse("no-inherited-ace-conflict") unless node.child("inherited", davNamespace) is none
+				let (parsed, problem) = parseAce(node)
+				return try refuse(problem) when problem != ""
+				return try ctx.error(400, "malformed ace") when parsed is none
+				let ace Ace = parsed
+				if !(ace.principal := "all" || "authenticated" || "unauthenticated" || "self" || "owner") {
+					let named = pathOfHref(ace.principal, prefix)
+					return try refuse("recognized-principal") unless !(named is none) && isPrincipal(named)
+					ace.principal = hrefOf(prefix, named, false)
+				}
+				aces.push(ace)
+			}
+			acls.set(path, aces)
+			changes.record(path, false)
+			return try ctx.noContent(200)
+		}
+
+		// The ACL reports (RFC 3744 §9).
+		internal def aclReport(ctx Context, path string, root XMLNode, asker Asker) !none {
+			let propNode = root.child("prop", davNamespace)
+			let wanted = propNode is none ?? (XMLNode[], propNode.elements())
+			let responses DavResponse[] = []
+			switch {
+				case root.localName == "acl-principal-prop-set":
+					return try ctx.error(400, "acl-principal-prop-set needs Depth: 0") unless ctx.header("Depth").trim() := "" || "0"
+					if !can(asker, path, Privilege.ReadAcl) {
+						return try ctx.blob(403, "application/xml; charset=utf-8", needPrivileges([hrefOf(prefix, path, false)], [Privilege.ReadAcl]))
+					}
+					let seen string[] = []
+					for let ace in acl(path) {
+						continue when ace.principal := "all" || "authenticated" || "unauthenticated" || "self" || "owner"
+						continue when seen.includes(ace.principal)
+						seen.push(ace.principal)
+						let named = pathOfHref(ace.principal, prefix)
+						if named is none || !isPrincipal(named) {
+							responses.push(DavResponse{href: ace.principal, status: 404})
+						} else {
+							responses.push(principalResponse(named, "prop", wanted, asker))
+						}
+					}
+				case root.localName == "principal-match":
+					return try ctx.error(400, "principal-match needs Depth: 0") unless ctx.header("Depth").trim() := "" || "0"
+					if !(root.child("self", davNamespace) is none) {
+						// The principals the asker is, under this collection.
+						for let href in asker.principals {
+							let named = pathOfHref(href, prefix)
+							continue when named is none
+							responses.push(principalResponse(named, "prop", wanted, asker)) when within(named, path) && isPrincipal(named)
+						}
+					} else {
+						let property = root.child("principal-property", davNamespace)
+						return try ctx.error(400, "principal-match names self or a principal-property") when property is none
+						let names = property.elements()
+						return try ctx.error(400, "principal-property names one property") unless names.len() == 1
+						let name = names[0]
+						let paths string[] = []
+						let found fs.FileEntry[] = []
+						try gather(path, statOrNone(path), -1, paths, found)
+						for let i = 0; i < paths.len(); i++ {
+							continue unless can(asker, paths[i], Privilege.Read)
+							let value = propertyOf(paths[i], found[i], name, asker)
+							continue when value is none
+							let hrefs = value.elements("href", davNamespace).mapElem<string>(h => h.text().trim())
+							let matched = false
+							for let h in hrefs {
+								matched = true when asker.principals.includes(h)
+							}
+							responses.push(responseFor(paths[i], found[i], "prop", wanted, asker)) when matched
+						}
+					}
+				case root.localName == "principal-property-search":
+					let test = root.attribute("test")
+					let anyOf = !(test is none) && test.lower() == "anyof"
+					let everywhere = !(root.child("apply-to-principal-collection-set", davNamespace) is none)
+					let searches = root.elements("property-search", davNamespace)
+					return try ctx.error(400, "principal-property-search needs a property-search") when searches.len() == 0
+					for let candidate in principalMembers() {
+						continue unless everywhere || within(candidate, path)
+						let hits = 0
+						for let search in searches {
+							let props = search.child("prop", davNamespace)
+							let matchNode = search.child("match", davNamespace)
+							continue when props is none || matchNode is none
+							let needle = matchNode.text().lower()
+							let hit = false
+							for let p in props.elements() {
+								let value = principalProperty(candidate, p, asker)
+								hit = true when !(value is none) && value.text().lower().contains(needle)
+							}
+							hits++ when hit
+						}
+						let matched = anyOf ?? (hits > 0, hits == searches.len())
+						responses.push(principalResponse(candidate, "prop", wanted, asker)) when matched
+					}
+				case root.localName == "expand-property":
+					let response = expandProperties(path, root.elements("property", davNamespace), asker, 0)
+					return try ctx.error(404) when response is none
+					responses.push(response)
+				default:
+					// principal-search-property-set
+					return try ctx.error(400, "principal-search-property-set needs Depth: 0") unless ctx.header("Depth").trim() := "" || "0"
+					let set = davNode("principal-search-property-set")
+					set.set("xmlns:D", davNamespace)
+					let property = set.add(davNode("principal-search-property"))
+					property.add(davNode("prop")).add(davNode("displayname"))
+					property.add(davText("description", "Full name")).set("xml:lang", "en")
+					return try ctx.blob(200, "application/xml; charset=utf-8", document(set))
+			}
+			return try ctx.blob(207, "application/xml; charset=utf-8", multistatus(responses))
+		}
+
+		// expand-property (RFC 3253 §3.8): the named properties of a
+		// resource, each `href` in a property with nested `property`
+		// elements replaced by the response of the resource it names,
+		// expanded in turn. None when `path` names nothing.
+		internal def expandProperties(path string, properties XMLNode[], asker Asker, depth int) ?DavResponse {
+			let collection = !isPrincipal(path)
+			let lookup = def (name XMLNode) ?XMLNode {
+				return principalProperty(path, name, asker)
+			}
+			if principalKind(path) == "" {
+				let entry = statOrNone(path)
+				return none when entry is none
+				collection = entry.kind == fs.FileKind.Dir
+				return DavResponse{href: hrefOf(prefix, path, collection), status: 403} unless can(asker, path, Privilege.Read)
+				lookup = def (name XMLNode) ?XMLNode {
+					return propertyOf(path, entry, name, asker)
+				}
+			}
+			let r = DavResponse{href: hrefOf(prefix, path, collection)}
+			let found = PropStat{status: 200}
+			let missing = PropStat{status: 404}
+			for let p in properties {
+				let nameAttr = p.attribute("name")
+				continue when nameAttr is none
+				let ns = p.attribute("namespace")
+				let name = new XMLNode(nameAttr, ns is none ?? (davNamespace, ns))
+				let value = lookup(name)
+				if value is none || !readable(asker, path, name) {
+					missing.props.push(emptyLike(name))
+					continue
+				}
+				let nested = p.elements("property", davNamespace)
+				if nested.len() == 0 || depth >= 8 {
+					found.props.push(value)
+					continue
+				}
+				let expanded = new XMLNode(value.name, value.namespace)
+				for let child in value.elements() {
+					if child.namespace == davNamespace && child.localName == "href" {
+						let target = pathOfHref(child.text().trim(), prefix)
+						let inner = target is none ?? (none, expandProperties(target, nested, asker, depth + 1))
+						if inner is none {
+							expanded.add(child)
+						} else {
+							let resp = expanded.add(davNode("response"))
+							resp.add(davText("href", inner.href))
+							resp.add(davText("status", statusLine(inner.status))) when inner.status != 0
+							for let ps in inner.propstats {
+								let propstat = resp.add(davNode("propstat"))
+								let prop = propstat.add(davNode("prop"))
+								for let x in ps.props {
+									prop.add(x)
+								}
+								propstat.add(davText("status", statusLine(ps.status)))
+							}
+						}
+					} else {
+						expanded.add(child)
+					}
+				}
+				found.props.push(expanded)
+			}
+			r.propstats.push(found) when found.props.len() > 0 || missing.props.len() == 0
+			r.propstats.push(missing) when missing.props.len() > 0
+			return r
+		}
+
+		// ---- Principals ----
+
+		// What a path below `principalPath` is: `root`, `users`, `groups`,
+		// `user`, `group`; "" when it names nothing.
+		internal def principalKind(path string) string {
+			let base = cleanStorePath(principalPath)
+			return "root" when path == base
+			return "" unless within(path, base)
+			let rest = path[base.len():].trimPrefix("/").split("/")
+			return rest[0] when rest.len() == 1 && (rest[0] := "users" || "groups")
+			return "" unless rest.len() == 2
+			return "user" when rest[0] == "users" && principals.hasUser(rest[1])
+			return "group" when rest[0] == "groups" && principals.hasGroup(rest[1])
+			return ""
+		}
+
+		internal def isPrincipal(path string) bool {
+			return principalKind(path) := "user" || "group"
+		}
+
+		// Every user and group path.
+		internal def principalMembers() string[] {
+			let base = cleanStorePath(principalPath)
+			let out string[] = []
+			for let n in principals.userNames() {
+				out.push(joinPath(joinPath(base, "users"), n))
+			}
+			for let n in principals.groupNames() {
+				out.push(joinPath(joinPath(base, "groups"), n))
+			}
+			return out
+		}
+
+		// The members of a principal collection.
+		internal def principalChildren(path string) string[] {
+			let kind = principalKind(path)
+			let base = cleanStorePath(principalPath)
+			return [joinPath(base, "users"), joinPath(base, "groups")] when kind == "root"
+			return principalMembers().filter(p => parentOf(p) == path) when kind := "users" || "groups"
+			return []
+		}
+
+		// A request below `principalPath`: principals are read-only
+		// resources anyone may read.
+		internal def principalRequest(ctx Context, method string, path string, asker Asker) !none {
+			let kind = principalKind(path)
+			return try ctx.error(404) when kind == ""
+			switch {
+				case method == "OPTIONS":
+					ctx.setHeader("Allow", "OPTIONS, PROPFIND, REPORT")
+					ctx.setHeader("Content-Length", "0")
+					return try ctx.noContent(200)
+				case method == "PROPFIND":
+					let depthText = ctx.header("Depth").trim().lower()
+					let depth = depthText == "0" ?? (0, depthText == "1" ?? (1, -1))
+					let body = try ctx.bytes()
+					let mode = "allprop"
+					let wanted XMLNode[] = []
+					if body.len() > 0 {
+						let root = new XML().parse(body) onerror recover new XMLNode("")
+						return try ctx.error(400, "the PROPFIND body is not a propfind") unless root.localName == "propfind" && root.namespace == davNamespace
+						let prop = root.child("prop", davNamespace)
+						if !(root.child("propname", davNamespace) is none) {
+							mode = "propname"
+						} else if !(prop is none) {
+							mode = "prop"
+							wanted = prop.elements()
+						}
+					}
+					let responses DavResponse[] = []
+					let queue = [path]
+					let depths = [depth]
+					for let i = 0; i < queue.len(); i++ {
+						responses.push(principalResponse(queue[i], mode, wanted, asker))
+						continue when depths[i] == 0
+						for let c in principalChildren(queue[i]) {
+							queue.push(c)
+							depths.push(depths[i] == 1 ?? (0, -1))
+						}
+					}
+					return try answerMultistatus(ctx, responses, depth != 0 && !isPrincipal(path))
+				case method == "REPORT":
+					let root = new XML().parse(try ctx.bytes()) onerror recover new XMLNode("")
+					if root.namespace == davNamespace && (root.localName := "principal-match" || "principal-property-search" || "principal-search-property-set" || "expand-property") {
+						return try aclReport(ctx, path, root, asker)
+					}
+					return try ctx.blob(403, "application/xml; charset=utf-8", davError("supported-report"))
+			}
+			return try ctx.blob(403, "application/xml; charset=utf-8", needPrivileges([hrefOf(prefix, path, !isPrincipal(path))], [Privilege.Write]))
+		}
+
+		internal def principalNames(path string) string[] {
+			let names = ["displayname", "resourcetype", "principal-URL", "alternate-URI-set", "group-membership", "current-user-principal", "principal-collection-set", "owner", "acl", "current-user-privilege-set", "supported-privilege-set", "supported-report-set"]
+			names.push("group-member-set") when principalKind(path) == "group"
+			return names
+		}
+
+		internal def principalResponse(path string, mode string, wanted XMLNode[], asker Asker) DavResponse {
+			let collection = !isPrincipal(path)
+			let r = DavResponse{href: hrefOf(prefix, path, collection)}
+			let found = PropStat{status: 200}
+			let missing = PropStat{status: 404}
+			if mode == "propname" {
+				for let name in principalNames(path) {
+					found.props.push(davNode(name))
+				}
+				r.propstats.push(found)
+				return r
+			}
+			let asked = mode == "allprop" ?? (["displayname", "resourcetype", "principal-URL", "alternate-URI-set", "group-membership", "group-member-set"].mapElem<XMLNode>(n => davNode(n)), wanted)
+			for let w in asked {
+				let value = principalProperty(path, w, asker)
+				if value is none {
+					missing.props.push(emptyLike(w)) unless mode == "allprop"
+				} else {
+					found.props.push(value)
+				}
+			}
+			r.propstats.push(found) when found.props.len() > 0 || missing.props.len() == 0
+			r.propstats.push(missing) when missing.props.len() > 0
+			return r
+		}
+
+		// A property of a principal or principal collection.
+		internal def principalProperty(path string, name XMLNode, asker Asker) ?XMLNode {
+			return none unless name.namespace == davNamespace
+			let kind = principalKind(path)
+			let principal = kind := "user" || "group"
+			let url = hrefOf(prefix, path, !principal)
+			let local = name.localName
+			switch {
+				case local == "displayname":
+					return davText(local, principal ?? (principals.displayNameOf(kind == "user" ?? ("users", "groups"), baseName(path)), baseName(path)))
+				case local == "resourcetype":
+					let n = davNode(local)
+					if principal {
+						n.add(davNode("principal"))
+					} else {
+						n.add(davNode("collection"))
+					}
+					return n
+				case local == "principal-URL" && principal:
+					let n = davNode(local)
+					n.add(davText("href", url))
+					return n
+				case local == "alternate-URI-set" && principal:
+					return davNode(local)
+				case local == "group-member-set" && kind == "group":
+					let n = davNode(local)
+					for let m in principals.membersOf(baseName(path)) {
+						n.add(davText("href", m))
+					}
+					return n
+				case local == "group-membership" && principal:
+					let n = davNode(local)
+					for let g in principals.groupsHolding(principalBase(), url) {
+						n.add(davText("href", g))
+					}
+					return n
+				case local == "current-user-principal":
+					return currentUserPrincipal(asker)
+				case local == "principal-collection-set":
+					let n = davNode(local)
+					n.add(davText("href", principalBase() + "/"))
+					return n
+				case local == "owner":
+					return davNode(local)
+				case local == "acl":
+					return aclNode(principalAcl())
+				case local == "current-user-privilege-set":
+					return privilegeSet(heldPrivileges(principalAcl(), asker, "", principal ?? (url, "")))
+				case local == "supported-privilege-set":
+					return supportedPrivilegeSet()
+				case local == "supported-report-set":
+					let n = davNode(local)
+					for let report in ["principal-match", "principal-property-search", "principal-search-property-set", "expand-property"] {
+						n.add(davNode("supported-report")).add(davNode("report")).add(davNode(report))
+					}
+					return n
+			}
+			return none
+		}
+
+		// The fixed ACL of principals: anyone reads them; a principal also
+		// reads its own ACL.
+		internal def principalAcl() Ace[] {
+			return [
+				Ace{principal: "all", privileges: [Privilege.Read, Privilege.ReadCurrentUserPrivilegeSet], protected: true},
+				Ace{principal: "self", privileges: [Privilege.ReadAcl], protected: true}
+			]
+		}
+
+		// Names the share.
+		def str() string {
+			return "webdav.Server({prefix == "" ?? ("/", prefix)})"
+		}
+	}
+
+	// A child path.
+	internal def joinPath(dir string, name string) string {
+		return "/" + name when dir == "/"
+		return dir + "/" + name
+	}
 }

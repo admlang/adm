@@ -1,0 +1,260 @@
+internal partial module std.net.ssh.transport {
+	use (
+		std.bytes
+		std.crypto::(constantTimeEqual, rand)
+		std.crypto.cipher
+		std.crypto.hash::(HMAC, Hash)
+		std.data.compress.zlib
+		std.net
+		std.net.sshwire::*
+	)
+
+	// The binary packet protocol (RFC 4253 §6): one direction's cipher,
+	// MAC and sequence number, and how a payload becomes a packet and
+	// back. Covers chacha20-poly1305@openssh.com (PROTOCOL.chacha20poly1305),
+	// AES-GCM (RFC 5647 as OpenSSH names it), AES-CTR (RFC 4344) with
+	// HMAC, and HMAC in its encrypt-then-MAC form (`-etm@openssh.com`).
+	// Payloads are compressed with `zlib` (RFC 4253 §6.2) or
+	// `zlib@openssh.com`, which starts once the user logged in.
+
+	// The largest packet accepted; RFC 4253 asks for 35000 at least.
+	const maxPacket = 262144
+
+	// Protection is one direction of a connection.
+	type Protection {
+		cipherName   string         = "none"
+		macName      string         = "none"
+		blockSize    int            = 8
+		macSize      int            = 0
+		etm          bool           = false
+		ctr          ?cipher.CTR    = none
+		gcm          ?cipher.GCM    = none
+		gcmNonce     byte[]         = []
+		chachaMain   byte[]         = []
+		chachaHeader byte[]         = []
+		macKey       byte[]         = []
+		macHash      Hash           = Hash.SHA256
+		seq          int64          = 0
+		// Bytes and packets since the last key exchange.
+		bytes        int64          = 0
+		packets      int64          = 0
+		// The compression method this direction negotiated, and its
+		// state once it runs: one zlib stream for the whole connection,
+		// flushed after each packet.
+		compression  string         = "none"
+		deflater     ?zlib.Writer   = none
+		deflated     bytes.Buffer
+		inflater     ?zlib.Inflater = none
+
+		def new() {
+			deflated = new bytes.Buffer()
+		}
+
+		// Whether the length field is sent in the clear and left out of
+		// the block alignment (AEAD ciphers and encrypt-then-MAC).
+		def plainLength() bool {
+			return etm || isAead()
+		}
+
+		def isAead() bool {
+			return cipherName := "chacha20-poly1305@openssh.com" || "aes128-gcm@openssh.com" || "aes256-gcm@openssh.com"
+		}
+
+		def nextSeq() {
+			seq = (seq + 1) & 0xffffffff
+			packets++
+		}
+
+		// The packet that carries `payload`, protected. Fails when the
+		// random source does.
+		def seal(payload byte[]) !byte[] {
+			let d = deflater
+			if !(d is none) {
+				try d.write(payload)
+				try d.flush()
+				payload = deflated.bytes().clone()
+				deflated.reset()
+			}
+			let aad = plainLength() ?? (4, 0)
+			let padding = blockSize - ((5 + payload.len() - aad) % blockSize)
+			padding += blockSize when padding < 4
+			let length = 1 + payload.len() + padding
+			let packet = new Writer().putUint32(int64(length)).putByte(padding).putRaw(payload).putRaw(try rand(padding)).bytes()
+			let out byte[] = []
+			if cipherName == "chacha20-poly1305@openssh.com" {
+				let nonce = chachaNonce()
+				let head = try cipher.chacha20(chachaHeader, nonce, 0, packet[:4])
+				let body = try cipher.chacha20(chachaMain, nonce, 1, packet[4:])
+				let polyKey = try cipher.chacha20(chachaMain, nonce, 0, zeros(32))
+				let tag = try cipher.poly1305(polyKey, head + body)
+				out = head + body + tag
+			} else if !(gcm is none) {
+				out = packet[:4] + gcm.seal(gcmNonce, packet[4:], packet[:4])
+				bumpGcmNonce()
+			} else if !(ctr is none) {
+				if etm {
+					let body = ctr.encrypt(packet[4:])
+					out = packet[:4] + body + mac(packet[:4] + body)
+				} else {
+					out = ctr.encrypt(packet) + mac(packet)
+				}
+			} else {
+				out = packet
+			}
+			bytes += int64(out.len())
+			nextSeq()
+			return out
+		}
+
+		// Reads one packet off `lines` and returns its payload. Fails when
+		// the stream does, the packet is too long, or it does not
+		// authenticate.
+		def open(lines net.LineReader, timeout duration) !byte[] {
+			let body byte[] = []
+			if cipherName == "chacha20-poly1305@openssh.com" {
+				let nonce = chachaNonce()
+				let head = try lines.readBytes(4, timeout)
+				let length = int(uint32At(try cipher.chacha20(chachaHeader, nonce, 0, head), 0))
+				try checkLength(length, 8, 0)
+				let rest = try lines.readBytes(length + 16, timeout)
+				let polyKey = try cipher.chacha20(chachaMain, nonce, 0, zeros(32))
+				let tag = try cipher.poly1305(polyKey, head + rest[:length])
+				fail sshError("protocol", "packet does not authenticate", disconnectMacError) unless constantTimeEqual(tag, rest[length:])
+				body = try cipher.chacha20(chachaMain, nonce, 1, rest[:length])
+			} else if !(gcm is none) {
+				let head = try lines.readBytes(4, timeout)
+				let length = int(uint32At(head, 0))
+				try checkLength(length, 16, 0)
+				let rest = try lines.readBytes(length + 16, timeout)
+				body = gcm.open(gcmNonce, rest, head) onerror fail sshError("protocol", "packet does not authenticate", disconnectMacError)
+				bumpGcmNonce()
+			} else if !(ctr is none) && etm {
+				let head = try lines.readBytes(4, timeout)
+				let length = int(uint32At(head, 0))
+				try checkLength(length, blockSize, 0)
+				let rest = try lines.readBytes(length + macSize, timeout)
+				fail sshError("protocol", "packet does not authenticate", disconnectMacError) unless constantTimeEqual(mac(head + rest[:length]), rest[length:])
+				body = ctr.decrypt(rest[:length])
+			} else if !(ctr is none) {
+				let first = ctr.decrypt(try lines.readBytes(blockSize, timeout))
+				let length = int(uint32At(first, 0))
+				try checkLength(length, blockSize, 4)
+				let more = ctr.decrypt(try lines.readBytes(length + 4 - blockSize, timeout))
+				let packet = first + more
+				let tag = try lines.readBytes(macSize, timeout)
+				fail sshError("protocol", "packet does not authenticate", disconnectMacError) unless constantTimeEqual(mac(packet), tag)
+				body = packet[4:]
+			} else {
+				let head = try lines.readBytes(4, timeout)
+				let length = int(uint32At(head, 0))
+				try checkLength(length, 1, 0)
+				body = try lines.readBytes(length, timeout)
+			}
+			let padding = int(body[0])
+			fail protocolError("bad padding length") when padding < 4 || padding + 1 > body.len()
+			bytes += int64(body.len() + 4 + macSize)
+			nextSeq()
+			let payload = body[1:body.len() - padding].clone()
+			let z = inflater
+			return payload when z is none
+			let plain = z.feed(payload) onerror (err error) fail protocolError("compressed packet does not decompress: {err.message}")
+			fail protocolError("packet decompresses past {maxPacket} bytes") when plain.len() > maxPacket
+			return plain
+		}
+
+		// Starts compressing as `compression` says, now that the keys
+		// changed (`loggedIn` tells whether the user did). Each new set
+		// of keys starts a fresh zlib stream, as OpenSSH does; a direction
+		// already compressing (`loggedIn` arriving) is left alone. `outbound`
+		// says whether this is the sending direction.
+		def startCompression(outbound bool, loggedIn bool) {
+			return unless compression == "zlib" || compression == "zlib@openssh.com" && loggedIn
+			if outbound && deflater is none {
+				deflater = new zlib.Writer(deflated)
+			}
+			if !outbound && inflater is none {
+				inflater = new zlib.Inflater()
+			}
+		}
+
+		// Checks a packet length: within limits and aligned (`extra` is
+		// the length field when it counts toward the alignment).
+		internal def checkLength(length int, align int, extra int) !none {
+			fail protocolError("packet length {length} out of range") when length < 5 || length > maxPacket
+			fail protocolError("packet length {length} not a multiple of {align}") when align > 1 && (length + extra) % align != 0
+			return none
+		}
+
+		internal def mac(data byte[]) byte[] {
+			let h = new HMAC(macHash, macKey)
+			h.write(new Writer().putUint32(seq).bytes())
+			h.write(data)
+			let sum = h.hash()
+			return sum[:macSize].clone()
+		}
+
+		internal def chachaNonce() byte[] {
+			let nonce byte[] = []
+			nonce.len(12)
+			for let i = 0; i < 8; i++ {
+				nonce[4 + i] = byte(seq >> int64(56 - 8 * i))
+			}
+			return nonce
+		}
+
+		// The last 8 bytes of the GCM nonce count packets (RFC 5647 §7.1).
+		internal def bumpGcmNonce() {
+			for let i = 11; i >= 4; i-- {
+				gcmNonce[i] = gcmNonce[i] + byte(1)
+				break when gcmNonce[i] != byte(0)
+			}
+		}
+	}
+
+	// A cipher's key and IV sizes; 0, 0 for an unknown name.
+	def cipherSizes(name string) (int, int) {
+		return (64, 0) when name == "chacha20-poly1305@openssh.com"
+		return (16, 12) when name == "aes128-gcm@openssh.com"
+		return (32, 12) when name == "aes256-gcm@openssh.com"
+		return (16, 16) when name == "aes128-ctr"
+		return (24, 16) when name == "aes192-ctr"
+		return (32, 16) when name == "aes256-ctr"
+		return (0, 0)
+	}
+
+	// A MAC's hash and key size; 0 for an unknown name.
+	def macSpec(name string) (Hash, int) {
+		return (Hash.SHA256, 32) when name := "hmac-sha2-256" || "hmac-sha2-256-etm@openssh.com"
+		return (Hash.SHA512, 64) when name := "hmac-sha2-512" || "hmac-sha2-512-etm@openssh.com"
+		return (Hash.SHA1, 20) when name := "hmac-sha1" || "hmac-sha1-etm@openssh.com"
+		return (Hash.SHA256, 0)
+	}
+
+	// A direction keyed for a cipher and MAC.
+	def newProtection(cipherName string, macName string, key byte[], iv byte[], macKey byte[]) !Protection {
+		let p = new Protection()
+		p.cipherName = cipherName
+		if cipherName == "chacha20-poly1305@openssh.com" {
+			p.chachaMain = key[:32].clone()
+			p.chachaHeader = key[32:64].clone()
+			p.macSize = 16
+			return p
+		}
+		p.blockSize = 16
+		let block = try cipher.newAES(key)
+		if p.isAead() {
+			p.gcm = try cipher.newGCM(block)
+			p.gcmNonce = iv.clone()
+			p.macSize = 16
+			return p
+		}
+		p.ctr = try cipher.newCTR(block, iv)
+		p.macName = macName
+		let (hash, size) = macSpec(macName)
+		p.macHash = hash
+		p.macSize = size
+		p.macKey = macKey
+		p.etm = macName.endsWith("-etm@openssh.com")
+		return p
+	}
+}

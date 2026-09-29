@@ -1,4 +1,358 @@
 partial module std.net.snmp {
-	// Server is the SNMP agent; it has no members yet.
-	type Server {}
+	use (
+		std.crypto.x509
+		std.metrics
+		std.net
+		std.net.snmp.proto::*
+		std.net.tls
+		std.net.udp
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// Server is an SNMP agent: it answers Get, GetNext, GetBulk and Set
+	// for the objects registered on it, over SNMPv1 and v2c (communities)
+	// and v3 (`users`, or TLS certificates), on UDP and optionally TCP and
+	// TLS. `access` decides who sees and changes what. The system group
+	// (sysDescr, sysObjectID, sysUpTime, sysContact, sysName, sysLocation,
+	// sysServices) and the engine objects of SNMP-FRAMEWORK-MIB are there
+	// from the start. Implements `net.Server`.
+	//
+	// ```
+	// let agent = new snmp.Server(":161")
+	// agent.name = "gateway-1"
+	// agent.register("1.3.6.1.4.1.32473.1.1.0", def () snmp.Variable {
+	//     return snmp.gauge32("", openConnections())
+	// })
+	// try agent.listenAndServe()
+	// ```
+	type Server {
+		addr string = ":161"
+		// The community that may read, and the one that may also write;
+		// none turns SNMPv1/v2c reads or writes off.
+		community ?Secret<string> = "public"
+		writeCommunity ?Secret<string> = none
+		// SNMPv3 users; those with authentication may write.
+		users User[] = []
+		// SNMP over TCP (RFC 3430) on this address too; "" for none.
+		tcpAddr string = ""
+		// SNMP over TLS (RFC 6353) on this address too (10161 is its
+		// port); "" for none. Needs `tls`, which should require client
+		// certificates (`clientAuth`): the Transport Security Model names
+		// managers by them.
+		tlsAddr string = ""
+		tls ?tls.Config = none
+		// The security names of managers over TLS, by the SHA-256
+		// fingerprint of their certificate in hex (colons and case do not
+		// matter), as RFC 6353's certToTSN table.
+		certificateNames map<string, string>
+		// Names a certificate no fingerprint lists (e.g. by its subject);
+		// none to refuse it. A manager without a name is not answered.
+		certificateMapper ?def (x509.Certificate) ?string = none
+		// The View-based Access Control (RFC 3415) deciding every request;
+		// none keeps the simple rules: `community` reads, `writeCommunity`
+		// writes, v3 users with authentication and TLS managers with a name
+		// write.
+		access ?Access = none
+		backlog int = 64
+		// System group values.
+		description string = "ADM SNMP agent"
+		objectId string = "1.3.6.1.4.1.32473.1"
+		contact string = ""
+		name string = ""
+		location string = ""
+		internal mib Mib
+		internal engine ?Engine = none
+		internal socket ?udp.Server = none
+		internal tcpListener ?net.Listener = none
+		internal tlsListener ?net.Listener = none
+		internal atomic running bool = false
+		internal atomic unknownContexts int64 = 0
+		internal started time.Time
+		// Shared by every agent of the process.
+		@metric("net.snmp.server.requests")
+		internal requests metrics.Counter
+		@metric("net.snmp.server.bad.communities")
+		internal badCommunities metrics.Counter
+
+		def new(addr string = ":161") {
+			self.addr = addr
+			mib = new Mib()
+			started = time.now()
+			register(sysDescr, () => octets(sysDescr, description))
+			register(sysObjectID, () => objectId(sysObjectID, objectId))
+			register(sysUpTime, () => timeTicks(sysUpTime, time.now() - started))
+			writable(sysContact, () => octets(sysContact, contact), def (v Variable) !none {
+				contact = text(v)
+				return none
+			})
+			writable(sysName, () => octets(sysName, name), def (v Variable) !none {
+				name = text(v)
+				return none
+			})
+			writable(sysLocation, () => octets(sysLocation, location), def (v Variable) !none {
+				location = text(v)
+				return none
+			})
+			set(integer(sysServices, 72))
+			register(snmpEngineID, () => octets(snmpEngineID, engineID() onerror recover byte[]))
+			register(snmpEngineBoots, () => integer(snmpEngineBoots, 1))
+			register(snmpEngineTime, () => integer(snmpEngineTime, int64(time.now() - started) / 1000000000))
+			set(integer(snmpEngineMaxMessageSize, 65507))
+		}
+
+		// Serves a fixed, read-only value under its OID.
+		def set(v Variable) {
+			let e = new MibEntry(v.oid)
+			e.value = v
+			mib.put(e)
+		}
+
+		// Serves a value read each time it is asked for.
+		def register(oid string, read def () Variable) {
+			let e = new MibEntry(oid)
+			e.reader = read
+			mib.put(e)
+		}
+
+		// Serves a value that Set may change: `write` gets the new value
+		// and fails to refuse it (the manager sees wrongValue).
+		def writable(oid string, read def () Variable, write def (Variable) !none) {
+			let e = new MibEntry(oid)
+			e.reader = read
+			e.writer = write
+			mib.put(e)
+		}
+
+		// Stops serving an OID.
+		def remove(oid string) {
+			mib.remove(oid)
+		}
+
+		// The value an OID has now; none when nothing is served there.
+		def value(oid string) ?Variable {
+			let e = mib.find(oid)
+			return e is none ?? (none, e.read())
+		}
+
+		// The SNMPv3 engine ID managers see. Fails when the random source
+		// does.
+		def engineID() !byte[] {
+			return (try engineOf()).id
+		}
+
+		internal def engineOf() !Engine {
+			let e = engine
+			if e is none {
+				let made = new Engine(try newEngineId())
+				made.users = users
+				engine = made
+				return made
+			}
+			e.users = users
+			return e
+		}
+
+		// Binds `addr` and answers until `close`. Fails with PolicyDenied
+		// when the policy denies listening there, or NetError when the
+		// address cannot be bound.
+		def listenAndServe() !none {
+			try bind()
+			try listenStreams()
+			return try loop()
+		}
+
+		// Implements net.Server: binds and answers in the background.
+		// Fails as `listenAndServe` does.
+		def start() !none {
+			return none when running
+			try bind()
+			listenStreams() onerror (err error) {
+				close() onerror recover none
+				fail err
+			}
+			let task = async loopInBackground()
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops answering. Never fails.
+		def close() !none {
+			running = false
+			let s = socket
+			socket = none
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			for let ln in [tcpListener, tlsListener] {
+				if !(ln is none) {
+					ln.close() onerror recover none
+				}
+			}
+			tcpListener = none
+			tlsListener = none
+			return none
+		}
+
+		// Implements net.Server: the bound address of a transport (UDP
+		// unless named), or its configured address before `start`.
+		def address(transport Transport = Transport.Udp) net.Address {
+			if transport == Transport.Udp {
+				let s = socket
+				return s.address() unless s is none
+				return net.parseAddress(addr) onerror recover new net.Address()
+			}
+			let ln = transport == Transport.Tcp ?? (tcpListener, tlsListener)
+			return ln.address() unless ln is none
+			return net.parseAddress(transport == Transport.Tcp ?? (tcpAddr, tlsAddr)) onerror recover new net.Address()
+		}
+
+		// Listens on `tcpAddr` and `tlsAddr` when set, each accepting in
+		// its own task.
+		internal def listenStreams() !none {
+			if tcpAddr != "" {
+				let ln = try listenStream("snmp+tcp", tcpAddr, backlog)
+				tcpListener = ln
+				startStreams(ln, none, certificateNames, certificateMapper, () => running, (data, peer) => handle(data, peer) onerror recover byte[])
+			}
+			if tlsAddr != "" {
+				let config = tls
+				fail SnmpError{message: "snmp: tlsAddr needs a tls config", code: "config"} when config is none
+				let ln = try listenStream("snmp+tls", tlsAddr, backlog)
+				tlsListener = ln
+				startStreams(ln, config, certificateNames, certificateMapper, () => running, (data, peer) => handle(data, peer) onerror recover byte[])
+			}
+			return none
+		}
+
+		internal def bind() !none {
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "snmp://" + addr)
+			try engineOf()
+			let s = new udp.Server(addr)
+			try s.start()
+			socket = s
+			running = true
+			return none
+		}
+
+		internal def loopInBackground() {
+			loop() onerror recover none
+		}
+
+		internal def loop() !none {
+			let buf byte[] = []
+			buf.len(65536)
+			for running {
+				let s = socket
+				break when s is none
+				let failed = false
+				let (n, from) = s.recv(buf, 1s) onerror (err error) {
+					failed = true
+					recover (0, new net.Address())
+				}
+				continue when failed || n <= 0
+				let reply = handle(buf[:n].clone(), Peer{address: from}) onerror recover byte[]
+				if reply.len() > 0 {
+					s.send(reply, from) onerror recover 0
+				}
+			}
+			return none
+		}
+
+		// The reply to one message; empty to drop it.
+		internal def handle(data byte[], peer Peer) !byte[] {
+			let m = try decodeMessage(data)
+			requests.inc()
+			if m.version == 3 {
+				let v3 = m.v3
+				return [] when v3 is none
+				let e = try engineOf()
+				let level = levelOf(v3.flags)
+				if v3.model == modelTsm {
+					// TSM: the TLS session vouches for the name (RFC 6353 §5.2).
+					return [] unless peer.secured && peer.tlsName != ""
+					let request = v3.pdu
+					return [] when request is none || !isRequest(request)
+					let reply = decide(request, SecurityModel.Tsm, peer.tlsName, level, v3.contextName, 3, true)
+					return [] when reply is none
+					return try e.respond(v3, Checked{request: request}, reply)
+				}
+				let checked = try e.admit(v3)
+				let report = checked.report
+				return report unless report is none
+				let request = checked.request
+				return [] when request is none || !isRequest(request)
+				let u = checked.user
+				let mayWrite = !(u is none) && u.authProtocol != AuthProtocol.None
+				let reply = decide(request, SecurityModel.Usm, u is none ?? ("", u.name), level, v3.contextName, 3, mayWrite)
+				return [] when reply is none
+				return try e.respond(v3, checked, reply)
+			}
+			let request = m.pdu
+			return [] when request is none || !isRequest(request)
+			return [] when request.kind == pduGetBulk && m.version == 0
+			let version = m.version == 0 ?? (Version.V1, Version.V2c)
+			if access is none {
+				let reads = community
+				let writes = writeCommunity
+				let canWrite = !(writes is none) && writes.reveal() == m.community
+				let canRead = canWrite || (!(reads is none) && reads.reveal() == m.community)
+				if !canRead {
+					badCommunities.inc()
+					return []
+				}
+				return try encodeCommunity(version, m.community, answer(mib, request, m.version, canWrite))
+			}
+			let model = m.version == 0 ?? (SecurityModel.V1, SecurityModel.V2c)
+			let reply = decide(request, model, m.community, SecurityLevel.NoAuthNoPriv, "", m.version, false)
+			if reply is none {
+				badCommunities.inc()
+				return []
+			}
+			return try encodeCommunity(version, m.community, reply)
+		}
+
+		// The answer to a request under `access`, or with `writable` when
+		// there is none. None drops it: a community in no group. An unknown
+		// context gets the snmpUnknownContexts Report (RFC 3413 §3.2).
+		internal def decide(request PDU, model SecurityModel, name string, level SecurityLevel, context string, version int, writable bool) ?PDU {
+			let acl = access
+			if acl is none {
+				return answer(mib, request, version, writable) when context == ""
+				return unknownContext(request)
+			}
+			let kind = request.kind == pduSet ?? (AccessKind.Write, AccessKind.Read)
+			let (result, chosen) = acl.viewFor(model, name, level, kind, context)
+			return unknownContext(request) when result == AccessResult.NoSuchContext
+			return none when result == AccessResult.NoGroupName && version < 3
+			if result != AccessResult.Allowed {
+				return failed(request, version == 0 ?? (errNoSuchName, errAuthorizationError), version == 0 ?? (1, 0))
+			}
+			return answer(mib, request, version, true, def (oid string, write bool) bool {
+				return write == (kind == AccessKind.Write) && acl.inView(chosen, oid)
+			})
+		}
+
+		internal atomic def unknownContext(request PDU) PDU {
+			unknownContexts++
+			return PDU{kind: pduReport, requestId: request.requestId, variables: [counter32(snmpUnknownContexts, unknownContexts)]}
+		}
+
+		// Names the agent and its address.
+		def str() string {
+			return "snmp.Server({addr})"
+		}
+	}
+
+	// The requests an agent answers.
+	internal def isRequest(p PDU) bool {
+		return p.kind := pduGet || pduGetNext || pduGetBulk || pduSet
+	}
+
+	// The security level of v3 message flags.
+	internal def levelOf(flags int) SecurityLevel {
+		return SecurityLevel.AuthPriv when (flags & flagPriv) != 0
+		return SecurityLevel.AuthNoPriv when (flags & flagAuth) != 0
+		return SecurityLevel.NoAuthNoPriv
+	}
 }

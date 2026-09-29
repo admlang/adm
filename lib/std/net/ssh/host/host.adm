@@ -1,0 +1,441 @@
+internal partial module std.net.ssh.host {
+	use (
+		std.net
+		std.net.ssh::(Algorithms, Authenticator, Certificate, Channel, Handler, PrivateKey, PublicKey, Session, Signal, Terminal)
+		std.net.ssh.auth::*
+		std.net.ssh.mux::*
+		std.net.ssh.transport::*
+		std.net.sshwire::*
+		std.services::(Policy)
+	)
+
+	// The server side of a connection: the login, then session channels
+	// (pty-req, env, shell, exec, subsystem, window-change, signal;
+	// RFC 4254 §6), direct TCP/IP channels and remote port forwarding
+	// (§7).
+
+	// What a connection needs of its `Server`.
+	struct ServerConfig {
+		hostKeys              PrivateKey[]
+		hostCertificates      Certificate[]        = []
+		userAuthorities       PublicKey[]          = []
+		handler               ?Handler             = none
+		subsystems            map<string, Handler>
+		authenticator         ?Authenticator       = none
+		banner                string               = ""
+		algorithms            Algorithms
+		allowForwarding       bool                 = false
+		allowRemoteForwarding bool                 = false
+		maxAuthTries          int                  = 6
+		rekeyLimit            int64                = 1073741824
+		timeout               duration             = 60s
+	}
+
+	// SessionState is what a `Session` shows its handler.
+	type SessionState {
+		channel       Chan
+		user          string
+		key           ?PublicKey          = none
+		command       string              = ""
+		subsystem     string              = ""
+		terminal      ?Terminal           = none
+		environment   map<string, string>
+		remote        net.Address
+		started       bool                = false
+		atomic exited bool                = false
+		resizeHooks   ResizeHook[]        = []
+		signalHooks   SignalHook[]        = []
+		reader        ?net.LineReader     = none
+
+		def new(channel Chan, user string, remote net.Address) {
+			self.channel = channel
+			self.user = user
+			self.remote = remote
+		}
+
+		// A line reader over the input, made on first use.
+		def lines() net.LineReader {
+			let r = reader
+			if r is none {
+				let made = new net.LineReader(new Channel(channel))
+				reader = made
+				return made
+			}
+			return r
+		}
+
+		// Sends the exit status, EOF and CLOSE, once. Fails when the
+		// connection breaks.
+		def exitWith(code int) !none {
+			return none unless markExited()
+			try channel.request("exit-status", false, new Writer().putUint32(int64(code)).bytes())
+			try channel.sendEof()
+			channel.close()
+			return none
+		}
+
+		internal atomic def markExited() bool {
+			return false when exited
+			exited = true
+			return true
+		}
+
+		atomic def addResize(fn def (int, int)) {
+			resizeHooks.push(new ResizeHook(fn))
+		}
+
+		atomic def addSignal(fn def (Signal)) {
+			signalHooks.push(new SignalHook(fn))
+		}
+	}
+
+	// Connection is one client connection to a server.
+	type Connection {
+		conn                     net.Connection
+		config                   ServerConfig
+		transport                ?Transport                = none
+		mux                      ?Mux                      = none
+		user                     string                    = ""
+		key                      ?PublicKey                = none
+		remote                   net.Address
+		internal atomic forwards map<string, net.Listener>
+
+		def new(conn net.Connection, config ServerConfig) {
+			self.conn = conn
+			self.config = config
+			remote = conn.remoteAddr()
+		}
+
+		// Runs the connection to its end. Returns false when the login
+		// failed, true otherwise.
+		def run() bool {
+			let t = new Transport(conn, false, config.algorithms, config.timeout)
+			t.hostKeys = config.hostKeys
+			t.hostCerts = config.hostCertificates
+			t.rekeyBytes = config.rekeyLimit
+			transport = t
+			let broken = false
+			t.handshake() onerror (err error) {
+				broken = true
+				recover none
+			}
+			if broken {
+				t.close()
+				return true
+			}
+			let policy = ServerPolicy{authenticator: config.authenticator, banner: config.banner, maxTries: config.maxAuthTries, authorities: config.userAuthorities, remote: remote}
+			let login = serverLogin(t, policy) onerror (err error) {
+				broken = true
+				recover ServerLogin{user: ""}
+			}
+			if broken {
+				t.close()
+				return false
+			}
+			t.loggedIn()
+			user = login.user
+			key = login.key
+			let m = new Mux(t)
+			m.onOpen = def (req OpenRequest) !none {
+				return try decideOpen(req)
+			}
+			m.onAccepted = def (req OpenRequest) {
+				startChannel(req)
+			}
+			m.onGlobal = def (name string, data byte[]) !byte[] {
+				return try globalRequest(name, data)
+			}
+			mux = m
+			m.run()
+			for let (_, ln) in takeForwards() {
+				ln.close() onerror recover none
+			}
+			return true
+		}
+
+		// Ends the connection. Never fails.
+		def end() {
+			let t = transport
+			if !(t is none) {
+				t.disconnect(disconnectByApplication, "server closing")
+				return
+			}
+			conn.close() onerror recover none
+		}
+
+		// Sessions are always taken; direct TCP/IP when forwarding is
+		// allowed and the policy allows the connection.
+		internal def decideOpen(req OpenRequest) !none {
+			if req.kind == "session" {
+				let state = new SessionState(req.channel, user, remote)
+				state.key = key
+				req.channel.onRequest = def (name string, data byte[]) bool {
+					return sessionRequest(state, name, data)
+				}
+				return none
+			}
+			if req.kind == "direct-tcpip" {
+				fail sshError("channel", "forwarding is not allowed", openAdministrativelyProhibited) unless config.allowForwarding && permits("permit-port-forwarding")
+				let r = new Reader(req.extra)
+				let host = try r.readText()
+				let port = int(try r.readUint32())
+				let target = net.withPort(host, port)
+				try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "tcp://" + target)
+				req.channel.kind = "direct-tcpip:" + target
+				return none
+			}
+			fail sshError("channel", "{req.kind} channels are not accepted", openUnknownChannelType)
+		}
+
+		// Whether the login allows something: always for a plain key or
+		// a password, only when its certificate grants the extension
+		// otherwise.
+		internal def permits(extension string) bool {
+			let k = key
+			return true when k is none
+			let cert = k.certificate()
+			return cert is none || cert.permits(extension)
+		}
+
+		// The command a user certificate forces on every session; none
+		// when it forces none.
+		internal def forcedCommand() ?string {
+			let k = key
+			return none when k is none
+			let cert = k.certificate()
+			return none when cert is none
+			return cert.criticalOptions.get("force-command")
+		}
+
+		internal def startChannel(req OpenRequest) {
+			let ch = req.channel
+			return unless ch.kind.startsWith("direct-tcpip:")
+			let task = async carry(ch, ch.kind["direct-tcpip:".len():])
+			task.keepAlive()
+		}
+
+		internal def carry(ch Chan, target string) {
+			let outbound = dialTarget(target) onerror recover none
+			if outbound is none {
+				ch.close()
+				return
+			}
+			pipe(outbound, new Channel(ch))
+		}
+
+		internal def dialTarget(target string) !?net.Connection {
+			return try net.dialStream(target, config.timeout)
+		}
+
+		// A request on a session channel. Returns whether it succeeded.
+		internal def sessionRequest(state SessionState, name string, data byte[]) bool {
+			let r = new Reader(data)
+			switch {
+				case name == "pty-req":
+					return false unless permits("permit-pty")
+					let t = Terminal{}
+					t.name = r.readText() onerror recover "vt100"
+					t.columns = int(r.readUint32() onerror recover 80)
+					t.rows = int(r.readUint32() onerror recover 24)
+					t.width = int(r.readUint32() onerror recover 0)
+					t.height = int(r.readUint32() onerror recover 0)
+					let modes = new Reader(r.readString() onerror recover byte[])
+					for !modes.done() {
+						let op = modes.readByte() onerror recover 0
+						break when op == 0 || op >= 160
+						t.modes[op] = int(modes.readUint32() onerror recover 0)
+					}
+					state.terminal = t
+					return true
+				case name == "env":
+					let variable = r.readText() onerror recover ""
+					let value = r.readText() onerror recover ""
+					return false when variable == ""
+					state.environment[variable] = value
+					return true
+				case name == "window-change":
+					let columns = int(r.readUint32() onerror recover 0)
+					let rows = int(r.readUint32() onerror recover 0)
+					let term = state.terminal
+					if !(term is none) {
+						term.columns = columns
+						term.rows = rows
+					}
+					for let hook in state.resizeHooks {
+						hook.fn(columns, rows)
+					}
+					return true
+				case name == "signal":
+					let signalName = r.readText() onerror recover ""
+					let sig = signalOf(signalName)
+					return false when sig is none
+					for let hook in state.signalHooks {
+						hook.fn(sig)
+					}
+					return true
+				case name == "shell" || name == "exec":
+					return false when state.started
+					let handler = config.handler
+					return false when handler is none
+					state.command = name == "exec" ?? (r.readText() onerror recover "", "")
+					forceCommand(state)
+					return startSession(state, handler)
+				case name == "subsystem":
+					return false when state.started
+					let wanted = r.readText() onerror recover ""
+					let forced = forcedCommand()
+					if !(forced is none) {
+						// A forced command replaces subsystems too, as in OpenSSH.
+						let shell = config.handler
+						return false when shell is none
+						state.command = wanted
+						forceCommand(state)
+						return startSession(state, shell)
+					}
+					let handler = config.subsystems.get(wanted)
+					return false when handler is none
+					state.subsystem = wanted
+					return startSession(state, handler)
+			}
+			return false
+		}
+
+		// Puts a forced command in place of what the client asked for,
+		// which stays in `SSH_ORIGINAL_COMMAND`.
+		internal def forceCommand(state SessionState) {
+			let forced = forcedCommand()
+			return when forced is none
+			state.environment["SSH_ORIGINAL_COMMAND"] = state.command
+			state.command = forced
+		}
+
+		internal def startSession(state SessionState, handler Handler) bool {
+			state.started = true
+			let task = async runSession(state, handler)
+			task.keepAlive()
+			return true
+		}
+
+		// Runs the handler; its return ends the session with 0, its
+		// failure with the message on the error output and 1.
+		internal def runSession(state SessionState, handler Handler) {
+			let session = new Session(state)
+			let failed ?error = none
+			handler.serve(session) onerror (err error) {
+				failed = err
+				recover none
+			}
+			if failed is none {
+				state.exitWith(0) onerror recover none
+				return
+			}
+			session.writeErrors(failed.message + "\n") onerror recover 0
+			state.exitWith(1) onerror recover none
+		}
+
+		// Global requests: remote forwarding when allowed. Fails to refuse.
+		internal def globalRequest(name string, data byte[]) !byte[] {
+			let r = new Reader(data)
+			if name == "tcpip-forward" {
+				fail sshError("channel", "remote forwarding is not allowed") unless config.allowRemoteForwarding && permits("permit-port-forwarding")
+				let host = try r.readText()
+				let port = int(try r.readUint32())
+				let bindHost = host == "" || host == "localhost" ?? ("127.0.0.1", host)
+				let addr = net.withPort(bindHost, port)
+				try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "tcp://" + addr)
+				let a = try net.parseAddress(addr)
+				let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+				sock.setReuseAddr(true) onerror recover none
+				try sock.bind(addr)
+				let ln = try sock.listen(64)
+				let bound = ln.address().port
+				addForward("{host}:{bound}", ln)
+				let task = async acceptForwarded(ln, host, bound)
+				task.keepAlive()
+				return port == 0 ?? (new Writer().putUint32(int64(bound)).bytes(), [])
+			}
+			if name == "cancel-tcpip-forward" {
+				let host = try r.readText()
+				let port = int(try r.readUint32())
+				let ln = dropForward("{host}:{port}")
+				fail sshError("channel", "no forward on {host}:{port}") when ln is none
+				ln.close() onerror recover none
+				return []
+			}
+			fail sshError("channel", "global request {name} is not supported")
+		}
+
+		internal def acceptForwarded(ln net.Listener, host string, port int) {
+			for {
+				let accepted = acceptOne(ln) onerror recover none
+				break when accepted is none
+				let task = async forwardBack(accepted, host, port)
+				task.keepAlive()
+			}
+		}
+
+		internal def acceptOne(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def forwardBack(conn net.Connection, host string, port int) {
+			let m = mux
+			if m is none {
+				conn.close() onerror recover none
+				return
+			}
+			let peer = conn.remoteAddr()
+			let extra = new Writer().putText(host).putUint32(int64(port)).putText(peer.host).putUint32(int64(peer.port))
+			let ch = openOrNone(m, extra.bytes()) onerror recover none
+			if ch is none {
+				conn.close() onerror recover none
+				return
+			}
+			pipe(conn, new Channel(ch))
+		}
+
+		internal def openOrNone(m Mux, extra byte[]) !?Chan {
+			return try m.open("forwarded-tcpip", extra)
+		}
+
+		internal atomic def addForward(key string, ln net.Listener) {
+			forwards[key] = ln
+		}
+
+		internal atomic def dropForward(key string) ?net.Listener {
+			let ln = forwards.get(key)
+			forwards.delete(key)
+			return ln
+		}
+
+		internal atomic def takeForwards() map<string, net.Listener> {
+			let all = forwards
+			forwards = map<string, net.Listener>{}
+			return all
+		}
+	}
+
+	type ResizeHook {
+		fn def (int, int)
+
+		def new(fn def (int, int)) {
+			self.fn = fn
+		}
+	}
+
+	type SignalHook {
+		fn def (Signal)
+
+		def new(fn def (Signal)) {
+			self.fn = fn
+		}
+	}
+
+	// The Signal an RFC 4254 signal name stands for; none for another.
+	def signalOf(name string) ?Signal {
+		for let s in [Signal.Abort, Signal.Alarm, Signal.FloatingPoint, Signal.Hangup, Signal.Illegal, Signal.Interrupt, Signal.Kill, Signal.Pipe, Signal.Quit, Signal.Segfault, Signal.Terminate, Signal.User1, Signal.User2] {
+			return s when s.value == name
+		}
+		return none
+	}
+}

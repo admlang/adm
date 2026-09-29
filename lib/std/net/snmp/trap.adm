@@ -1,0 +1,258 @@
+partial module std.net.snmp {
+	use (
+		std.crypto.x509
+		std.net
+		std.net.snmp.proto::*
+		std.net.tls
+		std.net.udp
+		std.services::(Policy)
+	)
+
+	// TrapReceiver listens for notifications: SNMPv1 traps, SNMPv2 traps
+	// and informs (acknowledged), and SNMPv3 ones from `users` (traps are
+	// checked with keys made from the sender's engine ID, informs with this
+	// receiver's), on UDP and optionally TCP and TLS (whose senders the
+	// Transport Security Model names by their certificates). `handler`
+	// runs for each.
+	//
+	// ```
+	// let traps = new snmp.TrapReceiver(def (t snmp.Trap) {
+	//     print("{t.source.str()}: {t.trapOid}")
+	// }, ":162")
+	// try traps.start()
+	// ```
+	type TrapReceiver {
+		addr                    string            = ":162"
+		handler                 def (Trap)
+		// The community accepted from SNMPv1/v2c senders; none accepts any.
+		community               ?Secret<string>   = none
+		users                   User[]            = []
+		// Notifications over TCP (RFC 3430) on this address too; "" for
+		// none.
+		tcpAddr                 string            = ""
+		// Notifications over TLS (RFC 6353, port 10162) on this address
+		// too; "" for none. Needs `tls`, requiring client certificates.
+		tlsAddr                 string            = ""
+		tls                     ?tls.Config       = none
+		// Senders over TLS by the SHA-256 fingerprint of their
+		// certificate (see `Server.certificateNames`), and a mapping for
+		// the others; a sender without a name is ignored.
+		certificateNames        map<string, string>
+		certificateMapper       ?def (x509.Certificate) ?string = none
+		internal engine         ?Engine           = none
+		internal tcpListener    ?net.Listener     = none
+		internal tlsListener    ?net.Listener     = none
+		internal socket         ?udp.Server       = none
+		internal atomic running bool              = false
+		internal senderKeys     map<string, Keys>
+
+		def new(handler def (Trap), addr string = ":162") {
+			self.handler = handler
+			self.addr = addr
+		}
+
+		// Binds and listens in the background. Fails with PolicyDenied or
+		// NetError when the address cannot be bound.
+		def start() !none {
+			return none when running
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "snmptrap://" + addr)
+			let e = new Engine(try newEngineId())
+			e.users = users
+			engine = e
+			let s = new udp.Server(addr)
+			try s.start()
+			socket = s
+			running = true
+			let task = async loop()
+			task.keepAlive()
+			if tcpAddr != "" {
+				let ln = listenStream("snmptrap+tcp", tcpAddr, 16) onerror (err error) {
+					close() onerror recover none
+					fail err
+				}
+				tcpListener = ln
+				startStreams(ln, none, certificateNames, certificateMapper, () => running, (data, peer) => receive(data, peer) onerror recover byte[])
+			}
+			if tlsAddr != "" {
+				let config = tls
+				if config is none {
+					close() onerror recover none
+					fail SnmpError{message: "snmp: tlsAddr needs a tls config", code: "config"}
+				}
+				let ln = listenStream("snmptrap+tls", tlsAddr, 16) onerror (err error) {
+					close() onerror recover none
+					fail err
+				}
+				tlsListener = ln
+				startStreams(ln, config, certificateNames, certificateMapper, () => running, (data, peer) => receive(data, peer) onerror recover byte[])
+			}
+			return none
+		}
+
+		// This receiver's engine ID, what SNMPv3 informs are sent to.
+		// Fails before `start`.
+		def engineID() !byte[] {
+			let e = engine
+			fail SnmpError{message: "snmp: the receiver is not started", code: "closed"} when e is none
+			return e.id
+		}
+
+		// The bound address of a transport (UDP unless named), or its
+		// configured address before `start`.
+		def address(transport Transport = Transport.Udp) net.Address {
+			if transport == Transport.Udp {
+				let s = socket
+				return s.address() unless s is none
+				return net.parseAddress(addr) onerror recover new net.Address()
+			}
+			let ln = transport == Transport.Tcp ?? (tcpListener, tlsListener)
+			return ln.address() unless ln is none
+			return net.parseAddress(transport == Transport.Tcp ?? (tcpAddr, tlsAddr)) onerror recover new net.Address()
+		}
+
+		// Stops listening. Never fails.
+		def close() !none {
+			running = false
+			let s = socket
+			socket = none
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			for let ln in [tcpListener, tlsListener] {
+				if !(ln is none) {
+					ln.close() onerror recover none
+				}
+			}
+			tcpListener = none
+			tlsListener = none
+			return none
+		}
+
+		internal def loop() {
+			let buf byte[] = []
+			buf.len(65536)
+			for running {
+				let s = socket
+				break when s is none
+				let failed = false
+				let (n, from) = s.recv(buf, 1s) onerror (err error) {
+					failed = true
+					recover (0, new net.Address())
+				}
+				continue when failed || n <= 0
+				let reply = receive(buf[:n].clone(), Peer{address: from}) onerror recover byte[]
+				if reply.len() > 0 {
+					s.send(reply, from) onerror recover 0
+				}
+			}
+		}
+
+		// Takes one message; returns what to send back (an inform's
+		// acknowledgement, a Report), empty for nothing.
+		internal def receive(data byte[], peer Peer) !byte[] {
+			let from = peer.address
+			let m = try decodeMessage(data)
+			return try receiveV3(m, peer) when m.version == 3
+			let p = m.pdu
+			return [] when p is none
+			let wanted = community
+			return [] unless wanted is none || wanted.reveal() == m.community
+			let version = m.version == 0 ?? (Version.V1, Version.V2c)
+			return [] unless p.kind := pduTrapV1 || pduTrapV2 || pduInform
+			handler(trapOf(p, version, m.community, from))
+			return [] unless p.kind == pduInform
+			return try encodeCommunity(version, m.community, PDU{kind: pduResponse, requestId: p.requestId, variables: p.variables})
+		}
+
+		internal def receiveV3(m Message, peer Peer) !byte[] {
+			let from = peer.address
+			let v3 = m.v3
+			return [] when v3 is none
+			let e = engine
+			return [] when e is none
+			if v3.model == modelTsm {
+				// The TLS session vouches for the sender (RFC 6353).
+				let p = v3.pdu
+				return [] unless peer.secured && peer.tlsName != "" && !(p is none)
+				return [] unless p.kind := pduTrapV2 || pduInform
+				handler(trapOf(p, Version.V3, peer.tlsName, from))
+				return [] unless p.kind == pduInform
+				return try e.respond(v3, Checked{request: p}, PDU{kind: pduResponse, requestId: p.requestId, variables: p.variables})
+			}
+			return [] when v3.pdu is none && v3.encrypted is none
+			// An inform or a discovery probe: this receiver is authoritative.
+			if !sameBytes(v3.engineId, e.id) || v3.engineId.len() == 0 {
+				let trap = try senderTrap(v3, from)
+				if !(trap is none) {
+					handler(trap)
+					return []
+				}
+			}
+			let checked = try e.admit(v3)
+			let report = checked.report
+			return report unless report is none
+			let p = checked.request
+			return [] when p is none || p.kind != pduInform
+			handler(trapOf(p, Version.V3, v3.userName, from))
+			return try e.respond(v3, checked, PDU{kind: pduResponse, requestId: p.requestId, variables: p.variables})
+		}
+
+		// A trap whose sender is the authoritative engine: checked with the
+		// user's keys localized to the sender's engine ID. None when the
+		// message is not such a trap or does not check out.
+		internal def senderTrap(v3 V3Message, from net.Address) !?Trap {
+			return none when v3.engineId.len() == 0
+			let u = userNamed(v3.userName)
+			return none when u is none
+			let key = u.name + "/" + v3.engineId.hex()
+			let cached = senderKeys.get(key)
+			let k = cached is none ?? (try keysFor(u, v3.engineId), cached)
+			senderKeys[key] = k
+			if (v3.flags & flagAuth) != 0 {
+				return none unless verifyDigest(v3, k)
+			}
+			let failed = false
+			openScoped(v3, k) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return none when failed
+			let p = v3.pdu
+			return none when p is none || p.kind != pduTrapV2
+			return trapOf(p, Version.V3, u.name, from)
+		}
+
+		internal def userNamed(name string) ?User {
+			for let u in users {
+				return u when u.name == name
+			}
+			return none
+		}
+	}
+
+	// A Trap from a notification PDU; SNMPv1 traps get their snmpTrapOID
+	// as RFC 3584 §3.1 builds it.
+	internal def trapOf(p PDU, version Version, community string, from net.Address) Trap {
+		let t = Trap{version: version, community: community, source: from, trapOid: "", uptime: 0, variables: [], inform: p.kind == pduInform}
+		if p.kind == pduTrapV1 {
+			t.enterprise = p.enterprise
+			t.agentAddr = text(Variable{oid: "", kind: ValueKind.IpAddress, data: p.agentAddr})
+			t.generic = p.generic
+			t.specific = p.specific
+			t.uptime = p.timestamp
+			t.trapOid = p.generic == 6 ?? ("{p.enterprise}.0.{p.specific}", "1.3.6.1.6.3.1.1.5.{p.generic + 1}")
+			t.variables = p.variables
+			return t
+		}
+		for let v in p.variables {
+			if v.oid == sysUpTime {
+				t.uptime = v.number
+			} else if v.oid == snmpTrapOID {
+				t.trapOid = v.objectId
+			} else {
+				t.variables.push(v)
+			}
+		}
+		return t
+	}
+}

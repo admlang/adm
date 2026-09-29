@@ -1,4 +1,206 @@
 partial module std.net.ldap {
-	// Server is the LDAP server; it has no members yet.
-	type Server {}
+	use (
+		std.metrics
+		std.net
+		std.net.ldap.proto::*
+		std.net.tls
+		std.services::(Policy, metric)
+	)
+
+	// Server is an LDAPv3 server answering from a `Directory`, one task
+	// per connection: binds (simple, SASL PLAIN), searches with paged
+	// results, add, modify, delete, rename and compare, and the WhoAmI,
+	// password change and (with a TLS config) StartTLS extended
+	// operations. Implements `net.Server`: `start` returns at once and
+	// `close` stops it; `listenAndServe` is the blocking form, `serve`
+	// the form over a listener the caller made.
+	//
+	// ```
+	// let dir = new ldap.MemoryDirectory("dc=example,dc=com")
+	// try dir.loadFile("seed.ldif")
+	// dir.admins.push("cn=admin,dc=example,dc=com")
+	// let server = new ldap.Server(dir, ":389")
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr string = ":389"
+		directory Directory
+		// With `Implicit` every connection starts with the TLS handshake
+		// (ldaps); with `StartTls` clients may upgrade. Both need `tls`.
+		security Security = Security.Plain
+		tls ?tls.Config = none
+		// The suffixes the root DSE lists; set from a MemoryDirectory's
+		// suffix when empty.
+		namingContexts string[] = []
+		// Whether anonymous binds (and so anonymous access) are allowed.
+		allowAnonymous bool = true
+		// Entries a search may return; 0 for no limit.
+		sizeLimit int = 1000
+		// How long each write may wait.
+		timeout duration = 30s
+		// How long a connection may sit without a request.
+		idleTimeout duration = 300s
+		// Where to send requests for names outside `namingContexts` (the
+		// default referral, as slapd's `referral`): LDAP URLs of servers,
+		// which get the name appended. Empty answers NoSuchObject.
+		referrals string[] = []
+		// Connections served at once; one past it is closed. 0 is no limit.
+		maxConnections int = 0
+		backlog int = 128
+		internal listener ?net.Listener = none
+		internal atomic running bool = false
+		internal atomic open int = 0
+		// Shared by every server of the process.
+		@metric("net.ldap.server.connections.open")
+		internal connectionsOpen metrics.Gauge
+		@metric("net.ldap.server.connections.total")
+		internal connectionsTotal metrics.Counter
+
+		def new(directory Directory, addr string = ":389") {
+			self.directory = directory
+			self.addr = addr
+			if directory is MemoryDirectory {
+				let memory MemoryDirectory = directory
+				namingContexts = [memory.suffix]
+			}
+		}
+
+		// Binds `addr` and serves until `close`.
+		// Fails with PolicyDenied when the policy denies listening there,
+		// NetError when the address cannot be bound, or when TLS is asked
+		// for without a config.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Accepts on the listener until it closes; each connection runs in
+		// its own task. Returns none after `close`.
+		// Fails with NetError when an accept fails for another reason, or
+		// when TLS is asked for without a config.
+		def serve(ln net.Listener) !none {
+			fail failure(ResultCode.Other, "Security.{security.value} needs a TLS config") when security != Security.Plain && tls is none
+			fail failure(ResultCode.Other, "server is already serving") when running
+			listener = ln
+			running = true
+			for running {
+				let failed ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failed = err
+					recover none
+				}
+				if !(failed is none) {
+					return none unless running
+					fail failed
+				}
+				continue when accepted is none
+				if !running || (maxConnections > 0 && open >= maxConnections) {
+					accepted.close() onerror recover none
+					continue
+				}
+				let task = async runConnection(accepted)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with PolicyDenied or NetError when the address cannot be
+		// bound, or when TLS is asked for without a config.
+		def start() !none {
+			return none when running
+			fail failure(ResultCode.Other, "Security.{security.value} needs a TLS config") when security != Security.Plain && tls is none
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting. Connections finish their
+		// current request. Never fails.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed
+		// before `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def runConnection(conn net.Connection) {
+			opened()
+			let config = SessionConfig{directory: directory, namingContexts: namingContexts, allowAnonymous: allowAnonymous, sizeLimit: sizeLimit, tlsConfig: tls, startTls: security == Security.StartTls, timeout: timeout, idleTimeout: idleTimeout, referrals: referrals}
+			let stream net.Stream = conn
+			let ok = true
+			if security == Security.Implicit {
+				let upgraded = serverTls(conn, tls, timeout) onerror (err error) {
+					ok = false
+					recover stream
+				}
+				stream = upgraded
+			}
+			if ok {
+				let session = new ServerSession(conn, stream, config, security == Security.Implicit)
+				session.run()
+			} else {
+				conn.close() onerror recover none
+			}
+			closedOne()
+		}
+
+		internal atomic def opened() {
+			open++
+			connectionsOpen.inc()
+			connectionsTotal.inc()
+		}
+
+		internal atomic def closedOne() {
+			open--
+			connectionsOpen.dec()
+		}
+
+		// Binds `addr` once the `listen` permission allows `ldap://addr`
+		// (`ldaps` with implicit TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("ldaps", "ldap")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let domain = a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "ldap.Server({addr})"
+		}
+	}
+
+	// The TLS server stream over an accepted connection.
+	internal def serverTls(conn net.Connection, config ?tls.Config, timeout duration) !net.Stream {
+		fail failure(ResultCode.Other, "no TLS config") when config is none
+		let secured = tls.server(conn, config)
+		try secured.handshake(timeout)
+		return secured
+	}
 }

@@ -1,0 +1,276 @@
+internal partial module std.net.ntp.proto {
+	use (
+		std.math
+		std.time
+	)
+
+	// The clock filter, selection, clustering and combining algorithms of
+	// RFC 5905 §10 and §11, on seconds as float. Times are local
+	// monotonic seconds (`now`), so a stepped wall clock cannot age a
+	// sample wrongly.
+
+	// Frequency tolerance: how fast dispersion grows (15 PPM).
+	const phi = 0.000015
+	const filterStages = 8
+	const maxDispersion = 16.0
+	const minDispersion = 0.01
+	// A source farther than this (root distance, seconds) is not used.
+	const maxDistance = 1.5
+	// Clustering stops at this many survivors.
+	const minSurvivors = 3
+	const maxStratum = 16
+
+	// One exchange's measurements.
+	struct Sample {
+		offset     float = 0.0
+		delay      float = 0.0
+		dispersion float = 0.0
+		// When it was taken (local monotonic seconds).
+		at         float = 0.0
+	}
+
+	// What a peer's last answer said about the server itself.
+	struct PeerInfo {
+		stratum        int    = 0
+		leap           int    = 3
+		precision      int    = 0
+		rootDelay      float  = 0.0
+		rootDispersion float  = 0.0
+		referenceId    byte[] = [0, 0, 0, 0]
+		reference      Stamp  = Stamp{}
+	}
+
+	// Peer is one server as the clock filter sees it.
+	type Peer {
+		address    string
+		info       PeerInfo = PeerInfo{}
+		samples    Sample[] = []
+		// The filter's output.
+		offset     float    = 0.0
+		delay      float    = 0.0
+		dispersion float    = maxDispersion
+		jitter     float    = 0.0
+		// When the filter output was last updated.
+		updated    float    = 0.0
+		reach      int      = 0
+		poll       int      = 6
+		lastError  string   = ""
+		// Set by a Kiss-o'-Death DENY or RSTR: never poll again.
+		banned     bool     = false
+		// Selection's verdict, as SourceState's ordinal.
+		state      int      = 5
+		// The name the server was given as, for its NTS key exchange,
+		// and the NTS session once there is one.
+		name       string   = ""
+		session    ?NtsSession = none
+		// A broadcasting server: the delay its calibration measured, -1
+		// before it.
+		broadcastDelay float = -1.0
+		// Heard as a broadcaster: never polled.
+		broadcaster bool = false
+
+		def new(address string) {
+			self.address = address
+		}
+
+		// Records a poll: `answered` shifts a 1 into reach, else a 0.
+		def polled(answered bool) {
+			reach = ((reach << 1) | (answered ?? (1, 0))) & 0xff
+		}
+
+		// The clock filter (RFC 5905 §10): the new sample joins the last
+		// eight; the one with the least delay gives offset and delay,
+		// dispersion is their weighted sum and jitter the RMS of the
+		// offsets around the chosen one.
+		def add(s Sample, now float) {
+			samples.unshift(s)
+			samples.pop() when samples.len() > filterStages
+			// Aged copies, sorted by delay.
+			let aged Sample[] = []
+			for let x in samples {
+				aged.push(Sample{offset: x.offset, delay: x.delay, dispersion: x.dispersion + phi * (now - x.at), at: x.at})
+			}
+			aged.sort((a, b) => a.delay < b.delay)
+			let disp = 0.0
+			let weight = 0.5
+			for let i = 0; i < filterStages; i++ {
+				disp += (i < aged.len() ?? (aged[i].dispersion, maxDispersion)) * weight
+				weight /= 2.0
+			}
+			let best = aged[0]
+			offset = best.offset
+			delay = best.delay
+			dispersion = disp
+			let sum = 0.0
+			for let i = 1; i < aged.len(); i++ {
+				let d = aged[i].offset - best.offset
+				sum += d * d
+			}
+			jitter = aged.len() > 1 ?? (math.sqrt(sum / float(aged.len() - 1)), 0.0)
+			let floor = precisionSeconds(info.precision)
+			jitter = floor when jitter < floor
+			updated = now
+		}
+
+		// Root distance λ (RFC 5905 §11.2): the worst error of this
+		// source's time.
+		def distance(now float) float {
+			let total = info.rootDelay + delay
+			total = minDispersion when total < minDispersion
+			return total / 2.0 + info.rootDispersion + dispersion + phi * (now - updated) + jitter
+		}
+
+		// Whether the source can take part in selection (RFC 5905 §11.2
+		// fit()).
+		def fit(now float) bool {
+			return false when banned || reach == 0 || samples.len() == 0
+			return false when info.leap == 3 || info.stratum == 0 || info.stratum >= maxStratum
+			return distance(now) <= maxDistance + phi * float(1 << poll)
+		}
+	}
+
+	// 2^precision seconds.
+	def precisionSeconds(precision int) float {
+		return float(1 << precision) when precision >= 0
+		return precision < -62 ?? (0.0, 1.0 / float(int64(1) << -precision))
+	}
+
+	// One end or the middle of a correctness interval: low (-1), mid (0),
+	// high (+1).
+	struct Edge {
+		at   float
+		kind int
+	}
+
+	// What selection made of the peers.
+	struct Selection {
+		// The survivors, best first; empty when no majority agreed.
+		survivors Peer[] = []
+		// The combined offset of the survivors, and the system jitter.
+		offset    float  = 0.0
+		jitter    float  = 0.0
+	}
+
+	// Runs selection (Marzullo's intersection), clustering and combining
+	// over the peers (RFC 5905 §11.2.1–11.2.3), and leaves each peer's
+	// verdict in its `state`: 0 selected, 1 candidate, 2 falseticker,
+	// 3 outlier, 4 unusable, 5 unreachable.
+	def selectPeers(peers Peer[], now float) Selection {
+		let candidates Peer[] = []
+		for let p in peers {
+			if p.fit(now) {
+				candidates.push(p)
+				continue
+			}
+			p.state = p.reach == 0 ?? (5, 4)
+		}
+		let result = Selection{}
+		return result when candidates.len() == 0
+		// Endpoints of every correctness interval: low (-1), mid (0),
+		// high (+1).
+		let edges Edge[] = []
+		for let c in candidates {
+			let d = c.distance(now)
+			edges.push(Edge{at: c.offset - d, kind: -1})
+			edges.push(Edge{at: c.offset, kind: 0})
+			edges.push(Edge{at: c.offset + d, kind: 1})
+		}
+		edges.sort((a, b) => a.at < b.at || (a.at == b.at && a.kind < b.kind))
+		let n = candidates.len()
+		let low = 0.0
+		let high = 0.0
+		let agreed = false
+		for let allow = 0; 2 * allow < n; allow++ {
+			let found = 0
+			let chime = 0
+			for let (_, e) in edges {
+				chime -= e.kind
+				if chime >= n - allow {
+					low = e.at
+					break
+				}
+				found++ when e.kind == 0
+			}
+			chime = 0
+			for let i = edges.len() - 1; i >= 0; i-- {
+				let e = edges[i]
+				chime += e.kind
+				if chime >= n - allow {
+					high = e.at
+					break
+				}
+				found++ when e.kind == 0
+			}
+			continue when found > allow
+			if low < high {
+				agreed = true
+				break
+			}
+		}
+		if !agreed {
+			for let c in candidates {
+				c.state = 2
+			}
+			return result
+		}
+		let survivors Peer[] = []
+		for let c in candidates {
+			if c.offset < low || c.offset > high {
+				c.state = 2
+				continue
+			}
+			survivors.push(c)
+		}
+		// Best first: lower stratum, then shorter distance.
+		survivors.sort((a, b) => merit(a, now) < merit(b, now))
+		// Clustering: drop the survivor whose offset sits farthest from
+		// the others while that spread exceeds the best peer jitter.
+		for survivors.len() > minSurvivors {
+			let worst = 0
+			let worstJitter = -1.0
+			let bestPeerJitter = survivors[0].jitter
+			for let i = 0; i < survivors.len(); i++ {
+				let sum = 0.0
+				for let j = 0; j < survivors.len(); j++ {
+					let d = survivors[j].offset - survivors[i].offset
+					sum += d * d
+				}
+				let spread = math.sqrt(sum / float(survivors.len() - 1))
+				if spread > worstJitter {
+					worstJitter = spread
+					worst = i
+				}
+				bestPeerJitter = survivors[i].jitter when survivors[i].jitter < bestPeerJitter
+			}
+			break when worstJitter <= bestPeerJitter
+			survivors[worst].state = 3
+			survivors.remove(worst)
+		}
+		// Combining: offsets weighted by 1/λ.
+		let x = 0.0
+		let y = 0.0
+		let z = 0.0
+		for let s in survivors {
+			let d = s.distance(now)
+			x += s.offset / d
+			y += 1.0 / d
+		}
+		let combined = x / y
+		for let s in survivors {
+			let d = s.distance(now)
+			let off = s.offset - survivors[0].offset
+			z += off * off / d
+		}
+		let selectionJitter = math.sqrt(z / y)
+		let peerJitter = survivors[0].jitter
+		for let (i, s) in survivors {
+			s.state = i == 0 ?? (0, 1)
+		}
+		return Selection{survivors: survivors, offset: combined, jitter: math.sqrt(selectionJitter * selectionJitter + peerJitter * peerJitter)}
+	}
+
+	// A peer's selection order: stratum dominates, then distance.
+	def merit(p Peer, now float) float {
+		return float(p.info.stratum) * maxDistance + p.distance(now)
+	}
+}

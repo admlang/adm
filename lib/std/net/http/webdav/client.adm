@@ -1,4 +1,1052 @@
 partial module std.net.http.webdav {
-	// Client is the WebDAV client; it has no members yet.
-	type Client {}
+	use (
+		std.bytes
+		std.data.encoding::(XML, XMLNode, XMLNodeKind)
+		std.fs
+		std.io
+		std.net.http
+		std.net.http::(Method)
+		std.net.http.webdav.proto::*
+		std.net.url
+		std.time
+		std.time::(Time)
+	)
+
+	// Client reaches a WebDAV share (RFC 4918) as an `fs.FileStore`:
+	// Nextcloud, ownCloud, Apache mod_dav, nginx, IIS, Box, a
+	// `webdav.Server`. Implements `net.RemoteFiles`, so `fs.copy` moves
+	// trees between it and any other store. Holds the locks it takes and
+	// sends their tokens with every change under them. Paths are relative
+	// to `baseURL`.
+	//
+	// ```
+	// let dav = new webdav.Client("https://dav.example.com/share", "me", "s3cret")
+	// try dav.upload("report.pdf", "/inbox/report.pdf")
+	// let lock = try dav.lock("/inbox/report.pdf", 10m)
+	// try dav.writeFile("/inbox/report.pdf", updated)
+	// try dav.unlock(lock)
+	// ```
+	type Client {
+		// The share's root URL.
+		baseURL              string
+		username             string            = ""
+		password             ?Secret<string>   = none
+		// Deadline of each request.
+		timeout              duration          = 30s
+		internal http        http.Client
+		internal basePath    string            = "/"
+		internal atomic held map<string, Lock>
+		internal signedIn    bool              = false
+
+		def new(baseURL string, timeout duration = 30s) {
+			self.baseURL = baseURL.trimSuffix("/")
+			self.timeout = timeout
+			http = new http.Client("", timeout)
+			basePath = pathOfBase(self.baseURL)
+		}
+
+		// A client that signs in: with Digest or Basic, whichever the
+		// server asks for (see `http.Client.username`).
+		def new(baseURL string, username string, password Secret<string>, timeout duration = 30s) {
+			self.baseURL = baseURL.trimSuffix("/")
+			self.timeout = timeout
+			self.username = username
+			self.password = password
+			http = new http.Client("", timeout)
+			basePath = pathOfBase(self.baseURL)
+		}
+
+		// ---- reading ----
+
+		// Implements fs.FileStore: a directory's entries (PROPFIND,
+		// Depth 1). Fails with WebDavError `notFound` when it is missing,
+		// `forbidden` when the login is refused.
+		def list(path string) !fs.FileEntry[] {
+			let all = try find(path, 1)
+			let self_ = cleanStorePath(path)
+			return all.filter(e => e.path != self_)
+		}
+
+		// The entries of the share's root.
+		def list() !fs.FileEntry[] {
+			return try list("/")
+		}
+
+		// Every file and directory under `path`, at any depth (PROPFIND
+		// Depth infinity; servers that refuse it are walked a level at a
+		// time). Fails as `list` does.
+		def walk(path string) !fs.FileEntry[] {
+			let deep = findDeep(path) onerror (err error) {
+				fail err unless err is WebDavError && err.status == 403
+				recover none
+			}
+			let self_ = cleanStorePath(path)
+			return deep.filter(e => e.path != self_) unless (deep is none)
+			let out fs.FileEntry[] = []
+			for let e in try list(path) {
+				out.push(e)
+				out = out + (try walk(e.path)) when e.kind == fs.FileKind.Dir
+			}
+			return out
+		}
+
+		// Implements fs.FileStore: one file or directory (PROPFIND, Depth
+		// 0). Fails with WebDavError `notFound` when it is missing.
+		def stat(path string) !fs.FileEntry {
+			let found = try find(path, 0)
+			fail WebDavError{message: "webdav: {path}: no such file", code: "notFound", status: 404, path: path} when found.len() == 0
+			return found[0]
+		}
+
+		// Whether the path exists. Fails on anything but a 404.
+		def exists(path string) !bool {
+			let missing = false
+			stat(path) onerror (err error) {
+				fail err unless err is WebDavError && err.code == "notFound"
+				missing = true
+				recover fs.FileEntry{name: "", path: ""}
+			}
+			return !missing
+		}
+
+		// Implements fs.FileStore: a reader of a file from `offset` on (a
+		// ranged GET). Fails with WebDavError when it is missing or a
+		// directory.
+		def open(path string, offset int64) !io.ReadCloser {
+			let req = try requestFor(Method.GET, path, false)
+			req.headers.set("Range", "bytes={offset}-") when offset > 0
+			let res = try send(req, path)
+			try expectStatus(res, path, [200, 206])
+			let reader = new ResponseReader(res)
+			// A server that ignored the range sends everything: skip.
+			if offset > 0 && res.status == 200 {
+				try skipBytes(reader, offset)
+			}
+			return reader
+		}
+
+		// A reader of a whole file. Fails as `open` does.
+		def download(remote string) !io.ReadCloser {
+			return try open(remote, int64(0))
+		}
+
+		// A reader from `offset` on, to resume a download. Fails as `open`
+		// does.
+		def download(remote string, offset int64) !io.ReadCloser {
+			return try open(remote, offset)
+		}
+
+		// Implements net.RemoteFiles: copies a remote file to a local
+		// path, or a remote directory with everything under it. Fails with
+		// WebDavError when the remote path is missing, the os error when a
+		// local write fails.
+		def download(remote string, local string) !none {
+			return try fs.copy(self, remote, new fs.DiskStore(), local)
+		}
+
+		// A whole remote file. Fails as `open` does.
+		def readFile(path string) !byte[] {
+			let reader = try open(path, int64(0))
+			let data = io.readAll(reader) onerror (err error) {
+				reader.close() onerror recover none
+				fail err
+			}
+			try reader.close()
+			return data
+		}
+
+		// A whole remote file as UTF-8 text. Fails as `open` does.
+		def readText(path string) !string {
+			return string(try readFile(path))
+		}
+
+		// ---- writing ----
+
+		// Implements fs.FileStore: a writer that replaces a file, or
+		// appends to it, once it closes (WebDAV has no append: the file is
+		// read, extended and written back). Fails with WebDavError
+		// `conflict` when the directory is missing.
+		def create(path string, append bool) !io.WriteCloser {
+			let start byte[] = []
+			start = (try readFile(path)) when append && (try exists(path))
+			return new UploadWriter(self, path, start)
+		}
+
+		// Implements fs.FileStore: a writer from `offset` on, keeping the
+		// bytes before it. Fails with WebDavError when the file is missing
+		// or shorter than `offset`.
+		def resume(path string, offset int64) !io.WriteCloser {
+			return try create(path, false) when offset == 0
+			let whole = try readFile(path)
+			fail WebDavError{message: "webdav: resume {path}: the file has {whole.len()} bytes, fewer than {offset}", code: "precondition", path: path} when int64(whole.len()) < offset
+			return new UploadWriter(self, path, whole[:int(offset)].clone())
+		}
+
+		// Uploads what `from` reads to a remote file, replacing it (a
+		// streamed PUT). Fails with WebDavError `conflict` when the
+		// directory is missing, `locked` when another client's lock covers
+		// it.
+		def upload(from io.Reader, remote string) !none {
+			let req = try requestFor(Method.PUT, remote, false, from)
+			let res = try send(req, remote)
+			return try expectDone(res, remote, [200, 201, 204])
+		}
+
+		// Uploads what `from` reads after the first `offset` bytes of the
+		// remote file. Fails as `resume` does.
+		def upload(from io.Reader, remote string, offset int64) !none {
+			let writer = try resume(remote, offset)
+			io.copy(from, writer) onerror (err error) {
+				writer.close() onerror recover none
+				fail err
+			}
+			return try writer.close()
+		}
+
+		// Uploads bytes to a remote file, replacing it. Fails as
+		// `upload(reader, remote)` does.
+		def upload(data byte[], remote string) !none {
+			return try writeFile(remote, data)
+		}
+
+		// Implements net.RemoteFiles: copies a local file to a remote
+		// path, or a local directory with everything under it. Fails with
+		// the os error when the local path is missing, WebDavError when
+		// the server refuses a file.
+		def upload(local string, remote string) !none {
+			return try fs.copy(new fs.DiskStore(), local, self, remote)
+		}
+
+		// Writes a whole remote file, replacing it. Fails with WebDavError
+		// `conflict` when the directory is missing, `locked` when another
+		// client's lock covers it.
+		def writeFile(path string, data byte[]) !none {
+			let req = try requestFor(Method.PUT, path, false)
+			req.replaceBody(data)
+			let res = try send(req, path)
+			return try expectDone(res, path, [200, 201, 204])
+		}
+
+		// writeFile of text as UTF-8.
+		def writeFile(path string, text string) !none {
+			return try writeFile(path, text.bytes())
+		}
+
+		// ---- changing the tree ----
+
+		// Implements fs.FileStore: deletes a file. Fails with WebDavError
+		// `notFound` when it is missing, `conflict` when it is a
+		// directory.
+		def remove(path string) !none {
+			let entry = try stat(path)
+			fail WebDavError{message: "webdav: {path} is a directory", code: "conflict", path: path} when entry.kind == fs.FileKind.Dir
+			return try deletePath(path, false)
+		}
+
+		// Deletes a file, or a directory with everything under it. Fails
+		// with WebDavError `notFound` when it is missing.
+		def removeAll(path string) !none {
+			let entry = try stat(path)
+			return try deletePath(path, entry.kind == fs.FileKind.Dir)
+		}
+
+		// Implements fs.FileStore: moves a file or directory, replacing
+		// what is at `to` (MOVE). Fails with WebDavError `notFound` when
+		// the source is missing, `conflict` when the target's directory
+		// is.
+		def rename(from string, to string) !none {
+			return try transfer("MOVE", from, to, true)
+		}
+
+		// Moves without replacing: fails with WebDavError `precondition`
+		// when `to` exists.
+		def rename(from string, to string, overwrite bool) !none {
+			return try transfer("MOVE", from, to, overwrite)
+		}
+
+		// Copies a file or directory on the server, replacing what is at
+		// `to` (COPY). Fails as `rename` does.
+		def copy(from string, to string, overwrite bool = true) !none {
+			return try transfer("COPY", from, to, overwrite)
+		}
+
+		// Implements fs.FileStore: creates a directory (MKCOL). Fails
+		// with WebDavError `exists` when it exists, `conflict` when its
+		// parent is missing.
+		def makeDir(path string) !none {
+			let req = try requestFor(rawMethod("MKCOL"), path, true)
+			req.rawMethod = "MKCOL"
+			let res = try send(req, path)
+			return try expectDone(res, path, [201])
+		}
+
+		// Creates a directory and any parents missing.
+		def makeDirs(path string) !none {
+			let built = ""
+			for let part in cleanStorePath(path).split("/") {
+				continue when part == ""
+				built += "/" + part
+				continue when try exists(built)
+				try makeDir(built)
+			}
+			return none
+		}
+
+		// Implements fs.FileStore: removes an empty directory. Fails with
+		// WebDavError `notFound` when it is missing, `conflict` when it is
+		// not empty or not a directory.
+		def removeDir(path string) !none {
+			let entry = try stat(path)
+			fail WebDavError{message: "webdav: {path} is not a directory", code: "conflict", path: path} unless entry.kind == fs.FileKind.Dir
+			fail WebDavError{message: "webdav: {path} is not empty", code: "conflict", path: path} when (try list(path)).len() > 0
+			return try deletePath(path, true)
+		}
+
+		// Implements fs.FileStore. WebDAV has no permission bits: fails
+		// with WebDavError `unsupported`.
+		def chmod(path string, mode int) !none {
+			fail WebDavError{message: "webdav: {path}: WebDAV has no permission bits", code: "unsupported", path: path}
+		}
+
+		// Implements fs.FileStore: sets the modification time with a
+		// PROPPATCH of DAV:getlastmodified. Fails with WebDavError
+		// `forbidden` on a server that keeps it read-only (most do).
+		def touch(path string, modified Time) !none {
+			let prop = davText("getlastmodified", time.formatHTTPDate(modified))
+			return try patch(path, [prop], [])
+		}
+
+		// ---- properties ----
+
+		// Every property of a resource, live and dead (PROPFIND allprop).
+		// Fails with WebDavError `notFound` when it is missing.
+		def properties(path string) !Property[] {
+			let responses = try propfind(path, 0, allpropBody())
+			let out Property[] = []
+			for let r in responses {
+				for let ps in r.propstats {
+					continue unless ps.status == 200
+					for let p in ps.props {
+						out.push(propertyOf(p))
+					}
+				}
+			}
+			return out
+		}
+
+		// One property; none when the resource does not have it. Fails
+		// with WebDavError `notFound` when the resource is missing.
+		def property(path string, namespace string, name string) !?Property {
+			let root = davNode("propfind")
+			root.set("xmlns:D", davNamespace)
+			root.add(davNode("prop")).add(emptyLike(new XMLNode(name, namespace)))
+			for let r in try propfind(path, 0, document(root)) {
+				for let ps in r.propstats {
+					continue unless ps.status == 200
+					for let p in ps.props {
+						return propertyOf(p) when p.localName == name && p.namespace == namespace
+					}
+				}
+			}
+			return none
+		}
+
+		// Stores a dead property with text. Fails with WebDavError
+		// `forbidden` when the server refuses it.
+		def setProperty(path string, namespace string, name string, value string) !none {
+			let node = emptyLike(new XMLNode(name, namespace))
+			node.add(value)
+			return try patch(path, [node], [])
+		}
+
+		// Removes a dead property. Fails with WebDavError `forbidden` when
+		// the server refuses.
+		def removeProperty(path string, namespace string, name string) !none {
+			return try patch(path, [], [emptyLike(new XMLNode(name, namespace))])
+		}
+
+		// The bytes used and still available where `path` lives (RFC 4331
+		// quota properties); -1 for a figure the server does not give.
+		// Fails with WebDavError `notFound` when the path is missing.
+		def quota(path string = "/") !(int64, int64) {
+			let root = davNode("propfind")
+			root.set("xmlns:D", davNamespace)
+			let prop = root.add(davNode("prop"))
+			prop.add(davNode("quota-used-bytes"))
+			prop.add(davNode("quota-available-bytes"))
+			let used int64 = -1
+			let available int64 = -1
+			for let r in try propfind(path, 0, document(root)) {
+				for let ps in r.propstats {
+					continue unless ps.status == 200
+					for let p in ps.props {
+						let text = p.text().trim()
+						continue unless text.isNumeric()
+						used = text.toInt<int64>() when p.localName == "quota-used-bytes"
+						available = text.toInt<int64>() when p.localName == "quota-available-bytes"
+					}
+				}
+			}
+			return (used, available)
+		}
+
+		// ---- locks ----
+
+		// Takes a write lock (LOCK): exclusive or shared, on the resource
+		// alone (`depth` 0) or everything under a collection (-1), for
+		// `timeout` (0s asks for no end). A path that does not exist is
+		// created empty. The client sends the token with its changes under
+		// the lock until `unlock`. Fails with WebDavError `locked` when
+		// another lock conflicts.
+		def lock(path string, timeout duration = 0s, exclusive bool = true, depth int = -1, owner string = "") !Lock {
+			let root = davNode("lockinfo")
+			root.set("xmlns:D", davNamespace)
+			root.add(davNode("lockscope")).add(davNode(exclusive ?? ("exclusive", "shared")))
+			root.add(davNode("locktype")).add(davNode("write"))
+			root.add(davNode("owner")).add(owner) when owner != ""
+			let req = try requestFor(rawMethod("LOCK"), path, false)
+			req.rawMethod = "LOCK"
+			req.headers.set("Timeout", timeout == 0s ?? ("Infinite", "Second-{int64(timeout) / 1000000000}"))
+			req.headers.set("Depth", depth == 0 ?? ("0", "infinity"))
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, path)
+			let body = try readBody(res, path, [200, 201])
+			let token = res.header("Lock-Token").trim().trimPrefix("<").trimSuffix(">")
+			let l = try lockOf(body, cleanStorePath(path), token)
+			remember(l)
+			return l
+		}
+
+		// Restarts a lock's timeout. Fails with WebDavError
+		// `precondition` when the server no longer holds it.
+		def refresh(l Lock, timeout duration = 0s) !Lock {
+			let req = try requestFor(rawMethod("LOCK"), l.path, false)
+			req.rawMethod = "LOCK"
+			req.headers.set("Timeout", timeout == 0s ?? ("Infinite", "Second-{int64(timeout) / 1000000000}"))
+			req.headers.set("If", "(<{l.token}>)")
+			let res = try send(req, l.path)
+			let body = try readBody(res, l.path, [200])
+			let fresh = try lockOf(body, l.path, l.token)
+			remember(fresh)
+			return fresh
+		}
+
+		// Releases a lock (UNLOCK). Fails with WebDavError `conflict` when
+		// the server does not know the token.
+		def unlock(l Lock) !none {
+			let req = try requestFor(rawMethod("UNLOCK"), l.path, false)
+			req.rawMethod = "UNLOCK"
+			req.headers.set("Lock-Token", "<{l.token}>")
+			forget(l.token)
+			let res = try send(req, l.path)
+			return try expectDone(res, l.path, [200, 204])
+		}
+
+		// The locks this client holds.
+		atomic def locks() Lock[] {
+			let out Lock[] = []
+			for let (_, l) in held {
+				out.push(l)
+			}
+			return out
+		}
+
+		// Implements io.Closer: releases every lock still held. Never
+		// fails.
+		def close() !none {
+			for let l in locks() {
+				unlock(l) onerror recover none
+			}
+			return none
+		}
+
+		// Names the client and its share.
+		def str() string {
+			return "webdav.Client({baseURL})"
+		}
+
+		// ---- internals ----
+
+		internal atomic def remember(l Lock) {
+			held[l.token] = l
+		}
+
+		internal atomic def forget(token string) {
+			held.delete(token)
+		}
+
+		// The URL of a store path.
+		internal def urlOf(path string, collection bool) string {
+			return baseURL + hrefOf("", path, collection)
+		}
+
+		// Learns how the server wants credentials before the first
+		// request: an OPTIONS on the share answers its challenge once, so
+		// later requests (streamed uploads among them, whose bodies cannot
+		// be sent twice) carry them from the start.
+		internal def signIn() !none {
+			return none when signedIn || password is none || username == ""
+			http.username = username
+			http.password = password
+			signedIn = true
+			let probe = try http.request(Method.OPTIONS, urlOf("/", true))
+			let res = try http.do(probe)
+			try res.close()
+			return none
+		}
+
+		internal def rawMethod(name string) Method {
+			return Method.Other
+		}
+
+		// A request with credentials and the `If` header for held locks
+		// covering or under `path`.
+		internal def requestFor(method Method, path string, collection bool, body ?io.Reader = none) !http.Request {
+			try signIn()
+			let req = try http.request(method, urlOf(path, collection), body)
+			let target = cleanStorePath(path)
+			let lists string[] = []
+			for let l in locks() {
+				continue unless within(target, l.path) || within(l.path, target)
+				lists.push("<{urlOf(l.path, false)}> (<{l.token}>)")
+			}
+			req.headers.set("If", lists.join(" ")) when lists.len() > 0
+			return req
+		}
+
+		internal def send(req http.Request, path string) !http.Response {
+			return http.do(req) onerror (err error) {
+				fail WebDavError{message: "webdav: {path}: {err.message}", code: "protocol", cause: err, path: path}
+			}
+		}
+
+		internal def expectStatus(res http.Response, path string, ok int[]) !none {
+			return none when ok.includes(res.status)
+			res.close() onerror recover none
+			fail errorFor(res.status, path)
+		}
+
+		internal def expectDone(res http.Response, path string, ok int[]) !none {
+			try expectStatus(res, path, ok)
+			res.close() onerror recover none
+			return none
+		}
+
+		internal def readBody(res http.Response, path string, ok int[]) !byte[] {
+			try expectStatus(res, path, ok)
+			return try res.bytes()
+		}
+
+		internal def deletePath(path string, collection bool) !none {
+			let req = try requestFor(Method.DELETE, path, collection)
+			let res = try send(req, path)
+			if res.status == 207 {
+				// A multistatus DELETE failed for some member.
+				let body = try res.bytes()
+				for let r in parseMultistatus(body) onerror recover [] {
+					fail errorFor(r.status, path) when r.status >= 400
+				}
+				fail errorFor(500, path)
+			}
+			return try expectDone(res, path, [200, 204])
+		}
+
+		internal def transfer(method string, from string, to string, overwrite bool) !none {
+			let entry = try stat(from)
+			let collection = entry.kind == fs.FileKind.Dir
+			let req = try requestFor(Method.Other, from, collection)
+			req.rawMethod = method
+			req.headers.set("Destination", urlOf(to, collection))
+			req.headers.set("Overwrite", overwrite ?? ("T", "F"))
+			req.headers.set("Depth", "infinity") when collection
+			// The destination's locks too.
+			let target = cleanStorePath(to)
+			let lists string[] = []
+			let existing = req.headers.get("If")
+			lists.push(existing) unless existing == ""
+			for let l in locks() {
+				continue unless within(target, l.path) || within(l.path, target)
+				lists.push("<{urlOf(l.path, false)}> (<{l.token}>)")
+			}
+			req.headers.set("If", lists.join(" ")) when lists.len() > 0
+			let res = try send(req, from)
+			if res.status == 207 {
+				res.close() onerror recover none
+				fail errorFor(424, from)
+			}
+			return try expectDone(res, from, [200, 201, 204])
+		}
+
+		internal def patch(path string, set XMLNode[], remove XMLNode[]) !none {
+			let root = davNode("propertyupdate")
+			root.set("xmlns:D", davNamespace)
+			if set.len() > 0 {
+				let prop = root.add(davNode("set")).add(davNode("prop"))
+				for let p in set {
+					prop.add(p)
+				}
+			}
+			if remove.len() > 0 {
+				let prop = root.add(davNode("remove")).add(davNode("prop"))
+				for let p in remove {
+					prop.add(p)
+				}
+			}
+			let req = try requestFor(Method.Other, path, false)
+			req.rawMethod = "PROPPATCH"
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, path)
+			let body = try readBody(res, path, [200, 207])
+			return none when res.status == 200
+			for let r in try parseMultistatus(body) {
+				fail errorFor(r.status, path) when r.status >= 400
+				for let ps in r.propstats {
+					fail errorFor(ps.status, path) when ps.status >= 400
+				}
+			}
+			return none
+		}
+
+		// What changed in a collection since `token` (RFC 6578
+		// sync-collection): with no token, every member now. `deep`
+		// reports the whole tree rather than direct members; `limit`
+		// (0 for none) caps the answer, `truncated` then asks for another
+		// call. Fails with WebDavError `forbidden` when the token is no
+		// longer valid (sync again without it) or the server does not
+		// synchronize.
+		def sync(path string = "/", token string = "", deep bool = true, limit int = 0) !SyncResult {
+			let root = davNode("sync-collection")
+			root.set("xmlns:D", davNamespace)
+			root.add(davText("sync-token", token))
+			root.add(davText("sync-level", deep ?? ("infinite", "1")))
+			root.add(davNode("limit")).add(davText("nresults", limit.str())) when limit > 0
+			let prop = root.add(davNode("prop"))
+			for let name in ["resourcetype", "getcontentlength", "getlastmodified", "getetag"] {
+				prop.add(davNode(name))
+			}
+			let req = try requestFor(Method.Other, path, true)
+			req.rawMethod = "REPORT"
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, path)
+			let data = try readBody(res, path, [207])
+			let out = SyncResult{token: multistatusToken(data)}
+			let base = cleanStorePath(path)
+			for let r in try parseMultistatus(data) {
+				let found = pathOfHref(r.href, basePath)
+				continue when found is none
+				if r.status == 507 && found == base {
+					out.truncated = true
+					continue
+				}
+				if r.status == 404 {
+					out.removed.push(found)
+					continue
+				}
+				out.changed.push(entryOf(found, r))
+			}
+			return out
+		}
+
+		// The ACL of a resource (RFC 3744 `DAV:acl`): its own entries, the
+		// protected ones and those it inherits. Fails with WebDavError
+		// `forbidden` when reading it needs a privilege the login lacks,
+		// `unsupported` when the server has no access control.
+		def acl(path string) !Ace[] {
+			let found = try davProperty(path, "acl")
+			fail WebDavError{message: "webdav: {path}: the server has no access control", code: "unsupported", path: path} when found is none
+			let out Ace[] = []
+			for let node in found.elements("ace", davNamespace) {
+				let (parsed, _) = parseAce(node)
+				continue when parsed is none
+				let ace Ace = parsed
+				ace.protected = !(node.child("protected", davNamespace) is none)
+				let inherited = node.child("inherited", davNamespace)
+				if !(inherited is none) {
+					let href = inherited.child("href", davNamespace)
+					ace.inherited = href is none ?? ("", href.text().trim())
+				}
+				out.push(ace)
+			}
+			return out
+		}
+
+		// Sets a resource's own ACL entries (RFC 3744 ACL); protected and
+		// inherited entries in `aces` are left out. Fails with WebDavError
+		// `forbidden` when the login may not change it or the server
+		// refuses an entry.
+		def setAcl(path string, aces Ace[]) !none {
+			let root = davNode("acl")
+			root.set("xmlns:D", davNamespace)
+			for let ace in aces {
+				continue when ace.protected || ace.inherited != ""
+				root.add(aceNode(ace))
+			}
+			let entry = try stat(path)
+			let req = try requestFor(Method.Other, path, entry.kind == fs.FileKind.Dir)
+			req.rawMethod = "ACL"
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, path)
+			return try expectDone(res, path, [200, 204])
+		}
+
+		// The privileges the login holds on a resource (RFC 3744
+		// `current-user-privilege-set`). Fails as `acl` does.
+		def privileges(path string) !Privilege[] {
+			let found = try davProperty(path, "current-user-privilege-set")
+			fail WebDavError{message: "webdav: {path}: the server has no access control", code: "unsupported", path: path} when found is none
+			let out Privilege[] = []
+			for let p in found.elements("privilege", davNamespace) {
+				for let named in p.elements() {
+					let known = privilegeNamed(named.localName)
+					out.push(known) unless known is none
+				}
+			}
+			return out
+		}
+
+		// The URL of the login's principal (RFC 5397
+		// `current-user-principal`); "" when the server sees no login.
+		// Fails with WebDavError `unsupported` when the server has no
+		// principals.
+		def principal() !string {
+			let found = try davProperty("/", "current-user-principal")
+			fail WebDavError{message: "webdav: the server has no principals", code: "unsupported", path: "/"} when found is none
+			let href = found.child("href", davNamespace)
+			return href is none ?? ("", href.text().trim())
+		}
+
+		// A DAV: property of a resource as XML; none when the server
+		// answers it missing.
+		internal def davProperty(path string, name string) !?XMLNode {
+			let root = davNode("propfind")
+			root.set("xmlns:D", davNamespace)
+			root.add(davNode("prop")).add(davNode(name))
+			for let r in try propfind(path, 0, document(root)) {
+				for let ps in r.propstats {
+					if ps.status == 403 {
+						fail WebDavError{message: "webdav: {path}: reading {name} is forbidden", code: "forbidden", status: 403, path: path}
+					}
+					continue unless ps.status == 200
+					for let p in ps.props {
+						return p when p.localName == name && p.namespace == davNamespace
+					}
+				}
+			}
+			return none
+		}
+
+		// Searches the share (RFC 5323 SEARCH, `DAV:basicsearch`): the
+		// entries under `scope`, to `depth` levels (-1 for all), whose
+		// name is like `nameLike` (`%` any run, `_` one character, case
+		// ignored), whose content contains `contains`, that are
+		// collections or not, modified after `modifiedAfter`, larger than
+		// `largerThan` bytes; ordered by the DAV: property `orderBy`, at
+		// most `limit` of them (0 for all). Fails with WebDavError
+		// `notFound` when the scope is missing, `forbidden` when the
+		// server does not search.
+		def search(scope string = "/", nameLike string = "", contains string = "", collections ?bool = none, modifiedAfter ?Time = none, largerThan int64 = -1, orderBy string = "", descending bool = false, limit int = 0, depth int = -1) !fs.FileEntry[] {
+			let root = davNode("searchrequest")
+			root.set("xmlns:D", davNamespace)
+			let basic = root.add(davNode("basicsearch"))
+			let prop = basic.add(davNode("select")).add(davNode("prop"))
+			for let name in ["displayname", "resourcetype", "getcontentlength", "getlastmodified", "getetag"] {
+				prop.add(davNode(name))
+			}
+			let scopeNode = basic.add(davNode("from")).add(davNode("scope"))
+			scopeNode.add(davText("href", urlOf(scope, true)))
+			scopeNode.add(davText("depth", depth < 0 ?? ("infinity", depth.str())))
+			let conditions XMLNode[] = []
+			if nameLike != "" {
+				let like = davNode("like")
+				like.set("caseless", "yes")
+				like.add(davNode("prop")).add(davNode("displayname"))
+				like.add(davText("literal", nameLike))
+				conditions.push(like)
+			}
+			conditions.push(davText("contains", contains)) when contains != ""
+			if !(collections is none) {
+				let test = davNode("is-collection")
+				if collections {
+					conditions.push(test)
+				} else {
+					let negated = davNode("not")
+					negated.add(test)
+					conditions.push(negated)
+				}
+			}
+			if !(modifiedAfter is none) {
+				let after = davNode("gt")
+				after.add(davNode("prop")).add(davNode("getlastmodified"))
+				after.add(davText("literal", modifiedAfter.str()))
+				conditions.push(after)
+			}
+			if largerThan >= 0 {
+				let larger = davNode("gt")
+				larger.add(davNode("prop")).add(davNode("getcontentlength"))
+				larger.add(davText("literal", largerThan.str()))
+				conditions.push(larger)
+			}
+			if conditions.len() == 1 {
+				basic.add(davNode("where")).add(conditions[0])
+			} else if conditions.len() > 1 {
+				let all = basic.add(davNode("where")).add(davNode("and"))
+				for let c in conditions {
+					all.add(c)
+				}
+			}
+			if orderBy != "" {
+				let order = basic.add(davNode("orderby")).add(davNode("order"))
+				order.add(davNode("prop")).add(davNode(orderBy))
+				order.add(davNode(descending ?? ("descending", "ascending")))
+			}
+			basic.add(davNode("limit")).add(davText("nresults", limit.str())) when limit > 0
+			let req = try requestFor(Method.Other, scope, true)
+			req.rawMethod = "SEARCH"
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, scope)
+			if res.status == 409 {
+				res.close() onerror recover none
+				fail errorFor(404, scope)
+			}
+			let data = try readBody(res, scope, [207])
+			let out fs.FileEntry[] = []
+			for let r in try parseMultistatus(data) {
+				continue when r.status >= 400
+				let found = pathOfHref(r.href, basePath)
+				continue when found is none
+				out.push(entryOf(found, r))
+			}
+			return out
+		}
+
+		// Orders a collection's members (RFC 3648 ORDERPATCH): makes it
+		// custom-ordered and puts `names` first, in that order; members not
+		// named follow. Fails with WebDavError `conflict` when a name is not
+		// a member, or the server does not order collections.
+		def order(dir string, names string[]) !none {
+			let root = davNode("orderpatch")
+			root.set("xmlns:D", davNamespace)
+			root.add(davNode("ordering-type")).add(davText("href", "DAV:custom"))
+			for let i = 0; i < names.len(); i++ {
+				let member = root.add(davNode("order-member"))
+				member.add(davText("segment", names[i]))
+				let position = member.add(davNode("position"))
+				if i == 0 {
+					position.add(davNode("first"))
+				} else {
+					position.add(davNode("after")).add(davText("segment", names[i - 1]))
+				}
+			}
+			let req = try requestFor(Method.Other, dir, true)
+			req.rawMethod = "ORDERPATCH"
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(document(root))
+			let res = try send(req, dir)
+			if res.status == 207 {
+				let body = try res.bytes()
+				for let r in parseMultistatus(body) onerror recover [] {
+					fail errorFor(r.status, dir) when r.status >= 400
+				}
+			}
+			return try expectDone(res, dir, [200, 207])
+		}
+
+		internal def allpropBody() byte[] {
+			let root = davNode("propfind")
+			root.set("xmlns:D", davNamespace)
+			root.add(davNode("allprop"))
+			return document(root)
+		}
+
+		internal def propfind(path string, depth int, body byte[]) !DavResponse[] {
+			let req = try requestFor(Method.Other, path, false)
+			req.rawMethod = "PROPFIND"
+			req.headers.set("Depth", depth < 0 ?? ("infinity", depth.str()))
+			req.headers.set("Content-Type", "application/xml; charset=utf-8")
+			req.replaceBody(body)
+			let res = try send(req, path)
+			let data = try readBody(res, path, [207])
+			return try parseMultistatus(data)
+		}
+
+		internal def findDeep(path string) !?fs.FileEntry[] {
+			return try find(path, -1)
+		}
+
+		// PROPFIND for the figures a FileEntry needs.
+		internal def find(path string, depth int) !fs.FileEntry[] {
+			let root = davNode("propfind")
+			root.set("xmlns:D", davNamespace)
+			let prop = root.add(davNode("prop"))
+			for let name in ["resourcetype", "getcontentlength", "getlastmodified", "displayname"] {
+				prop.add(davNode(name))
+			}
+			let out fs.FileEntry[] = []
+			for let r in try propfind(path, depth, document(root)) {
+				let found = pathOfHref(r.href, basePath)
+				continue when found is none
+				out.push(entryOf(found, r))
+			}
+			return out
+		}
+
+		internal def entryOf(path string, r DavResponse) fs.FileEntry {
+			let e = fs.FileEntry{name: baseName(path), path: path, modified: time.fromUnixNs(0)}
+			for let ps in r.propstats {
+				continue unless ps.status == 200
+				for let p in ps.props {
+					continue unless p.namespace == davNamespace
+					switch {
+						case p.localName == "resourcetype":
+							e.kind = fs.FileKind.Dir unless p.child("collection", davNamespace) is none
+						case p.localName == "getcontentlength":
+							let text = p.text().trim()
+							e.size = text.toInt<int64>() when text.isNumeric()
+						case p.localName == "getlastmodified":
+							e.modified = time.parseHTTPDate(p.text().trim()) onerror recover time.fromUnixNs(0)
+					}
+				}
+			}
+			e.size = 0 when e.kind == fs.FileKind.Dir
+			return e
+		}
+
+		// The lock a LOCK answer describes.
+		internal def lockOf(body byte[], path string, token string) !Lock {
+			let root = new XML().parse(body) onerror (err error) {
+				fail WebDavError{message: "webdav: the LOCK answer is not XML", code: "protocol", cause: err, path: path}
+			}
+			for let active in root.descendants("activelock", davNamespace) {
+				let tokenNode = active.child("locktoken", davNamespace)
+				let href = tokenNode is none ?? ("", tokenNode.text().trim())
+				continue unless token == "" || href == token
+				let scope = active.child("lockscope", davNamespace)
+				let depthNode = active.child("depth", davNamespace)
+				let timeoutNode = active.child("timeout", davNamespace)
+				let ownerNode = active.child("owner", davNamespace)
+				let l = Lock{token: href, path: path}
+				l.exclusive = scope is none || !(scope.child("exclusive", davNamespace) is none)
+				l.depth = !(depthNode is none) && depthNode.text().trim() == "0" ?? (0, -1)
+				l.owner = ownerNode is none ?? ("", ownerNode.text().trim())
+				let timeoutText = timeoutNode is none ?? ("", timeoutNode.text().trim())
+				if timeoutText.startsWith("Second-") && timeoutText[7:].isNumeric() {
+					l.timeout = duration(timeoutText[7:].toInt<int64>() * 1000000000)
+					l.expires = time.now() + l.timeout
+				}
+				return l
+			}
+			fail WebDavError{message: "webdav: the LOCK answer holds no lock", code: "protocol", path: path}
+		}
+	}
+
+	// A property from its XML: its text, and its markup when it holds
+	// elements.
+	internal def propertyOf(p XMLNode) Property {
+		let prop = Property{namespace: p.namespace, name: p.localName, value: p.text().trim()}
+		let markup = ""
+		for let c in p.children {
+			markup += standalone(c).str() when c.kind == XMLNodeKind.Element
+		}
+		prop.markup = markup
+		return prop
+	}
+
+	// The path of the share's root URL ("/" when it names none).
+	internal def pathOfBase(base string) string {
+		let at = base.indexOf("://")
+		let rest = at < 0 ?? (base, base[at + 3:])
+		let slash = rest.indexOf("/")
+		return slash < 0 ?? ("/", rest[slash:])
+	}
+
+	// Reads and drops `count` bytes.
+	internal def skipBytes(r io.Reader, count int64) !none {
+		let buf byte[] = []
+		buf.len(32768)
+		let left = count
+		for left > 0 {
+			let want = left < int64(buf.len()) ?? (int(left), buf.len())
+			let n = try r.read(buf[:want])
+			fail WebDavError{message: "webdav: the body ended before the resume offset", code: "protocol"} when n <= 0
+			left -= int64(n)
+		}
+		return none
+	}
+
+	// The WebDavError of a status.
+	internal def errorFor(status int, path string) WebDavError {
+		let code = "status"
+		switch {
+			case status == 404:
+				code = "notFound"
+			case status == 405:
+				code = "exists"
+			case status == 409:
+				code = "conflict"
+			case status == 412:
+				code = "precondition"
+			case status == 423 || status == 424:
+				code = "locked"
+			case status == 401 || status == 403:
+				code = "forbidden"
+			case status == 415 || status == 501:
+				code = "unsupported"
+		}
+		return WebDavError{message: "webdav: {path}: {status} {http.statusText(status)}", code: code, status: status, path: path}
+	}
+
+	// The body of a GET as a reader that closes the response.
+	internal type ResponseReader {
+		res http.Response
+
+		def new(res http.Response) {
+			self.res = res
+		}
+
+		def read(buf byte[]) !int {
+			let body = res.body
+			return 0 when body is none
+			return try body.read(buf)
+		}
+
+		def close() !none {
+			return try res.close()
+		}
+	}
+
+	// A writer that collects a file and PUTs it on close.
+	internal type UploadWriter {
+		client Client
+		path   string
+		buffer bytes.Buffer
+		done   bool         = false
+
+		def new(client Client, path string, start byte[]) {
+			self.client = client
+			self.path = path
+			buffer = new bytes.Buffer()
+			buffer.write(start) onerror recover 0
+		}
+
+		def write(data byte[]) !int {
+			return try buffer.write(data)
+		}
+
+		def close() !none {
+			return none when done
+			done = true
+			return try client.writeFile(path, buffer.bytes())
+		}
+
+		// Implements io.Aborter: drops what was written.
+		def abort() !none {
+			done = true
+			return none
+		}
+	}
 }

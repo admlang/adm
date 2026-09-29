@@ -1,4 +1,666 @@
 partial module std.net.ldap {
-	// Client is the LDAP client; it has no members yet.
-	type Client {}
+	use (
+		std.data.encoding::(ASN1Element, asn1Sequence, berParse)
+		std.data.encoding
+		std.net
+		std.net.ldap.proto::*
+		std.net.sasl
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Client is an LDAPv3 client (RFC 4511): binds, searches (every page
+	// of a large result, RFC 2696), adds, modifies, renames, deletes and
+	// compares entries, and runs extended operations (WhoAmI, password
+	// change). Requests may be sent from several tasks at once.
+	//
+	// ```
+	// let dir = new ldap.Client(Security.StartTls)
+	// try dir.connect("ldap.example.com")
+	// try dir.bind("cn=admin,dc=example,dc=com", password)
+	// for let e in try dir.search("ou=people,dc=example,dc=com", "(mail=*@example.com)") {
+	//     print("{e.dn}: {e.get("cn")}")
+	// }
+	// try dir.close()
+	// ```
+	type Client {
+		security        Security    = Security.Plain
+		// The TLS settings with StartTLS and ldaps; none verifies the
+		// server against the system roots under the host name dialled.
+		tls             ?tls.Config = none
+		// How long each request may wait for its reply.
+		timeout         duration    = 30s
+		// The TLS channel binding a SCRAM bind uses when the server offers
+		// the `-PLUS` mechanism: `tls-exporter` (RFC 9266) or
+		// `tls-server-end-point` (RFC 5929, OpenLDAP's `tls-endpoint`); ""
+		// never binds.
+		channelBinding  string      = "tls-exporter"
+		// Follow referrals (RFC 4511 §4.1.10) and search continuation
+		// references (§4.5.3): a request the server answers with a
+		// Referral goes to the servers it names, and a search also reads
+		// the parts of the tree held elsewhere. The other servers get this
+		// client's security and TLS settings, and the bind `referralBind`
+		// makes on them; without one they are used anonymously.
+		followReferrals bool        = true
+		// Servers a request may be passed through before it fails with
+		// LoopDetect.
+		referralLimit   int         = 5
+		// Binds a client made to follow a referral, e.g. with the
+		// credentials this one used. Fails to give up on that server.
+		referralBind    ?def (Client) !none = none
+		// Send the ManageDsaIT control (RFC 3296) with each request, so
+		// the server treats referral objects as plain entries, to read or
+		// change them instead of being referred.
+		manageDsaIT     bool        = false
+		// How many referrals deep this client is.
+		internal referralHops int   = 0
+		internal conn   ?Conn       = none
+		internal secured ?tls.Conn  = none
+		internal target string      = ""
+		internal bound  string      = ""
+
+		def new(security Security = Security.Plain, timeout duration = 30s) {
+			self.security = security
+			self.timeout = timeout
+		}
+
+		// Connects to `addr`: `host` or `host:port` (389, or 636 with
+		// `Implicit`), or a URL: `ldap://host:port`, `ldaps://host` (sets
+		// `Implicit`), `ldapi://%2Fpath%2Fto%2Fsocket` (a Unix socket).
+		// With `StartTls` the connection is upgraded before it returns.
+		// Fails when the server cannot be reached, the policy denies it,
+		// or the TLS handshake fails.
+		def connect(addr string) !none {
+			fail LdapError{message: "ldap: already connected", code: "protocol"} unless conn is none
+			let (dial, host, scheme) = try targetOf(addr)
+			security = Security.Implicit when scheme == "ldaps"
+			target = dial
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", scheme + "://" + dial)
+			let socket = try net.dialStream(dial, timeout)
+			let stream net.Stream = socket
+			if security == Security.Implicit {
+				let t = try secureStream(socket, tls, host, timeout)
+				secured = t
+				stream = t
+			}
+			let c = new Conn(stream, timeout)
+			if security == Security.StartTls {
+				let _ = c.request(extendedRequest(oidStartTls, none), []) onerror (err error) {
+					c.close()
+					fail err
+				}
+				let upgraded = secureStream(socket, tls, host, timeout) onerror (err error) {
+					c.close()
+					fail err
+				}
+				secured = upgraded
+				c.upgrade(upgraded)
+			}
+			c.start()
+			conn = c
+			return none
+		}
+
+		// Binds with a DN and password (simple bind). Fails with
+		// `InvalidCredentials` when the server refuses them.
+		def bind(dn string, password Secret<string>) !none {
+			let m = try call(bindSimple(dn, password.reveal()), "bind")
+			try expectResult(m, "bind {dn}")
+			bound = dn
+			return none
+		}
+
+		// Binds anonymously, dropping an earlier bind. Fails when the
+		// server refuses anonymous binds.
+		def bind() !none {
+			let m = try call(bindSimple("", ""), "bind")
+			try expectResult(m, "anonymous bind")
+			bound = ""
+			return none
+		}
+
+		// Binds with SASL PLAIN (RFC 4616): a user name and password,
+		// optionally acting as `authzId`. Fails when the server refuses
+		// them or does not offer PLAIN.
+		def bindPlain(user string, password Secret<string>, authzId string = "") !none {
+			let credentials = authzId.bytes() + byte[0] + user.bytes() + byte[0] + password.reveal().bytes()
+			let m = try call(bindSasl("", "PLAIN", credentials), "bind")
+			try expectResult(m, "SASL PLAIN bind")
+			bound = user
+			return none
+		}
+
+		// Binds with SCRAM (RFC 5802, RFC 7677): the password is proved,
+		// never sent, and the server proves it knows it too. Over TLS the
+		// exchange binds to the connection (`SCRAM-SHA-256-PLUS`, see
+		// `channelBinding`) when the server offers that. `user` is the SASL
+		// user name, which the server maps to an entry. Fails with
+		// `InvalidCredentials` when the password is wrong, a `sasl` error
+		// when the server's proof or the binding fails, or
+		// `AuthMethodNotSupported` when the server lacks the mechanism.
+		def bindScram(user string, password Secret<string>, mechanism sasl.ScramMechanism = sasl.ScramMechanism.Sha256, authzId string = "") !none {
+			let scram = new sasl.ScramClient(user, password, mechanism, try bindingData())
+			scram.authzId = authzId
+			if !(scram.binding is none) {
+				let offered = (try rootDSE()).getAll("supportedSASLMechanisms")
+				scram.bindingOffered = offered.includes(mechanism.value + "-PLUS")
+			}
+			let name = scram.mechanismName()
+			let challenge = try call(bindSasl("", name, (try scram.first()).bytes()), "bind")
+			let first = try decodeResult(challenge.body)
+			fail resultError(first, "SASL {name} bind") when first.code != ResultCode.SaslBindInProgress.value
+			let serverFirst = first.value
+			fail protocolFailure("SASL {name}: no server-first message") when serverFirst is none
+			let done = try call(bindSasl("", name, (try scram.final(string(serverFirst))).bytes()), "bind")
+			let outcome = try decodeResult(done.body)
+			let serverFinal = outcome.value
+			if outcome.code != ResultCode.Success.value {
+				// The server's `e=` reason, when it gave one, says why.
+				if !(serverFinal is none) {
+					scram.verify(string(serverFinal)) onerror (err error) fail resultError(outcome, "SASL {name} bind: {err.message}")
+				}
+				fail resultError(outcome, "SASL {name} bind")
+			}
+			fail protocolFailure("SASL {name}: no server-final message") when serverFinal is none
+			try scram.verify(string(serverFinal))
+			bound = user
+			return none
+		}
+
+		// The channel binding for SCRAM on this connection; none without
+		// TLS or with `channelBinding` "". Fails when TLS cannot give it.
+		internal def bindingData() !?sasl.ChannelBinding {
+			let t = secured
+			return none when t is none || channelBinding == ""
+			return sasl.ChannelBinding{kind: channelBinding, data: try t.channelBinding(channelBinding)}
+		}
+
+		// Binds with SASL EXTERNAL (RFC 4422 Appendix A): the identity the
+		// connection already carries, a TLS client certificate or the
+		// Unix user of an `ldapi://` socket. Fails when the server knows
+		// no such identity.
+		def bindExternal(authzId string = "") !none {
+			let m = try call(bindSasl("", "EXTERNAL", authzId.bytes()), "bind")
+			try expectResult(m, "SASL EXTERNAL bind")
+			bound = authzId
+			return none
+		}
+
+		// Who the server says this connection is bound as (RFC 4532):
+		// `dn:...`, `u:...`, or "" when anonymous. Fails when the server
+		// does not offer WhoAmI.
+		def whoAmI() !string {
+			let (_, value) = try extended(oidWhoAmI, none)
+			return value is none ?? ("", string(value))
+		}
+
+		// The entries below `base` (the whole subtree) matching a filter
+		// in RFC 4515 form. Large results are read page by page. Fails
+		// when the base does not exist, the filter is malformed, or the
+		// server refuses the search.
+		def search(base string, filter string = "(objectClass=*)", options SearchOptions = SearchOptions{}) !Entry[] {
+			return try search(base, try parseFilter(filter), options)
+		}
+
+		// search with a Filter value. Fails as `search(string)` does.
+		def search(base string, filter Filter, options SearchOptions = SearchOptions{}) !Entry[] {
+			let out Entry[] = []
+			try each(base, filter, options, def (e Entry) !none {
+				out.push(e)
+				return none
+			})
+			return out
+		}
+
+		// Calls `fn` for each entry as it arrives, pages included, so
+		// results of any size go through. Fails as `search` does, or when
+		// `fn` does (the search then stops).
+		def each(base string, filter Filter, options SearchOptions, fn def (Entry) !none) !none {
+			let c = try connected()
+			let cookie byte[] = []
+			let total = 0
+			let references string[][] = []
+			for {
+				let controls = requestControls()
+				controls.push(pagedControl(options.pageSize, cookie)) when options.pageSize > 0
+				let op = searchRequest(base, options.scope.value, options.deref.value, options.sizeLimit, options.timeLimit, options.typesOnly, filter, options.attributes)
+				let id = try c.send(op, controls)
+				let done ?Message = none
+				let failed ?error = none
+				for done is none {
+					let m = c.next(id) onerror (err error) {
+						failed = err
+						recover Message{id: -1, op: opSearchDone, body: encoding.asn1Null(), controls: []}
+					}
+					break unless failed is none
+					switch {
+						case m.op == opSearchEntry:
+							let e = decodeEntry(m.body) onerror (err error) {
+								failed = err
+								recover new Entry("")
+							}
+							if failed is none {
+								fn(e) onerror (err error) {
+									failed = err
+									recover none
+								}
+							}
+							total++
+						case m.op == opSearchReference:
+							let urls string[] = []
+							for let u in m.body.children {
+								urls.push(string(u.content))
+							}
+							references.push(urls) when urls.len() > 0
+						case m.op == opSearchDone:
+							done = m
+					}
+					break unless failed is none
+				}
+				c.forget(id)
+				if !(failed is none) {
+					c.sendOnly(abandonRequest(id)) onerror recover none
+					fail failed
+				}
+				let last = done
+				fail protocolFailure("search ended without a result") when last is none
+				let result = try decodeResult(last.body)
+				if result.code == ResultCode.Referral.value && followReferrals && result.referrals.len() > 0 {
+					return try searchElsewhere(result.referrals, base, filter, options, false, fn)
+				}
+				fail resultError(result, "search {base}") when result.code != ResultCode.Success.value
+				cookie = pagedCookie(last.controls)
+				break when cookie.len() == 0 || options.pageSize == 0
+				break when options.sizeLimit > 0 && total >= options.sizeLimit
+			}
+			if followReferrals {
+				for let urls in references {
+					try searchElsewhere(urls, base, filter, options, true, fn)
+				}
+			}
+			return none
+		}
+
+		// The first entry below `base` matching the filter; none when no
+		// entry matches. Fails as `search` does.
+		def find(base string, filter string) !?Entry {
+			let options = SearchOptions{}
+			options.sizeLimit = 1
+			options.pageSize = 0
+			let found = search(base, filter, options) onerror (err error) {
+				// A size limit hit after one entry is still an answer.
+				if err is LdapError {
+					let e LdapError = err
+					fail err unless e.result == ResultCode.SizeLimitExceeded.value
+				} else {
+					fail err
+				}
+				recover []
+			}
+			return found.len() == 0 ?? (none, found[0])
+		}
+
+		// The entry named `dn`, with every user attribute (or those named).
+		// Fails with `NoSuchObject` when it does not exist.
+		def get(dn string, attributes string[] = []) !Entry {
+			let options = SearchOptions{scope: Scope.Base, attributes: attributes, pageSize: 0}
+			let found = try search(dn, "(objectClass=*)", options)
+			fail failure(ResultCode.NoSuchObject, "{dn} does not exist") when found.len() == 0
+			return found[0]
+		}
+
+		// Whether an entry named `dn` exists. Fails when the server
+		// refuses the search for another reason.
+		def exists(dn string) !bool {
+			let missing = false
+			let failed ?error = none
+			get(dn, ["1.1"]) onerror (err error) {
+				if err is LdapError {
+					let e LdapError = err
+					missing = e.result == ResultCode.NoSuchObject.value
+				}
+				failed = err unless missing
+				recover new Entry(dn)
+			}
+			fail failed unless failed is none
+			return !missing
+		}
+
+		// The server's root DSE: its naming contexts, supported controls,
+		// extensions and SASL mechanisms. Fails when the server refuses.
+		def rootDSE() !Entry {
+			let options = SearchOptions{scope: Scope.Base, attributes: ["*", "+"], pageSize: 0}
+			let found = try search("", "(objectClass=*)", options)
+			fail failure(ResultCode.NoSuchObject, "no root DSE") when found.len() == 0
+			return found[0]
+		}
+
+		// Adds an entry. Fails with `EntryAlreadyExists`, `NoSuchObject`
+		// (a missing parent) or a schema violation.
+		def add(entry Entry) !none {
+			return try chase(entry.dn, "add", def (c Client, dn string) !none {
+				let e = entry.clone()
+				e.dn = dn
+				return try expectResult(try c.call(addRequest(e), "add"), "add {dn}")
+			})
+		}
+
+		// add from a DN and attribute values. Fails as `add(entry)` does.
+		def add(dn string, attributes map<string, string[]>) !none {
+			let e = new Entry(dn)
+			for let (name, values) in attributes {
+				e.set(name, values)
+			}
+			return try add(e)
+		}
+
+		// Applies changes to one entry, all or none. Fails with
+		// `NoSuchObject`, `NoSuchAttribute`, `AttributeOrValueExists` or a
+		// schema violation.
+		def modify(dn string, changes Change[]) !none {
+			return try chase(dn, "modify", def (c Client, target string) !none {
+				return try expectResult(try c.call(modifyRequest(target, changes), "modify"), "modify {target}")
+			})
+		}
+
+		// Replaces every value of one attribute. Fails as `modify` does.
+		def replace(dn string, attribute string, values string[]) !none {
+			return try modify(dn, [Change{kind:ChangeKind.Replace, attribute:attribute, values:values}])
+		}
+
+		// replace with a single value. Fails as `modify` does.
+		def replace(dn string, attribute string, value string) !none {
+			return try replace(dn, attribute, [value])
+		}
+
+		// Deletes an entry; with `recursive`, everything below it first.
+		// Fails with `NoSuchObject`, or `NotAllowedOnNonLeaf` when it has
+		// children and `recursive` is false.
+		def delete(dn string, recursive bool = false) !none {
+			if recursive {
+				let options = SearchOptions{scope: Scope.One, attributes: ["1.1"]}
+				for let child in try search(dn, "(objectClass=*)", options) {
+					try delete(child.dn, true)
+				}
+			}
+			return try chase(dn, "delete", def (c Client, target string) !none {
+				return try expectResult(try c.call(deleteRequest(target), "delete"), "delete {target}")
+			})
+		}
+
+		// Renames an entry (`newRDN`, like `cn=Bob`) and optionally moves it
+		// under `newParent`; `keepOld` keeps the old name's value as an
+		// attribute. Fails with `NoSuchObject` or `EntryAlreadyExists`.
+		def rename(dn string, newRDN string, newParent string = "", keepOld bool = false) !none {
+			return try chase(dn, "rename", def (c Client, target string) !none {
+				return try expectResult(try c.call(modifyDNRequest(target, newRDN, !keepOld, newParent), "rename"), "rename {target}")
+			})
+		}
+
+		// Whether the entry's attribute holds the value, decided by the
+		// server's matching rules (the way to check a password-like value
+		// without reading it). Fails with `NoSuchObject` or
+		// `NoSuchAttribute`.
+		def compare(dn string, attribute string, value string) !bool {
+			let same = false
+			try chase(dn, "compare", def (c Client, target string) !none {
+				let m = try c.call(compareRequest(target, attribute, value), "compare")
+				let result = try decodeResult(m.body)
+				same = result.code == ResultCode.CompareTrue.value
+				return none when result.code := ResultCode.CompareTrue.value || ResultCode.CompareFalse.value
+				fail resultError(result, "compare {target}")
+			})
+			return same
+		}
+
+		// Changes a password (RFC 3062): `dn` empty for the bound user,
+		// `oldPassword` checked when given, `newPassword` empty to have the server make one,
+		// which is returned. Fails when the server refuses.
+		def changePassword(dn string, oldPassword Secret<string>, newPassword Secret<string>) !string {
+			let parts ASN1Element[] = []
+			parts.push(contextPrimitive(0, dn.bytes())) when dn != ""
+			parts.push(contextPrimitive(1, oldPassword.reveal().bytes())) when oldPassword.reveal() != ""
+			parts.push(contextPrimitive(2, newPassword.reveal().bytes())) when newPassword.reveal() != ""
+			let (_, value) = try extended(oidPasswordModify, asn1Sequence(parts).encode())
+			return "" when value is none
+			let (seq, _) = berParse(value) onerror recover (encoding.asn1Null(), 0)
+			for let c in seq.children {
+				return string(c.content) when c.isContext(0)
+			}
+			return ""
+		}
+
+		// Runs an extended operation; returns the response's name and
+		// value. Fails when the server refuses or does not know it.
+		def extended(oid string, value ?byte[]) !(string, ?byte[]) {
+			let name = ""
+			let answer ?byte[] = none
+			try chase("", "extended", def (c Client, _ string) !none {
+				let m = try c.call(extendedRequest(oid, value), "extended")
+				let result = try decodeResult(m.body)
+				fail resultError(result, "extended {oid}") when result.code != ResultCode.Success.value
+				name = result.name
+				answer = result.value
+				return none
+			})
+			return (name, answer)
+		}
+
+		// The DN of the last successful bind; "" when anonymous.
+		def boundAs() string {
+			return bound
+		}
+
+		// Whether the connection is up.
+		def isOpen() bool {
+			let c = conn
+			return !(c is none) && c.failure is none
+		}
+
+		// Unbinds and closes. Never fails.
+		def close() !none {
+			let c = conn
+			conn = none
+			if !(c is none) {
+				c.sendOnly(unbind()) onerror recover none
+				c.close()
+			}
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		internal def connected() !Conn {
+			let c = conn
+			fail LdapError{message: "ldap: not connected; call connect first", code: "closed"} when c is none
+			return c
+		}
+
+		internal def call(op ASN1Element, what string) !Message {
+			return try (try connected()).request(op, requestControls())
+		}
+
+		// The controls every request carries: ManageDsaIT when asked.
+		internal def requestControls() Control[] {
+			let out Control[] = []
+			out.push(Control{oid: oidManageDsaIT, critical: true}) when manageDsaIT
+			return out
+		}
+
+		// Runs `op` against `dn` here and, when the server answers with a
+		// referral and `followReferrals` is on, at the servers it names.
+		// Fails as the last server tried fails.
+		internal def chase(dn string, what string, op def (Client, string) !none) !none {
+			let failed ?error = none
+			op(self, dn) onerror (err error) {
+				failed = err
+				recover none
+			}
+			return none when failed is none
+			let urls = referralsOf(failed)
+			fail failed when urls.len() == 0 || !followReferrals
+			return try follow(urls, dn, what, op)
+		}
+
+		// Sends `op` to the servers `urls` names, in order, until one does
+		// it; the URL's DN, when it has one, replaces `dn`.
+		internal def follow(urls string[], dn string, what string, op def (Client, string) !none) !none {
+			fail LdapError{message: "ldap: {what}: more than {referralLimit} referrals deep", code: "LoopDetect", result: ResultCode.LoopDetect.value, referrals: urls} when referralHops >= referralLimit
+			let last ?error = none
+			for let text in urls {
+				let failed ?error = none
+				let url = parseURL(text) onerror (err error) {
+					failed = err
+					recover LdapURL{}
+				}
+				if failed is none && url.host != "" {
+					let other = referralClient(url) onerror (err error) {
+						failed = err
+						recover self
+					}
+					if failed is none {
+						other.chase(url.dn == "" ?? (dn, url.dn), what, op) onerror (err error) {
+							failed = err
+							recover none
+						}
+						other.close() onerror recover none
+						return none when failed is none
+					}
+				}
+				last = failed
+			}
+			fail last unless last is none
+			fail LdapError{message: "ldap: {what}: no referral names a server", code: "Referral", result: ResultCode.Referral.value, referrals: urls}
+		}
+
+		// Searches at the servers of a search continuation reference or a
+		// referral, the first that answers; see RFC 4511 §4.5.3 for the
+		// base, scope and filter the new search takes.
+		internal def searchElsewhere(urls string[], base string, filter Filter, options SearchOptions, continuation bool, fn def (Entry) !none) !none {
+			fail LdapError{message: "ldap: search {base}: more than {referralLimit} referrals deep", code: "LoopDetect", result: ResultCode.LoopDetect.value, referrals: urls} when referralHops >= referralLimit
+			let last ?error = none
+			for let text in urls {
+				let failed ?error = none
+				let url = parseURL(text) onerror (err error) {
+					failed = err
+					recover LdapURL{}
+				}
+				if failed is none && url.host != "" {
+					let next = SearchOptions{scope: options.scope, attributes: options.attributes, sizeLimit: options.sizeLimit, timeLimit: options.timeLimit, typesOnly: options.typesOnly, deref: options.deref, pageSize: options.pageSize}
+					next.scope = Scope.Base when continuation && options.scope == Scope.One
+					let scope = url.scope
+					next.scope = scope unless scope is none
+					let urlFilter = url.filter
+					let f = urlFilter == "" ?? (filter, parseFilter(urlFilter) onerror recover filter)
+					let other = referralClient(url) onerror (err error) {
+						failed = err
+						recover self
+					}
+					if failed is none {
+						other.each(url.dn == "" ?? (base, url.dn), f, next, fn) onerror (err error) {
+							failed = err
+							recover none
+						}
+						other.close() onerror recover none
+						return none when failed is none
+					}
+				}
+				last = failed
+			}
+			fail last unless last is none
+			fail LdapError{message: "ldap: search {base}: no reference names a server", code: "Referral", result: ResultCode.Referral.value, referrals: urls}
+		}
+
+		// A client for a referral's server: this one's settings, the same
+		// kind of TLS (or implicit TLS for `ldaps`), one hop further, bound
+		// through `referralBind` (anonymous when none).
+		internal def referralClient(url LdapURL) !Client {
+			let kind = url.scheme == "ldaps" ?? (Security.Implicit, security == Security.Implicit ?? (Security.StartTls, security))
+			let other = new Client(kind, timeout)
+			let base = tls
+			if !(base is none) {
+				let host = net.parseAddress(url.host) onerror recover new net.Address()
+				other.tls = configFor(base, host.host)
+			}
+			other.channelBinding = channelBinding
+			other.followReferrals = followReferrals
+			other.referralLimit = referralLimit
+			other.referralHops = referralHops + 1
+			other.referralBind = referralBind
+			other.manageDsaIT = manageDsaIT
+			try other.connect(url.scheme + "://" + url.host)
+			let hook = referralBind
+			if !(hook is none) {
+				hook(other) onerror (err error) {
+					other.close() onerror recover none
+					fail err
+				}
+			}
+			return other
+		}
+
+		// Names the client and its server.
+		def str() string {
+			return "ldap.Client({target})"
+		}
+	}
+
+	// The TLS client stream over a socket, the server checked under
+	// `host` unless the config names another.
+	internal def secureStream(socket net.Connection, base ?tls.Config, host string, timeout duration) !tls.Conn {
+		let config = tls.Config{}
+		config = base unless base is none
+		config = tls.withServerName(config, host) when config.serverName == ""
+		let secured = tls.client(socket, config)
+		try secured.handshake(timeout)
+		return secured
+	}
+
+
+	// Fails unless the reply is a success.
+	internal def expectResult(m Message, what string) !none {
+		let result = try decodeResult(m.body)
+		fail resultError(result, what) when result.code != ResultCode.Success.value
+		return none
+	}
+
+	// Where to dial, the TLS host name and the policy scheme for an
+	// address or URL.
+	internal def targetOf(addr string) !(string, string, string) {
+		if addr.startsWith("ldapi://") {
+			let path = percentDecode(addr["ldapi://".len():].trimSuffix("/"))
+			return (path == "" ?? ("/var/run/ldapi", path), "", "ldapi")
+		}
+		let rest = addr
+		let scheme = "ldap"
+		if addr.startsWith("ldaps://") {
+			rest = addr["ldaps://".len():]
+			scheme = "ldaps"
+		} else if addr.startsWith("ldap://") {
+			rest = addr["ldap://".len():]
+		}
+		let slash = rest.indexOf("/")
+		rest = rest[:slash] when slash >= 0
+		let dial = net.withPort(rest, scheme == "ldaps" ?? (636, 389))
+		let a = net.parseAddress(dial) onerror recover new net.Address()
+		return (dial, a.host, scheme)
+	}
+
+	internal def percentDecode(text string) string {
+		let raw = text.bytes()
+		let out byte[] = []
+		let i = 0
+		for i < raw.len() {
+			if raw[i] == byte(37) && i + 2 < raw.len() && isHexDigit(raw[i + 1]) && isHexDigit(raw[i + 2]) {
+				out.push(byte(hexDigit(raw[i + 1]) * 16 + hexDigit(raw[i + 2])))
+				i += 3
+				continue
+			}
+			out.push(raw[i])
+			i++
+		}
+		return string(out)
+	}
 }

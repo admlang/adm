@@ -1,0 +1,320 @@
+internal partial module std.net.mqtt.proto {
+	use (
+		std.crypto::(rand)
+		std.net
+		std.net.mqtt::(Message, matches)
+		std.time
+	)
+
+	// The broker: sessions that outlive connections, retained messages,
+	// routing with each subscription's options, shared subscriptions, wills
+	// and message expiry (MQTT 5.0 §4).
+
+	// A message waiting for a subscriber, with when it was published so its
+	// expiry can run down.
+	struct Stored {
+		message   Message
+		published time.Time
+	}
+
+	// One subscription of a session.
+	struct Sub {
+		filter            string
+		qos               int
+		noLocal           bool   = false
+		retainAsPublished bool   = false
+		retainHandling    int    = 0
+		subscriptionId    int    = 0
+		// "" or the share group of a `$share/group/filter`.
+		group             string = ""
+	}
+
+	// What a broker needs to know of its server.
+	struct BrokerLimits {
+		maxQoS        int  = 2
+		maxQueued     int  = 1000
+		retainEnabled bool = true
+		maxPacketSize int  = 268435455
+	}
+
+	// Session is one client's state: its subscriptions, what waits for it
+	// while it is away, and what is in flight on its connection.
+	type Session {
+		clientId          string
+		subs              map<string, Sub>
+		// Session Expiry Interval in seconds; 0 ends the session with its
+		// connection, 4294967295 never.
+		expiry            int64            = 0
+		atomic queued     Stored[]         = []
+		atomic inflight   map<int, Packet>
+		atomic nextId     int              = 1
+		atomic receiveMax int              = 65535
+		conn              ?BrokerConn      = none
+		// Which connection holds the session (ServerConn.serial).
+		connSerial        int              = 0
+		version           int              = 5
+		disconnectedAt    ?time.Time       = none
+		will              ?Message         = none
+		willDelay         int64            = 0
+		willGeneration    int              = 0
+
+		def new(clientId string) {
+			self.clientId = clientId
+		}
+
+		atomic def takeId() int {
+			for {
+				let id = nextId
+				nextId = nextId == 65535 ?? (1, nextId + 1)
+				return id unless inflight.hasKey(id)
+			}
+			return 0
+		}
+
+		atomic def keep(id int, p Packet) {
+			inflight[id] = p
+		}
+
+		atomic def acked(id int) ?Packet {
+			let p = inflight.get(id)
+			inflight.delete(id)
+			return p
+		}
+
+		atomic def replace(id int, p Packet) {
+			inflight[id] = p
+		}
+
+		atomic def windowFull() bool {
+			return inflight.len() >= receiveMax
+		}
+
+		atomic def enqueue(s Stored, limit int) {
+			queued.shift() when limit > 0 && queued.len() >= limit
+			queued.push(s)
+		}
+
+		atomic def takeQueued() Stored[] {
+			let all = queued
+			queued = []
+			return all
+		}
+
+		atomic def unacked() Packet[] {
+			let out Packet[] = []
+			for let (_, p) in inflight {
+				out.push(p)
+			}
+			return out
+		}
+	}
+
+	// BrokerConn is how the broker writes to a connected client.
+	interface BrokerConn {
+		def deliver(p Packet) !none
+		def kick(reason int)
+	}
+
+	type Broker {
+		limits             BrokerLimits
+		atomic sessions    map<string, Session>
+		atomic retained    map<string, Stored>
+		atomic shareCursor map<string, int>
+		// Counters for $SYS.
+		atomic received    int64                = 0
+		atomic sent        int64                = 0
+		atomic dropped     int64                = 0
+		atomic serials     int                  = 0
+		// Observes every message published through the broker.
+		onPublish          ?def (Message)       = none
+
+		def new(limits BrokerLimits) {
+			self.limits = limits
+		}
+
+		// The session of a client: the one kept, or a fresh one. Returns
+		// it and whether it was kept.
+		atomic def attach(clientId string, clean bool) (Session, bool) {
+			let found = sessions.get(clientId)
+			return (found, true) when !(found is none) && !clean
+			let fresh = new Session(clientId)
+			sessions[clientId] = fresh
+			return (fresh, false)
+		}
+
+		atomic def detach(s Session) {
+			s.conn = none
+			s.disconnectedAt = time.now()
+			sessions.delete(s.clientId) when s.expiry == 0
+		}
+
+		atomic def sessionOf(clientId string) ?Session {
+			return sessions.get(clientId)
+		}
+
+		atomic def allSessions() Session[] {
+			let out Session[] = []
+			for let (_, s) in sessions {
+				out.push(s)
+			}
+			return out
+		}
+
+		atomic def connectedCount() int {
+			let n = 0
+			for let (_, s) in sessions {
+				n++ unless s.conn is none
+			}
+			return n
+		}
+
+		// Drops sessions whose expiry ran out while disconnected.
+		atomic def expireSessions() {
+			let now = time.now()
+			let kept map<string, Session> = map<string, Session>{}
+			for let (id, s) in sessions {
+				let gone = s.disconnectedAt
+				if s.conn is none && !(gone is none) && s.expiry != 4294967295 && int64(now - gone) / 1000000000 >= s.expiry {
+					continue
+				}
+				kept[id] = s
+			}
+			sessions = kept
+		}
+
+		// Routes a message to every matching subscription and keeps it
+		// when retained. `from` is the publishing client ("" for the broker
+		// itself).
+		def publish(m Message, from string) {
+			bumpReceived()
+			let hook = onPublish
+			hook(m) unless hook is none
+			let stored = Stored{message: m, published: time.now()}
+			storeRetained(m.topic, stored) when m.retain && limits.retainEnabled
+			let groups map<string, Session[]> = map<string, Session[]>{}
+			let groupSubs map<string, Sub[]> = map<string, Sub[]>{}
+			for let s in allSessions() {
+				let best ?Sub = none
+				for let (_, sub) in s.subs {
+					continue unless matches(sub.filter, m.topic)
+					continue when sub.noLocal && s.clientId == from
+					if sub.group != "" {
+						let key = sub.group + "\u0001" + sub.filter
+						let list = groups.get(key)
+						let members Session[] = list is none ?? ([], list)
+						members.push(s)
+						groups[key] = members
+						let subsList = groupSubs.get(key)
+						let subsOf Sub[] = subsList is none ?? ([], subsList)
+						subsOf.push(sub)
+						groupSubs[key] = subsOf
+						continue
+					}
+					best = sub when best is none || sub.qos > best.qos
+				}
+				send(s, stored, best, false) unless (best is none)
+			}
+			for let (key, members) in groups {
+				let i = nextShare(key, members.len())
+				let subs = groupSubs.get(key)
+				send(members[i], stored, subs is none ?? (Sub{filter: "", qos: 0}, subs[i]), false)
+			}
+		}
+
+		internal atomic def nextShare(key string, count int) int {
+			let at = shareCursor.get(key)
+			let i = at is none ?? (0, (at + 1) % count)
+			shareCursor[key] = i
+			return i
+		}
+
+		internal atomic def storeRetained(topic string, s Stored) {
+			if s.message.payload.len() == 0 {
+				retained.delete(topic)
+				return
+			}
+			retained[topic] = s
+		}
+
+		// The retained messages matching a filter.
+		atomic def retainedFor(filter string) Stored[] {
+			let out Stored[] = []
+			for let (topic, s) in retained {
+				out.push(s) when matches(filter, topic)
+			}
+			return out
+		}
+
+		atomic def retainedCount() int {
+			return retained.len()
+		}
+
+		atomic def nextSerial() int {
+			serials++
+			return serials
+		}
+
+		internal atomic def bumpReceived() {
+			received++
+		}
+
+		internal atomic def bumpSent() {
+			sent++
+		}
+
+		internal atomic def bumpDropped() {
+			dropped++
+		}
+
+		// Hands a message to a session: on its connection, or queued while
+		// it is away (QoS 1 and 2 only). `retainedCopy` is a retained
+		// message sent on subscribe, which keeps its retain flag.
+		def send(s Session, stored Stored, sub Sub, retainedCopy bool) {
+			let m = stored.message
+			// Message expiry: the time left, or gone.
+			let left int64 = 0
+			if m.expiry > 0 {
+				left = int64(m.expiry) - int64(time.now() - stored.published) / 1000000000
+				if left <= 0 {
+					bumpDropped()
+					return
+				}
+			}
+			let qos = m.qos.value < sub.qos ?? (m.qos.value, sub.qos)
+			qos = limits.maxQoS when qos > limits.maxQoS
+			let conn = s.conn
+			if conn is none || s.windowFull() {
+				if qos > 0 {
+					s.enqueue(stored, limits.maxQueued)
+				} else {
+					bumpDropped()
+				}
+				return
+			}
+			let id = qos > 0 ?? (s.takeId(), 0)
+			let p = publishOf(m, qos, id)
+			p.retain = retainedCopy || (sub.retainAsPublished && m.retain)
+			p.props.messageExpiry = left when m.expiry > 0
+			p.props.subscriptionIds = [sub.subscriptionId] when sub.subscriptionId > 0
+			s.keep(id, p) when qos > 0
+			conn.deliver(p) onerror (err error) {
+				recover none
+			}
+			bumpSent()
+		}
+
+		// Sends what waited while the session was away.
+		def flush(s Session) {
+			for let stored in s.takeQueued() {
+				let best = Sub{filter: "", qos: stored.message.qos.value}
+				send(s, stored, best, false)
+			}
+		}
+
+		// A fresh client identifier for a client that sent none.
+		def assignId() string {
+			let raw = rand(8) onerror recover byte[1, 2, 3, 4, 5, 6, 7, 8]
+			return "adm-" + raw.hex().lower()
+		}
+	}
+}

@@ -1,0 +1,417 @@
+partial module std.net.ldap {
+	use (
+		std.crypto::(bcrypt, bcryptVerify, constantTimeEqual, rand)
+		std.crypto.hash::(Hash, digest)
+		std.data.encoding
+		std.net.sasl
+		std.os
+	)
+
+	// Directory is what a `Server` answers from. Each method gets the DN
+	// the client is bound as ("" when anonymous) to decide access, and
+	// fails with `failure(ResultCode...)` to answer with that result;
+	// any other failure answers `Other`.
+	interface Directory {
+		// Checks a simple bind. Fails with InvalidCredentials to refuse.
+		def bind(dn string, password Secret<string>) !none
+		// The entries below `base` within `scope` that match, at most
+		// `limit` (0 for no limit). Fails with NoSuchObject when the base
+		// does not exist.
+		def search(bound string, base string, scope Scope, filter Filter, limit int) !Entry[]
+		// Fails with EntryAlreadyExists, NoSuchObject (no parent) or
+		// InsufficientAccessRights.
+		def add(bound string, entry Entry) !none
+		// Fails with NoSuchObject, NoSuchAttribute, AttributeOrValueExists
+		// or InsufficientAccessRights.
+		def modify(bound string, dn string, changes Change[]) !none
+		// Fails with NoSuchObject, NotAllowedOnNonLeaf or
+		// InsufficientAccessRights.
+		def delete(bound string, dn string) !none
+		// Fails with NoSuchObject, EntryAlreadyExists or
+		// InsufficientAccessRights.
+		def rename(bound string, dn string, newRDN string, deleteOld bool, newParent string) !none
+		// Fails with NoSuchObject or NoSuchAttribute.
+		def compare(bound string, dn string, attribute string, value string) !bool
+	}
+
+	// ScramDirectory is a `Directory` that also answers SCRAM binds
+	// (RFC 5802): a `Server` whose directory implements it offers
+	// SCRAM-SHA-1, -256 and -512, and the `-PLUS` forms over TLS.
+	interface ScramDirectory {
+		// The SCRAM credentials of the entry `dn` for a mechanism. Fails
+		// with InvalidCredentials when there are none.
+		def scram(dn string, mechanism sasl.ScramMechanism) !sasl.ScramCredentials
+	}
+
+	// MemoryDirectory is a `Directory` held in memory: entries under one
+	// suffix, loaded from and saved to LDIF. Anyone may read (unless
+	// `anonymousRead` is off); `admins` may change anything; a bound user
+	// may change their own entry. `userPassword` is shown to admins and
+	// its owner only, and checked in plain text or in the `{SSHA}`,
+	// `{SSHA256}`, `{SSHA512}`, `{SHA}`, `{SHA256}`, `{SHA512}` and
+	// `{CRYPT}` (bcrypt) schemes. SCRAM binds (it is a `ScramDirectory`)
+	// check the entry's `authPassword` values of the mechanism (RFC 5803:
+	// `SCRAM-SHA-256$4096:salt$storedKey:serverKey`, as
+	// `sasl.ScramCredentials.str()` writes them), or a plain-text
+	// `userPassword`.
+	//
+	// ```
+	// let dir = new ldap.MemoryDirectory("dc=example,dc=com")
+	// try dir.load(try os.readFile("seed.ldif"))
+	// dir.admins.push("cn=admin,dc=example,dc=com")
+	// let server = new ldap.Server(dir, ":389")
+	// ```
+	type MemoryDirectory {
+		suffix                  string
+		admins                  string[]           = []
+		anonymousRead           bool               = true
+		internal atomic entries map<string, Entry>
+
+		def new(suffix string) {
+			self.suffix = suffix
+		}
+
+		// Adds the entries of an LDIF file, parents before children.
+		// Fails on malformed LDIF or an entry outside the suffix.
+		def load(text string) !none {
+			for let e in try parseLDIF(text) {
+				try put(e)
+			}
+			return none
+		}
+
+		// load from bytes. Fails as `load(string)` does.
+		def load(data byte[]) !none {
+			return try load(string(data))
+		}
+
+		// load from a file. Fails when it cannot be read, or as
+		// `load(string)` does.
+		def loadFile(path string) !none {
+			return try load(try os.readFile(path))
+		}
+
+		// Every entry as LDIF, parents before children.
+		def ldif() string {
+			return entriesLdif(all())
+		}
+
+		// Writes `ldif()` to a file. Fails when it cannot be written.
+		def save(path string) !none {
+			return try os.writeFile(path, ldif().bytes())
+		}
+
+		// The entry named `dn`; none when missing.
+		def entry(dn string) ?Entry {
+			let key = keyOf(dn) onerror recover ""
+			let found = lookup(key)
+			return found is none ?? (none, found.clone())
+		}
+
+		// Stores an entry, replacing one of the same name, without access
+		// checks. Fails when it lies outside the suffix.
+		def put(e Entry) !none {
+			let name = try parseDN(e.dn)
+			let base = try parseDN(suffix)
+			fail failure(ResultCode.NoSuchObject, "{e.dn} is outside {suffix}") unless name.within(base)
+			store(name.canonical(), e.clone())
+			return none
+		}
+
+		// Implements Directory. Fails with LdapError InvalidCredentials when
+		// the entry is missing or no userPassword matches.
+		def bind(dn string, password Secret<string>) !none {
+			let e = entry(dn)
+			fail failure(ResultCode.InvalidCredentials) when e is none
+			for let stored in e.getAll("userPassword") {
+				return none when passwordMatches(stored, password.reveal())
+			}
+			fail failure(ResultCode.InvalidCredentials)
+		}
+
+		// Implements ScramDirectory: the entry's `authPassword` of the
+		// mechanism, else credentials made now from a plain-text
+		// `userPassword`. Fails with LdapError InvalidCredentials when the
+		// entry is missing or has neither.
+		def scram(dn string, mechanism sasl.ScramMechanism) !sasl.ScramCredentials {
+			let e = entry(dn)
+			fail failure(ResultCode.InvalidCredentials) when e is none
+			for let stored in e.getAll("authPassword") {
+				continue unless stored.upper().startsWith(mechanism.value + "$")
+				return sasl.parseScramCredentials(stored) onerror fail failure(ResultCode.InvalidCredentials, "malformed authPassword")
+			}
+			for let stored in e.getAll("userPassword") {
+				continue when stored.startsWith("\{")
+				return try sasl.scramCredentials(stored, mechanism)
+			}
+			fail failure(ResultCode.InvalidCredentials)
+		}
+
+		// Implements Directory. Fails with LdapError InsufficientAccessRights
+		// for an anonymous read when `anonymousRead` is off, NoSuchObject when
+		// the base is missing; stops quietly at `limit` entries.
+		def search(bound string, base string, scope Scope, filter Filter, limit int) !Entry[] {
+			fail failure(ResultCode.InsufficientAccessRights, "anonymous reads are off") when bound == "" && !anonymousRead
+			let baseName = try parseDN(base)
+			fail failure(ResultCode.NoSuchObject, "{base} does not exist") when lookup(baseName.canonical()) is none
+			let privileged = isAdmin(bound)
+			let boundKey = keyOf(bound) onerror recover ""
+			let out Entry[] = []
+			for let e in all() {
+				let name = parseDN(e.dn) onerror recover new DN()
+				let depth = name.depthBelow(baseName)
+				continue when depth < 0
+				let inScope = scope == Scope.Base ?? (depth == 0, scope == Scope.One ?? (depth == 1, scope == Scope.Children ?? (depth >= 1, true)))
+				continue unless inScope && filter.matches(e)
+				let shown = e.clone()
+				shown.remove("userPassword") unless privileged || name.canonical() == boundKey
+				out.push(shown)
+				break when limit > 0 && out.len() >= limit
+			}
+			return out
+		}
+
+		// Implements Directory. Fails with LdapError InsufficientAccessRights
+		// when `bound` may not write there, NoSuchObject when the entry is
+		// outside the suffix or its parent is missing, EntryAlreadyExists.
+		def add(bound string, e Entry) !none {
+			try mayWrite(bound, e.dn)
+			let name = try parseDN(e.dn)
+			let base = try parseDN(suffix)
+			fail failure(ResultCode.NoSuchObject, "{e.dn} is outside {suffix}") unless name.within(base)
+			fail failure(ResultCode.EntryAlreadyExists, "{e.dn} exists") unless lookup(name.canonical()) is none
+			if !name.equals(base) {
+				fail failure(ResultCode.NoSuchObject, "the parent of {e.dn} does not exist") when lookup(name.parent().canonical()) is none
+			}
+			let stored = e.clone()
+			for let rdn in name.parts[:1] {
+				for let p in rdn {
+					stored.add(p.attribute, p.value) unless stored.hasValue(p.attribute, p.value)
+				}
+			}
+			store(name.canonical(), stored)
+			return none
+		}
+
+		// Implements Directory: every change or none. Fails with LdapError
+		// InsufficientAccessRights, NoSuchObject, AttributeOrValueExists,
+		// NoSuchAttribute, ConstraintViolation (increment of a non-number) or
+		// NotAllowedOnRDN (removing a naming value).
+		def modify(bound string, dn string, changes Change[]) !none {
+			try mayWrite(bound, dn)
+			let name = try parseDN(dn)
+			let found = lookup(name.canonical())
+			fail failure(ResultCode.NoSuchObject, "{dn} does not exist") when found is none
+			let e = found.clone()
+			for let c in changes {
+				switch {
+					case c.kind == ChangeKind.Add:
+						for let v in c.values {
+							fail failure(ResultCode.AttributeOrValueExists, "{c.attribute} already holds {v}") when e.hasValue(c.attribute, v)
+							e.add(c.attribute, v)
+						}
+					case c.kind == ChangeKind.Replace:
+						e.set(c.attribute, c.values)
+					case c.kind == ChangeKind.Delete:
+						fail failure(ResultCode.NoSuchAttribute, "{dn} has no {c.attribute}") unless e.has(c.attribute)
+						if c.values.len() == 0 {
+							e.remove(c.attribute)
+						} else {
+							let kept string[] = []
+							for let v in e.getAll(c.attribute) {
+								let drop = false
+								for let gone in c.values {
+									drop = true when gone.lower() == v.lower()
+								}
+								kept.push(v) unless drop
+							}
+							fail failure(ResultCode.NoSuchAttribute, "{c.attribute} does not hold those values") when kept.len() == e.getAll(c.attribute).len()
+							e.set(c.attribute, kept)
+						}
+					case c.kind == ChangeKind.Increment:
+						let current = e.get(c.attribute)
+						fail failure(ResultCode.NoSuchAttribute, "{dn} has no {c.attribute}") when current == ""
+						fail failure(ResultCode.ConstraintViolation, "{c.attribute} is not a number") unless isInteger(current) && c.values.len() == 1 && isInteger(c.values[0])
+						e.set(c.attribute, "{current.toInt<int64>() + c.values[0].toInt<int64>()}")
+				}
+			}
+			for let rdn in name.parts[:1] {
+				for let p in rdn {
+					fail failure(ResultCode.NotAllowedOnRDN, "{p.attribute} names the entry") unless e.hasValue(p.attribute, p.value)
+				}
+			}
+			store(name.canonical(), e)
+			return none
+		}
+
+		// Implements Directory. Fails with LdapError InsufficientAccessRights,
+		// NoSuchObject, or NotAllowedOnNonLeaf when the entry has children.
+		def delete(bound string, dn string) !none {
+			try mayWrite(bound, dn)
+			let name = try parseDN(dn)
+			fail failure(ResultCode.NoSuchObject, "{dn} does not exist") when lookup(name.canonical()) is none
+			for let e in all() {
+				let other = parseDN(e.dn) onerror recover new DN()
+				fail failure(ResultCode.NotAllowedOnNonLeaf, "{dn} has children") when other.depthBelow(name) > 0
+			}
+			drop(name.canonical())
+			return none
+		}
+
+		// Implements Directory: renames and moves an entry and everything
+		// below it. Fails with LdapError InsufficientAccessRights,
+		// NoSuchObject (the entry or the new parent), InvalidDNSyntax for a
+		// multi-part RDN, EntryAlreadyExists at the target.
+		def rename(bound string, dn string, newRDN string, deleteOld bool, newParent string) !none {
+			try mayWrite(bound, dn)
+			let name = try parseDN(dn)
+			let found = lookup(name.canonical())
+			fail failure(ResultCode.NoSuchObject, "{dn} does not exist") when found is none
+			let rdn = try parseDN(newRDN)
+			fail failure(ResultCode.InvalidDNSyntax, "{newRDN} is not one relative name") when rdn.parts.len() != 1
+			let parent = newParent == "" ?? (name.parent(), try parseDN(newParent))
+			if newParent != "" {
+				try mayWrite(bound, newParent)
+				fail failure(ResultCode.NoSuchObject, "{newParent} does not exist") when lookup(parent.canonical()) is none
+			}
+			let parts NamePart[][] = [rdn.parts[0]]
+			for let p in parent.parts {
+				parts.push(p)
+			}
+			let target = new DN(parts)
+			fail failure(ResultCode.EntryAlreadyExists, "{target.str()} exists") unless lookup(target.canonical()) is none
+			let moved Entry[] = []
+			for let e in all() {
+				let other = parseDN(e.dn) onerror recover new DN()
+				let depth = other.depthBelow(name)
+				continue when depth < 0
+				let renamed = e.clone()
+				let tail NamePart[][] = other.parts[:depth].clone()
+				for let p in target.parts {
+					tail.push(p)
+				}
+				renamed.dn = new DN(tail).str()
+				if depth == 0 {
+					if deleteOld {
+						for let p in name.parts[0] {
+							let kept = renamed.getAll(p.attribute).filter(v => v.lower() != p.value.lower())
+							renamed.set(p.attribute, kept)
+						}
+					}
+					for let p in rdn.parts[0] {
+						renamed.add(p.attribute, p.value) unless renamed.hasValue(p.attribute, p.value)
+					}
+				}
+				drop(other.canonical())
+				moved.push(renamed)
+			}
+			for let e in moved {
+				store(keyOf(e.dn) onerror recover e.dn.lower(), e)
+			}
+			return none
+		}
+
+		// Implements Directory. Fails with LdapError InsufficientAccessRights
+		// for an anonymous compare when `anonymousRead` is off, NoSuchObject,
+		// or NoSuchAttribute.
+		def compare(bound string, dn string, attribute string, value string) !bool {
+			fail failure(ResultCode.InsufficientAccessRights) when bound == "" && !anonymousRead
+			let e = entry(dn)
+			fail failure(ResultCode.NoSuchObject, "{dn} does not exist") when e is none
+			fail failure(ResultCode.NoSuchAttribute, "{dn} has no {attribute}") unless e.has(attribute)
+			if attribute.lower() == "userpassword" {
+				for let stored in e.getAll(attribute) {
+					return true when passwordMatches(stored, value)
+				}
+				return false
+			}
+			return e.hasValue(attribute, value)
+		}
+
+		// Whether `bound` is one of the admins.
+		def isAdmin(bound string) bool {
+			return false when bound == ""
+			let key = keyOf(bound) onerror recover ""
+			for let a in admins {
+				return true when (keyOf(a) onerror recover "") == key
+			}
+			return false
+		}
+
+		internal def mayWrite(bound string, dn string) !none {
+			return none when isAdmin(bound)
+			fail failure(ResultCode.InsufficientAccessRights, "only an admin or the entry's owner may change it") when bound == ""
+			let mine = keyOf(bound) onerror recover ""
+			let target = keyOf(dn) onerror recover "-"
+			fail failure(ResultCode.InsufficientAccessRights, "{bound} may not change {dn}") when mine != target
+			return none
+		}
+
+		internal atomic def lookup(key string) ?Entry {
+			return entries.get(key)
+		}
+
+		internal atomic def store(key string, e Entry) {
+			entries[key] = e
+		}
+
+		internal atomic def drop(key string) {
+			entries.delete(key)
+		}
+
+		// Every entry, parents before children.
+		internal atomic def all() Entry[] {
+			let out Entry[] = []
+			for let (_, e) in entries {
+				out.push(e)
+			}
+			out.sort((a, b Entry) => a.dn.count(",") < b.dn.count(","))
+			return out
+		}
+	}
+
+	internal def keyOf(dn string) !string {
+		return (try parseDN(dn)).canonical()
+	}
+
+	// hashPassword stores a password for `userPassword`: `{SSHA512}` with
+	// a random salt by default; `scheme` may also be `SSHA256`, `SSHA` or
+	// `CRYPT` (bcrypt). Fails for another scheme or when the random
+	// source does.
+	def hashPassword(password Secret<string>, scheme string = "SSHA512") !string {
+		let upper = scheme.upper()
+		return "\{CRYPT\}" + (try bcrypt(password.reveal(), 10)) when upper == "CRYPT"
+		let hash = try saltedHash(upper)
+		let salt = try rand(8)
+		let sum = digest(hash, password.reveal().bytes() + salt)
+		return "\{" + upper + "\}" + encoding.base64encode(sum + salt)
+	}
+
+	internal def saltedHash(scheme string) !Hash {
+		return Hash.SHA1 when scheme := "SSHA" || "SHA"
+		return Hash.SHA256 when scheme := "SSHA256" || "SHA256"
+		return Hash.SHA512 when scheme := "SSHA512" || "SHA512"
+		fail failure(ResultCode.UnwillingToPerform, "password scheme {scheme} is not supported")
+	}
+
+	// Whether a stored `userPassword` value matches a password.
+	internal def passwordMatches(stored string, password string) bool {
+		return constantTimeEqual(stored.bytes(), password.bytes()) unless stored.startsWith("\{")
+		let close = stored.indexOf("\}")
+		return false when close < 0
+		let scheme = stored[1:close].upper()
+		let body = stored[close + 1:]
+		if scheme := "CRYPT" || "BCRYPT" {
+			return bcryptVerify(password, body)
+		}
+		let hash = saltedHash(scheme) onerror recover Hash.MD5
+		return false when hash == Hash.MD5
+		let raw = encoding.base64decode(body) onerror recover byte[]
+		let size = digest(hash, []).len()
+		return false when raw.len() < size
+		let salt = raw[size:]
+		let salted = scheme.startsWith("S") && scheme != "SHA" && scheme != "SHA256" && scheme != "SHA512"
+		let sum = digest(hash, password.bytes() + (salted ?? (salt, byte[])))
+		return constantTimeEqual(sum, raw[:size])
+	}
+}

@@ -1,4 +1,304 @@
 partial module std.net.mqtt {
-	// Server is the MQTT broker; it has no members yet.
-	type Server {}
+	use (
+		std.metrics
+		std.net
+		std.net.http::(Context, Handler, HandlerFunc)
+		std.net.http.websocket
+		std.net.mqtt.proto::*
+		std.net.tls
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// Server is an MQTT broker for 3.1.1 and 5.0 clients: sessions that
+	// outlive their connections (MQTT 5 session expiry, 3.1.1 persistent
+	// sessions), QoS 0, 1 and 2 both ways, retained messages, wills (with
+	// MQTT 5 delays), shared subscriptions (`$share/group/filter`),
+	// subscription options, message expiry and flow control. Serves TCP
+	// or TLS (`addr`), and WebSocket clients through `webSocketHandler`
+	// on an HTTP server. Implements `net.Server`.
+	//
+	// ```
+	// let broker = new mqtt.Server(":1883")
+	// let users = new mqtt.Users()
+	// users.add("sensor", "s3cret")
+	// broker.authenticator = users
+	// try broker.listenAndServe()
+	// ```
+	type Server {
+		addr string = ":1883"
+		security Security = Security.Plain
+		tls ?tls.Config = none
+		// Decides who may connect; none lets anyone in.
+		authenticator ?Authenticator = none
+		// Decides who may publish and subscribe to what; none allows all.
+		authorizer ?Authorizer = none
+		// The highest QoS granted.
+		maxQoS QoS = QoS.ExactlyOnce
+		// Messages kept for a disconnected session before the oldest go.
+		maxQueued int = 1000
+		retain bool = true
+		maxPacketSize int = 268435455
+		// Publishes broker statistics under `$SYS/broker/...` this often;
+		// 0s never.
+		sysInterval duration = 0s
+		// How long CONNECT may take to arrive.
+		timeout duration = 30s
+		maxConnections int = 0
+		backlog int = 128
+		internal broker ?Broker = none
+		internal listener ?net.Listener = none
+		internal atomic running bool = false
+		internal atomic open int = 0
+		internal started time.Time
+		// Shared by every broker of the process.
+		@metric("net.mqtt.server.connections.open")
+		internal connectionsOpen metrics.Gauge
+		@metric("net.mqtt.server.connections.total")
+		internal connectionsTotal metrics.Counter
+
+		def new(addr string = ":1883") {
+			self.addr = addr
+			started = time.now()
+		}
+
+		// Publishes a message from the broker itself (`from` is empty, so
+		// noLocal subscribers still get it).
+		def publish(topic string, payload byte[], qos QoS = QoS.AtMostOnce, retain bool = false) {
+			publish(Message{topic: topic, payload: payload, qos: qos, retain: retain})
+		}
+
+		// publish of text.
+		def publish(topic string, text string, qos QoS = QoS.AtMostOnce, retain bool = false) {
+			publish(Message{topic: topic, payload: text.bytes(), qos: qos, retain: retain, utf8: true})
+		}
+
+		// publish of a whole message.
+		def publish(message Message) {
+			brokerOf().publish(message, "")
+		}
+
+		// Calls `fn` with every message published through the broker, by
+		// clients or by `publish`.
+		def onPublish(fn def (Message)) {
+			brokerOf().onPublish = fn
+		}
+
+		// The retained messages whose topics match a filter.
+		def retained(filter string = "#") Message[] {
+			let out Message[] = []
+			for let s in brokerOf().retainedFor(filter) {
+				out.push(s.message)
+			}
+			return out
+		}
+
+		// Clients connected right now.
+		def connectionCount() int {
+			return open
+		}
+
+		internal def brokerOf() Broker {
+			let b = broker
+			if b is none {
+				let made = new Broker(BrokerLimits{maxQoS: maxQoS.value, maxQueued: maxQueued, retainEnabled: retain, maxPacketSize: maxPacketSize})
+				broker = made
+				return made
+			}
+			return b
+		}
+
+		internal def config() ConnConfig {
+			return ConnConfig{authenticator: authenticator, authorizer: authorizer, timeout: timeout}
+		}
+
+		// Binds `addr` and serves until `close`. Fails with PolicyDenied
+		// when the policy denies listening there, NetError when the address
+		// cannot be bound, or when TLS is asked for without a config.
+		def listenAndServe() !none {
+			let ln = try bind()
+			return try serve(ln)
+		}
+
+		// Accepts on the listener until it closes, one task per client.
+		// Returns none after `close`. Fails with NetError when an accept
+		// fails for another reason.
+		def serve(ln net.Listener) !none {
+			fail MqttError{message: "mqtt: Security.{security.value} needs a TLS config", code: "config"} when security != Security.Plain && tls is none
+			fail MqttError{message: "mqtt: the server is already serving", code: "config"} when running
+			listener = ln
+			running = true
+			let b = brokerOf()
+			let keeper = async upkeep()
+			keeper.keepAlive()
+			for running {
+				let failed ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failed = err
+					recover none
+				}
+				if !(failed is none) {
+					return none unless running
+					fail failed
+				}
+				continue when accepted is none
+				if !running || (maxConnections > 0 && open >= maxConnections) {
+					accepted.close() onerror recover none
+					continue
+				}
+				let task = async runConnection(accepted, b)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails as `listenAndServe` does.
+		def start() !none {
+			return none when running
+			fail MqttError{message: "mqtt: Security.{security.value} needs a TLS config", code: "config"} when security != Security.Plain && tls is none
+			let ln = try bind()
+			listener = ln
+			let task = async serveInBackground(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting and disconnects every
+		// client. Never fails.
+		def close() !none {
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			let b = broker
+			if !(b is none) {
+				for let s in b.allSessions() {
+					let c = s.conn
+					c.kick(0x8B) unless c is none
+				}
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed before
+		// `start`.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// An HTTP handler that takes MQTT over WebSocket (subprotocol
+		// `mqtt`); mount it on an `http.Server`, e.g. at `/mqtt`.
+		def webSocketHandler() Handler {
+			let upgrader = new websocket.Upgrader()
+			upgrader.subprotocols = ["mqtt"]
+			let b = brokerOf()
+			return new HandlerFunc(def (ctx Context) !none {
+				let ws = try upgrader.upgrade(ctx)
+				let stream net.Stream = new WsStream(ws)
+				let peer = ctx.request.remote
+				runStream(stream, b, peer is none ?? (new net.Address(), peer))
+				return none
+			})
+		}
+
+		internal def serveInBackground(ln net.Listener) {
+			serve(ln) onerror recover none
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def runConnection(conn net.Connection, b Broker) {
+			let stream net.Stream = conn
+			if security == Security.Implicit {
+				let secured = serverTls(conn, tls, timeout) onerror (err error) {
+					conn.close() onerror recover none
+					recover stream
+				}
+				return when secured == stream
+				stream = secured
+			}
+			runStream(stream, b, conn.remoteAddr())
+		}
+
+		internal def runStream(stream net.Stream, b Broker, remote net.Address) {
+			opened()
+			let c = new ServerConn(stream, b, config(), remote)
+			c.run()
+			closedOne()
+		}
+
+		internal atomic def opened() {
+			open++
+			connectionsOpen.inc()
+			connectionsTotal.inc()
+		}
+
+		internal atomic def closedOne() {
+			open--
+			connectionsOpen.dec()
+		}
+
+		// Expires sessions, and publishes $SYS statistics when asked.
+		internal def upkeep() {
+			let lastSys = time.now()
+			for running {
+				time.sleep(1s)
+				let b = brokerOf()
+				b.expireSessions()
+				if sysInterval > 0s && time.now() - lastSys >= sysInterval {
+					lastSys = time.now()
+					publishSys(b)
+				}
+			}
+		}
+
+		internal def publishSys(b Broker) {
+			let uptime = int64(time.now() - started) / 1000000000
+			let stats = [
+				("$SYS/broker/uptime", "{uptime} seconds"),
+				("$SYS/broker/clients/connected", "{b.connectedCount()}"),
+				("$SYS/broker/messages/received", "{b.received}"),
+				("$SYS/broker/messages/sent", "{b.sent}"),
+				("$SYS/broker/messages/dropped", "{b.dropped}"),
+				("$SYS/broker/retained messages/count", "{b.retainedCount()}"),
+				("$SYS/broker/version", "ADM MQTT broker"),
+			]
+			for let (_, pair) in stats {
+				let (topic, value) = pair
+				b.publish(Message{topic: topic, payload: value.bytes(), retain: true}, "")
+			}
+		}
+
+		// Binds `addr` once the `listen` permission allows `mqtt://addr`
+		// (`mqtts` with TLS).
+		internal def bind() !net.Listener {
+			let scheme = security == Security.Implicit ?? ("mqtts", "mqtt")
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			return try sock.listen(backlog)
+		}
+
+		// Names the broker and its address.
+		def str() string {
+			return "mqtt.Server({addr})"
+		}
+	}
+
+	// The TLS server stream over an accepted connection.
+	internal def serverTls(conn net.Connection, config ?tls.Config, timeout duration) !net.Stream {
+		fail MqttError{message: "mqtt: no TLS config", code: "config"} when config is none
+		let secured = tls.server(conn, config)
+		try secured.handshake(timeout)
+		return secured
+	}
 }

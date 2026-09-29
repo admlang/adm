@@ -1,1 +1,499 @@
-partial module std.net.sftp {}
+partial module std.net.sftp {
+	use (
+		std.fs
+		std.io
+		std.net
+		std.net.sftp.proto::*
+		std.net.ssh
+		std.net.sshwire::*
+		std.time::(Time)
+	)
+
+	// Client is an SFTP client (version 3, with OpenSSH's extensions)
+	// over an SSH connection. Implements `net.RemoteFiles`: the same code
+	// copies files over SFTP or FTP. Reads and writes keep many requests
+	// in flight, so transfers do not wait a round trip per block.
+	//
+	// ```
+	// let files = new sftp.Client()
+	// files.ssh.hostKeyPolicy = ssh.HostKeyPolicy.AcceptNew
+	// try files.connect("example.com", "alice", password = "s3cret")
+	// try files.upload("report.pdf", "/inbox/report.pdf")
+	// for let e in try files.list("/inbox") {
+	//     print(e.name)
+	// }
+	// try files.download("/photos", "photos")
+	// try files.close()
+	// ```
+	type Client {
+		// The SSH connection underneath: set its host key checks, keys and
+		// algorithms before `connect`.
+		ssh              ssh.Client
+		// How long each request may wait for its reply.
+		timeout          duration   = 30s
+		// Requests kept in flight during a transfer.
+		inFlight         int        = 64
+		internal conn    ?Conn      = none
+		internal ownsSsh bool       = false
+
+		def new(timeout duration = 30s) {
+			self.timeout = timeout
+			ssh = new ssh.Client(timeout)
+		}
+
+		// Connects to `addr`, logs in as `user` with the agent's keys and
+		// `ssh.keys`, and starts SFTP. Fails when the SSH connection or
+		// login fails, or the server does not offer SFTP.
+		def connect(addr string, user string = "") !none {
+			try ssh.connect(addr, user)
+			ownsSsh = true
+			return try start()
+		}
+
+		// connect with a password as well. Fails as `connect(addr, user)`
+		// does.
+		def connect(addr string, user string, password Secret<string>) !none {
+			try ssh.connect(addr, user, password)
+			ownsSsh = true
+			return try start()
+		}
+
+		// connect with one key. Fails as `connect(addr, user)` does.
+		def connect(addr string, user string, key ssh.Signer) !none {
+			try ssh.connect(addr, user, key)
+			ownsSsh = true
+			return try start()
+		}
+
+		// Starts SFTP over an SSH connection already made; `close` then
+		// leaves that connection open. Fails when the server does not
+		// offer SFTP.
+		def attach(conn ssh.Client) !none {
+			ssh = conn
+			return try start()
+		}
+
+		internal def start() !none {
+			let ch = try ssh.subsystem("sftp")
+			let c = new Conn(ch, timeout)
+			c.inFlight = inFlight
+			try c.start()
+			conn = c
+			return none
+		}
+
+		internal def connected() !Conn {
+			let c = conn
+			fail SftpError{message: "sftp: not connected; call connect first", code: "closed"} when c is none
+			return c
+		}
+
+		internal def has(extension string) bool {
+			let c = conn
+			return !(c is none) && c.has(extension)
+		}
+
+		internal def call(kind int, body byte[], op string) !byte[] {
+			return try (try connected()).call(kind, body, op)
+		}
+
+		internal def openHandle(path string, flags int, op string) !byte[] {
+			return try (try connected()).openHandle(path, flags, op)
+		}
+
+		internal def closeHandle(handle byte[]) {
+			let c = conn
+			c.closeHandle(handle) unless c is none
+		}
+
+		internal def simple(kind int, body byte[], op string) !none {
+			return try (try connected()).simple(kind, body, op)
+		}
+
+		internal def extended(name string, body byte[], op string) !none {
+			return try (try connected()).extended(name, body, op)
+		}
+
+		// The server's version and extensions (`posix-rename@openssh.com`
+		// and the like), by name.
+		def serverExtensions() map<string, string> {
+			let c = conn
+			return c is none ?? (map<string, string>{}, c.extensions)
+		}
+
+		// Implements fs.FileStore: the entries of a directory.
+		// Fails with SftpError when it is missing or not a directory.
+		def list(path string) !fs.FileEntry[] {
+			let handle = try handleOf(try call(fxpOpendir, new Writer().putText(path).bytes(), "list {path}"), "list {path}")
+			let out fs.FileEntry[] = []
+			let failed ?error = none
+			for {
+				let reply = call(fxpReaddir, new Writer().putString(handle).bytes(), "list {path}") onerror (err error) {
+					failed = err
+					recover byte[]
+				}
+				break unless failed is none
+				if int(reply[0]) == fxpStatus {
+					let status = statusOf(reply, "list {path}")
+					break when status is none
+					failed = status
+					break
+				}
+				fail protocolFailure("expected NAME") when int(reply[0]) != fxpName
+				let r = new Reader(reply[5:])
+				let count = try r.readUint32()
+				for let i = int64(0); i < count; i++ {
+					let name = try r.readText()
+					try r.readText()
+					let attrs = try readAttrs(r)
+					continue when name := "." || ".."
+					out.push(entryOf(name, joinPath(path, name), attrs))
+				}
+			}
+			closeHandle(handle)
+			fail failed unless failed is none
+			return out
+		}
+
+		// The entries of the home directory. Fails as `list(path)` does.
+		def list() !fs.FileEntry[] {
+			return try list(".")
+		}
+
+		// Implements fs.FileStore: a file or directory, links followed.
+		// Fails with SftpError when it is missing.
+		def stat(path string) !fs.FileEntry {
+			return try statWith(fxpStat, path)
+		}
+
+		// A link itself, not what it points to. Fails with SftpError when
+		// it is missing.
+		def lstat(path string) !fs.FileEntry {
+			return try statWith(fxpLstat, path)
+		}
+
+		// Whether a path exists. Fails only when the connection breaks.
+		def exists(path string) !bool {
+			let missing = false
+			let failed ?error = none
+			stat(path) onerror (err error) {
+				if err is SftpError {
+					let e SftpError = err
+					missing = e.status == fxNoSuchFile
+				}
+				failed = err unless missing
+				recover fs.FileEntry{}
+			}
+			fail failed unless failed is none
+			return !missing
+		}
+
+		internal def statWith(kind int, path string) !fs.FileEntry {
+			let reply = try call(kind, new Writer().putText(path).bytes(), "stat {path}")
+			try failOnStatus(reply, "stat {path}")
+			fail protocolFailure("expected ATTRS") when int(reply[0]) != fxpAttrs
+			let attrs = try readAttrs(new Reader(reply[5:]))
+			return entryOf(baseName(path), path, attrs)
+		}
+
+		// Implements fs.FileStore: a reader of a file from `offset` on.
+		// Fails with SftpError when the file is missing or unreadable.
+		def open(path string, offset int64) !io.ReadCloser {
+			let handle = try openHandle(path, openRead, "open {path}")
+			return new FileReader(try connected(), handle, offset)
+		}
+
+		// A reader of a whole file. Fails as `open(path, offset)` does.
+		def download(remote string) !io.ReadCloser {
+			return try open(remote, int64(0))
+		}
+
+		// A reader from `offset` on, to resume a download that broke off.
+		// Fails as `open(path, offset)` does.
+		def download(remote string, offset int64) !io.ReadCloser {
+			return try open(remote, offset)
+		}
+
+		// Implements net.RemoteFiles: copies a remote file to a local
+		// path, or a remote directory with everything under it.
+		// Fails with SftpError when the remote path is missing, the os
+		// error when a local write fails.
+		def download(remote string, local string) !none {
+			return try fs.copy(self, remote, new fs.DiskStore(), local)
+		}
+
+		// A whole remote file. Fails with SftpError when it is missing or
+		// unreadable.
+		def readFile(path string) !byte[] {
+			let reader = try open(path, int64(0))
+			let chunks byte[][] = []
+			let buf byte[] = []
+			buf.len(65536)
+			let failed ?error = none
+			for {
+				let n = reader.read(buf) onerror (err error) {
+					failed = err
+					recover 0
+				}
+				break when n <= 0
+				chunks.push(buf[:n].clone())
+			}
+			reader.close() onerror recover none
+			fail failed unless failed is none
+			return joinChunks(chunks)
+		}
+
+		// Implements fs.FileStore: a writer that creates or replaces a
+		// file, or appends to it. Fails with SftpError when the directory
+		// is missing or the file cannot be written.
+		def create(path string, append bool) !io.WriteCloser {
+			let flags = openWrite | openCreate | (append ?? (openAppend, openTrunc))
+			let handle = try openHandle(path, flags, "create {path}")
+			let start int64 = 0
+			if append {
+				let entry = stat(path) onerror recover fs.FileEntry{}
+				start = entry.size
+			}
+			return new FileWriter(try connected(), handle, start)
+		}
+
+		// Implements fs.FileStore: a writer from `offset` on, keeping the
+		// bytes before it and dropping those after. Fails with SftpError
+		// when the file is missing or shorter than `offset`.
+		def resume(path string, offset int64) !io.WriteCloser {
+			return try create(path, false) when offset == 0
+			let entry = try stat(path)
+			fail SftpError{message: "sftp: resume {path}: the file has {entry.size} bytes, fewer than {offset}", code: "failure", status: fxFailure} when entry.size < offset
+			let handle = try openHandle(path, openWrite, "resume {path}")
+			try expectOk(try call(fxpFsetstat, putAttrs(new Writer().putString(handle), Attrs{flags: attrSize, size: offset}).bytes(), "resume {path}"), "resume {path}")
+			return new FileWriter(try connected(), handle, offset)
+		}
+
+		// Uploads what `from` reads to a remote file, replacing it. Fails
+		// with SftpError when the server refuses the file, or as the read
+		// does.
+		def upload(from io.Reader, remote string) !none {
+			let writer = try create(remote, false)
+			io.copy(from, writer) onerror (err error) {
+				writer.close() onerror recover none
+				fail err
+			}
+			return try writer.close()
+		}
+
+		// Uploads what `from` reads to a remote file from `offset` on, to
+		// finish an upload that broke off. Fails as `resume` does, or as
+		// the read does.
+		def upload(from io.Reader, remote string, offset int64) !none {
+			let writer = try resume(remote, offset)
+			io.copy(from, writer) onerror (err error) {
+				writer.close() onerror recover none
+				fail err
+			}
+			return try writer.close()
+		}
+
+		// Uploads bytes to a remote file, replacing it. Fails with
+		// SftpError when the server refuses the file.
+		def upload(data byte[], remote string) !none {
+			return try writeFile(remote, data)
+		}
+
+		// Implements net.RemoteFiles: copies a local file to a remote
+		// path, or a local directory with everything under it.
+		// Fails with the os error when the local path is missing,
+		// SftpError when the server refuses a file.
+		def upload(local string, remote string) !none {
+			return try fs.copy(new fs.DiskStore(), local, self, remote)
+		}
+
+		// Writes a whole remote file, replacing it. Fails with SftpError
+		// when the server refuses it.
+		def writeFile(path string, data byte[]) !none {
+			let writer = try create(path, false)
+			let failed ?error = none
+			writer.write(data) onerror (err error) {
+				failed = err
+				recover 0
+			}
+			let closed ?error = none
+			writer.close() onerror (err error) {
+				closed = err
+				recover none
+			}
+			fail failed unless failed is none
+			fail closed unless closed is none
+			return none
+		}
+
+		// writeFile of text as UTF-8. Fails as `writeFile(path, bytes)`
+		// does.
+		def writeFile(path string, text string) !none {
+			return try writeFile(path, text.bytes())
+		}
+
+		// Implements fs.FileStore. Fails with SftpError when the file is
+		// missing or cannot be removed.
+		def remove(path string) !none {
+			return try simple(fxpRemove, new Writer().putText(path).bytes(), "remove {path}")
+		}
+
+		// Implements fs.FileStore: moves a file or directory, replacing a
+		// file at `to` when the server offers `posix-rename@openssh.com`.
+		// Fails with SftpError when the source is missing or the move is
+		// refused.
+		def rename(from string, to string) !none {
+			return try extended("posix-rename@openssh.com", new Writer().putText(from).putText(to).bytes(), "rename {from}") when has("posix-rename@openssh.com")
+			return try simple(fxpRename, new Writer().putText(from).putText(to).bytes(), "rename {from}")
+		}
+
+		// Implements fs.FileStore. Fails with SftpError when it exists or
+		// its parent is missing.
+		def makeDir(path string) !none {
+			return try simple(fxpMkdir, putAttrs(new Writer().putText(path), Attrs{}).bytes(), "makeDir {path}")
+		}
+
+		// Creates a directory and the missing ones above it. Fails with
+		// SftpError when one cannot be created.
+		def makeDirs(path string) !none {
+			let parts = path.split("/")
+			let at = path.startsWith("/") ?? ("/", "")
+			for let p in parts {
+				continue when p == ""
+				at = at == "" || at == "/" ?? (at + p, at + "/" + p)
+				let there = try exists(at)
+				try makeDir(at) unless there
+			}
+			return none
+		}
+
+		// Implements fs.FileStore. Fails with SftpError when it is missing
+		// or not empty.
+		def removeDir(path string) !none {
+			return try simple(fxpRmdir, new Writer().putText(path).bytes(), "removeDir {path}")
+		}
+
+		// Implements fs.FileStore: sets permission bits. Fails with
+		// SftpError when it is missing or the change is refused.
+		def chmod(path string, mode int) !none {
+			return try simple(fxpSetstat, putAttrs(new Writer().putText(path), Attrs{flags: attrPermissions, permissions: int64(mode)}).bytes(), "chmod {path}")
+		}
+
+		// Implements fs.FileStore: sets the modification (and access)
+		// time. Fails with SftpError when it is missing or the change is
+		// refused.
+		def touch(path string, modified Time) !none {
+			let seconds = modified.unixNs() / 1000000000
+			return try simple(fxpSetstat, putAttrs(new Writer().putText(path), Attrs{flags: attrTimes, atime: seconds, mtime: seconds}).bytes(), "touch {path}")
+		}
+
+		// Cuts or extends a file to `size` bytes. Fails with SftpError
+		// when it is missing or the change is refused.
+		def truncate(path string, size int64) !none {
+			return try simple(fxpSetstat, putAttrs(new Writer().putText(path), Attrs{flags: attrSize, size: size}).bytes(), "truncate {path}")
+		}
+
+		// Makes `link` a symbolic link to `target`. Fails with SftpError
+		// when `link` exists or the server refuses links.
+		def symlink(target string, link string) !none {
+			// OpenSSH puts the target first, against the draft's order;
+			// every server in use follows OpenSSH.
+			return try simple(fxpSymlink, new Writer().putText(target).putText(link).bytes(), "symlink {link}")
+		}
+
+		// Makes `link` a hard link to `target` (`hardlink@openssh.com`).
+		// Fails with SftpError when the server does not offer it or
+		// refuses.
+		def hardlink(target string, link string) !none {
+			fail unsupported("hardlink@openssh.com") unless has("hardlink@openssh.com")
+			return try extended("hardlink@openssh.com", new Writer().putText(target).putText(link).bytes(), "hardlink {link}")
+		}
+
+		// Where a symbolic link points. Fails with SftpError when it is
+		// missing or not a link.
+		def readLink(path string) !string {
+			return try nameOf(try call(fxpReadlink, new Writer().putText(path).bytes(), "readLink {path}"), "readLink {path}")
+		}
+
+		// The absolute, cleaned form of a path; "." is the home directory.
+		// Fails with SftpError when the server cannot resolve it.
+		def realPath(path string) !string {
+			return try nameOf(try call(fxpRealpath, new Writer().putText(path).bytes(), "realPath {path}"), "realPath {path}")
+		}
+
+		// The home directory. Fails when the server cannot say.
+		def home() !string {
+			if has("home-directory") {
+				let reply = try call(fxpExtended, new Writer().putText("home-directory").putText("").bytes(), "home")
+				return try nameOf(reply, "home")
+			}
+			return try realPath(".")
+		}
+
+		// The space of the file system holding `path`
+		// (`statvfs@openssh.com`). Fails with SftpError when the server
+		// does not offer it.
+		def space(path string = ".") !Space {
+			fail unsupported("statvfs@openssh.com") unless has("statvfs@openssh.com")
+			let reply = try call(fxpExtended, new Writer().putText("statvfs@openssh.com").putText(path).bytes(), "space {path}")
+			try failOnStatus(reply, "space {path}")
+			let r = new Reader(reply[5:])
+			let blockSize = int64(try r.readUint64())
+			let fragmentSize = int64(try r.readUint64())
+			let blocks = int64(try r.readUint64())
+			let free = int64(try r.readUint64())
+			let available = int64(try r.readUint64())
+			let unit = fragmentSize > 0 ?? (fragmentSize, blockSize)
+			return Space{total: blocks * unit, free: free * unit, available: available * unit}
+		}
+
+		// Copies a remote file to another remote path: on the server with
+		// `copy-data` when it is offered, else through this client.
+		// Fails with SftpError when the source is missing or the target
+		// cannot be written.
+		def copy(from string, to string) !none {
+			if !has("copy-data") {
+				let reader = try open(from, int64(0))
+				defer reader.close()
+				return try upload(reader, to)
+			}
+			let source = try openHandle(from, openRead, "copy {from}")
+			let target = openHandle(to, openWrite | openCreate | openTrunc, "copy {to}") onerror (err error) {
+				closeHandle(source)
+				fail err
+			}
+			let w = new Writer().putText("copy-data").putString(source).putUint64(0).putUint64(0).putString(target).putUint64(0)
+			let failed ?error = none
+			let reply = call(fxpExtended, w.bytes(), "copy {from}") onerror (err error) {
+				failed = err
+				recover byte[]
+			}
+			if failed is none {
+				expectOk(reply, "copy {from}") onerror (err error) {
+					failed = err
+					recover none
+				}
+			}
+			closeHandle(source)
+			closeHandle(target)
+			fail failed unless failed is none
+			return none
+		}
+
+		// Implements io.Closer: ends SFTP, and the SSH connection when
+		// `connect` made it. Never fails.
+		def close() !none {
+			let c = conn
+			conn = none
+			c.close() unless c is none
+			if ownsSsh {
+				ssh.close() onerror recover none
+			}
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+}

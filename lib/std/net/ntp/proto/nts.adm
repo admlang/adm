@@ -1,0 +1,335 @@
+internal partial module std.net.ntp.proto {
+	use (
+		std.crypto::(rand)
+		std.crypto.cipher
+		std.net
+		std.net.ntp::(NtpError)
+		std.net.tls
+		std.time
+	)
+
+	// Network Time Security (RFC 8915): the key exchange over TLS 1.3
+	// (NTS-KE) that hands a client keys and cookies, and the NTP extension
+	// fields that carry a cookie and authenticate (and encrypt) a packet
+	// with AEAD_AES_SIV_CMAC_256.
+
+	const ntsAlpn = "ntske/1"
+	const ntsPort = 4460
+	const ntsExporterLabel = "EXPORTER-network-time-security"
+	// The next protocol NTPv4 and the AEAD AES-SIV-CMAC-256.
+	const ntsProtocolNtp = 0
+	const ntsAeadSiv256 = 15
+
+	// NTS-KE record types (§4).
+	const (
+		recordEnd        = 0
+		recordNextProto  = 1
+		recordError      = 2
+		recordWarning    = 3
+		recordAead       = 4
+		recordCookie     = 5
+		recordServer     = 6
+		recordPort       = 7
+		recordCritical   = 0x8000
+	)
+
+	// NTS extension field types (§5.7).
+	const (
+		fieldUniqueId      = 0x0104
+		fieldCookie        = 0x0204
+		fieldPlaceholder   = 0x0304
+		fieldAuthenticator = 0x0404
+	)
+
+	// One NTS-KE record.
+	struct NtsRecord {
+		kind     int
+		critical bool   = false
+		body     byte[] = []
+	}
+
+	def encodeRecord(r NtsRecord) byte[] {
+		let head = r.kind | (r.critical ?? (recordCritical, 0))
+		return [byte(head >> 8), byte(head), byte(r.body.len() >> 8), byte(r.body.len())] + r.body
+	}
+
+	def uint16Body(v int) byte[] {
+		return [byte(v >> 8), byte(v)]
+	}
+
+	// Reads records off a stream until End of Message. Fails when the
+	// stream ends first or a record is malformed.
+	def readRecords(lines net.LineReader, wait duration) !NtsRecord[] {
+		let out NtsRecord[] = []
+		for out.len() < 1024 {
+			let head = try lines.readBytes(4, wait)
+			let kind = (int(head[0]) << 8) | int(head[1])
+			let size = (int(head[2]) << 8) | int(head[3])
+			let body = size == 0 ?? (byte[], try lines.readBytes(size, wait))
+			let r = NtsRecord{kind: kind & 0x7fff, critical: (kind & recordCritical) != 0, body: body}
+			out.push(r)
+			return out when r.kind == recordEnd
+		}
+		fail ntsFailure("protocol", "NTS-KE message of too many records")
+	}
+
+	def ntsFailure(code string, text string) error {
+		return NtpError{message: "ntp: nts: {text}", code: code}
+	}
+
+	// The two keys of a session (§5.1): TLS-exported under the label
+	// with the protocol, the AEAD and the direction as context.
+	def ntsKeys(conn tls.Conn) !(byte[], byte[]) {
+		let base = uint16Body(ntsProtocolNtp) + uint16Body(ntsAeadSiv256)
+		let c2s = try conn.exportKeyingMaterial(ntsExporterLabel, base + [byte(0)], 32)
+		let s2c = try conn.exportKeyingMaterial(ntsExporterLabel, base + [byte(1)], 32)
+		return (c2s, s2c)
+	}
+
+	// NtsSession is what a key exchange gave a client: where to send NTP,
+	// its keys and the cookies left.
+	type NtsSession {
+		target  string
+		c2s     byte[]
+		s2c     byte[]
+		cookies byte[][] = []
+
+		def new(target string, c2s byte[], s2c byte[]) {
+			self.target = target
+			self.c2s = c2s
+			self.s2c = s2c
+		}
+
+		atomic def takeCookie() ?byte[] {
+			return none when cookies.len() == 0
+			let c = cookies[0]
+			cookies = cookies[1:].clone()
+			return c
+		}
+
+		atomic def addCookies(more byte[][]) {
+			for let c in more {
+				cookies.push(c) when cookies.len() < 8
+			}
+		}
+
+		atomic def cookieCount() int {
+			return cookies.len()
+		}
+	}
+
+	// Runs NTS-KE with `host:port` (§4): offers NTPv4 and AES-SIV-CMAC-256,
+	// takes the keys, cookies and the NTP server and port. Fails when the
+	// TLS handshake or the negotiation fails, or the server sends an Error
+	// record.
+	def ntsKeyExchange(host string, port int, config ?tls.Config, wait duration) !NtsSession {
+		let addr = net.withPort(host, port)
+		let conn = try net.dialStream(addr, wait)
+		let base = config is none ?? (tls.Config{}, config)
+		let settings = tls.withServerName(base, base.serverName == "" ?? (hostOf(addr), base.serverName))
+		settings.alpn = [ntsAlpn]
+		settings.minVersion = tls.Version.TLS13
+		let t = tls.client(conn, settings)
+		let failed ?error = none
+		let session = runKeyExchange(t, hostOf(addr), wait) onerror (err error) {
+			failed = err
+			recover new NtsSession("", [], [])
+		}
+		t.close() onerror recover none
+		fail failed unless failed is none
+		return session
+	}
+
+	internal def runKeyExchange(t tls.Conn, host string, wait duration) !NtsSession {
+		try t.handshake(wait)
+		fail ntsFailure("protocol", "server did not agree on ALPN {ntsAlpn}") unless t.connectionState().alpn == ntsAlpn
+		let request = encodeRecord(NtsRecord{kind: recordNextProto, critical: true, body: uint16Body(ntsProtocolNtp)}) + encodeRecord(NtsRecord{kind: recordAead, critical: true, body: uint16Body(ntsAeadSiv256)}) + encodeRecord(NtsRecord{kind: recordEnd, critical: true})
+		try t.writeAll(request, wait)
+		let records = try readRecords(new net.LineReader(t, 1), wait)
+		let protocolOk = false
+		let aeadOk = false
+		let server = host
+		let port = 123
+		let cookies byte[][] = []
+		for let r in records {
+			switch {
+				case r.kind == recordError:
+					fail ntsFailure("nts", "server refused the key exchange (error {r.body.len() >= 2 ?? ((int(r.body[0]) << 8) | int(r.body[1]), -1)})")
+				case r.kind == recordNextProto:
+					protocolOk = r.body.len() == 2 && r.body[0] == byte(0) && r.body[1] == byte(0)
+				case r.kind == recordAead:
+					aeadOk = r.body.len() == 2 && ((int(r.body[0]) << 8) | int(r.body[1])) == ntsAeadSiv256
+				case r.kind == recordCookie:
+					cookies.push(r.body)
+				case r.kind == recordServer:
+					server = string(r.body)
+				case r.kind == recordPort && r.body.len() == 2:
+					port = (int(r.body[0]) << 8) | int(r.body[1])
+				case r.critical && r.kind != recordEnd && r.kind != recordWarning:
+					fail ntsFailure("protocol", "server sent an unknown critical record {r.kind}")
+			}
+		}
+		fail ntsFailure("nts", "server does not speak NTPv4 over NTS") unless protocolOk
+		fail ntsFailure("nts", "server does not offer AEAD_AES_SIV_CMAC_256") unless aeadOk
+		fail ntsFailure("nts", "server gave no cookies") when cookies.len() == 0
+		let (c2s, s2c) = try ntsKeys(t)
+		let session = new NtsSession(net.withPort(server, port), c2s, s2c)
+		session.addCookies(cookies)
+		return session
+	}
+
+	internal def hostOf(addr string) string {
+		let a = net.parseAddress(addr) onerror recover new net.Address()
+		return a.host
+	}
+
+	// ---- extension fields ----
+
+	// An extension field, its value zero-padded to a multiple of four and
+	// the whole at least 16 bytes (RFC 7822).
+	def field(kind int, value byte[]) byte[] {
+		let body = value.clone()
+		for body.len() % 4 != 0 || body.len() + 4 < 16 {
+			body.push(byte(0))
+		}
+		let size = body.len() + 4
+		return [byte(kind >> 8), byte(kind), byte(size >> 8), byte(size)] + body
+	}
+
+	def fieldKind(f byte[]) int {
+		return (int(f[0]) << 8) | int(f[1])
+	}
+
+	def fieldValue(f byte[]) byte[] {
+		return f[4:]
+	}
+
+	// The NTS Authenticator and Encrypted Extension Fields field (§5.6):
+	// the AEAD over everything before it, with `plaintext` (more fields)
+	// sealed inside.
+	def authenticator(key byte[], associated byte[], plaintext byte[]) !byte[] {
+		let siv = try cipher.newSIV(key)
+		let nonce = try rand(16)
+		let sealed = siv.seal(nonce, plaintext, associated)
+		let value = uint16Body(nonce.len()) + uint16Body(sealed.len()) + nonce + sealed
+		return field(fieldAuthenticator, value)
+	}
+
+	// The plaintext of an Authenticator field, `associated` being the
+	// packet before it. Fails when it does not authenticate.
+	def openAuthenticator(key byte[], associated byte[], f byte[]) !byte[] {
+		let v = fieldValue(f)
+		fail ntsFailure("auth", "short authenticator") when v.len() < 4
+		let nonceLen = (int(v[0]) << 8) | int(v[1])
+		let sealedLen = (int(v[2]) << 8) | int(v[3])
+		fail ntsFailure("auth", "bad authenticator lengths") when 4 + padded(nonceLen) + sealedLen > v.len()
+		let nonce = v[4:4 + nonceLen]
+		let sealed = v[4 + padded(nonceLen):4 + padded(nonceLen) + sealedLen]
+		let siv = try cipher.newSIV(key)
+		return siv.open(nonce, sealed, associated) onerror fail ntsFailure("auth", "packet does not authenticate")
+	}
+
+	internal def padded(n int) int {
+		return (n + 3) / 4 * 4
+	}
+
+	// Splits concatenated extension fields.
+	def splitFields(data byte[]) !byte[][] {
+		let out byte[][] = []
+		let at = 0
+		for at + 4 <= data.len() {
+			let size = (int(data[at + 2]) << 8) | int(data[at + 3])
+			fail ntsFailure("protocol", "bad extension field") when size < 4 || at + size > data.len()
+			out.push(data[at:at + size].clone())
+			at += size
+		}
+		return out
+	}
+
+	// A client request's fields: its unique identifier, a cookie,
+	// placeholders asking for `want` cookies in all, and the
+	// authenticator over the header and those.
+	def ntsRequestFields(header byte[], uniqueId byte[], cookie byte[], want int, c2s byte[]) !byte[][] {
+		let fields = [field(fieldUniqueId, uniqueId), field(fieldCookie, cookie)]
+		for let i = 1; i < want; i++ {
+			let blank byte[] = []
+			blank.len(cookie.len())
+			fields.push(field(fieldPlaceholder, blank))
+		}
+		let associated = header
+		for let f in fields {
+			associated = associated + f
+		}
+		fields.push(try authenticator(c2s, associated, []))
+		return fields
+	}
+
+	// ServerKeys encrypt a server's cookies (§6): the current key and the
+	// one before it, each with an id, replaced every `rotation`.
+	type ServerKeys {
+		rotation      duration = 24h
+		atomic ids    int64[]  = []
+		atomic keys   byte[][] = []
+		atomic since  time.Time
+
+		def new(rotation duration) {
+			self.rotation = rotation
+			since = time.now()
+		}
+
+		// The current key and its id, rotated when due. Fails when the
+		// random source does.
+		atomic def current() !(int64, byte[]) {
+			if keys.len() == 0 || time.now() - since > rotation {
+				let id = ids.len() == 0 ?? (int64(1), ids[ids.len() - 1] + 1)
+				ids.push(id)
+				keys.push(try rand(32))
+				if keys.len() > 2 {
+					ids = ids[1:].clone()
+					keys = keys[1:].clone()
+				}
+				since = time.now()
+			}
+			return (ids[ids.len() - 1], keys[keys.len() - 1])
+		}
+
+		atomic def keyOf(id int64) ?byte[] {
+			for let i = 0; i < ids.len(); i++ {
+				return keys[i] when ids[i] == id
+			}
+			return none
+		}
+
+		// A cookie holding the session keys: key id, nonce, then the keys
+		// sealed under the server key.
+		def cookie(c2s byte[], s2c byte[]) !byte[] {
+			let (id, key) = try current()
+			let nonce = try rand(16)
+			let sealed = (try cipher.newSIV(key)).seal(nonce, c2s + s2c, [])
+			return [byte(id >> 24), byte(id >> 16), byte(id >> 8), byte(id)] + nonce + sealed
+		}
+
+		// The keys in a cookie; none when it is not one of ours or was
+		// changed. Fails only when a stored key is unusable.
+		def open(cookie byte[]) !?SessionKeys {
+			return none when cookie.len() != 4 + 16 + 16 + 64
+			let id = (int64(cookie[0]) << 24) | (int64(cookie[1]) << 16) | (int64(cookie[2]) << 8) | int64(cookie[3])
+			let key = keyOf(id)
+			return none when key is none
+			let siv = try cipher.newSIV(key)
+			let failed = false
+			let plain = siv.open(cookie[4:20], cookie[20:], []) onerror (err error) {
+				failed = true
+				recover byte[]
+			}
+			return none when failed || plain.len() != 64
+			return SessionKeys{c2s: plain[:32].clone(), s2c: plain[32:].clone()}
+		}
+	}
+
+	// The two keys of an NTS session.
+	struct SessionKeys {
+		c2s byte[]
+		s2c byte[]
+	}
+}

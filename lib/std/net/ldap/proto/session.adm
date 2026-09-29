@@ -1,0 +1,731 @@
+internal partial module std.net.ldap.proto {
+	use (
+		std.crypto::(rand)
+		std.data.encoding
+		std.data.encoding::(ASN1Element, asn1OctetString, asn1Sequence, berParse)
+		std.net
+		std.net.ldap::(Change, ChangeKind, DN, Directory, Entry, Filter, FilterKind, LdapError, ResultCode, LdapURL, ScramDirectory, Scope, hashPassword, parseDN, parseURL)
+		std.net.sasl
+		std.net.tls
+	)
+
+	// The server side of one connection: requests answered in order from
+	// a `Directory`.
+
+	// What a session needs of its server.
+	struct SessionConfig {
+		directory      Directory
+		namingContexts string[]
+		allowAnonymous bool
+		sizeLimit      int
+		tlsConfig      ?tls.Config = none
+		startTls       bool        = false
+		timeout        duration    = 30s
+		idleTimeout    duration    = 300s
+		vendor         string      = "ADM"
+		referrals      string[]    = []
+	}
+
+	// A paged search kept between pages.
+	struct Paging {
+		entries Entry[]
+		at      int
+	}
+
+	type ServerSession {
+		socket   net.Connection
+		stream   net.Stream
+		lines    net.LineReader
+		config   SessionConfig
+		bound    string              = ""
+		secured  bool                = false
+		pages    map<string, Paging>
+		nextPage int                 = 1
+		closed   bool                = false
+		// The TLS connection under `stream`, for channel bindings.
+		tlsConn  ?tls.Conn           = none
+		// A SCRAM bind under way: its mechanism name, its server side and
+		// the DN its user stands for.
+		scramName string             = ""
+		scram    ?sasl.ScramServer   = none
+		scramDN  string              = ""
+
+		def new(socket net.Connection, stream net.Stream, config SessionConfig, secured bool) {
+			self.socket = socket
+			self.stream = stream
+			self.config = config
+			self.secured = secured
+			lines = new net.LineReader(stream, 1)
+			if stream is tls.Conn {
+				let t tls.Conn = stream
+				tlsConn = t
+			}
+		}
+
+		// Answers requests until the client unbinds or leaves. Returns
+		// false when it broke off with a protocol error.
+		def run() bool {
+			for !closed {
+				let broken = false
+				let m = readMessage(lines, config.idleTimeout) onerror (err error) {
+					broken = true
+					recover Message{id: -1, op: -1, body: encoding.asn1Null(), controls: []}
+				}
+				break when broken
+				let failed = false
+				handle(m) onerror (err error) {
+					failed = true
+					recover none
+				}
+				break when failed
+			}
+			stream.close() onerror recover none
+			return true
+		}
+
+		internal def send(id int, op ASN1Element, controls Control[]) !none {
+			let data = envelope(id, op, controls)
+			let off = 0
+			for off < data.len() {
+				let n = try stream.write(data[off:], config.timeout)
+				fail protocolFailure("wrote nothing") when n <= 0
+				off += n
+			}
+			return none
+		}
+
+		internal def reply(id int, op int, err ?error) !none {
+			let (code, message, matched) = outcome(err)
+			return try send(id, resultElement(op, code, matched, message, [], []), [])
+		}
+
+		internal def handle(m Message) !none {
+			let target = targetOf(m)
+			if target != "" && !manages(m) {
+				let urls = referralsFor(target)
+				if urls.len() > 0 {
+					let op = responseOp(m.op)
+					return try send(m.id, resultElement(op, ResultCode.Referral.value, "", "", urls, []), []) when op >= 0
+				}
+			}
+			switch {
+				case m.op == opBindRequest:
+					return try bind(m)
+				case m.op == opUnbindRequest:
+					closed = true
+					return none
+				case m.op == opSearchRequest:
+					return try search(m)
+				case m.op == opAddRequest:
+					let entry = try decodeAdd(m.body)
+					let err ?error = none
+					config.directory.add(bound, entry) onerror (e error) {
+						err = e
+						recover none
+					}
+					return try reply(m.id, opAddResponse, err)
+				case m.op == opModifyRequest:
+					let dn = string((try m.body.at(0)).content)
+					let changes = try decodeChanges(try m.body.at(1))
+					let err ?error = none
+					config.directory.modify(bound, dn, changes) onerror (e error) {
+						err = e
+						recover none
+					}
+					return try reply(m.id, opModifyResponse, err)
+				case m.op == opDelRequest:
+					let err ?error = none
+					config.directory.delete(bound, string(m.body.content)) onerror (e error) {
+						err = e
+						recover none
+					}
+					return try reply(m.id, opDelResponse, err)
+				case m.op == opModifyDNRequest:
+					let dn = string((try m.body.at(0)).content)
+					let newRDN = string((try m.body.at(1)).content)
+					let deleteOld = (try m.body.at(2)).asBool() onerror recover true
+					let newParent = m.body.children.len() > 3 ?? (string(m.body.children[3].content), "")
+					let err ?error = none
+					config.directory.rename(bound, dn, newRDN, deleteOld, newParent) onerror (e error) {
+						err = e
+						recover none
+					}
+					return try reply(m.id, opModifyDNResponse, err)
+				case m.op == opCompareRequest:
+					let dn = string((try m.body.at(0)).content)
+					let ava = try m.body.at(1)
+					let attribute = string((try ava.at(0)).content)
+					let value = string((try ava.at(1)).content)
+					let err ?error = none
+					let same = config.directory.compare(bound, dn, attribute, value) onerror (e error) {
+						err = e
+						recover false
+					}
+					return try reply(m.id, opCompareResponse, err) unless (err is none)
+					let code = same ?? (ResultCode.CompareTrue.value, ResultCode.CompareFalse.value)
+					return try send(m.id, resultElement(opCompareResponse, code, "", "", [], []), [])
+				case m.op == opAbandonRequest:
+					return none
+				case m.op == opExtendedRequest:
+					return try extendedOp(m)
+			}
+			// An unknown request: answer as a protocol error.
+			return try send(m.id, resultElement(opExtendedResponse, ResultCode.ProtocolError.value, "", "operation {m.op} is not supported", [], []), [])
+		}
+
+		internal def bind(m Message) !none {
+			let version = int(try (try m.body.at(0)).asInt())
+			let dn = string((try m.body.at(1)).content)
+			let auth = try m.body.at(2)
+			return try send(m.id, resultElement(opBindResponse, ResultCode.ProtocolError.value, "", "only LDAPv3", [], []), []) when version != 3
+			if auth.isContext(0) {
+				scram = none
+				let password = string(auth.content)
+				if dn == "" || password == "" {
+					// Anonymous (and unauthenticated, RFC 4513 §5.1.2) binds.
+					let allowed = config.allowAnonymous && password == ""
+					bound = ""
+					let code = allowed ?? (ResultCode.Success.value, ResultCode.UnwillingToPerform.value)
+					return try send(m.id, resultElement(opBindResponse, code, "", allowed ?? ("", "anonymous binds are off"), [], []), [])
+				}
+				let err ?error = none
+				config.directory.bind(dn, password) onerror (e error) {
+					err = e
+					recover none
+				}
+				bound = err is none ?? (dn, "")
+				return try reply(m.id, opBindResponse, err)
+			}
+			if auth.isContext(3) {
+				let mechanism = string((try auth.at(0)).content)
+				let credentials = auth.children.len() > 1 ?? (auth.children[1].content, byte[])
+				return try scramBind(m.id, mechanism, credentials) when mechanism.upper().startsWith("SCRAM-")
+				scram = none
+				if mechanism == "PLAIN" && auth.children.len() > 1 {
+					let fields = splitNul(auth.children[1].content)
+					if fields.len() == 3 {
+						let user = try plainUser(fields[1])
+						let err ?error = none
+						config.directory.bind(user, fields[2]) onerror (e error) {
+							err = e
+							recover none
+						}
+						bound = err is none ?? (user, "")
+						return try reply(m.id, opBindResponse, err)
+					}
+				}
+				return try send(m.id, resultElement(opBindResponse, ResultCode.AuthMethodNotSupported.value, "", "SASL {mechanism} is not supported", [], []), [])
+			}
+			return try send(m.id, resultElement(opBindResponse, ResultCode.AuthMethodNotSupported.value, "", "", [], []), [])
+		}
+
+		// One step of a SCRAM bind (RFC 5802): the first message starts
+		// it and gets the challenge (SaslBindInProgress), the second ends
+		// it. A failure answers InvalidCredentials, with the `e=` reason
+		// as server credentials when SCRAM has one.
+		internal def scramBind(id int, mechanism string, credentials byte[]) !none {
+			let dir = config.directory
+			let kind = sasl.scramMechanismOf(mechanism)
+			if kind is none || !(dir is ScramDirectory) {
+				scram = none
+				return try send(id, resultElement(opBindResponse, ResultCode.AuthMethodNotSupported.value, "", "SASL {mechanism} is not supported", [], []), [])
+			}
+			let scramDir ScramDirectory = dir
+			let current = scram
+			if current is none || scramName != mechanism {
+				bound = ""
+				let server = new sasl.ScramServer(def (user string) !sasl.ScramCredentials {
+					let dn = try plainUser(user)
+					scramDN = dn
+					return try scramDir.scram(dn, kind)
+				}, kind, channelBindings(), mechanism.upper().endsWith("-PLUS"))
+				let failed ?error = none
+				let first = server.first(string(credentials)) onerror (err error) {
+					failed = err
+					recover ""
+				}
+				if !(failed is none) {
+					scram = none
+					return try scramRefused(id, failed)
+				}
+				scram = server
+				scramName = mechanism
+				return try send(id, resultElement(opBindResponse, ResultCode.SaslBindInProgress.value, "", "", [], [contextPrimitive(7, first.bytes())]), [])
+			}
+			scram = none
+			let failed ?error = none
+			let final = current.final(string(credentials)) onerror (err error) {
+				failed = err
+				recover ""
+			}
+			return try scramRefused(id, failed) unless failed is none
+			bound = scramDN
+			return try send(id, resultElement(opBindResponse, ResultCode.Success.value, "", "", [], [contextPrimitive(7, final.bytes())]), [])
+		}
+
+		internal def scramRefused(id int, err error) !none {
+			let extra ASN1Element[] = []
+			if err is sasl.SaslError {
+				let e sasl.SaslError = err
+				extra.push(contextPrimitive(7, "e={e.reply}".bytes())) when e.reply != ""
+			}
+			return try send(id, resultElement(opBindResponse, ResultCode.InvalidCredentials.value, "", err.message, [], extra), [])
+		}
+
+		// The channel bindings this connection offers SCRAM-PLUS: none
+		// without TLS.
+		internal def channelBindings() sasl.ChannelBinding[] {
+			let t = tlsConn
+			return [] when t is none
+			let out sasl.ChannelBinding[] = []
+			for let kind in ["tls-exporter", "tls-server-end-point"] {
+				let data = t.channelBinding(kind) onerror recover byte[]
+				out.push(sasl.ChannelBinding{kind: kind, data: data}) when data.len() > 0
+			}
+			return out
+		}
+
+		// The DN a SASL PLAIN user name stands for: a DN as it is,
+		// `dn:...`, or a plain name found as `uid=` under the naming
+		// contexts.
+		internal def plainUser(name string) !string {
+			return name["dn:".len():] when name.startsWith("dn:")
+			return name when name.contains("=")
+			let user = name.startsWith("u:") ?? (name[2:], name)
+			let f = new Filter(FilterKind.Equal)
+			f.attribute = "uid"
+			f.value = user
+			for let context in config.namingContexts {
+				let found = config.directory.search(bound, context, Scope.Subtree, f, 1) onerror recover Entry[]
+				return found[0].dn when found.len() > 0
+			}
+			return name
+		}
+
+		// The DN a request acts on, "" for none (binds, the root DSE,
+		// extended operations).
+		internal def targetOf(m Message) string {
+			return "" unless m.op := opSearchRequest || opAddRequest || opModifyRequest || opDelRequest || opModifyDNRequest || opCompareRequest
+			return string(m.body.content) when m.op == opDelRequest
+			let first = m.body.at(0) onerror recover encoding.asn1Null()
+			return string(first.content)
+		}
+
+		// The response of a request that can be referred, -1 for another.
+		internal def responseOp(op int) int {
+			return opSearchDone when op == opSearchRequest
+			return opAddResponse when op == opAddRequest
+			return opModifyResponse when op == opModifyRequest
+			return opDelResponse when op == opDelRequest
+			return opModifyDNResponse when op == opModifyDNRequest
+			return opCompareResponse when op == opCompareRequest
+			return -1
+		}
+
+		// Whether a request carries ManageDsaIT (RFC 3296 §3): referral
+		// objects are then plain entries.
+		internal def manages(m Message) bool {
+			for let c in m.controls {
+				return true when c.oid == oidManageDsaIT
+			}
+			return false
+		}
+
+		// Where a request on `dn` must go instead: the referral object at
+		// or above it (RFC 3296 §5.6), or the default referral for a name
+		// outside the naming contexts; empty to answer here.
+		internal def referralsFor(dn string) string[] {
+			let name = parseDN(dn) onerror recover new DN()
+			return [] when name.isRoot()
+			let inside = false
+			for let context in config.namingContexts {
+				let base = parseDN(context) onerror recover new DN()
+				inside = true when name.within(base)
+			}
+			if !inside {
+				let out string[] = []
+				for let url in config.referrals {
+					out.push(urlWithDN(url, dn))
+				}
+				return out
+			}
+			let referral = referralObject(name)
+			return [] when referral is none
+			let depth = name.depthBelow(parseDN(referral.dn) onerror recover new DN())
+			let out string[] = []
+			for let ref in referral.getAll("ref") {
+				let parsed = true
+				let url = parseURL(ref) onerror (err error) {
+					parsed = false
+					recover LdapURL{}
+				}
+				if !parsed || url.dn == "" {
+					out.push(ref)
+					continue
+				}
+				// The names below the referral object stay in front of
+				// the DN the reference gives.
+				let below = new DN(name.parts[:depth]).str()
+				out.push(urlWithDN(ref, below == "" ?? (url.dn, below + "," + url.dn)))
+			}
+			return out
+		}
+
+		// The nearest referral object at or above `name`; none when there
+		// is none.
+		internal def referralObject(name DN) ?Entry {
+			let f = new Filter(FilterKind.Equal)
+			f.attribute = "objectClass"
+			f.value = "referral"
+			let at = name
+			for !at.isRoot() {
+				let found = config.directory.search(bound, at.str(), Scope.Base, f, 1) onerror recover Entry[]
+				return found[0] when found.len() > 0
+				at = at.parent()
+			}
+			return none
+		}
+
+		internal def search(m Message) !none {
+			let base = string((try m.body.at(0)).content)
+			let scope = int(try (try m.body.at(1)).asInt())
+			let sizeLimit = int(try (try m.body.at(3)).asInt())
+			let typesOnly = (try m.body.at(5)).asBool() onerror recover false
+			let filter = try decodeFilter(try m.body.at(6))
+			let wanted string[] = []
+			for let a in (try m.body.at(7)).children {
+				wanted.push(string(a.content))
+			}
+			if base == "" && scope == 0 {
+				try send(m.id, entryElement(rootDSE(), wanted, typesOnly), [])
+				return try send(m.id, resultElement(opSearchDone, 0, "", "", [], []), [])
+			}
+			let limit = config.sizeLimit
+			limit = sizeLimit when sizeLimit > 0 && (limit == 0 || sizeLimit < limit)
+			let paged = pagedRequest(m.controls)
+			let (pageSize, cookie) = paged
+			let entries Entry[] = []
+			let start = 0
+			let known = pages.get(string(cookie))
+			if cookie.len() > 0 && !(known is none) {
+				entries = known.entries
+				start = known.at
+				pages.delete(string(cookie))
+			} else {
+				let err ?error = none
+				let s = scopeOf(scope)
+				// One past the limit, to tell a full answer from a cut one.
+				entries = config.directory.search(bound, base, s, filter, limit > 0 ?? (limit + 1, 0)) onerror (e error) {
+					err = e
+					recover Entry[]
+				}
+				if !(err is none) {
+					let (code, message, matched) = outcome(err)
+					return try send(m.id, resultElement(opSearchDone, code, matched, message, [], []), [])
+				}
+			}
+			if !manages(m) && start == 0 {
+				// Referral objects in scope become continuation references
+				// whatever the filter (RFC 3296 §5.3), and what lies below
+				// them is theirs.
+				let f = new Filter(FilterKind.Equal)
+				f.attribute = "objectClass"
+				f.value = "referral"
+				let referrals = config.directory.search(bound, base, scopeOf(scope), f, 0) onerror recover Entry[]
+				let (plain, references) = splitReferrals(entries, referrals, scopeOf(scope))
+				entries = plain
+				for let urls in references {
+					let parts ASN1Element[] = []
+					for let u in urls {
+						parts.push(octets(u))
+					}
+					try send(m.id, app(opSearchReference, parts), [])
+				}
+			}
+			let cut = limit > 0 && entries.len() > limit
+			let total = cut ?? (limit, entries.len())
+			let end = total
+			end = start + pageSize when pageSize > 0 && start + pageSize < total
+			for let i = start; i < end; i++ {
+				try send(m.id, entryElement(entries[i], wanted, typesOnly), [])
+			}
+			let controls Control[] = []
+			if pageSize > 0 {
+				let next byte[] = []
+				if end < total {
+					next = "p{nextPage}".bytes()
+					nextPage++
+					pages[string(next)] = Paging{entries: entries, at: end}
+				}
+				controls.push(pagedControl(0, next))
+			}
+			let code = cut && end == total ?? (ResultCode.SizeLimitExceeded.value, ResultCode.Success.value)
+			return try send(m.id, resultElement(opSearchDone, code, "", "", [], []), controls)
+		}
+
+		// The entries of a search that are not referral objects or below
+		// one, and the continuation references of the referral objects:
+		// their URLs with the object's DN when a URL has none, and the
+		// scope to go on with (`sub`, or `base` under a one-level search).
+		internal def splitReferrals(entries Entry[], objects Entry[], scope Scope) (Entry[], string[][]) {
+			let referrals DN[] = []
+			let references string[][] = []
+			for let e in objects {
+				continue unless isReferral(e)
+				referrals.push(parseDN(e.dn) onerror recover new DN())
+				let urls string[] = []
+				for let ref in e.getAll("ref") {
+					let parsed = true
+					let url = parseURL(ref) onerror (err error) {
+						parsed = false
+						recover LdapURL{}
+					}
+					continue unless parsed
+					let withDN = url.dn == "" ?? (urlWithDN(ref, e.dn), ref)
+					urls.push(withDN.contains("?") ?? (withDN, withDN + (scope == Scope.One ?? ("??base", "??sub"))))
+				}
+				references.push(urls) when urls.len() > 0
+			}
+			return (entries, references) when referrals.len() == 0
+			let plain Entry[] = []
+			for let e in entries {
+				let name = parseDN(e.dn) onerror recover new DN()
+				let under = false
+				for let r in referrals {
+					under = true when name.within(r)
+				}
+				plain.push(e) unless under
+			}
+			return (plain, references)
+		}
+
+		internal def rootDSE() Entry {
+			let e = new Entry("")
+			e.set("objectClass", ["top", "extensibleObject"])
+			e.set("namingContexts", config.namingContexts)
+			e.set("supportedLDAPVersion", "3")
+			let extensions = [oidWhoAmI, oidPasswordModify]
+			extensions.push(oidStartTls) when config.startTls
+			e.set("supportedExtension", extensions)
+			e.set("supportedControl", [oidPagedResults, oidManageDsaIT])
+			let mechanisms = ["PLAIN"]
+			if config.directory is ScramDirectory {
+				for let m in ["SCRAM-SHA-512", "SCRAM-SHA-256", "SCRAM-SHA-1"] {
+					mechanisms.push(m + "-PLUS") when !(tlsConn is none)
+					mechanisms.push(m)
+				}
+			}
+			e.set("supportedSASLMechanisms", mechanisms)
+			e.set("vendorName", config.vendor)
+			return e
+		}
+
+		internal def extendedOp(m Message) !none {
+			let oid = string((try m.body.at(0)).content)
+			let value ?byte[] = m.body.children.len() > 1 ?? (m.body.children[1].content, none)
+			switch {
+				case oid == oidStartTls:
+					let tlsConfig = config.tlsConfig
+					return try send(m.id, resultElement(opExtendedResponse, ResultCode.UnavailableCriticalExtension.value, "", "StartTLS is not available", [], [contextPrimitive(10, oid.bytes())]), []) when secured || tlsConfig is none || !config.startTls
+					try send(m.id, resultElement(opExtendedResponse, 0, "", "", [], [contextPrimitive(10, oid.bytes())]), [])
+					let upgraded = tls.server(socket, tlsConfig)
+					try upgraded.handshake(config.timeout)
+					stream = upgraded
+					tlsConn = upgraded
+					lines = new net.LineReader(upgraded, 1)
+					secured = true
+					return none
+				case oid == oidWhoAmI:
+					let who = bound == "" ?? ("", "dn:" + bound)
+					return try send(m.id, resultElement(opExtendedResponse, 0, "", "", [], [contextPrimitive(11, who.bytes())]), [])
+				case oid == oidPasswordModify:
+					return try passwordModify(m.id, value)
+			}
+			return try send(m.id, resultElement(opExtendedResponse, ResultCode.ProtocolError.value, "", "extended operation {oid} is not supported", [], []), [])
+		}
+
+		internal def passwordModify(id int, value ?byte[]) !none {
+			let target = bound
+			let oldPassword = ""
+			let newPassword = ""
+			if !(value is none) {
+				let (seq, _) = try berParse(value)
+				for let c in seq.children {
+					switch {
+						case c.isContext(0):
+							target = string(c.content)
+						case c.isContext(1):
+							oldPassword = string(c.content)
+						case c.isContext(2):
+							newPassword = string(c.content)
+					}
+				}
+			}
+			let err ?error = none
+			err = LdapError{message: "bind first", code: "UnwillingToPerform", result: ResultCode.UnwillingToPerform.value} when target == ""
+			if err is none && oldPassword != "" {
+				config.directory.bind(target, oldPassword) onerror (e error) {
+					err = e
+					recover none
+				}
+			}
+			let generated = newPassword == ""
+			newPassword = (try rand(12)).base64().replace("/", "x").replace("+", "y").replace("=", "") when err is none && generated
+			if err is none {
+				let stored = try hashPassword(newPassword)
+				config.directory.modify(bound, target, [Change{kind:ChangeKind.Replace, attribute:"userPassword", values:[stored]}]) onerror (e error) {
+					err = e
+					recover none
+				}
+			}
+			let (code, message, matched) = outcome(err)
+			let extra ASN1Element[] = []
+			extra.push(contextPrimitive(11, asn1Sequence([contextPrimitive(0, newPassword.bytes())]).encode())) when err is none && generated
+			return try send(id, resultElement(opExtendedResponse, code, matched, message, [], extra), [])
+		}
+	}
+
+	// A SearchResultEntry with the attributes asked for: all user
+	// attributes for none or `*`, none for `1.1`.
+	def entryElement(e Entry, wanted string[], typesOnly bool) ASN1Element {
+		let all = wanted.len() == 0 || wanted.includes("*") || wanted.includes("+")
+		let attrs ASN1Element[] = []
+		for let name in e.attributeNames() {
+			if !all {
+				let asked = false
+				for let w in wanted {
+					asked = true when w.lower() == name.lower()
+				}
+				continue unless asked
+			}
+			let vals ASN1Element[] = []
+			if !typesOnly {
+				for let v in e.getAllBytes(name) {
+					vals.push(asn1OctetString(v))
+				}
+			}
+			attrs.push(asn1Sequence([octets(name), setOf(vals)]))
+		}
+		return app(opSearchEntry, [octets(e.dn), asn1Sequence(attrs)])
+	}
+
+	// The result code, message and matched DN for an outcome.
+	def outcome(err ?error) (int, string, string) {
+		return (0, "", "") when err is none
+		if err is LdapError {
+			let e LdapError = err
+			let text = e.message.trimPrefix("ldap: ")
+			return (e.result == 0 ?? (ResultCode.Other.value, e.result), text, e.matchedDN)
+		}
+		return (ResultCode.Other.value, err.message, "")
+	}
+
+	def decodeAdd(body ASN1Element) !Entry {
+		let e = new Entry(string((try body.at(0)).content))
+		for let attr in (try body.at(1)).children {
+			let name = string((try attr.at(0)).content)
+			let raw byte[][] = []
+			for let v in (try attr.at(1)).children {
+				raw.push(v.content)
+			}
+			e.setBytes(name, raw)
+		}
+		return e
+	}
+
+	def decodeChanges(list ASN1Element) !Change[] {
+		let out Change[] = []
+		for let c in list.children {
+			let kind = int(try (try c.at(0)).asInt())
+			let modification = try c.at(1)
+			let change = Change{kind: kindOf(kind), attribute: string((try modification.at(0)).content)}
+			for let v in (try modification.at(1)).children {
+				change.values.push(string(v.content))
+			}
+			out.push(change)
+		}
+		return out
+	}
+
+	// The parts of bytes separated by NUL (SASL PLAIN), as text.
+	def splitNul(raw byte[]) string[] {
+		let out string[] = []
+		let start = 0
+		for let i = 0; i <= raw.len(); i++ {
+			if i == raw.len() || raw[i] == byte(0) {
+				out.push(string(raw[start:i]))
+				start = i + 1
+			}
+		}
+		return out
+	}
+
+	def kindOf(value int) ChangeKind {
+		return ChangeKind.Delete when value == 1
+		return ChangeKind.Replace when value == 2
+		return ChangeKind.Increment when value == 3
+		return ChangeKind.Add
+	}
+
+	def scopeOf(value int) Scope {
+		return Scope.Base when value == 0
+		return Scope.One when value == 1
+		return Scope.Children when value == 3
+		return Scope.Subtree
+	}
+
+	// The page size and cookie of a paged results request control; 0
+	// when there is none.
+	def pagedRequest(controls Control[]) (int, byte[]) {
+		for let c in controls {
+			continue unless c.oid == oidPagedResults
+			let v = c.value
+			return (0, byte[]) when v is none
+			let (seq, _) = berParse(v) onerror recover (encoding.asn1Null(), 0)
+			return (0, byte[]) when seq.children.len() < 2
+			let size = int(seq.children[0].asInt() onerror recover 0)
+			return (size, seq.children[1].content)
+		}
+		return (0, byte[])
+	}
+
+	// Whether an entry is a referral object (objectClass `referral`).
+	def isReferral(e Entry) bool {
+		for let c in e.getAll("objectClass") {
+			return true when c.lower() == "referral"
+		}
+		return false
+	}
+
+	// An LDAP URL with its DN part set to `dn`, percent-encoded; the
+	// attributes, scope and filter after it are kept.
+	def urlWithDN(url string, dn string) string {
+		let at = url.indexOf("://")
+		return url when at < 0
+		let rest = url[at + 3:]
+		let slash = rest.indexOf("/")
+		let host = slash < 0 ?? (rest, rest[:slash])
+		let query = ""
+		if slash >= 0 {
+			let q = rest[slash + 1:].indexOf("?")
+			query = q < 0 ?? ("", rest[slash + 1 + q:])
+		}
+		return url[:at + 3] + host + "/" + percentEncodeDN(dn) + query
+	}
+
+	// A DN as an LDAP URL writes it: `?`, `%`, `#`, `/`, spaces and bytes
+	// outside ASCII percent-encoded.
+	def percentEncodeDN(dn string) string {
+		let out = ""
+		let hex = "0123456789ABCDEF"
+		for let b in dn.bytes() {
+			let c = int(b)
+			if c <= 32 || c >= 127 || (c := 63 || 37 || 35 || 47) {
+				out += "%" + hex[c >> 4:(c >> 4) + 1] + hex[c & 15:(c & 15) + 1]
+				continue
+			}
+			out += string([b])
+		}
+		return out
+	}
+}

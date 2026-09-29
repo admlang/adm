@@ -1,0 +1,332 @@
+internal partial module std.net.mqtt.proto {
+	use (
+		std.net
+		std.net.mqtt::(Authenticator, Authorizer, Message, MqttError)
+		std.time
+	)
+
+	// What a connection needs of its server.
+	struct ConnConfig {
+		authenticator ?Authenticator = none
+		authorizer    ?Authorizer    = none
+		// How long CONNECT may take to arrive.
+		timeout       duration       = 30s
+		// Keep-alive a server imposes when the client asks for none or
+		// more; 0 takes the client's.
+		maxKeepAlive  int            = 0
+	}
+
+	// ServerConn is one client connection to the broker. Implements
+	// BrokerConn.
+	type ServerConn {
+		stream             net.Stream
+		lines              net.LineReader
+		broker             Broker
+		config             ConnConfig
+		remote             net.Address
+		version            int            = 4
+		clientId           string         = ""
+		username           string         = ""
+		session            ?Session       = none
+		keepAlive          int            = 60
+		atomic closed      bool           = false
+		atomic awaitingRel map<int, bool>
+		graceful           bool           = false
+		serial             int            = 0
+
+		def new(stream net.Stream, broker Broker, config ConnConfig, remote net.Address) {
+			self.stream = stream
+			self.broker = broker
+			self.config = config
+			self.remote = remote
+			lines = new net.LineReader(stream, 1)
+			serial = broker.nextSerial()
+		}
+
+		// Serves the connection to its end. Never fails.
+		def run() {
+			serve() onerror recover none
+			wrapUp()
+		}
+
+		internal def serve() !none {
+			let first = try readPacket(lines, 0, broker.limits.maxPacketSize, config.timeout)
+			fail protocolFailure("the first packet is not CONNECT") when first.kind != pktConnect
+			version = first.protocolLevel
+			if version != 4 && version != 5 && version != 3 {
+				try refuse(0x84)
+				return none
+			}
+			version = 4 when version == 3
+			// A client with no identifier gets one (3.1.1 allows it only with
+			// a clean session).
+			let assigned = ""
+			clientId = first.clientId
+			if clientId == "" {
+				if version == 4 && !first.cleanStart {
+					try refuse(0x85)
+					return none
+				}
+				clientId = broker.assignId()
+				assigned = clientId
+			}
+			let user = first.username
+			username = user is none ?? ("", user)
+			let auth = config.authenticator
+			if !(auth is none) {
+				let pass = first.password
+				let secret = pass is none ?? ("", string(pass))
+				let refused = false
+				auth.login(clientId, username, secret) onerror (err error) {
+					refused = true
+					recover none
+				}
+				if refused {
+					try refuse(0x86)
+					return none
+				}
+			}
+			let (s, present) = broker.attach(clientId, first.cleanStart)
+			let previous = s.conn
+			previous.kick(0x8E) unless (previous is none)
+			s.version = version
+			s.expiry = version == 5 ?? ((first.props.sessionExpiry < 0 ?? (int64(0), first.props.sessionExpiry)), (first.cleanStart ?? (int64(0), int64(4294967295))))
+			s.receiveMax = first.props.receiveMaximum > 0 ?? (first.props.receiveMaximum, 65535)
+			s.willGeneration++
+			s.will = none
+			if first.hasWill {
+				let w = messageOf(Packet{kind: pktPublish, topic: first.willTopic, payload: first.willPayload, qos: first.willQoS, retain: first.willRetain, props: first.willProps})
+				s.will = w
+				s.willDelay = first.willProps.willDelay < 0 ?? (int64(0), first.willProps.willDelay)
+			}
+			keepAlive = first.keepAlive
+			keepAlive = config.maxKeepAlive when config.maxKeepAlive > 0 && (keepAlive == 0 || keepAlive > config.maxKeepAlive)
+			let ack = Packet{kind: pktConnack, sessionPresent: present, reason: 0}
+			if version == 5 {
+				ack.props.assignedClientId = assigned
+				ack.props.maximumQoS = broker.limits.maxQoS when broker.limits.maxQoS < 2
+				ack.props.retainAvailable = broker.limits.retainEnabled ?? (-1, 0)
+				ack.props.topicAliasMaximum = 0
+				ack.props.receiveMaximum = 65535
+				ack.props.maximumPacketSize = int64(broker.limits.maxPacketSize)
+				ack.props.serverKeepAlive = keepAlive when keepAlive != first.keepAlive
+				ack.props.sharedAvailable = 1
+				ack.props.subIdAvailable = 1
+				ack.props.wildcardAvailable = 1
+			}
+			try deliver(ack)
+			session = s
+			s.conn = self
+			s.connSerial = serial
+			s.disconnectedAt = none
+			// Resume: what was in flight goes out again, then what queued.
+			for let p in s.unacked() {
+				let again = p
+				again.duplicate = p.kind == pktPublish
+				deliver(again) onerror recover none
+			}
+			broker.flush(s)
+			let wait = keepAlive == 0 ?? (87600h, duration(int64(keepAlive) * 1500000000))
+			for !closed {
+				let p = try readPacket(lines, version, broker.limits.maxPacketSize, wait)
+				try handle(s, p)
+			}
+			return none
+		}
+
+		internal def refuse(reason int) !none {
+			let code = version == 5 ?? (reason, connack311(reason))
+			try deliver(Packet{kind: pktConnack, reason: code})
+			closed = true
+			return none
+		}
+
+		internal def handle(s Session, p Packet) !none {
+			switch {
+				case p.kind == pktPublish:
+					let m = messageOf(p)
+					let allowed = mayPublish(p.topic)
+					let bad = p.topic == "" || p.topic.contains("+") || p.topic.contains("#")
+					if bad {
+						kick(0x90)
+						return none
+					}
+					if p.qos == 2 {
+						let seen = markRel(p.packetId)
+						broker.publish(m, clientId) when !seen && allowed
+						return try deliver(Packet{kind: pktPubrec, packetId: p.packetId, reason: allowed ?? (0, 0x87)})
+					}
+					broker.publish(m, clientId) when allowed
+					return try deliver(Packet{kind: pktPuback, packetId: p.packetId, reason: allowed ?? (0, 0x87)}) when p.qos == 1
+				case p.kind == pktPubrel:
+					clearRel(p.packetId)
+					return try deliver(Packet{kind: pktPubcomp, packetId: p.packetId})
+				case p.kind == pktPuback || p.kind == pktPubcomp:
+					s.acked(p.packetId)
+					broker.flush(s)
+				case p.kind == pktPubrec:
+					if p.reason >= 0x80 {
+						s.acked(p.packetId)
+						return none
+					}
+					let rel = Packet{kind: pktPubrel, packetId: p.packetId}
+					s.replace(p.packetId, rel)
+					return try deliver(rel)
+				case p.kind == pktSubscribe:
+					return try subscribe(s, p)
+				case p.kind == pktUnsubscribe:
+					let reasons int[] = []
+					for let f in p.filters {
+						let (filter, _) = shareOf(f)
+						let existed = s.subs.hasKey(f)
+						s.subs.delete(f)
+						reasons.push(existed ?? (0, 17))
+					}
+					return try deliver(Packet{kind: pktUnsuback, packetId: p.packetId, reasons: reasons})
+				case p.kind == pktPingreq:
+					return try deliver(Packet{kind: pktPingresp})
+				case p.kind == pktDisconnect:
+					graceful = p.reason != 4
+					s.expiry = p.props.sessionExpiry when version == 5 && p.props.sessionExpiry >= 0
+					closed = true
+				case p.kind == pktAuth:
+					kick(0x8C)
+				default:
+					kick(0x82)
+			}
+			return none
+		}
+
+		internal def subscribe(s Session, p Packet) !none {
+			let reasons int[] = []
+			let subId = p.props.subscriptionIds.len() > 0 ?? (p.props.subscriptionIds[0], 0)
+			for let want in p.subscriptions {
+				let (filter, group) = shareOf(want.filter)
+				if !validFilter(filter) || (group != "" && want.noLocal) {
+					reasons.push(0x8F)
+					continue
+				}
+				if !maySubscribe(want.filter) {
+					reasons.push(0x87)
+					continue
+				}
+				let existed = s.subs.hasKey(want.filter)
+				let granted = want.qos < broker.limits.maxQoS ?? (want.qos, broker.limits.maxQoS)
+				let sub = Sub{filter: filter, qos: granted, noLocal: want.noLocal, retainAsPublished: want.retainAsPublished, retainHandling: want.retainHandling, subscriptionId: subId, group: group}
+				s.subs[want.filter] = sub
+				reasons.push(granted)
+				// Retained messages: always, only for a new subscription, or
+				// never; never for a shared one.
+				let sendRetained = group == "" && (want.retainHandling == 0 || (want.retainHandling == 1 && !existed))
+				if sendRetained {
+					for let stored in broker.retainedFor(filter) {
+						broker.send(s, stored, sub, true)
+					}
+				}
+			}
+			return try deliver(Packet{kind: pktSuback, packetId: p.packetId, reasons: reasons})
+		}
+
+		internal def mayPublish(topic string) bool {
+			let a = config.authorizer
+			return a is none || a.canPublish(clientId, username, topic)
+		}
+
+		internal def maySubscribe(filter string) bool {
+			let a = config.authorizer
+			return a is none || a.canSubscribe(clientId, username, filter)
+		}
+
+		// Implements BrokerConn: writes one packet. Fails when the
+		// connection is gone.
+		atomic def deliver(p Packet) !none {
+			fail MqttError{message: "mqtt: connection closed", code: "closed"} when closed && p.kind != pktConnack
+			let data = encodePacket(p, version)
+			let off = 0
+			for off < data.len() {
+				let n = try stream.write(data[off:], 30s)
+				fail protocolFailure("wrote nothing") when n <= 0
+				off += n
+			}
+			return none
+		}
+
+		// Implements BrokerConn: ends the connection with a reason (sent
+		// as DISCONNECT to MQTT 5 clients). Never fails.
+		def kick(reason int) {
+			if version == 5 && !closed {
+				deliver(Packet{kind: pktDisconnect, reason: reason}) onerror recover none
+			}
+			closed = true
+			stream.close() onerror recover none
+		}
+
+		internal atomic def markRel(id int) bool {
+			let seen = awaitingRel.hasKey(id)
+			awaitingRel[id] = true
+			return seen
+		}
+
+		internal atomic def clearRel(id int) {
+			awaitingRel.delete(id)
+		}
+
+		// After the connection ended: the will, unless the client said
+		// goodbye; then the session is detached (and dropped when it does
+		// not outlive the connection).
+		internal def wrapUp() {
+			closed = true
+			stream.close() onerror recover none
+			let s = session
+			return when s is none
+			// Taken over by a newer connection: that one owns the session.
+			return when s.conn is none || s.connSerial != serial
+			let w = s.will
+			if !graceful && !(w is none) {
+				let delay = s.willDelay < s.expiry || s.expiry == 0 ?? (s.willDelay, s.expiry)
+				if delay <= 0 {
+					broker.publish(w, clientId)
+				} else {
+					let task = async delayedWill(s, w, s.willGeneration, delay)
+					task.keepAlive()
+				}
+			}
+			broker.detach(s)
+		}
+
+		// Publishes the will once its delay passed, unless the client came
+		// back first.
+		internal def delayedWill(s Session, w Message, generation int, delay int64) {
+			time.sleep(duration(delay * 1000000000))
+			return when s.willGeneration != generation || !(s.conn is none)
+			broker.publish(w, clientId)
+		}
+	}
+
+	// A subscription filter and its share group: `$share/group/filter`
+	// gives (filter, group); anything else (filter, "").
+	def shareOf(filter string) (string, string) {
+		return (filter, "") unless filter.startsWith("$share/")
+		let rest = filter["$share/".len():]
+		let slash = rest.indexOf("/")
+		return (filter, "") when slash <= 0
+		return (rest[slash + 1:], rest[:slash])
+	}
+
+	// Whether a filter is well formed: `#` only last and alone in its
+	// level, `+` alone in its level.
+	def validFilter(filter string) bool {
+		return false when filter == ""
+		let levels = filter.split("/")
+		for let i = 0; i < levels.len(); i++ {
+			let level = levels[i]
+			if level.contains("#") {
+				return false unless level == "#" && i == levels.len() - 1
+			}
+			if level.contains("+") {
+				return false unless level == "+"
+			}
+		}
+		return true
+	}
+}

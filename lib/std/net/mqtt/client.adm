@@ -1,4 +1,421 @@
 partial module std.net.mqtt {
-	// Client is the MQTT client; it has no members yet.
-	type Client {}
+	use (
+		std.crypto::(rand)
+		std.net
+		std.net.http.websocket
+		std.net.mqtt.proto::*
+		std.net.tls
+		std.services::(Policy)
+		std.time
+	)
+
+	// Client is an MQTT client (3.1.1 and 5.0) over TCP, TLS or a
+	// WebSocket: it publishes with each QoS, subscribes with a handler
+	// per filter (or reads unhandled messages with `receive`), keeps the
+	// connection alive, and with `autoReconnect` comes back after a drop,
+	// resubscribing and resending what was in flight.
+	//
+	// ```
+	// let c = new mqtt.Client("sensor-7")
+	// try c.connect("broker.example.com")
+	// try c.subscribe("home/+/temperature", def (m mqtt.Message) {
+	//     print("{m.topic}: {mqtt.text(m)}")
+	// })
+	// try c.publish("home/kitchen/temperature", "21.5", QoS.AtLeastOnce, retain = true)
+	// ```
+	type Client {
+		// The client identifier; empty lets the broker assign one (MQTT 5)
+		// or picks a random one (3.1.1).
+		clientId                   string          = ""
+		version                    Version         = Version.V5
+		username                   string          = ""
+		password                   ?Secret<string> = none
+		keepAlive                  duration        = 60s
+		// Start without the session the broker kept (MQTT 5: Clean Start;
+		// 3.1.1: Clean Session).
+		cleanStart                 bool            = true
+		// MQTT 5: how long the broker keeps the session after a
+		// disconnect; 0 ends it with the connection.
+		sessionExpiry              duration        = 0s
+		// Published by the broker when the connection drops without a
+		// DISCONNECT, after `willDelay` (MQTT 5).
+		will                       ?Message        = none
+		willDelay                  duration        = 0s
+		security                   Security        = Security.Plain
+		tls                        ?tls.Config     = none
+		// How long connecting and each acknowledgement may take.
+		timeout                    duration        = 30s
+		// Reconnect after the connection drops, waiting from one second up
+		// to a minute between tries.
+		autoReconnect              bool            = false
+		// MQTT 5: user properties sent with CONNECT.
+		properties                 UserProperty[]  = []
+		internal atomic conn       ?Conn           = none
+		internal target            string          = ""
+		internal atomic handlers   Route[]         = []
+		internal atomic queue      Message[]       = []
+		internal queued            channel<none>
+		internal atomic subscribed Subscription[]  = []
+		internal atomic closing    bool            = false
+
+		def new(clientId string = "", version Version = Version.V5) {
+			self.clientId = clientId
+			self.version = version
+			queued = new channel<none>(1)
+		}
+
+		// Connects to a broker: `host` or `host:port` (1883, or 8883 with
+		// `Implicit`), or a URL: `mqtt://`, `mqtts://`, `ws://host/path`,
+		// `wss://host/path`. Fails when the broker cannot be reached,
+		// refuses the connection (the reason in the MqttError) or the
+		// policy denies it.
+		def connect(addr string) !none {
+			fail MqttError{message: "mqtt: already connected", code: "protocol"} unless conn is none
+			target = addr
+			clientId = "adm-" + (try rand(6)).hex().lower() when clientId == "" && version == Version.V311
+			let c = try open()
+			conn = c
+			if autoReconnect {
+				let watcher = async watch()
+				watcher.keepAlive()
+			}
+			return none
+		}
+
+		internal def open() !Conn {
+			let (stream, _, _) = try dialTarget(target, security, tls, timeout)
+			let c = new Conn(stream, version.value, timeout)
+			c.onMessage = def (m Message) {
+				deliver(m)
+			}
+			let p = Packet{kind: pktConnect, cleanStart: cleanStart, keepAlive: int(int64(keepAlive) / 1000000000), clientId: clientId}
+			p.username = username when username != ""
+			let secret = password
+			p.password = secret.reveal().bytes() unless secret is none
+			let w = will
+			if !(w is none) {
+				p.hasWill = true
+				p.willQoS = w.qos.value
+				p.willRetain = w.retain
+				p.willTopic = w.topic
+				p.willPayload = w.payload
+				let wp = publishOf(w, 0, 0).props
+				wp.willDelay = int64(willDelay) / 1000000000 when willDelay > 0s
+				p.willProps = wp
+			}
+			p.props.sessionExpiry = int64(sessionExpiry) / 1000000000 when sessionExpiry > 0s
+			p.props.receiveMaximum = 65535
+			p.props.user = properties
+			try c.connect(p)
+			clientId = c.assignedClientId when c.assignedClientId != ""
+			return c
+		}
+
+		// Publishes bytes to a topic. With QoS 1 or 2 it waits until the
+		// broker acknowledged. Fails when the broker refuses (MQTT 5
+		// reason code), the connection breaks, or no acknowledgement
+		// comes in time.
+		def publish(topic string, payload byte[], qos QoS = QoS.AtMostOnce, retain bool = false) !none {
+			return try publish(Message{topic: topic, payload: payload, qos: qos, retain: retain})
+		}
+
+		// publish of text, sent as UTF-8 (marked so with MQTT 5). Fails as
+		// `publish(bytes)` does.
+		def publish(topic string, text string, qos QoS = QoS.AtMostOnce, retain bool = false) !none {
+			return try publish(Message{topic: topic, payload: text.bytes(), qos: qos, retain: retain, utf8: version == Version.V5})
+		}
+
+		// publish of a whole message, properties included. Fails as
+		// `publish(bytes)` does.
+		def publish(message Message) !none {
+			fail MqttError{message: "mqtt: topic names cannot hold wildcards", code: "topicNameInvalid", reason: 0x90} when message.topic.contains("+") || message.topic.contains("#") || message.topic == ""
+			let c = try connected()
+			return try c.publish(message)
+		}
+
+		// Subscribes to a topic filter; `handler` gets each matching message
+		// in its own task, one at a time. Returns the QoS the broker
+		// granted. Fails when the broker refuses the filter.
+		def subscribe(filter string, handler def (Message), qos QoS = QoS.AtLeastOnce) !QoS {
+			// A shared subscription's messages carry topics of the bare filter.
+			let (bare, _) = shareOf(filter)
+			addRoute(new Route(bare, handler))
+			return try subscribe(filter, qos)
+		}
+
+		// Subscribes without a handler: messages go to `receive`. Fails
+		// when the broker refuses the filter.
+		def subscribe(filter string, qos QoS = QoS.AtLeastOnce) !QoS {
+			return try subscribe(Subscription{filter: filter, qos: qos.value})
+		}
+
+		// Subscribes with every MQTT 5 option: `noLocal` (not our own
+		// messages), `retainAsPublished`, `retainHandling`. Fails when the
+		// broker refuses the filter.
+		def subscribe(filter string, qos QoS, noLocal bool, retainAsPublished bool = false, retainHandling int = 0) !QoS {
+			return try subscribe(Subscription{filter: filter, qos: qos.value, noLocal: noLocal, retainAsPublished: retainAsPublished, retainHandling: retainHandling})
+		}
+
+		internal def subscribe(s Subscription) !QoS {
+			let c = try connected()
+			let granted = try c.subscribe([s])
+			remember(s)
+			return qosOf(granted[0])
+		}
+
+		// Stops a subscription. Fails when the connection breaks.
+		def unsubscribe(filter string) !none {
+			let c = try connected()
+			forgetFilter(filter)
+			return try c.unsubscribe([filter])
+		}
+
+		// The next message no handler took, waiting up to `timeout` (0
+		// without end); none when the wait ends first. Fails when the
+		// client is closed.
+		def receive(timeout duration = 0s) !?Message {
+			let deadline = time.now() + timeout
+			for {
+				let m = takeQueued()
+				return m unless m is none
+				fail MqttError{message: "mqtt: the client is closed", code: "closed"} when closing
+				if timeout > 0s {
+					let left = deadline - time.now()
+					return none when left <= 0s
+					let sleep = time.sleepChan(left)
+					select {
+						case queued:
+							queued.flush()
+						case sleep:
+					}
+				} else {
+					select {
+						case queued:
+							queued.flush()
+					}
+				}
+			}
+			return none
+		}
+
+		// MQTT 5 request/response: publishes `payload` to `topic` with a
+		// fresh response topic and correlation data, and returns the first
+		// answer. Fails when none comes within `timeout`.
+		def request(topic string, payload byte[], timeout duration = 10s) !Message {
+			fail MqttError{message: "mqtt: request/response needs MQTT 5", code: "protocol"} when version != Version.V5
+			let token = (try rand(8)).hex().lower()
+			let replyTopic = "adm/reply/{clientId}/{token}"
+			let answers = new channel<Message>(1)
+			try subscribe(replyTopic, def (m Message) {
+				answers <- m when answers.len() == 0
+			}, QoS.AtLeastOnce)
+			try publish(Message{topic: topic, payload: payload, qos: QoS.AtLeastOnce, responseTopic: replyTopic, correlationData: token.bytes()})
+			let sleep = time.sleepChan(timeout)
+			let got ?Message = none
+			select {
+				case answers:
+					got = <-answers
+				case sleep:
+			}
+			unsubscribe(replyTopic) onerror recover none
+			fail MqttError{message: "mqtt: no answer on {topic} within {timeout}", code: "timeout"} when got is none
+			return got
+		}
+
+		// request of text. Fails as `request(bytes)` does.
+		def request(topic string, text string, timeout duration = 10s) !Message {
+			return try request(topic, text.bytes(), timeout)
+		}
+
+		// Whether the connection is up.
+		def isConnected() bool {
+			let c = conn
+			return !(c is none) && c.isOpen()
+		}
+
+		// Sends DISCONNECT and closes; the will is not published. Never
+		// fails.
+		def close() !none {
+			closing = true
+			let c = conn
+			conn = none
+			c.disconnect() unless c is none
+			queued <- none when queued.len() == 0
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// ---- internals ----
+
+		internal def connected() !Conn {
+			let c = conn
+			fail MqttError{message: "mqtt: not connected; call connect first", code: "closed"} when c is none
+			return c
+		}
+
+		internal def deliver(m Message) {
+			// Every handler whose filter matches gets the message; with none,
+			// it waits for `receive`.
+			let routes = routesFor(m.topic)
+			for let r in routes {
+				r.enqueue(m)
+			}
+			return when routes.len() > 0
+			pushQueued(m)
+			queued <- none when queued.len() == 0
+		}
+
+		internal atomic def routesFor(topic string) Route[] {
+			let out Route[] = []
+			for let r in handlers {
+				out.push(r) when matches(r.filter, topic)
+			}
+			return out
+		}
+
+		internal atomic def addRoute(r Route) {
+			handlers.push(r)
+		}
+
+		internal atomic def pushQueued(m Message) {
+			queue.push(m)
+		}
+
+		internal atomic def takeQueued() ?Message {
+			return none when queue.len() == 0
+			return queue.shift()
+		}
+
+		internal atomic def remember(s Subscription) {
+			let kept Subscription[] = []
+			for let x in subscribed {
+				kept.push(x) unless x.filter == s.filter
+			}
+			kept.push(s)
+			subscribed = kept
+		}
+
+		internal atomic def forgetFilter(filter string) {
+			subscribed = subscribed.filter(s => s.filter != filter)
+			handlers = handlers.filter(r => r.filter != filter)
+		}
+
+		// Reconnects after a drop until `close`, backing off.
+		internal def watch() {
+			let wait = 1s
+			for !closing {
+				let c = conn
+				if !(c is none) && c.isOpen() {
+					time.sleep(500ms)
+					continue
+				}
+				time.sleep(wait)
+				break when closing
+				let fresh = openOrNone() onerror (err error) {
+					wait = wait + wait
+					wait = 60s when wait > 60s
+					recover none
+				}
+				if !(fresh is none) {
+					let old = conn
+					conn = fresh
+					wait = 1s
+					if !fresh.sessionPresent && subscribed.len() > 0 {
+						fresh.subscribe(subscribed) onerror recover int[]
+					}
+					fresh.resend(old.unacknowledged()) unless (old is none)
+				}
+			}
+		}
+
+		internal def openOrNone() !?Conn {
+			return try open()
+		}
+
+		// Names the client.
+		def str() string {
+			return "mqtt.Client({clientId}@{target})"
+		}
+	}
+
+	// Where a subscription's messages go: a handler run in its own task,
+	// one message at a time, so a handler may publish and wait.
+	internal type Route {
+		filter                  string
+		handler                 def (Message)
+		internal atomic pending Message[]     = []
+		internal atomic running bool          = false
+
+		def new(filter string, handler def (Message)) {
+			self.filter = filter
+			self.handler = handler
+		}
+
+		def enqueue(m Message) {
+			if push(m) {
+				let task = async drain()
+				task.keepAlive()
+			}
+		}
+
+		// Queues a message; true when no task is draining.
+		internal atomic def push(m Message) bool {
+			pending.push(m)
+			return false when running
+			running = true
+			return true
+		}
+
+		internal atomic def next() ?Message {
+			if pending.len() == 0 {
+				running = false
+				return none
+			}
+			return pending.shift()
+		}
+
+		internal def drain() {
+			for {
+				let m = next()
+				break when m is none
+				handler(m)
+			}
+		}
+	}
+
+	// Dials an address or URL; returns the stream, the scheme and the
+	// dialled address.
+	internal def dialTarget(addr string, security Security, config ?tls.Config, timeout duration) !(net.Stream, string, string) {
+		if addr.startsWith("ws://") || addr.startsWith("wss://") {
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", addr)
+			let options = websocket.DialOptions{subprotocols: ["mqtt"], timeout: timeout}
+			let (ws, _) = try websocket.dial(addr, options)
+			let stream net.Stream = new WsStream(ws)
+			return (stream, "ws", addr)
+		}
+		let rest = addr
+		let secure = security == Security.Implicit
+		if addr.startsWith("mqtts://") {
+			rest = addr["mqtts://".len():]
+			secure = true
+		} else if addr.startsWith("mqtt://") {
+			rest = addr["mqtt://".len():]
+		}
+		let dial = net.withPort(rest.trimSuffix("/"), secure ?? (8883, 1883))
+		try Policy.validate("adm.network.connect", "std.services.EndpointSpec", (secure ?? ("mqtts", "mqtt")) + "://" + dial)
+		let socket = try net.dialStream(dial, timeout)
+		let plain net.Stream = socket
+		return (plain, "mqtt", dial) unless secure
+		let tlsConfig = tls.Config{}
+		tlsConfig = config unless config is none
+		let a = net.parseAddress(dial) onerror recover new net.Address()
+		tlsConfig = tls.withServerName(tlsConfig, a.host) when tlsConfig.serverName == ""
+		let secured = tls.client(socket, tlsConfig)
+		try secured.handshake(timeout)
+		let stream net.Stream = secured
+		return (stream, "mqtts", dial)
+	}
 }

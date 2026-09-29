@@ -1,8 +1,13 @@
 partial module std.net.mail {
 	use (
+		std.errors
 		std.formats.mail::(Message)
+		std.net
+		std.net.dns
 		std.net.mail.imap
+		std.net.mail.pop3
 		std.net.mail.smtp
+		std.time
 		std.time::(Time)
 	)
 
@@ -26,6 +31,18 @@ partial module std.net.mail {
 		seen    bool
 	}
 
+	// MailError is the payload of a `Client` failure of its own: `code` is
+	// `discovery` when the domain publishes no servers, `unsupported` for
+	// an operation POP3 lacks, `notFound` for a message that is gone.
+	// Server refusals come as the protocol's error (`SmtpError`,
+	// `ImapError`, `Pop3Error`).
+	struct MailError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
+
 	// Client is a mail account: it sends through SMTP and reads through
 	// IMAP (or POP3), connecting on first use and keeping the connections
 	// until `close`. Servers left empty are found from the address's domain
@@ -42,67 +59,435 @@ partial module std.net.mail {
 	// ```
 	type Client {
 		// The account's address; the `From` of messages that have none.
-		address  string
+		address           string
 		// The display name next to `address` in `From`.
-		name     string           = ""
+		name              string         = ""
 		// The login name; empty uses `address`.
-		user     string           = ""
-		password Secret<string>
+		user              string         = ""
+		password          Secret<string>
 		// The SMTP submission server, `host` or `host:port`; empty finds it.
-		outgoing string           = ""
+		// TLS follows the port (implicit on 465 or with no port, STARTTLS
+		// otherwise); `smtps://host` forces implicit TLS, `smtp://host`
+		// plain text (a local relay).
+		outgoing          string         = ""
 		// The IMAP or POP3 server, `host` or `host:port`; empty finds it.
-		incoming string           = ""
-		protocol Protocol         = Protocol.Imap
+		// As with `outgoing`: implicit TLS on 993/995 or with no port,
+		// STARTTLS otherwise; `imaps://`/`pop3s://` implicit, `imap://`/
+		// `pop3://` plain text.
+		incoming          string         = ""
+		protocol          Protocol       = Protocol.Imap
 		// How long each command may wait.
-		timeout  duration         = 60s
+		timeout           duration       = 60s
+		internal sender   ?smtp.Client   = none
+		internal reader   ?imap.Client   = none
+		internal drop     ?pop3.Client   = none
+		internal selected string         = ""
 
-		def new(address string, password Secret<string>, name string = "") {}
+		def new(address string, password Secret<string>, name string = "") {
+			self.address = address
+			self.password = password
+			self.name = name
+		}
 
 		// Looks up `outgoing` and `incoming` from the address's domain where
 		// they are empty. Fails when the domain publishes no servers.
-		def discover() !none {}
+		def discover() !none {
+			let parts = address.split("@")
+			fail MailError{message: "mail: {address} is not an address", code: "discovery"} when parts.len() < 2
+			let domain = parts[parts.len() - 1]
+			if outgoing == "" {
+				outgoing = srvTarget(["submissions", "submission"], domain)
+				fail MailError{message: "mail: {domain} publishes no submission server (_submissions._tcp, _submission._tcp)", code: "discovery"} when outgoing == ""
+			}
+			if incoming == "" {
+				let services = protocol == Protocol.Imap ?? (["imaps", "imap"], ["pop3s", "pop3"])
+				incoming = srvTarget(services, domain)
+				fail MailError{message: "mail: {domain} publishes no {protocol.value} server (_{services[0]}._tcp, _{services[1]}._tcp)", code: "discovery"} when incoming == ""
+			}
+			return none
+		}
 
 		// Sends `message`, `From` set to the account when it has none.
 		// Fails when the server refuses the login, the sender or every
 		// recipient.
-		def send(message Message) !smtp.Delivery {}
+		def send(message Message) !smtp.Delivery {
+			message.from(address, name) when (try message.from()).len() == 0
+			let c = try smtpClient()
+			let first = sendOn(c, message) onerror (err error) {
+				// A connection the server dropped while idle: once more on a
+				// new one.
+				fail err when c.isOpen()
+				recover none
+			}
+			return first unless first is none
+			closeSender()
+			return try (try smtpClient()).send(message)
+		}
 
 		// Sends a reply to `original` with `text` as its body (`all` copies
 		// the other recipients). Fails as `send` does.
-		def reply(original Message, text string, all bool = false) !smtp.Delivery {}
+		def reply(original Message, text string, all bool = false) !smtp.Delivery {
+			let answer = try original.reply(all)
+			if all {
+				// The account's own address is not a copy it sends itself.
+				let kept = (try answer.cc()).filter(a => a.address.lower() != address.lower())
+				answer.header.remove("Cc")
+				for let a in kept {
+					answer.cc(a.address, a.name)
+				}
+			}
+			answer.text(text)
+			return try send(answer)
+		}
 
 		// The mailbox names (INBOX only with POP3). Fails when the server
 		// cannot be reached or refuses the login.
-		def mailboxes() !string[] {}
+		def mailboxes() !string[] {
+			return ["INBOX"] when protocol == Protocol.Pop3
+			let names string[] = []
+			for let m in try (try imapClient()).mailboxes() {
+				names.push(m.name)
+			}
+			return names
+		}
 
 		// The messages of `mailbox`, oldest first; with IMAP only those
 		// matching `condition`, all when none. Fails when the mailbox does
 		// not exist or the server cannot be reached.
-		def messages(mailbox string = "INBOX", condition ?imap.Search = none) !MessageInfo[] {}
+		def messages(mailbox string = "INBOX", condition ?imap.Search = none) !MessageInfo[] {
+			if protocol == Protocol.Pop3 {
+				try inboxOnly(mailbox)
+				let session = try pop3Client()
+				let out MessageInfo[] = []
+				for let e in try session.list() {
+					let head = try session.top(e.number, 0)
+					out.push(infoOf(e, head))
+				}
+				return out
+			}
+			let c = try selectMailbox(mailbox)
+			let wanted = condition
+			let uids = try c.search(wanted is none ?? (new imap.Search(), wanted))
+			return [] when uids.len() == 0
+			let out MessageInfo[] = []
+			for let summary in try c.summaries(uids) {
+				out.push(infoOf(summary))
+			}
+			return out
+		}
 
 		// Message `id` of `mailbox`, whole. Fails when it is gone.
-		def fetch(id string, mailbox string = "INBOX") !Message {}
+		def fetch(id string, mailbox string = "INBOX") !Message {
+			if protocol == Protocol.Pop3 {
+				try inboxOnly(mailbox)
+				let session = try pop3Client()
+				return try session.retrieve(try numberOf(session, id))
+			}
+			let c = try selectMailbox(mailbox)
+			return try c.message(try uidOf(id))
+		}
 
 		// Marks message `id` seen or unseen (IMAP only; POP3 has no flags).
 		// Fails when it is gone or the protocol is POP3.
-		def markSeen(id string, seen bool = true, mailbox string = "INBOX") !none {}
+		def markSeen(id string, seen bool = true, mailbox string = "INBOX") !none {
+			try imapOnly("markSeen")
+			let c = try selectMailbox(mailbox)
+			let uid = try uidOf(id)
+			return try c.addFlags([uid], [imap.Flag.Seen.value]) when seen
+			return try c.removeFlags([uid], [imap.Flag.Seen.value])
+		}
 
 		// Moves message `id` to mailbox `to` (IMAP only). Fails when either
 		// is missing or the protocol is POP3.
-		def move(id string, to string, mailbox string = "INBOX") !none {}
+		def move(id string, to string, mailbox string = "INBOX") !none {
+			try imapOnly("move")
+			let c = try selectMailbox(mailbox)
+			try c.move([try uidOf(id)], to)
+			return none
+		}
 
 		// Deletes message `id`: with IMAP it is flagged and expunged, with
 		// POP3 removed when the session ends. Fails when it is gone.
-		def delete(id string, mailbox string = "INBOX") !none {}
+		def delete(id string, mailbox string = "INBOX") !none {
+			if protocol == Protocol.Pop3 {
+				try inboxOnly(mailbox)
+				let session = try pop3Client()
+				return try session.delete(try numberOf(session, id))
+			}
+			let c = try selectMailbox(mailbox)
+			let uid = try uidOf(id)
+			try c.addFlags([uid], [imap.Flag.Deleted.value])
+			return try c.expunge([uid])
+		}
 
 		// Waits up to `timeout` for new messages in `mailbox` (IMAP IDLE,
 		// else polling) and returns them. Fails when the connection breaks.
-		def watch(mailbox string = "INBOX", timeout duration = 29m) !MessageInfo[] {}
+		def watch(mailbox string = "INBOX", timeout duration = 29m) !MessageInfo[] {
+			if protocol == Protocol.Pop3 {
+				try inboxOnly(mailbox)
+				return try pollPop3(timeout)
+			}
+			let c = try selectMailbox(mailbox)
+			// What is there now; anything with a higher UID is new.
+			let known = try c.search(new imap.Search())
+			let highest int64 = 0
+			for let uid in known {
+				highest = uid when uid > highest
+			}
+			let updates = try c.idle(timeout)
+			return [] when updates.filter(u => u.kind == imap.UpdateKind.Exists).len() == 0
+			let fresh = (try c.search(new imap.Search())).filter(uid => uid > highest)
+			return [] when fresh.len() == 0
+			let out MessageInfo[] = []
+			for let summary in try c.summaries(fresh) {
+				out.push(infoOf(summary))
+			}
+			return out
+		}
 
 		// Closes the connections. Fails when one cannot be closed cleanly;
 		// all are closed still.
-		def close() !none {}
+		def close() !none {
+			let failures error[] = []
+			let s = sender
+			sender = none
+			if !(s is none) {
+				s.close() onerror (err error) {
+					failures.push(err)
+					recover none
+				}
+			}
+			let r = reader
+			reader = none
+			selected = ""
+			if !(r is none) {
+				r.close() onerror (err error) {
+					failures.push(err)
+					recover none
+				}
+			}
+			let d = drop
+			drop = none
+			if !(d is none) {
+				d.close() onerror (err error) {
+					failures.push(err)
+					recover none
+				}
+			}
+			fail failures[0] when failures.len() > 0
+			return none
+		}
 
-		def dispose() {}
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// ---- internals ----
+
+		internal def login() string {
+			return user == "" ?? (address, user)
+		}
+
+		internal def smtpClient() !smtp.Client {
+			let existing = sender
+			return existing unless existing is none || !existing.isOpen()
+			try discover() when outgoing == ""
+			let c = new smtp.Client(smtpSecurity(outgoing), timeout)
+			try c.connect(hostPart(outgoing))
+			c.login(login(), password) onerror (err error) {
+				c.close() onerror recover none
+				fail err
+			}
+			sender = c
+			return c
+		}
+
+		internal def sendOn(c smtp.Client, message Message) !?smtp.Delivery {
+			return try c.send(message)
+		}
+
+		internal def closeSender() {
+			let s = sender
+			sender = none
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+		}
+
+		internal def imapClient() !imap.Client {
+			let existing = reader
+			return existing unless existing is none || !existing.isOpen()
+			try discover() when incoming == ""
+			let c = new imap.Client(imapSecurity(incoming), timeout)
+			try c.connect(hostPart(incoming))
+			c.login(login(), password) onerror (err error) {
+				c.close() onerror recover none
+				fail err
+			}
+			reader = c
+			selected = ""
+			return c
+		}
+
+		// The IMAP connection with `mailbox` selected.
+		internal def selectMailbox(mailbox string) !imap.Client {
+			let c = try imapClient()
+			if selected != mailbox {
+				try c.open(mailbox)
+				selected = mailbox
+				return c
+			}
+			// A NOOP brings in what arrived since the last command.
+			try c.noop()
+			return c
+		}
+
+		internal def pop3Client() !pop3.Client {
+			let existing = drop
+			return existing unless existing is none || !existing.isOpen()
+			try discover() when incoming == ""
+			let c = new pop3.Client(pop3Security(incoming), timeout)
+			try c.connect(hostPart(incoming))
+			c.login(login(), password) onerror (err error) {
+				c.close() onerror recover none
+				fail err
+			}
+			drop = c
+			return c
+		}
+
+		internal def imapOnly(operation string) !none {
+			fail MailError{message: "mail: {operation} needs IMAP; POP3 has no flags or folders", code: "unsupported"} when protocol == Protocol.Pop3
+			return none
+		}
+
+		internal def inboxOnly(mailbox string) !none {
+			fail MailError{message: "mail: POP3 reaches the inbox only, not {mailbox}", code: "unsupported"} unless mailbox.upper() == "INBOX"
+			return none
+		}
+
+		internal def uidOf(id string) !int64 {
+			fail MailError{message: "mail: {id} is not an IMAP UID", code: "notFound"} unless id.isNumeric()
+			return id.toInt<int64>()
+		}
+
+		// The session number of the message with unique ID `id`.
+		internal def numberOf(c pop3.Client, id string) !int {
+			for let e in try c.list() {
+				return e.number when e.uid == id
+			}
+			fail MailError{message: "mail: message {id} is gone", code: "notFound"}
+		}
+
+		// New messages on a POP3 maildrop: each poll is a session of its own,
+		// since a server shows new mail to new sessions only.
+		internal def pollPop3(timeout duration) !MessageInfo[] {
+			let known map<string, bool> = map<string, bool>{}
+			for let e in try (try pop3Client()).list() {
+				known[e.uid] = true
+			}
+			let started = time.now()
+			for time.since(started) < timeout {
+				let left = timeout - time.since(started)
+				time.sleep(left < 30s ?? (left, 30s))
+				let d = drop
+				drop = none
+				if !(d is none) {
+					d.close() onerror recover none
+				}
+				let c = try pop3Client()
+				let out MessageInfo[] = []
+				for let e in try c.list() {
+					continue when known.hasKey(e.uid)
+					out.push(infoOf(e, try c.top(e.number, 0)))
+				}
+				return out when out.len() > 0
+			}
+			return []
+		}
+
+		// Names the account.
+		def str() string {
+			return "mail.Client({address})"
+		}
+	}
+
+	// The first published server among `services` (`_name._tcp.domain`,
+	// RFC 6186), as `host:port`; "" when none is (a target of "." says the
+	// service is not offered).
+	internal def srvTarget(services string[], domain string) string {
+		for let name in services {
+			let records = dns.lookupSRV(name, "tcp", domain) onerror recover []
+			for let r in records {
+				let host = r.target.trimSuffix(".")
+				continue when host == ""
+				return "{host}:{r.port}"
+			}
+		}
+		return ""
+	}
+
+	// `host:port` of a server string, its URL scheme dropped.
+	internal def hostPart(server string) string {
+		let at = server.indexOf("://")
+		return server when at < 0
+		return server[at + 3:].trimSuffix("/")
+	}
+
+	// The URL scheme of a server string, "" when it has none.
+	internal def schemeOf(server string) string {
+		let at = server.indexOf("://")
+		return at < 0 ?? ("", server[:at].lower())
+	}
+
+	// The port of `host:port`, 0 when it names none.
+	internal def portOf(server string) int {
+		let a = net.parseAddress(hostPart(server)) onerror recover new net.Address()
+		return a.port
+	}
+
+	// TLS by scheme, else by port: implicit on the RFC 8314 ports and when
+	// no port is given, STARTTLS on the others.
+	internal def smtpSecurity(server string) smtp.Security {
+		let scheme = schemeOf(server)
+		return smtp.Security.Implicit when scheme == "smtps"
+		return smtp.Security.Plain when scheme == "smtp"
+		let port = portOf(server)
+		return smtp.Security.Implicit when port := 0 || 465
+		return smtp.Security.StartTls
+	}
+
+	internal def imapSecurity(server string) imap.Security {
+		let scheme = schemeOf(server)
+		return imap.Security.Implicit when scheme == "imaps"
+		return imap.Security.Plain when scheme == "imap"
+		let port = portOf(server)
+		return imap.Security.Implicit when port := 0 || 993
+		return imap.Security.StartTls
+	}
+
+	internal def pop3Security(server string) pop3.Security {
+		let scheme = schemeOf(server)
+		return pop3.Security.Implicit when scheme == "pop3s"
+		return pop3.Security.Plain when scheme == "pop3"
+		let port = portOf(server)
+		return pop3.Security.Implicit when port := 0 || 995
+		return pop3.Security.StartTls
+	}
+
+	// A listing entry from an IMAP summary.
+	internal def infoOf(s imap.Summary) MessageInfo {
+		return MessageInfo{id: s.uid.str(), subject: s.subject, from: s.from.len() > 0 ?? (s.from[0], ""), date: s.date, size: s.size, seen: s.flags.includes(imap.Flag.Seen.value)}
+	}
+
+	// A listing entry from a POP3 entry and the message's header.
+	internal def infoOf(e pop3.Entry, head Message) MessageInfo {
+		let authors = head.from() onerror recover []
+		let date = dateOf(head) onerror recover none
+		return MessageInfo{id: e.uid, subject: head.subject(), from: authors.len() > 0 ?? (authors[0].str(), ""), date: date, size: e.size, seen: false}
+	}
+
+	internal def dateOf(head Message) !?Time {
+		return try head.date()
 	}
 }

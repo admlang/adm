@@ -1,0 +1,438 @@
+internal partial module std.net.sftp.proto {
+	use (
+		std.net
+		std.net.sftp::(SftpError)
+		std.net.ssh
+		std.net.sshwire::*
+		std.time
+	)
+
+	// Conn is one SFTP session over an SSH channel: requests go out with
+	// ids, a reader task hands each reply to the request waiting for it.
+	type Conn {
+		channel        ssh.Channel
+		lines          net.LineReader
+		timeout        duration
+		inFlight       int                 = 64
+		version        int                 = 0
+		extensions     map<string, string>
+		readSize       int                 = 32768
+		writeSize      int                 = 32768
+		atomic nextId  int                 = 1
+		atomic waiting map<int, Pending>
+		atomic failure ?error              = none
+
+		def new(channel ssh.Channel, timeout duration) {
+			self.channel = channel
+			self.timeout = timeout
+			lines = new net.LineReader(channel, 1)
+		}
+
+		// Sends INIT, reads VERSION and the server's limits, then starts
+		// the reader task. Fails when the server does not answer SFTP.
+		def start() !none {
+			try channel.write(frame(new Writer(fxpInit).putUint32(3).bytes()))
+			let reply = try readFrame(lines)
+			fail protocolFailure("expected VERSION") when reply.len() == 0 || int(reply[0]) != fxpVersion
+			let r = new Reader(reply[1:])
+			version = int(try r.readUint32())
+			for !r.done() {
+				let name = try r.readText()
+				let value = try r.readText()
+				extensions[name] = value
+			}
+			try readLimits() when extensions.hasKey("limits@openssh.com")
+			let task = async readLoop(lines)
+			task.keepAlive()
+			return none
+		}
+
+		def has(extension string) bool {
+			return extensions.hasKey(extension)
+		}
+
+		// Sends a request and returns its id. Fails when the connection
+		// is gone.
+		def send(kind int, body byte[]) !int {
+			let err = failure
+			fail err unless err is none
+			let id = register()
+			let packet = new Writer(kind).putUint32(int64(id)).putRaw(body).bytes()
+			try channel.write(frame(packet))
+			return id
+		}
+
+		// Waits for the reply to request `id`. Fails when the connection
+		// breaks or the reply takes longer than `timeout`.
+		def waitFor(id int) !byte[] {
+			let slot = slotOf(id)
+			fail protocolFailure("no request {id}") when slot is none
+			let deadline = time.now() + timeout
+			for {
+				let reply = slot.reply
+				if !(reply is none) {
+					forget(id)
+					return reply
+				}
+				let err = failure
+				if !(err is none) {
+					forget(id)
+					fail err
+				}
+				let left = deadline - time.now()
+				if left <= 0s {
+					forget(id)
+					fail SftpError{message: "sftp: no reply within {timeout}", code: "timeout"}
+				}
+				let sleep = time.sleepChan(left)
+				select {
+					case slot.signal:
+						slot.signal.flush()
+					case sleep:
+				}
+			}
+			fail "unreachable"
+		}
+
+		def call(kind int, body byte[], op string) !byte[] {
+			return try waitFor(try send(kind, body))
+		}
+
+		atomic def register() int {
+			let id = nextId
+			nextId++
+			waiting[id] = new Pending()
+			return id
+		}
+
+		atomic def slotOf(id int) ?Pending {
+			return waiting.get(id)
+		}
+
+		atomic def forget(id int) {
+			waiting.delete(id)
+		}
+
+		// Reads replies and hands each to its waiting request.
+		def readLoop(reader net.LineReader) {
+			for {
+				let packet = readFrame(reader) onerror (err error) {
+					failure = err
+					recover byte[]
+				}
+				break unless failure is none
+				continue when packet.len() < 5
+				let id = int(uint32At(packet, 1))
+				let slot = slotOf(id)
+				if !(slot is none) {
+					slot.reply = packet
+					slot.signal <- none when slot.signal.len() == 0
+				}
+			}
+			for let (_, slot) in allSlots() {
+				slot.signal <- none when slot.signal.len() == 0
+			}
+		}
+
+		atomic def allSlots() map<int, Pending> {
+			return waiting
+		}
+
+		def readLimits() !none {
+			// Before the reader task runs: ask and read the reply directly.
+			try channel.write(frame(new Writer(fxpExtended).putUint32(0).putText("limits@openssh.com").bytes()))
+			let reply = try readFrame(lines)
+			return none unless int(reply[0]) == fxpExtendedReply
+			let r = new Reader(reply[5:])
+			try r.readUint64()
+			let maxRead = int(try r.readUint64())
+			let maxWrite = int(try r.readUint64())
+			readSize = maxRead when maxRead > 0 && maxRead < 262144
+			writeSize = maxWrite when maxWrite > 0 && maxWrite < 262144
+			return none
+		}
+
+		def openHandle(path string, flags int, op string) !byte[] {
+			let body = putAttrs(new Writer().putText(path).putUint32(int64(flags)), Attrs{}).bytes()
+			return try handleOf(try call(fxpOpen, body, op), op)
+		}
+
+		def closeHandle(handle byte[]) {
+			call(fxpClose, new Writer().putString(handle).bytes(), "close") onerror recover byte[]
+		}
+
+		def simple(kind int, body byte[], op string) !none {
+			return try expectOk(try call(kind, body, op), op)
+		}
+
+		def extended(name string, body byte[], op string) !none {
+			return try expectOk(try call(fxpExtended, new Writer().putText(name).putRaw(body).bytes(), op), op)
+		}
+
+		// Ends the session. Never fails.
+		def close() {
+			channel.close() onerror recover none
+		}
+	}
+
+	// The reply slot of one request.
+	type Pending {
+		reply  ?byte[]       = none
+		signal channel<none>
+
+		def new() {
+			signal = new channel<none>(1)
+		}
+	}
+
+	// FileReader reads a remote file with requests kept in flight ahead
+	// of the reader.
+	type FileReader {
+		conn     ?Conn
+		handle   byte[]
+		offset   int64
+		ahead    int[]   = []
+		aheadAt  int64[] = []
+		sentUpTo int64
+		pending  byte[]  = []
+		atEnd    bool    = false
+		closed   bool    = false
+
+		def new(conn Conn, handle byte[], offset int64) {
+			self.conn = conn
+			self.handle = handle
+			self.offset = offset
+			sentUpTo = offset
+		}
+
+		// Implements io.Reader: 0 at the end of the file. Fails with
+		// SftpError when a read fails.
+		def read(buf byte[]) !int {
+			for pending.len() == 0 {
+				return 0 when atEnd || closed
+				try fill()
+			}
+			let n = pending.len() < buf.len() ?? (pending.len(), buf.len())
+			pending[:n].copy(buf)
+			pending = pending[n:].clone()
+			return n
+		}
+
+		def fill() !none {
+			let c = conn
+			fail SftpError{message: "sftp: client closed", code: "closed"} when c is none
+			for ahead.len() < c.inFlight && !atEnd {
+				let body = new Writer().putString(handle).putUint64(uint64(sentUpTo)).putUint32(int64(c.readSize)).bytes()
+				ahead.push(try c.send(fxpRead, body))
+				aheadAt.push(sentUpTo)
+				sentUpTo += int64(c.readSize)
+			}
+			let id = ahead.shift()
+			let at = aheadAt.shift()
+			let reply = try c.waitFor(id)
+			if int(reply[0]) == fxpStatus {
+				let status = statusOf(reply, "read")
+				if status is none {
+					atEnd = true
+					try drain(c)
+					return none
+				}
+				fail status
+			}
+			fail protocolFailure("expected DATA") when int(reply[0]) != fxpData
+			let data = try new Reader(reply[5:]).readString()
+			fail protocolFailure("read out of order") when at != offset
+			offset += int64(data.len())
+			pending = data
+			if data.len() < c.readSize {
+				// A short read: ask again from where it stopped, dropping the
+				// requests already sent past it.
+				try drain(c)
+				sentUpTo = offset
+			}
+			return none
+		}
+
+		// Collects the replies of requests still in flight.
+		def drain(c Conn) !none {
+			for ahead.len() > 0 {
+				c.waitFor(ahead.shift()) onerror recover byte[]
+				aheadAt.shift()
+			}
+			return none
+		}
+
+		// Implements io.Closer. Never fails.
+		def close() !none {
+			return none when closed
+			closed = true
+			let c = conn
+			if !(c is none) {
+				drain(c) onerror recover none
+				c.closeHandle(handle)
+			}
+			return none
+		}
+	}
+
+	// FileWriter writes a remote file with writes kept in flight; their
+	// statuses are checked as they come back and at `close`.
+	type FileWriter {
+		conn   ?Conn
+		handle byte[]
+		offset int64
+		ahead  int[]  = []
+		closed bool   = false
+
+		def new(conn Conn, handle byte[], offset int64) {
+			self.conn = conn
+			self.handle = handle
+			self.offset = offset
+		}
+
+		// Implements io.Writer. Fails with SftpError when an earlier write
+		// was refused or the connection breaks.
+		def write(data byte[]) !int {
+			let c = conn
+			fail SftpError{message: "sftp: client closed", code: "closed"} when c is none
+			fail SftpError{message: "sftp: writer is closed", code: "closed"} when closed
+			let off = 0
+			for off < data.len() {
+				let n = data.len() - off
+				n = c.writeSize when n > c.writeSize
+				if ahead.len() >= c.inFlight {
+					try expectOk(try c.waitFor(ahead.shift()), "write")
+				}
+				let body = new Writer().putString(handle).putUint64(uint64(offset)).putString(data[off:off + n]).bytes()
+				ahead.push(try c.send(fxpWrite, body))
+				offset += int64(n)
+				off += n
+			}
+			return data.len()
+		}
+
+		// Implements io.Closer: waits for every write, then closes the
+		// file. Fails with SftpError when a write or the close was
+		// refused.
+		def close() !none {
+			return none when closed
+			closed = true
+			let c = conn
+			return none when c is none
+			let failed ?error = none
+			for ahead.len() > 0 {
+				let reply = c.waitFor(ahead.shift()) onerror (err error) {
+					failed = err unless !(failed is none)
+					recover byte[]
+				}
+				continue when reply.len() == 0
+				expectOk(reply, "write") onerror (err error) {
+					failed = err unless !(failed is none)
+					recover none
+				}
+			}
+			let reply = c.call(fxpClose, new Writer().putString(handle).bytes(), "close") onerror (err error) {
+				failed = err unless !(failed is none)
+				recover byte[]
+			}
+			if reply.len() > 0 {
+				expectOk(reply, "close") onerror (err error) {
+					failed = err unless !(failed is none)
+					recover none
+				}
+			}
+			fail failed unless failed is none
+			return none
+		}
+	}
+
+	// A packet with its length in front.
+	def frame(packet byte[]) byte[] {
+		return new Writer().putString(packet).bytes()
+	}
+
+	// The next packet, without its length.
+	def readFrame(reader net.LineReader) !byte[] {
+		let length = uint32At(try reader.readBytes(4, 0s), 0)
+		fail protocolFailure("packet of {length} bytes") when length == 0 || length > 1048576
+		return try reader.readBytes(int(length), 0s)
+	}
+
+	def protocolFailure(text string) error {
+		return SftpError{message: "sftp: " + text, code: "protocol"}
+	}
+
+	def unsupported(name string) error {
+		return SftpError{message: "sftp: the server does not offer {name}", code: "unsupported", status: fxOpUnsupported}
+	}
+
+	// The error a STATUS reply carries; none for OK and EOF.
+	def statusOf(reply byte[], op string) ?error {
+		let r = new Reader(reply[5:])
+		let code = int(r.readUint32() onerror recover int64(fxFailure))
+		return none when code == fxOk || code == fxEof
+		let message = r.readText() onerror recover ""
+		return statusError(code, message, op)
+	}
+
+	// Fails when the reply is a STATUS other than OK.
+	def failOnStatus(reply byte[], op string) !none {
+		return none unless int(reply[0]) == fxpStatus
+		let r = new Reader(reply[5:])
+		let code = int(try r.readUint32())
+		return none when code == fxOk
+		let message = r.readText() onerror recover ""
+		fail statusError(code, message, op)
+	}
+
+	// Fails unless the reply is STATUS OK.
+	def expectOk(reply byte[], op string) !none {
+		fail protocolFailure("expected STATUS for {op}") when int(reply[0]) != fxpStatus
+		return try failOnStatus(reply, op)
+	}
+
+	def handleOf(reply byte[], op string) !byte[] {
+		try failOnStatus(reply, op)
+		fail protocolFailure("expected HANDLE for {op}") when int(reply[0]) != fxpHandle
+		return try new Reader(reply[5:]).readString()
+	}
+
+	// The single name of a NAME reply (REALPATH, READLINK).
+	def nameOf(reply byte[], op string) !string {
+		try failOnStatus(reply, op)
+		fail protocolFailure("expected NAME for {op}") when int(reply[0]) != fxpName
+		let r = new Reader(reply[5:])
+		fail protocolFailure("empty NAME for {op}") when (try r.readUint32()) < 1
+		return try r.readText()
+	}
+
+	def putAttrs(w Writer, a Attrs) Writer {
+		writeAttrs(w, a)
+		return w
+	}
+
+	def joinPath(dir string, name string) string {
+		return name when dir := "." || ""
+		return dir.endsWith("/") ?? (dir + name, dir + "/" + name)
+	}
+
+	def baseName(path string) string {
+		let parts = path.split("/").filter(p => p != "")
+		return parts.len() == 0 ?? (path, parts[parts.len() - 1])
+	}
+
+	def joinChunks(chunks byte[][]) byte[] {
+		let total = 0
+		for let c in chunks {
+			total += c.len()
+		}
+		let out byte[] = []
+		out.len(total)
+		let at = 0
+		for let c in chunks {
+			c.copy(out[at:])
+			at += c.len()
+		}
+		return out
+	}
+}

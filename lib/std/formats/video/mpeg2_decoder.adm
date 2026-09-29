@@ -1,6 +1,7 @@
 internal partial module std.formats.video.mpeg2 {
 	use (
 		std.formats.video::*
+		std.formats.video.hardware::*
 		std.formats.video.mpegvideo::*
 	)
 
@@ -65,22 +66,23 @@ internal partial module std.formats.video.mpeg2 {
 		chromaInter    int[]
 
 		// Picture header and coding extension.
-		picType       int
-		fullPel       bool[]
+		picType          int
+		fullPel          bool[]
 		// [direction * 2 + component]
-		fCode         int[]
-		dcPrecision   int
-		structure     int
-		topFirst      bool
-		frameDct      bool
-		concealment   bool
-		qScaleType    bool
-		intraVlc      bool
-		alternateScan bool
-		repeatFirst   bool
-		closedGop     bool
-		headerTime    duration
-		headerTimed   bool
+		fCode            int[]
+		dcPrecision      int
+		structure        int
+		topFirst         bool
+		frameDct         bool
+		concealment      bool
+		qScaleType       bool
+		intraVlc         bool
+		alternateScan    bool
+		repeatFirst      bool
+		progressiveFrame bool
+		closedGop        bool
+		headerTime       duration
+		headerTimed      bool
 
 		// Pictures.
 		cur         MpegPicture
@@ -115,6 +117,16 @@ internal partial module std.formats.video.mpeg2 {
 		block       int[]
 		scan        int[]
 
+		// The GPU decoding, when it takes the stream.
+		hw          Mpeg2Hardware
+		// Set after the GPU gave up mid-stream: pictures wait for the next
+		// I picture, as the references were on the GPU.
+		waitIntra   bool
+		// The track's size, for saying before the first picture whether
+		// the GPU would decode it.
+		trackWidth  int
+		trackHeight int
+
 		def new() {
 			t = new Mpeg2Tables()
 			bits = new MpegBits()
@@ -138,6 +150,7 @@ internal partial module std.formats.video.mpeg2 {
 			bwd = cur
 			held = cur
 			structure = framePicture
+			hw = new Mpeg2Hardware()
 			defaultMatrices()
 		}
 
@@ -255,7 +268,7 @@ internal partial module std.formats.video.mpeg2 {
 			let code = int(pending[at + 3])
 			bits.reset(pending, at + 4, end)
 			if code >= 0x01 && code <= 0xAF {
-				slice(code)
+				slice(code, at, end)
 			} else if code == 0x00 {
 				completeField()
 				pictureHeader(at)
@@ -385,6 +398,8 @@ internal partial module std.formats.video.mpeg2 {
 				intraVlc = bits.flag()
 				alternateScan = bits.flag()
 				repeatFirst = bits.flag()
+				bits.skip(1)
+				progressiveFrame = bits.flag()
 				scan = alternateScan ?? (mpegAlternateVertical, mpegZigzag)
 			}
 		}
@@ -415,6 +430,7 @@ internal partial module std.formats.video.mpeg2 {
 			intraVlc = false
 			alternateScan = false
 			repeatFirst = false
+			progressiveFrame = true
 			scan = mpegZigzag
 			// The timestamp of the last packet that began at or before this
 			// picture; it is used up.
@@ -443,6 +459,7 @@ internal partial module std.formats.video.mpeg2 {
 					fwd = grey()
 					hasFwd = true
 				}
+				hw.describe(self, true) when cur.surface >= 0 && hw.gpu.active()
 				return
 			}
 			firstField = structure != framePicture
@@ -456,13 +473,30 @@ internal partial module std.formats.video.mpeg2 {
 			curType = picType
 			// D pictures and invalid types are not decoded.
 			skipPicture = picType < picI || picType > picB
+			skipPicture = true when waitIntra && picType != picI
+			waitIntra = false when !skipPicture
+			// A GPU session opens only where no reference decoded before is
+			// needed.
+			hwConfigure() when !skipPicture && !hasBwd && picType == picI
 			if picType == picB {
 				skipPicture = true when !hasFwd && !closedGop
 			} else if hasBwd {
 				fwd = bwd
 				hasFwd = true
 			}
-			let p = new MpegPicture(mbWidth * 16, mbHeight * 16, chromaFormat)
+			let onGpu = hw.gpu.active() && !skipPicture
+			let p = new MpegPicture(mbWidth * 16, mbHeight * 16, chromaFormat, !onGpu)
+			if onGpu {
+				let busy int[]
+				busy.push(fwd.surface) when hasFwd
+				busy.push(bwd.surface) when hasBwd
+				busy.push(held.surface) when hasHeld
+				p.surface = hw.gpu.freeSurface(busy)
+				if p.surface < 0 {
+					hwAbandon("mpeg2: every GPU picture buffer is in use")
+					skipPicture = true
+				}
+			}
 			p.width = width
 			p.height = height
 			p.keyframe = picType == picI
@@ -479,6 +513,60 @@ internal partial module std.formats.video.mpeg2 {
 				fwd = grey()
 				hasFwd = true
 			}
+			hw.describe(self, false) when p.surface >= 0
+		}
+
+		// Opens a GPU session for the stream's pictures unless one fits;
+		// the stream decodes in software when no GPU takes it.
+		def hwConfigure() {
+			let codec = mpeg2 ?? (hwCodecMpeg2, hwCodecMpeg1)
+			let w = mbWidth * 16
+			let h = mbHeight * 16
+			return when hw.gpu.fits(codec, w, h) || hw.gpu.disabled
+			hw.gpu.close()
+			if chromaFormat != 1 {
+				hw.gpu.why = "the stream is not 4:2:0"
+				return
+			}
+			// The pictures in flight: two references, the picture held for
+			// display and the one decoding.
+			hw.gpu.open(codec, 0, w, h, 4)
+		}
+
+		// Gives up the GPU after `reason`: the stream goes on in software
+		// from its next I picture, and the pictures the GPU held are not
+		// shown.
+		def hwAbandon(reason string) {
+			hw.gpu.abandon(reason)
+			hasFwd = false
+			hasBwd = false
+			hasHeld = false
+			waitIntra = true
+		}
+
+		// Hands the field or frame gathered for the GPU over.
+		def hwSubmit() {
+			return unless hw.gpu.active() && hw.slices > 0
+			hw.submit() onerror (err error) {
+				hwAbandon("{err}")
+				recover none
+			}
+		}
+
+		// What the GPU does with the pictures: see `Mpeg2.hardware`.
+		def hardware() VideoHardware {
+			let codec = mpeg2 ?? (hwCodecMpeg2, hwCodecMpeg1)
+			let open = hw.gpu.session
+			return VideoHardware{decoding: true, encoding: false, name: hwName(open.backend), device: open.device, reason: ""} unless open is none
+			return VideoHardware{decoding: false, encoding: false, name: "", device: "", reason: hw.gpu.why} when hw.gpu.disabled || hasBwd
+			// Nothing decoded yet: what the sequence header or the track
+			// promises.
+			let w = haveSequence ?? (mbWidth * 16, (trackWidth + 15) & ~15)
+			let h = haveSequence ?? (mbHeight * 16, (trackHeight + 15) & ~15)
+			return VideoHardware{decoding: false, encoding: false, name: "", device: "", reason: "the stream is not 4:2:0"} when haveSequence && chromaFormat != 1
+			let choice = hwProbe(haveSequence ?? (codec, hwCodecMpeg2), 0, 1, 8, w, h)
+			return VideoHardware{decoding: false, encoding: false, name: "", device: "", reason: hwLastError()} when choice is none
+			return VideoHardware{decoding: true, encoding: false, name: choice.name, device: choice.device, reason: ""}
 		}
 
 		// A mid-grey picture standing in for a missing reference.
@@ -509,6 +597,7 @@ internal partial module std.formats.video.mpeg2 {
 		def completeField() {
 			return unless started
 			started = false
+			hwSubmit()
 			return when firstField
 			finishFrame()
 		}
@@ -517,6 +606,7 @@ internal partial module std.formats.video.mpeg2 {
 		def completePicture() {
 			return unless started
 			started = false
+			hwSubmit()
 			finishFrame()
 		}
 
@@ -539,11 +629,39 @@ internal partial module std.formats.video.mpeg2 {
 		def emit(p MpegPicture, copy bool) {
 			p.time = nextTime unless p.timed
 			nextTime = p.time + p.length
-			out.push(p.frame(matrix, copy))
+			if p.surface < 0 {
+				out.push(p.frame(matrix, copy))
+				return
+			}
+			// Decoded on the GPU: the planes come back cropped to even
+			// sizes, or the frame keeps the picture there.
+			return unless hw.gpu.active()
+			let w = (p.width + 1) & ~1
+			let h = (p.height + 1) & ~1
+			let frame = p.frame(matrix, false)
+			frame.yStride = w
+			frame.uvStride = w >> 1
+			if hw.gpu.gpuOutput {
+				let kept = hw.gpu.keep(p.surface, 0, 0, w, h)
+				return when kept is none
+				frame.gpu = new GpuPicture(kept)
+				frame.onGpu = true
+			} else {
+				let planes = hw.gpu.download(p.surface, 0, 0, w, h) onerror (err error) {
+					hwAbandon("{err}")
+					return
+				}
+				let (y, u, v) = planes
+				frame.y = y
+				frame.u = u
+				frame.v = v
+			}
+			out.push(frame)
 		}
 
-		// Decodes one slice of the current picture.
-		def slice(code int) {
+		// Decodes one slice of the current picture, `pending[at:end]` from its
+		// start code.
+		def slice(code int, at int, end int) {
 			return unless haveSequence
 			beginPicture() unless started
 			return when skipPicture
@@ -552,12 +670,23 @@ internal partial module std.formats.video.mpeg2 {
 			let mbY = code - 1
 			mbY += bits.read(3) << 7 when height > 2800
 			return when mbY >= rows
-			qscale = quantiserScale(bits.read(5))
-			if bits.flag() {
+			let qCode = bits.read(5)
+			qscale = quantiserScale(qCode)
+			let intraSlice = bits.flag()
+			if intraSlice {
 				bits.skip(8)
 				for bits.flag() {
 					bits.skip(8)
 				}
+			}
+			if cur.surface >= 0 {
+				// The GPU decodes the macroblocks; the first one's column comes
+				// from its address increment.
+				let mbBits = bits.pos - at * 8
+				let inc = readIncrement()
+				return when inc <= 0 || inc > mbWidth
+				hw.add(pending, at, end, mbBits, inc - 1, mbY, qCode, intraSlice)
+				return
 			}
 			for let i = 0; i < 3; i++ {
 				dcPred[i] = 128 << dcPrecision

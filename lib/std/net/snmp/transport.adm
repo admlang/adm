@@ -1,0 +1,170 @@
+partial module std.net.snmp {
+	use (
+		std.crypto.hash::(Hash, digest)
+		std.crypto.x509
+		std.net
+		std.net.tls
+		std.services::(Policy)
+	)
+
+	// Transport is how SNMP messages travel: UDP datagrams (RFC 3417),
+	// a TCP stream of messages (RFC 3430), or TLS over TCP, where the
+	// Transport Security Model (RFC 6353) takes the peer's certificate as
+	// its identity.
+	enum Transport {
+		Udp = "udp",
+		Tcp = "tcp",
+		Tls = "tls",
+	}
+
+	// Where a message came from, as the security models see it: over
+	// TLS, the security name the manager's certificate maps to.
+	internal struct Peer {
+		address net.Address
+		secured bool        = false
+		tlsName string      = ""
+	}
+
+	// The largest message taken off a stream.
+	internal const maxStreamMessage = 1048576
+
+	// Reads one message off a stream: a BER SEQUENCE, its own length
+	// giving the frame (RFC 3430 §2.1). Fails when the stream ends or
+	// holds something else.
+	internal def readFrame(lines net.LineReader, wait duration) !byte[] {
+		let head = try lines.readBytes(2, wait)
+		fail SnmpError{message: "snmp: stream message is not a SEQUENCE", code: "protocol"} when head[0] != byte(0x30)
+		let first = int(head[1])
+		if first < 0x80 {
+			return head + try lines.readBytes(first, wait)
+		}
+		let count = first & 0x7f
+		fail SnmpError{message: "snmp: bad length in a stream message", code: "protocol"} when count == 0 || count > 4
+		let lenBytes = try lines.readBytes(count, wait)
+		let size = 0
+		for let b in lenBytes {
+			size = (size << 8) | int(b)
+		}
+		fail SnmpError{message: "snmp: stream message of {size} bytes", code: "protocol"} when size > maxStreamMessage
+		return head + lenBytes + try lines.readBytes(size, wait)
+	}
+
+	// The SHA-256 fingerprint of a certificate in lower-case hex, as
+	// `certificateNames` keys it.
+	def certificateFingerprint(der byte[]) string {
+		return digest(Hash.SHA256, der).hex().lower()
+	}
+
+	// The security name a TLS peer's certificate maps to (RFC 6353
+	// certToTSN): its fingerprint in `names`, else what `mapper` says;
+	// "" when neither knows it or there is no certificate.
+	internal def tlsSecurityName(conn tls.Conn, names map<string, string>, mapper ?def (x509.Certificate) ?string) string {
+		let peers = conn.connectionState().peerCertificates
+		return "" when peers.len() == 0
+		let leaf = peers[0]
+		for let (print, name) in names {
+			return name when print.replace(":", "").lower() == certificateFingerprint(leaf.raw)
+		}
+		return "" when mapper is none
+		let named = mapper(leaf)
+		return named is none ?? ("", named)
+	}
+
+	// A listener on `addr` for a stream transport, once the policy allows
+	// listening on `scheme://addr`.
+	internal def listenStream(scheme string, addr string, backlog int) !net.Listener {
+		try Policy.validate("adm.network.listen", "std.services.EndpointSpec", scheme + "://" + addr)
+		let a = net.parseAddress(addr) onerror recover new net.Address()
+		let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+		sock.setReuseAddr(true) onerror recover none
+		try sock.bind(addr)
+		return try sock.listen(backlog)
+	}
+
+	// Splits `tcp://host:port`, `tls://host`, `udp://host` or a bare
+	// address into the transport and `host:port`, with the transport's
+	// default port (`port` for UDP and TCP, `tlsPort` for TLS).
+	internal def transportTarget(addr string, port int, tlsPort int) (Transport, string) {
+		let lower = addr.lower()
+		return (Transport.Tcp, net.withPort(addr[6:], port)) when lower.startsWith("tcp://")
+		return (Transport.Tls, net.withPort(addr[6:], tlsPort)) when lower.startsWith("tls://")
+		return (Transport.Udp, net.withPort(addr[6:], port)) when lower.startsWith("udp://")
+		return (Transport.Udp, net.withPort(addr, port))
+	}
+
+	// Writes all of `data`; returns true once it is out. Fails when the
+	// stream does.
+	internal def writeFully(stream net.Stream, data byte[], wait duration) !bool {
+		let off = 0
+		for off < data.len() {
+			let n = try stream.write(data[off:], wait)
+			return false when n <= 0
+			off += n
+		}
+		return true
+	}
+
+	// The client side of TLS over a connection to `target`, handshake
+	// done: `config` (none for the defaults) checking the host name.
+	internal def clientTls(conn net.Connection, config ?tls.Config, target string, wait duration) !tls.Conn {
+		let base = config is none ?? (tls.Config{}, config)
+		let host = net.parseAddress(target) onerror recover new net.Address()
+		let settings = base.serverName == "" ?? (tls.withServerName(base, host.host), base)
+		let t = tls.client(conn, settings)
+		try t.handshake(wait)
+		return t
+	}
+
+	// Accepts on `ln` in the background while `open()` holds, reading the
+	// messages of each connection (after a TLS handshake when `config` is
+	// given, the peer named from its certificate) and writing back what
+	// `handle` answers, when anything. A connection ends when it closes or
+	// sits idle for five minutes.
+	internal def startStreams(ln net.Listener, config ?tls.Config, names map<string, string>, mapper ?def (x509.Certificate) ?string, open def () bool, handle def (byte[], Peer) byte[]) {
+		let task = async acceptStreams(ln, config, names, mapper, open, handle)
+		task.keepAlive()
+	}
+
+	internal def acceptStreams(ln net.Listener, config ?tls.Config, names map<string, string>, mapper ?def (x509.Certificate) ?string, open def () bool, handle def (byte[], Peer) byte[]) {
+		for open() {
+			let conn = acceptOne(ln) onerror recover none
+			break when conn is none
+			let task = async serveStream(conn, config, names, mapper, open, handle)
+			task.keepAlive()
+		}
+	}
+
+	internal def acceptOne(ln net.Listener) !?net.Connection {
+		return try ln.accept()
+	}
+
+	internal def serveStream(conn net.Connection, config ?tls.Config, names map<string, string>, mapper ?def (x509.Certificate) ?string, open def () bool, handle def (byte[], Peer) byte[]) {
+		let peer = Peer{address: conn.remoteAddr(), secured: !(config is none)}
+		let stream net.Stream = conn
+		if !(config is none) {
+			let t = tls.server(conn, config)
+			let ok = true
+			t.handshake(10s) onerror (err error) {
+				ok = false
+				recover none
+			}
+			if !ok {
+				conn.close() onerror recover none
+				return
+			}
+			peer.tlsName = tlsSecurityName(t, names, mapper)
+			stream = t
+		}
+		let lines = new net.LineReader(stream, 1)
+		for open() {
+			let data = readFrame(lines, 300s) onerror recover byte[]
+			break when data.len() == 0
+			let reply = handle(data, peer)
+			if reply.len() > 0 {
+				let sent = writeFully(stream, reply, 10s) onerror recover false
+				break unless sent
+			}
+		}
+		stream.close() onerror recover none
+	}
+}

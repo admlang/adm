@@ -1,0 +1,368 @@
+internal partial module std.net.mqtt.proto {
+	use (
+		std.net
+		std.net.mqtt::(Message, MqttError)
+		std.time
+	)
+
+	// The client side of one connection: CONNECT, a reader task that
+	// acknowledges what arrives and hands answers to the requests waiting
+	// for them, keep-alive pings, and the in-flight window.
+
+	// The replies to one packet identifier.
+	type Waiter {
+		replies Packet[]      = []
+		signal  channel<none>
+
+		def new() {
+			signal = new channel<none>(1)
+		}
+
+		atomic def put(p Packet) {
+			replies.push(p)
+			signal <- none when signal.len() == 0
+		}
+
+		atomic def take() ?Packet {
+			return none when replies.len() == 0
+			return replies.shift()
+		}
+	}
+
+	type Conn {
+		stream             net.Stream
+		lines              net.LineReader
+		version            int
+		timeout            duration
+		onMessage          ?def (Message)   = none
+		sessionPresent     bool             = false
+		assignedClientId   string           = ""
+		maxQoS             int              = 2
+		retainAvailable    bool             = true
+		maxPacketSize      int              = 0
+		receiveMaximum     int              = 65535
+		keepAliveSeconds   int              = 60
+		atomic nextId      int              = 1
+		atomic waiters     map<int, Waiter>
+		atomic inFlight    int              = 0
+		atomic unacked     map<int, Packet>
+		atomic awaitingRel map<int, bool>
+		atomic failure     ?error           = none
+		atomic lastHeard   time.Time
+		internal slot      channel<none>
+
+		def new(stream net.Stream, version int, timeout duration) {
+			self.stream = stream
+			self.version = version
+			self.timeout = timeout
+			lines = new net.LineReader(stream, 1)
+			slot = new channel<none>(1)
+			lastHeard = time.now()
+		}
+
+		def isOpen() bool {
+			return failure is none
+		}
+
+		// Sends CONNECT, reads CONNACK and starts the reader and the
+		// pinger. Fails with the broker's refusal.
+		def connect(p Packet) !none {
+			keepAliveSeconds = p.keepAlive
+			try write(encodePacket(p, version))
+			let ack = try readPacket(lines, version, 0, timeout)
+			fail protocolFailure("expected CONNACK") when ack.kind != pktConnack
+			let reason = version == 5 ?? (ack.reason, connackReason311(ack.reason))
+			if reason != 0 {
+				stream.close() onerror recover none
+				fail mqttError(reason, ack.props.reasonString)
+			}
+			sessionPresent = ack.sessionPresent
+			assignedClientId = ack.props.assignedClientId
+			maxQoS = ack.props.maximumQoS when ack.props.maximumQoS >= 0
+			retainAvailable = ack.props.retainAvailable != 0
+			maxPacketSize = int(ack.props.maximumPacketSize) when ack.props.maximumPacketSize > 0
+			receiveMaximum = ack.props.receiveMaximum when ack.props.receiveMaximum > 0
+			keepAliveSeconds = ack.props.serverKeepAlive when ack.props.serverKeepAlive >= 0
+			let reader = async readLoop()
+			reader.keepAlive()
+			if keepAliveSeconds > 0 {
+				let pinger = async pingLoop()
+				pinger.keepAlive()
+			}
+			return none
+		}
+
+		atomic def write(data byte[]) !none {
+			let err = failure
+			fail err unless err is none
+			let off = 0
+			for off < data.len() {
+				let n = try stream.write(data[off:], timeout)
+				fail protocolFailure("wrote nothing") when n <= 0
+				off += n
+			}
+			return none
+		}
+
+		def send(p Packet) !none {
+			return try write(encodePacket(p, version))
+		}
+
+		// Publishes with the lower of the message's QoS and the broker's
+		// maximum; waits for the acknowledgements QoS 1 and 2 need.
+		def publish(m Message) !none {
+			let qos = m.qos.value < maxQoS ?? (m.qos.value, maxQoS)
+			fail mqttError(0x9A, "the broker keeps no retained messages") when m.retain && !retainAvailable
+			return try send(publishOf(m, 0, 0)) when qos == 0
+			try enterFlight()
+			let id = register()
+			let p = publishOf(m, qos, id)
+			keep(id, p)
+			let failed ?error = none
+			exchange(id, p, qos) onerror (err error) {
+				failed = err
+				recover none
+			}
+			leaveFlight()
+			fail failed unless failed is none
+			return none
+		}
+
+		internal def exchange(id int, p Packet, qos int) !none {
+			try send(p)
+			let first = try awaitReply(id)
+			if qos == 1 {
+				fail protocolFailure("expected PUBACK") when first.kind != pktPuback
+				drop(id)
+				fail mqttError(first.reason, first.props.reasonString) when first.reason >= 0x80
+				return none
+			}
+			fail protocolFailure("expected PUBREC") when first.kind != pktPubrec
+			if first.reason >= 0x80 {
+				drop(id)
+				fail mqttError(first.reason, first.props.reasonString)
+			}
+			keep(id, Packet{kind: pktPubrel, packetId: id})
+			try send(Packet{kind: pktPubrel, packetId: id})
+			let done = try awaitReply(id)
+			fail protocolFailure("expected PUBCOMP") when done.kind != pktPubcomp
+			drop(id)
+			return none
+		}
+
+		// Waits for a free slot in the broker's receive window.
+		internal def enterFlight() !none {
+			let deadline = time.now() + timeout
+			for !tryEnter() {
+				let err = failure
+				fail err unless err is none
+				let left = deadline - time.now()
+				fail MqttError{message: "mqtt: the broker's receive window stayed full", code: "timeout"} when left <= 0s
+				let sleep = time.sleepChan(left)
+				select {
+					case slot:
+						slot.flush()
+					case sleep:
+				}
+			}
+			return none
+		}
+
+		internal atomic def tryEnter() bool {
+			return false when inFlight >= receiveMaximum
+			inFlight++
+			return true
+		}
+
+		internal def leaveFlight() {
+			release()
+			slot <- none when slot.len() == 0
+		}
+
+		internal atomic def release() {
+			inFlight--
+		}
+
+		def subscribe(subs Subscription[]) !int[] {
+			let id = register()
+			try send(Packet{kind: pktSubscribe, packetId: id, subscriptions: subs})
+			let ack = try awaitReply(id)
+			forget(id)
+			fail protocolFailure("expected SUBACK") when ack.kind != pktSuback
+			for let r in ack.reasons {
+				fail mqttError(r, ack.props.reasonString) when r >= 0x80
+			}
+			return ack.reasons
+		}
+
+		def unsubscribe(filters string[]) !none {
+			let id = register()
+			try send(Packet{kind: pktUnsubscribe, packetId: id, filters: filters})
+			let ack = try awaitReply(id)
+			forget(id)
+			fail protocolFailure("expected UNSUBACK") when ack.kind != pktUnsuback
+			return none
+		}
+
+		// Sends DISCONNECT and closes. Never fails.
+		def disconnect() {
+			send(Packet{kind: pktDisconnect}) onerror recover none
+			failure = MqttError{message: "mqtt: disconnected", code: "closed"} when failure is none
+			stream.close() onerror recover none
+			wakeAll()
+		}
+
+		// The publishes and releases still waiting for their
+		// acknowledgement, for a new connection to send again.
+		atomic def unacknowledged() Packet[] {
+			let out Packet[] = []
+			for let (_, p) in unacked {
+				out.push(p)
+			}
+			return out
+		}
+
+		// Sends again what a dropped connection left unacknowledged: PUBLISH
+		// with the DUP flag, PUBREL as it was. Never fails.
+		def resend(packets Packet[]) {
+			for let p in packets {
+				let again = p
+				again.duplicate = p.kind == pktPublish
+				send(again) onerror recover none
+			}
+		}
+
+		// ---- identifiers ----
+
+		internal atomic def register() int {
+			for {
+				let id = nextId
+				nextId = nextId == 65535 ?? (1, nextId + 1)
+				if !waiters.hasKey(id) {
+					waiters[id] = new Waiter()
+					return id
+				}
+			}
+			return 0
+		}
+
+		internal atomic def forget(id int) {
+			waiters.delete(id)
+		}
+
+		internal atomic def keep(id int, p Packet) {
+			unacked[id] = p
+		}
+
+		internal atomic def drop(id int) {
+			unacked.delete(id)
+			waiters.delete(id)
+		}
+
+		internal atomic def waiterOf(id int) ?Waiter {
+			return waiters.get(id)
+		}
+
+		internal def awaitReply(id int) !Packet {
+			let w = waiterOf(id)
+			fail protocolFailure("no request {id}") when w is none
+			let deadline = time.now() + timeout
+			for {
+				let p = w.take()
+				return p unless p is none
+				let err = failure
+				fail err unless err is none
+				let left = deadline - time.now()
+				fail MqttError{message: "mqtt: no acknowledgement within {timeout}", code: "timeout"} when left <= 0s
+				let sleep = time.sleepChan(left)
+				select {
+					case w.signal:
+						w.signal.flush()
+					case sleep:
+				}
+			}
+			fail "unreachable"
+		}
+
+		internal atomic def wakeAll() {
+			for let (_, w) in waiters {
+				w.signal <- none when w.signal.len() == 0
+			}
+			slot <- none when slot.len() == 0
+		}
+
+		// ---- reading ----
+
+		internal def readLoop() {
+			for failure is none {
+				let p = readPacket(lines, version, 0, 87600h) onerror (err error) {
+					failure = err
+					recover Packet{kind: 0}
+				}
+				break unless failure is none
+				lastHeard = time.now()
+				handle(p) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			stream.close() onerror recover none
+			wakeAll()
+		}
+
+		internal def handle(p Packet) !none {
+			switch {
+				case p.kind == pktPublish:
+					if p.qos == 2 {
+						let seen = markAwaiting(p.packetId)
+						try send(Packet{kind: pktPubrec, packetId: p.packetId})
+						// A resent QoS 2 message is delivered once.
+						return none when seen
+					}
+					let handler = onMessage
+					handler(messageOf(p)) unless (handler is none)
+					try send(Packet{kind: pktPuback, packetId: p.packetId}) when p.qos == 1
+				case p.kind == pktPubrel:
+					clearAwaiting(p.packetId)
+					try send(Packet{kind: pktPubcomp, packetId: p.packetId})
+				case p.kind := pktPuback || pktPubrec || pktPubcomp || pktSuback || pktUnsuback:
+					let w = waiterOf(p.packetId)
+					w.put(p) unless w is none
+				case p.kind == pktPingresp:
+				case p.kind == pktDisconnect:
+					fail mqttError(p.reason == 0 ?? (0x80, p.reason), p.props.reasonString)
+				case p.kind == pktAuth:
+					fail mqttError(0x8C, "enhanced authentication is not supported")
+			}
+			return none
+		}
+
+		// Records an incoming QoS 2 identifier; true when it was already
+		// waiting for PUBREL (a resent PUBLISH).
+		internal atomic def markAwaiting(id int) bool {
+			let seen = awaitingRel.hasKey(id)
+			awaitingRel[id] = true
+			return seen
+		}
+
+		internal atomic def clearAwaiting(id int) {
+			awaitingRel.delete(id)
+		}
+
+		// Pings when the connection is quiet; gives up when the broker
+		// has said nothing for one and a half keep-alive periods.
+		internal def pingLoop() {
+			let period = duration(int64(keepAliveSeconds) * 1000000000)
+			for failure is none {
+				time.sleep(duration(int64(period) / 2))
+				break unless failure is none
+				send(Packet{kind: pktPingreq}) onerror recover none
+				if time.now() - lastHeard > period + duration(int64(period) / 2) {
+					failure = MqttError{message: "mqtt: the broker stopped answering", code: "keepAliveTimeout", reason: 0x8D}
+					stream.close() onerror recover none
+					wakeAll()
+				}
+			}
+		}
+	}
+}

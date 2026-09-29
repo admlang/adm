@@ -1,0 +1,647 @@
+internal partial module std.net.ssh.mux {
+	use (
+		std.net
+		std.net.ssh::(SshError)
+		std.net.ssh.transport::*
+		std.net.sshwire::*
+		std.time
+	)
+
+	// The connection protocol (RFC 4254): channels multiplexed over one
+	// transport, their flow control windows, channel and global
+	// requests. One task (`run`) reads and dispatches; the owners of
+	// channels read, write and send requests from their own tasks.
+
+	// The window a channel starts with and the largest packet taken.
+	const (
+		initialWindow = 2097152
+		maxPacketSize = 32768
+	)
+
+	// Chan is one channel.
+	type Chan {
+		weak mux        ?Mux
+		localId         int
+		remoteId        int                        = -1
+		kind            string
+		// Bytes the peer may still send.
+		localWindow     int64                      = initialWindow
+		// Bytes this end may still send, and the largest packet.
+		remoteWindow    int64                      = 0
+		remoteMaxPacket int                        = maxPacketSize
+		// Opening: set when the peer answers the open.
+		opened          bool                       = false
+		openFailure     ?error                     = none
+		// Extra data of the open confirmation (unused by the standard
+		// channel types).
+		data            byte[][]                   = []
+		errors          byte[][]                   = []
+		dataOffset      int                        = 0
+		errorsOffset    int                        = 0
+		// Bytes read since the last window adjustment.
+		consumed        int64                      = 0
+		peerEof         bool                       = false
+		peerClosed      bool                       = false
+		sentEof         bool                       = false
+		sentClose       bool                       = false
+		// Replies to this end's requests, in order.
+		replies         bool[]                     = []
+		pendingReplies  int                        = 0
+		exitStatus      int                        = -1
+		exitSignal      string                     = ""
+		exitMessage     string                     = ""
+		// Requests the peer sends on this channel that the mux does not
+		// handle itself (the server's pty-req, exec, window-change, ...):
+		// returns whether it succeeded.
+		onRequest       ?def (string, byte[]) bool = none
+		internal signal channel<none>
+
+		def new(mux Mux, localId int, kind string) {
+			self.mux = mux
+			self.localId = localId
+			self.kind = kind
+			signal = new channel<none>(1)
+		}
+
+		atomic def wake() {
+			signal <- none when signal.len() == 0
+		}
+
+		// Waits for a wake-up, up to the deadline when there is one.
+		// Fails with a `closed` error when the deadline passes.
+		def wait(deadline ?time.Time) !none {
+			if deadline is none {
+				select {
+					case signal:
+						signal.flush()
+				}
+				return none
+			}
+			let left = deadline - time.now()
+			fail sshError("timeout", "timed out") when left <= 0s
+			let sleep = time.sleepChan(left)
+			select {
+				case signal:
+					signal.flush()
+				case sleep:
+					fail sshError("timeout", "timed out") when time.now() >= deadline
+			}
+			return none
+		}
+
+		// Queues data the reader task received.
+		atomic def enqueue(chunk byte[], extended bool) {
+			if extended {
+				errors.push(chunk)
+			} else {
+				data.push(chunk)
+			}
+		}
+
+		// Copies queued bytes out of one stream; 0 when none are queued.
+		atomic def take(buf byte[], extended bool) int {
+			return 0 when buf.len() == 0
+			if extended {
+				return 0 when errors.len() == 0
+				let head = errors[0]
+				let n = head.len() - errorsOffset
+				n = buf.len() when buf.len() < n
+				head[errorsOffset:errorsOffset + n].copy(buf)
+				errorsOffset += n
+				if errorsOffset >= head.len() {
+					errors.shift()
+					errorsOffset = 0
+				}
+				return n
+			}
+			return 0 when data.len() == 0
+			let head = data[0]
+			let n = head.len() - dataOffset
+			n = buf.len() when buf.len() < n
+			head[dataOffset:dataOffset + n].copy(buf)
+			dataOffset += n
+			if dataOffset >= head.len() {
+				data.shift()
+				dataOffset = 0
+			}
+			return n
+		}
+
+		def queued(extended bool) bool {
+			return extended ?? (errors.len() > 0, data.len() > 0)
+		}
+
+		// Reads channel data (or with `extended`, stderr data); 0 once the
+		// peer sent EOF or closed and everything queued was read. Fails
+		// when the connection breaks or the wait times out.
+		def read(buf byte[], extended bool, timeout duration) !int {
+			return 0 when buf.len() == 0
+			let deadline ?time.Time = none
+			deadline = time.now() + timeout when timeout > 0s
+			for {
+				let n = take(buf, extended)
+				if n > 0 {
+					try credit(n, extended)
+					return n
+				}
+				return 0 when peerEof || peerClosed
+				let m = mux
+				fail sshError("closed", "connection is closed") when m is none
+				let err = m.failure
+				fail err unless err is none
+				try wait(deadline)
+			}
+			return 0
+		}
+
+		// Gives the peer back window for bytes read; stderr is credited
+		// as it arrives, so an unread stderr never stalls stdout.
+		internal def credit(n int, extended bool) !none {
+			return none when extended
+			let grant = addConsumed(int64(n))
+			return none when grant == 0
+			let m = mux
+			return none when m is none
+			return try m.transport.writePacket(new Writer(msgChannelWindowAdjust).putUint32(int64(remoteId)).putUint32(grant).bytes())
+		}
+
+		// Counts read bytes; returns the window to grant once half the
+		// window is used, else 0.
+		internal atomic def addConsumed(n int64) int64 {
+			consumed += n
+			return 0 when consumed < initialWindow / 2
+			let grant = consumed
+			consumed = 0
+			localWindow += grant
+			return grant
+		}
+
+		// Writes all of `buf` as channel data (or stderr data with
+		// `extended`), waiting for window. Fails when the channel or the
+		// connection closes first, or the wait times out.
+		def write(buf byte[], extended bool, timeout duration) !int {
+			let deadline ?time.Time = none
+			deadline = time.now() + timeout when timeout > 0s
+			let off = 0
+			for off < buf.len() {
+				fail sshError("closed", "channel is closed") when sentEof || sentClose || peerClosed
+				let m = mux
+				fail sshError("closed", "connection is closed") when m is none
+				let err = m.failure
+				fail err unless err is none
+				let n = reserve(buf.len() - off)
+				if n == 0 {
+					try wait(deadline)
+					continue
+				}
+				let w = new Writer(extended ?? (msgChannelExtendedData, msgChannelData)).putUint32(int64(remoteId))
+				w.putUint32(1) when extended
+				w.putString(buf[off:off + n])
+				try m.transport.writePacket(w.bytes())
+				off += n
+			}
+			return buf.len()
+		}
+
+		// Takes up to `want` bytes of the peer's window.
+		internal atomic def reserve(want int) int {
+			let n = int64(want)
+			n = remoteWindow when n > remoteWindow
+			n = int64(remoteMaxPacket - 64) when n > int64(remoteMaxPacket - 64)
+			return 0 when n <= 0
+			remoteWindow -= n
+			return int(n)
+		}
+
+		atomic def grow(n int64) {
+			remoteWindow += n
+		}
+
+		// Sends a channel request; with `wantReply`, waits for the answer
+		// and returns it. Fails when the connection breaks.
+		def request(name string, wantReply bool, payload byte[]) !bool {
+			let m = mux
+			fail sshError("closed", "connection is closed") when m is none
+			addPending() when wantReply
+			let w = new Writer(msgChannelRequest).putUint32(int64(remoteId)).putText(name).putBool(wantReply).putRaw(payload)
+			try m.transport.writePacket(w.bytes())
+			return true unless wantReply
+			for {
+				let answer = takeReply()
+				return answer == 1 when answer >= 0
+				fail sshError("closed", "channel closed before replying") when peerClosed
+				let err = m.failure
+				fail err unless err is none
+				try wait(none)
+			}
+			return false
+		}
+
+		internal atomic def addPending() {
+			pendingReplies++
+		}
+
+		// 1 or 0 for the oldest reply received, -1 when none is waiting.
+		internal atomic def takeReply() int {
+			return -1 when replies.len() == 0
+			return replies.shift() ?? (1, 0)
+		}
+
+		atomic def addReply(ok bool) {
+			replies.push(ok)
+			pendingReplies--
+		}
+
+		// Sends EOF: no more data from this end. Never fails twice.
+		def sendEof() !none {
+			return none when sentEof || sentClose
+			sentEof = true
+			let m = mux
+			return none when m is none
+			return try m.transport.writePacket(new Writer(msgChannelEof).putUint32(int64(remoteId)).bytes())
+		}
+
+		// Sends CLOSE unless it went already; the channel is gone once the
+		// peer's CLOSE arrives too. Never fails.
+		def close() {
+			return when sentClose
+			sentClose = true
+			let m = mux
+			return when m is none
+			if remoteId >= 0 {
+				m.transport.writePacket(new Writer(msgChannelClose).putUint32(int64(remoteId)).bytes()) onerror recover none
+			}
+			m.forget(self) when peerClosed
+			wake()
+		}
+
+		// Waits until the peer closes the channel. Fails when the
+		// connection breaks first.
+		def waitClosed() !none {
+			for !peerClosed {
+				let m = mux
+				return none when m is none
+				let err = m.failure
+				fail err unless err is none
+				try wait(none)
+			}
+			return none
+		}
+	}
+
+	// An incoming channel open: the channel, its type and the
+	// type-specific data after the standard fields.
+	struct OpenRequest {
+		channel Chan
+		kind    string
+		extra   byte[]
+	}
+
+	// Mux runs the channels of one connection.
+	type Mux {
+		transport                Transport
+		internal atomic channels map<int, Chan>
+		internal nextId          int                           = 0
+		failure                  ?error                        = none
+		closed                   bool                          = false
+		// Decides a channel the peer opens: fails to refuse it (an
+		// SshError's `reason` is the refusal code).
+		onOpen                   ?def (OpenRequest) !none      = none
+		// Starts the work of a channel `onOpen` accepted, once the
+		// confirmation went out.
+		onAccepted               ?def (OpenRequest)            = none
+		// Answers a global request: the reply data, or fails to refuse.
+		onGlobal                 ?def (string, byte[]) !byte[] = none
+		internal globalReplies   ?byte[][]                     = none
+		internal globalAnswers   int[]                         = []
+		internal globalData      byte[][]                      = []
+		internal signal          channel<none>
+		// Every task waiting on the connection as a whole.
+		internal done            channel<none>
+
+		def new(transport Transport) {
+			self.transport = transport
+			signal = new channel<none>(1)
+			done = new channel<none>(1)
+		}
+
+		// Reads and dispatches until the connection ends; then every
+		// channel wakes and fails. Never fails itself.
+		def run() {
+			for {
+				let payload = transport.readPacket() onerror (err error) {
+					failure = err
+					recover byte[]
+				}
+				break unless failure is none
+				dispatch(payload) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+			}
+			closed = true
+			transport.close()
+			for let ch in allChannels() {
+				ch.wake()
+			}
+			signal <- none when signal.len() == 0
+			done <- none when done.len() == 0
+		}
+
+		// Waits until `run` ends.
+		def waitDone() {
+			select {
+				case done:
+					done <- none
+			}
+		}
+
+		internal atomic def allChannels() Chan[] {
+			let out Chan[] = []
+			for let (_, ch) in channels {
+				out.push(ch)
+			}
+			return out
+		}
+
+		// A new channel, registered under a fresh local id.
+		atomic def newChan(kind string) Chan {
+			let ch = new Chan(self, nextId, kind)
+			channels[nextId] = ch
+			nextId++
+			return ch
+		}
+
+		atomic def lookup(id int) ?Chan {
+			return channels.get(id)
+		}
+
+		atomic def forget(ch Chan) {
+			channels.delete(ch.localId)
+		}
+
+		// Opens a channel of `kind` with the type-specific `extra` data
+		// and waits for the answer. Fails when the peer refuses it (the
+		// reason in the SshError) or the connection breaks.
+		def open(kind string, extra byte[]) !Chan {
+			fail sshError("closed", "connection is closed") when closed
+			let ch = newChan(kind)
+			let w = new Writer(msgChannelOpen).putText(kind).putUint32(int64(ch.localId)).putUint32(ch.localWindow).putUint32(maxPacketSize).putRaw(extra)
+			try transport.writePacket(w.bytes())
+			for !ch.opened {
+				let refused = ch.openFailure
+				if !(refused is none) {
+					forget(ch)
+					fail refused
+				}
+				let err = failure
+				fail err unless err is none
+				try ch.wait(none)
+			}
+			return ch
+		}
+
+		// Sends a global request; with `wantReply`, waits and returns the
+		// reply data, or none when refused. Fails when the connection
+		// breaks.
+		def globalRequest(name string, wantReply bool, payload byte[]) !?byte[] {
+			let w = new Writer(msgGlobalRequest).putText(name).putBool(wantReply).putRaw(payload)
+			if !wantReply {
+				try transport.writePacket(w.bytes())
+				return byte[]
+			}
+			let ticket = try sendGlobal(w.bytes())
+			for {
+				let answer = globalAnswer(ticket)
+				if answer >= 0 {
+					return none when answer == 0
+					return globalReply(ticket)
+				}
+				let err = failure
+				fail err unless err is none
+				select {
+					case signal:
+						signal.flush()
+				}
+				signal <- none when signal.len() == 0 && hasOtherWaiters(ticket)
+			}
+			return none
+		}
+
+		// Global replies arrive in request order: each request takes the
+		// next slot.
+		internal atomic def sendGlobal(payload byte[]) !int {
+			globalAnswers.push(-1)
+			globalData.push([])
+			try transport.writePacket(payload)
+			return globalAnswers.len() - 1
+		}
+
+		internal atomic def globalAnswer(ticket int) int {
+			return globalAnswers[ticket]
+		}
+
+		internal atomic def globalReply(ticket int) byte[] {
+			return globalData[ticket]
+		}
+
+		internal atomic def hasOtherWaiters(ticket int) bool {
+			for let i = 0; i < globalAnswers.len(); i++ {
+				return true when i != ticket && globalAnswers[i] < 0
+			}
+			return false
+		}
+
+		internal atomic def answerGlobal(ok bool, data byte[]) {
+			for let i = 0; i < globalAnswers.len(); i++ {
+				if globalAnswers[i] < 0 {
+					globalAnswers[i] = ok ?? (1, 0)
+					globalData[i] = data
+					break
+				}
+			}
+		}
+
+		internal def dispatch(payload byte[]) !none {
+			let code = int(payload[0])
+			let r = new Reader(payload[1:])
+			switch {
+				case code == msgChannelData || code == msgChannelExtendedData:
+					let ch = try channelOf(r)
+					let extended = code == msgChannelExtendedData
+					if extended {
+						try r.readUint32()
+					}
+					let chunk = try r.readString()
+					fail sshError("protocol", "peer overran the channel window", disconnectProtocolError) when int64(chunk.len()) > ch.localWindow
+					ch.localWindow -= int64(chunk.len())
+					ch.enqueue(chunk, extended)
+					if extended {
+						// Credit stderr at once; see Chan.credit.
+						ch.localWindow += int64(chunk.len())
+						try transport.writePacket(new Writer(msgChannelWindowAdjust).putUint32(int64(ch.remoteId)).putUint32(int64(chunk.len())).bytes())
+					}
+					ch.wake()
+				case code == msgChannelWindowAdjust:
+					let ch = try channelOf(r)
+					ch.grow(try r.readUint32())
+					ch.wake()
+				case code == msgChannelEof:
+					let ch = try channelOf(r)
+					ch.peerEof = true
+					ch.wake()
+				case code == msgChannelClose:
+					let ch = try channelOf(r)
+					ch.peerClosed = true
+					ch.peerEof = true
+					if ch.sentClose {
+						forget(ch)
+					} else {
+						ch.close()
+					}
+					ch.wake()
+				case code == msgChannelRequest:
+					let ch = try channelOf(r)
+					let name = try r.readText()
+					let wantReply = try r.readBool()
+					let ok = handleChannelRequest(ch, name, r.rest())
+					if wantReply && !ch.sentClose {
+						try transport.writePacket(new Writer(ok ?? (msgChannelSuccess, msgChannelFailure)).putUint32(int64(ch.remoteId)).bytes())
+					}
+				case code == msgChannelSuccess || code == msgChannelFailure:
+					let ch = try channelOf(r)
+					ch.addReply(code == msgChannelSuccess)
+					ch.wake()
+				case code == msgChannelOpenConfirmation:
+					let ch = try channelOf(r)
+					ch.remoteId = int(try r.readUint32())
+					ch.remoteWindow = try r.readUint32()
+					ch.remoteMaxPacket = int(try r.readUint32())
+					ch.opened = true
+					ch.wake()
+				case code == msgChannelOpenFailure:
+					let ch = try channelOf(r)
+					let reason = int(try r.readUint32())
+					let text = try r.readText()
+					ch.openFailure = sshError("channel", "{ch.kind} channel refused: {text}", reason)
+					ch.wake()
+				case code == msgChannelOpen:
+					try handleOpen(r)
+				case code == msgGlobalRequest:
+					let name = try r.readText()
+					let wantReply = try r.readBool()
+					let data = r.rest()
+					let reply ?byte[] = none
+					let handler = onGlobal
+					if !(handler is none) {
+						reply = answerWith(handler, name, data) onerror recover none
+					}
+					if wantReply {
+						let answer = reply is none ?? (new Writer(msgRequestFailure), new Writer(msgRequestSuccess).putRaw(reply))
+						try transport.writePacket(answer.bytes())
+					}
+				case code == msgRequestSuccess || code == msgRequestFailure:
+					answerGlobal(code == msgRequestSuccess, r.rest())
+					signal <- none when signal.len() == 0
+				default:
+					try transport.writePacket(new Writer(msgUnimplemented).putUint32(transport.inbound.seq - 1).bytes())
+			}
+			return none
+		}
+
+		// The channel a message names by its local id.
+		internal def channelOf(r Reader) !Chan {
+			let id = int(try r.readUint32())
+			let ch = lookup(id)
+			fail sshError("protocol", "message for unknown channel {id}", disconnectProtocolError) when ch is none
+			return ch
+		}
+
+		// Channel requests: exit status and signal are recorded here, the
+		// rest go to the channel's handler.
+		internal def handleChannelRequest(ch Chan, name string, data byte[]) bool {
+			let r = new Reader(data)
+			if name == "exit-status" {
+				ch.exitStatus = int(r.readUint32() onerror recover -1)
+				return true
+			}
+			if name == "exit-signal" {
+				ch.exitSignal = r.readText() onerror recover ""
+				r.readBool() onerror recover false
+				ch.exitMessage = r.readText() onerror recover ""
+				return true
+			}
+			let handler = ch.onRequest
+			return false when handler is none
+			return handler(name, data)
+		}
+
+		internal def answerWith(handler def (string, byte[]) !byte[], name string, data byte[]) !?byte[] {
+			return try handler(name, data)
+		}
+
+		// A channel the peer opens: accepted when `onOpen` does not fail.
+		internal def handleOpen(r Reader) !none {
+			let kind = try r.readText()
+			let remoteId = int(try r.readUint32())
+			let window = try r.readUint32()
+			let maxPacket = int(try r.readUint32())
+			let ch = newChan(kind)
+			ch.remoteId = remoteId
+			ch.remoteWindow = window
+			ch.remoteMaxPacket = maxPacket
+			ch.opened = true
+			let refused ?error = sshError("channel", "{kind} channels are not accepted", openUnknownChannelType)
+			let handler = onOpen
+			if !(handler is none) {
+				refused = none
+				handler(OpenRequest{channel: ch, kind: kind, extra: r.rest()}) onerror (err error) {
+					refused = err
+					recover none
+				}
+			}
+			if !(refused is none) {
+				forget(ch)
+				let reason = openAdministrativelyProhibited
+				if refused is SshError {
+					let e SshError = refused
+					reason = e.reason when e.reason > 0
+				}
+				let w = new Writer(msgChannelOpenFailure).putUint32(int64(remoteId)).putUint32(int64(reason)).putText(refused.message).putText("")
+				return try transport.writePacket(w.bytes())
+			}
+			let w = new Writer(msgChannelOpenConfirmation).putUint32(int64(remoteId)).putUint32(int64(ch.localId)).putUint32(ch.localWindow).putUint32(maxPacketSize)
+			try transport.writePacket(w.bytes())
+			let start = onAccepted
+			start(OpenRequest{channel: ch, kind: kind, extra: []}) unless start is none
+			return none
+		}
+	}
+
+	// Copies both ways between two streams until either side ends, then
+	// closes both.
+	def pipe(a net.Stream, b net.Stream) {
+		let back = async pump(b, a)
+		pump(a, b)
+		await back
+	}
+
+	def pump(from net.Stream, to net.Stream) {
+		let buf byte[] = []
+		buf.len(32768)
+		for {
+			let n = from.read(buf, 87600h) onerror recover 0
+			break when n <= 0
+			let off = 0
+			for off < n {
+				let w = to.write(buf[off:n], 87600h) onerror recover 0
+				break when w <= 0
+				off += w
+			}
+			break when off < n
+		}
+		from.close() onerror recover none
+		to.close() onerror recover none
+	}
+}

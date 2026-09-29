@@ -1,4 +1,491 @@
 partial module std.net.ntp {
-	// Server is the NTP server; it has no members yet.
-	type Server {}
+	use (
+		std.metrics
+		std.net
+		std.net.ntp.proto::*
+		std.net.tls
+		std.net.udp
+		std.services::(Policy, metric)
+		std.time
+	)
+
+	// Server answers NTP and SNTP clients (versions 1–4, RFC 5905 server
+	// mode) with the local clock's time, or a `Clock`'s corrected time and
+	// its stratum, reference and error bounds. Requests signed with one of
+	// `keys` get signed answers; unknown keys or bad digests get a
+	// crypto-NAK. `rateLimit` answers clients that ask too often with a
+	// RATE Kiss-o'-Death. With `ntsAddr` it also runs Network Time
+	// Security (RFC 8915): the NTS-KE server there, and NTS-authenticated
+	// answers to requests carrying its cookies. Implements `net.Server`.
+	//
+	// ```
+	// let clock = new ntp.Clock(["time.cloudflare.com", "time.google.com"])
+	// try clock.start()
+	// let server = new ntp.Server(":123")
+	// server.clock = clock
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr string = ":123"
+		// Where the time comes from; none serves the local clock.
+		clock ?Clock = none
+		// 0 picks it: one more than the clock's, or `localStratum` on
+		// the local clock.
+		stratum int = 0
+		localStratum int = 10
+		// The reference: four letters at stratum 1 (GPS, PPS...), a
+		// dotted IPv4 address above. "" picks it: the clock's server, or
+		// 127.127.1.1 (LOCL at stratum 1) on the local clock.
+		referenceId string = ""
+		leap Leap = Leap.None
+		// Keys requests may be signed with.
+		keys Key[] = []
+		// Answer only signed requests (others get a crypto-NAK).
+		requireAuth bool = false
+		// A client asking more often than this gets a RATE
+		// Kiss-o'-Death; 0s never.
+		rateLimit duration = 0s
+		// log2 of the local clock's precision in seconds.
+		precision int = -20
+		// Broadcast mode (RFC 5905 §3): the time sent unasked to this
+		// address every `broadcastInterval` — a subnet's broadcast address
+		// (`192.168.1.255:123`), `255.255.255.255:123`, or a multicast group
+		// (`224.0.1.1:123`); "" for none. Signed with `broadcastKey` when
+		// set, as broadcast clients should require.
+		broadcast string = ""
+		broadcastInterval duration = 64s
+		broadcastKey ?Key = none
+		// Network Time Security: the NTS-KE port (4460) on this address,
+		// "" for none. Needs `tls` holding the server's certificate.
+		ntsAddr string = ""
+		tls ?tls.Config = none
+		// How often the key that seals cookies changes; cookies under the
+		// previous key still work.
+		ntsKeyRotation duration = 24h
+		internal ntsKeys ?ServerKeys = none
+		internal ntsListener ?net.Listener = none
+		internal socket ?udp.Server = none
+		internal atomic running bool = false
+		internal atomic lastSeen map<string, time.Time>
+		// Shared by every server of the process.
+		@metric("net.ntp.server.requests")
+		internal requests metrics.Counter
+		@metric("net.ntp.server.kisses")
+		internal kisses metrics.Counter
+		@metric("net.ntp.server.auth.failures")
+		internal authFailures metrics.Counter
+
+		def new(addr string = ":123") {
+			self.addr = addr
+		}
+
+		// Binds `addr` and serves until `close`. Fails with PolicyDenied
+		// when the policy denies listening there, NetError when the
+		// address cannot be bound.
+		def listenAndServe() !none {
+			try bind()
+			try listenNts()
+			try startBroadcasting()
+			return try loop()
+		}
+
+		// Starts the broadcasts, when `broadcast` is set. Fails when the
+		// policy denies sending there or the socket refuses broadcasts.
+		internal def startBroadcasting() !none {
+			return none when broadcast == ""
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "ntp://" + broadcast)
+			let s = socket
+			fail NtpError{message: "ntp: not started", code: "closed"} when s is none
+			try s.setBroadcast(true)
+			let to = try net.parseAddress(broadcast)
+			let task = async broadcastLoop(s, to)
+			task.keepAlive()
+			return none
+		}
+
+		internal def broadcastLoop(s udp.Server, to net.Address) {
+			for running {
+				s.send(broadcastPacket(), to) onerror recover 0
+				let until = time.now() + broadcastInterval
+				for running && time.now() < until {
+					time.sleep(250ms)
+				}
+			}
+		}
+
+		// A broadcast-mode packet: the header without origin and receive
+		// times, the poll as log2 of the interval.
+		internal def broadcastPacket() byte[] {
+			let request = Packet{version: 4, mode: modeClient, poll: pollOf(broadcastInterval)}
+			let p = header(request, now())
+			p.mode = modeBroadcast
+			p.origin = Stamp{}
+			p.receive = Stamp{}
+			p.transmit = stampOf(now())
+			return encodePacket(p, broadcastKey)
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails as `listenAndServe` does.
+		def start() !none {
+			return none when running
+			try bind()
+			listenNts() onerror (err error) {
+				close() onerror recover none
+				fail err
+			}
+			startBroadcasting() onerror (err error) {
+				close() onerror recover none
+				fail err
+			}
+			let task = async loopInBackground()
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops serving. Never fails.
+		def close() !none {
+			running = false
+			let s = socket
+			socket = none
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			let ln = ntsListener
+			ntsListener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, or `addr` parsed
+		// before `start`.
+		def address() net.Address {
+			let s = socket
+			return s.address() unless s is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// The bound NTS-KE address, or `ntsAddr` parsed before `start`.
+		def ntsAddress() net.Address {
+			let ln = ntsListener
+			return ln.address() unless ln is none
+			return net.parseAddress(ntsAddr) onerror recover new net.Address()
+		}
+
+		internal def listenNts() !none {
+			return none when ntsAddr == ""
+			let config = tls
+			fail NtpError{message: "ntp: ntsAddr needs a tls config with the server's certificate", code: "config"} when config is none
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "ntske://" + ntsAddr)
+			ntsKeys = new ServerKeys(ntsKeyRotation)
+			let a = net.parseAddress(ntsAddr) onerror recover new net.Address()
+			let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(ntsAddr)
+			let ln = try sock.listen(64)
+			ntsListener = ln
+			let task = async acceptKeyExchanges(ln, config)
+			task.keepAlive()
+			return none
+		}
+
+		internal def acceptKeyExchanges(ln net.Listener, config tls.Config) {
+			for running {
+				let conn = acceptOne(ln) onerror recover none
+				break when conn is none
+				let task = async keyExchange(conn, config)
+				task.keepAlive()
+			}
+		}
+
+		internal def acceptOne(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		// One NTS-KE session (RFC 8915 §4): NTPv4 and AES-SIV-CMAC-256
+		// agreed, eight cookies, the NTP port when it is not 123.
+		internal def keyExchange(conn net.Connection, config tls.Config) {
+			let t = ntsTlsServer(conn, config)
+			serveKeyExchange(t, address().port) onerror recover none
+			t.close() onerror recover none
+			conn.close() onerror recover none
+		}
+
+		internal def serveKeyExchange(t tls.Conn, ntpPort int) !none {
+			let keys = ntsKeys
+			fail NtpError{message: "ntp: NTS is not started", code: "closed"} when keys is none
+			try t.handshake(10s)
+			fail NtpError{message: "ntp: NTS-KE client did not ask for {ntsAlpn}", code: "protocol"} unless t.connectionState().alpn == ntsAlpn
+			let records = try readRecords(new net.LineReader(t, 1), 10s)
+			let protocolOk = false
+			let aeadOk = false
+			let unknownCritical = false
+			for let r in records {
+				switch {
+					case r.kind == recordNextProto:
+						for let i = 0; i + 1 < r.body.len(); i += 2 {
+							protocolOk = true when r.body[i] == byte(0) && r.body[i + 1] == byte(0)
+						}
+					case r.kind == recordAead:
+						for let i = 0; i + 1 < r.body.len(); i += 2 {
+							aeadOk = true when ((int(r.body[i]) << 8) | int(r.body[i + 1])) == ntsAeadSiv256
+						}
+					case r.critical && !(r.kind := recordEnd || recordServer || recordPort):
+						unknownCritical = true
+				}
+			}
+			if unknownCritical || !protocolOk {
+				// Error 0: unrecognized critical record; 1: bad request.
+				let code = unknownCritical ?? (0, 1)
+				return try t.writeAll(encodeRecord(NtsRecord{kind: recordError, critical: true, body: uint16Body(code)}) + encodeRecord(NtsRecord{kind: recordEnd, critical: true}), 10s)
+			}
+			let (c2s, s2c) = try ntsKeys(t)
+			let reply = encodeRecord(NtsRecord{kind: recordNextProto, critical: true, body: uint16Body(ntsProtocolNtp)})
+			reply = reply + encodeRecord(NtsRecord{kind: recordAead, critical: true, body: aeadOk ?? (uint16Body(ntsAeadSiv256), byte[])})
+			if aeadOk {
+				reply = reply + encodeRecord(NtsRecord{kind: recordPort, critical: false, body: uint16Body(ntpPort)}) when ntpPort != 123
+				for let i = 0; i < 8; i++ {
+					reply = reply + encodeRecord(NtsRecord{kind: recordCookie, body: try keys.cookie(c2s, s2c)})
+				}
+			}
+			return try t.writeAll(reply + encodeRecord(NtsRecord{kind: recordEnd, critical: true}), 10s)
+		}
+
+		internal def bind() !none {
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "ntp://" + addr)
+			let s = new udp.Server(addr)
+			try s.start()
+			socket = s
+			running = true
+			return none
+		}
+
+		internal def loopInBackground() {
+			loop() onerror recover none
+		}
+
+		internal def loop() !none {
+			let buf byte[] = []
+			buf.len(2048)
+			for running {
+				let s = socket
+				break when s is none
+				let failed = false
+				let (n, from) = s.recv(buf, 1s) onerror (err error) {
+					failed = true
+					recover (0, new net.Address())
+				}
+				continue when failed || n <= 0
+				// The receive timestamp, as close to arrival as we get.
+				let arrived = now()
+				let reply = answer(buf[:n].clone(), from, arrived)
+				if reply.len() > 0 {
+					s.send(reply, from) onerror recover 0
+				}
+			}
+			return none
+		}
+
+		// The time this server serves.
+		internal def now() time.Time {
+			let c = clock
+			return c.now() unless c is none
+			return time.now()
+		}
+
+		// The reply to one datagram; empty to drop it.
+		internal def answer(data byte[], from net.Address, arrived time.Time) byte[] {
+			let request = decodePacket(data) onerror recover Packet{mode: 0}
+			// Client requests only (symmetric and broadcast modes are not
+			// served); versions 1–4.
+			return [] unless request.mode == modeClient && request.version >= 1 && request.version <= 4
+			requests.inc()
+			let reply = header(request, arrived)
+			// Authentication: a known key and a matching digest, or a
+			// crypto-NAK (RFC 5905 §7.4).
+			let key ?Key = none
+			if request.hasMac {
+				let found = keyOf(request.keyId)
+				if found is none || !macValid(found, data, request) {
+					authFailures.inc()
+					return encodeCryptoNak(reply)
+				}
+				key = found
+			} else if requireAuth {
+				authFailures.inc()
+				return encodeCryptoNak(reply)
+			}
+			if hasNtsFields(request) {
+				return ntsAnswer(request, data, reply)
+			}
+			if rateLimit > 0s && tooSoon(from.host, arrived) {
+				kisses.inc()
+				return encodePacket(kiss(request, "RATE"), key)
+			}
+			reply.transmit = stampOf(now())
+			return encodePacket(reply, key)
+		}
+
+		// The answer to an NTS request (RFC 8915 §5.7): the unique
+		// identifier echoed and, sealed with the session's server key, a
+		// fresh cookie for the one used and each placeholder. A cookie this
+		// server cannot open, or a request that does not authenticate,
+		// gets an NTS NAK (kiss code NTSN).
+		internal def ntsAnswer(request Packet, data byte[], reply Packet) byte[] {
+			let keys = ntsKeys
+			let uniqueId byte[] = []
+			let cookie byte[] = []
+			let placeholders = 0
+			let authAt = -1
+			let at = 48
+			let authField byte[] = []
+			for let f in request.extensions {
+				let kind = fieldKind(f)
+				switch {
+					case kind == fieldUniqueId:
+						uniqueId = f
+					case kind == fieldCookie:
+						cookie = fieldValue(f)
+					case kind == fieldPlaceholder:
+						placeholders++
+					case kind == fieldAuthenticator && authAt < 0:
+						authAt = at
+						authField = f
+				}
+				at += f.len()
+			}
+			return [] when uniqueId.len() == 0 || authAt < 0
+			let nak = def () byte[] {
+				let k = kiss(request, "NTSN")
+				k.extensions = [uniqueId]
+				return encodePacket(k)
+			}
+			if keys is none || cookie.len() == 0 {
+				authFailures.inc()
+				return nak()
+			}
+			let session = keys.open(cookie) onerror recover none
+			if session is none {
+				authFailures.inc()
+				return nak()
+			}
+			let checked = openAuthenticator(session.c2s, data[:authAt], authField) onerror (err error) {
+				authFailures.inc()
+				recover byte[0]
+			}
+			return nak() when checked.len() == 1 && checked[0] == byte(0)
+			reply.transmit = stampOf(now())
+			let fresh byte[] = []
+			for let i = 0; i <= placeholders && i < 8; i++ {
+				fresh = fresh + field(fieldCookie, keys.cookie(session.c2s, session.s2c) onerror recover byte[])
+			}
+			let head = encodeHeader(reply) + uniqueId
+			let sealed = authenticator(session.s2c, head, fresh) onerror recover byte[]
+			return [] when sealed.len() == 0
+			reply.extensions = [uniqueId, sealed]
+			return encodePacket(reply)
+		}
+
+		// The server-mode header answering `request`.
+		internal def header(request Packet, arrived time.Time) Packet {
+			let p = Packet{version: request.version, mode: modeServer, poll: request.poll, precision: precision}
+			p.origin = request.transmit
+			p.receive = stampOf(arrived)
+			let c = clock
+			if !(c is none) {
+				p.leap = c.leap().value
+				p.stratum = stratum > 0 ?? (stratum, c.stratum())
+				p.rootDelay = seconds(c.rootDelay())
+				p.rootDispersion = seconds(c.rootDispersion())
+				p.referenceId = referenceId != "" ?? (idBytes(referenceId), referenceBytes(c.referenceId()))
+				p.reference = stampOf(c.referenceTime())
+				p.leap = 3 unless c.synchronized()
+				return p
+			}
+			p.leap = leap.value
+			p.stratum = stratum > 0 ?? (stratum, localStratum)
+			let local = p.stratum <= 1 ?? ("LOCL", "127.127.1.1")
+			p.referenceId = idBytes(referenceId != "" ?? (referenceId, local))
+			p.reference = stampOf(arrived)
+			return p
+		}
+
+		// A Kiss-o'-Death: stratum 0 and the code as reference id.
+		internal def kiss(request Packet, code string) Packet {
+			let p = Packet{leap: 3, version: request.version, mode: modeServer, stratum: 0, poll: request.poll, precision: precision}
+			p.referenceId = idBytes(code)
+			p.origin = request.transmit
+			p.receive = request.transmit
+			p.transmit = request.transmit
+			return p
+		}
+
+		internal def keyOf(id int64) ?Key {
+			for let k in keys {
+				return k when k.id == id
+			}
+			return none
+		}
+
+		// Whether `host` asked less than `rateLimit` ago; remembers now.
+		internal atomic def tooSoon(host string, arrived time.Time) bool {
+			let last = lastSeen.get(host)
+			lastSeen[host] = arrived
+			// Keep the table from growing without end.
+			lastSeen = map<string, time.Time>{} when lastSeen.len() > 10000
+			return !(last is none) && arrived - last < rateLimit
+		}
+
+		// Names the server and its address.
+		def str() string {
+			return "ntp.Server({addr})"
+		}
+	}
+
+	// A reference id: a dotted IPv4 address, or up to four ASCII letters
+	// NUL-padded.
+	internal def idBytes(text string) byte[] {
+		let parts = text.split(".")
+		return referenceBytes(text) when parts.len() == 4 && parts.filter(x => x.isNumeric()).len() == 4
+		let raw = text.bytes()
+		let out byte[] = [0, 0, 0, 0]
+		for let i = 0; i < 4 && i < raw.len(); i++ {
+			out[i] = raw[i]
+		}
+		return out
+	}
+
+	internal def seconds(d duration) float {
+		return float(int64(d)) / 1000000000.0
+	}
+
+	// Whether a request carries NTS fields: then it is answered under NTS
+	// or with an NTS NAK.
+	internal def hasNtsFields(p Packet) bool {
+		for let f in p.extensions {
+			return true when fieldKind(f) := fieldCookie || fieldAuthenticator
+		}
+		return false
+	}
+
+	// The TLS server side of an NTS-KE connection: `config` with the NTS
+	// ALPN, TLS 1.3 only.
+	internal def ntsTlsServer(conn net.Connection, config tls.Config) tls.Conn {
+		let settings = tls.withServerName(config, config.serverName)
+		settings.alpn = [ntsAlpn]
+		settings.minVersion = tls.Version.TLS13
+		return tls.server(conn, settings)
+	}
+
+	// log2 of an interval in seconds, within NTP's poll range 4..17.
+	internal def pollOf(interval duration) int {
+		let secs = int64(interval) / 1000000000
+		let p = 0
+		for (int64(1) << (p + 1)) <= secs {
+			p++
+		}
+		return p < 4 ?? (4, p > 17 ?? (17, p))
+	}
 }

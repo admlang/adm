@@ -1,0 +1,322 @@
+internal partial module std.net.ssh.auth {
+	use (
+		std.net
+		std.net.ssh::(Authenticator, Certificate, CertificateKind, Challenge, Prompt, PublicKey, Signer, parsePublicKey)
+		std.net.ssh.keyformat::(isCertName, plainName)
+		std.net.ssh.transport::*
+		std.net.sshwire::*
+		std.time
+	)
+
+	// User authentication (RFC 4252): public keys, passwords and
+	// keyboard-interactive (RFC 4256), on the client and the server.
+
+	// What a client may log in with.
+	struct Credentials {
+		user        string
+		signers     Signer[]
+		password    string                     = ""
+		hasPassword bool                       = false
+		// Answers keyboard-interactive challenges; none answers a single
+		// hidden prompt with the password.
+		answer      ?def (Challenge) !string[] = none
+	}
+
+	// The outcome of a client login: the server's banner, if any.
+	struct ClientLogin {
+		banner string = ""
+	}
+
+	// Asks for the user authentication service.
+	def requestService(t Transport, name string) !none {
+		try t.writePacket(new Writer(msgServiceRequest).putText(name).bytes())
+		let reply = try t.readPacket()
+		fail sshError("protocol", "server refused the {name} service", disconnectServiceNotAvailable) when int(reply[0]) != msgServiceAccept
+		return none
+	}
+
+	// Logs in: `none` first to learn the methods, then each public key,
+	// keyboard-interactive and the password, in the order the server
+	// allows. Fails with an `auth` SshError naming what the server
+	// allows when every attempt is refused.
+	def clientLogin(t Transport, creds Credentials) !ClientLogin {
+		try requestService(t, "ssh-userauth")
+		let login = ClientLogin{}
+		let head = new Writer(msgUserauthRequest).putText(creds.user).putText("ssh-connection")
+		try t.writePacket(new Writer().putRaw(head.bytes()).putText("none").bytes())
+		let (done0, allowed0) = try awaitResult(t, login)
+		return login when done0
+		let allowed = allowed0
+		let triedKeys = 0
+		let triedKbd = false
+		let triedPassword = false
+		for {
+			if allowed.includes("publickey") && triedKeys < creds.signers.len() {
+				let signer = creds.signers[triedKeys]
+				triedKeys++
+				let key = signer.publicKey()
+				let plain = signatureAlgorithmFor(key.kind.value, t.serverSigAlgs)
+				let algorithm = key.certificate() is none ?? (plain, plain + "-cert-v01@openssh.com")
+				let body = new Writer().putRaw(head.bytes()).putText("publickey").putBool(true).putText(algorithm).putString(key.blob())
+				let signed = new Writer().putString(t.sessionId).putRaw(body.bytes()).bytes()
+				let signature = signer.sign(signed, algorithm) onerror recover byte[]
+				continue when signature.len() == 0
+				try t.writePacket(body.putString(signature).bytes())
+				let (done, next) = try awaitResult(t, login)
+				return login when done
+				allowed = next
+				continue
+			}
+			if allowed.includes("keyboard-interactive") && !triedKbd && (creds.hasPassword || !(creds.answer is none)) {
+				triedKbd = true
+				try t.writePacket(new Writer().putRaw(head.bytes()).putText("keyboard-interactive").putText("").putText("").bytes())
+				let (done, next) = try interactive(t, creds, login)
+				return login when done
+				allowed = next
+				continue
+			}
+			if allowed.includes("password") && !triedPassword && creds.hasPassword {
+				triedPassword = true
+				try t.writePacket(new Writer().putRaw(head.bytes()).putText("password").putBool(false).putText(creds.password).bytes())
+				let (done, next) = try awaitResult(t, login)
+				return login when done
+				allowed = next
+				continue
+			}
+			break
+		}
+		fail sshError("auth", "login as {creds.user} refused; the server allows {allowed.join(", ")}", disconnectNoMoreAuthMethods)
+	}
+
+	// The signature algorithm for a user key: rsa-sha2-512 or -256 for
+	// RSA when the server lists them (or lists nothing), else ssh-rsa.
+	def signatureAlgorithmFor(kind string, serverAlgs string[]) string {
+		return kind unless kind == "ssh-rsa"
+		return "rsa-sha2-512" when serverAlgs.len() == 0 || serverAlgs.includes("rsa-sha2-512")
+		return "rsa-sha2-256" when serverAlgs.includes("rsa-sha2-256")
+		return "ssh-rsa"
+	}
+
+	// Waits for SUCCESS or FAILURE, taking banners on the way. Returns
+	// whether the login succeeded and the methods that may continue.
+	def awaitResult(t Transport, login ClientLogin) !(bool, string[]) {
+		for {
+			let reply = try t.readPacket()
+			let code = int(reply[0])
+			let r = new Reader(reply[1:])
+			if code == msgUserauthBanner {
+				login.banner += try r.readText()
+				continue
+			}
+			return (true, string[]) when code == msgUserauthSuccess
+			return (false, try r.readNames()) when code == msgUserauthFailure
+			fail sshError("protocol", "unexpected message {code} during login", disconnectProtocolError)
+		}
+		fail "unreachable"
+	}
+
+	// Answers keyboard-interactive rounds until the server decides.
+	def interactive(t Transport, creds Credentials, login ClientLogin) !(bool, string[]) {
+		for {
+			let reply = try t.readPacket()
+			let code = int(reply[0])
+			let r = new Reader(reply[1:])
+			if code == msgUserauthBanner {
+				login.banner += try r.readText()
+				continue
+			}
+			return (true, string[]) when code == msgUserauthSuccess
+			return (false, try r.readNames()) when code == msgUserauthFailure
+			fail sshError("protocol", "unexpected message {code} during login", disconnectProtocolError) when code != msgUserauthInfoRequest
+			let challenge = Challenge{name: try r.readText(), instruction: try r.readText()}
+			try r.readText()
+			let count = try r.readUint32()
+			for let i = int64(0); i < count; i++ {
+				let text = try r.readText()
+				challenge.prompts.push(Prompt{text: text, echo: try r.readBool()})
+			}
+			let answers = try answerChallenge(creds, challenge)
+			let w = new Writer(msgUserauthInfoResponse).putUint32(int64(answers.len()))
+			for let a in answers {
+				w.putText(a)
+			}
+			try t.writePacket(w.bytes())
+		}
+		fail "unreachable"
+	}
+
+	// The answers to one round: the caller's, or the password for each
+	// hidden prompt.
+	def answerChallenge(creds Credentials, challenge Challenge) !string[] {
+		// PAM ends with a round of no prompts: nothing to ask anyone.
+		return [] when challenge.prompts.len() == 0
+		let answer = creds.answer
+		if !(answer is none) {
+			let given = try answer(challenge)
+			fail sshError("auth", "{given.len()} answers for {challenge.prompts.len()} prompts") when given.len() != challenge.prompts.len()
+			return given
+		}
+		let out string[] = []
+		for let p in challenge.prompts {
+			out.push(p.echo ?? ("", creds.password))
+		}
+		return out
+	}
+
+	// How a server authenticates.
+	struct ServerPolicy {
+		authenticator ?Authenticator = none
+		banner        string         = ""
+		maxTries      int            = 6
+		// Certificate authorities whose user certificates log in.
+		authorities   PublicKey[]    = []
+		// Where the client connects from, for `source-address`.
+		remote        ?net.Address   = none
+	}
+
+	// Who logged in to a server, and with which key.
+	struct ServerLogin {
+		user string
+		key  ?PublicKey = none
+	}
+
+	// Runs the server side of user authentication. Without an
+	// authenticator every user gets in with the `none` method. Fails
+	// when the client gives up, sends garbage or runs out of tries.
+	def serverLogin(t Transport, policy ServerPolicy) !ServerLogin {
+		let request = try t.readPacket()
+		let rq = new Reader(request[1:])
+		fail sshError("protocol", "expected a service request", disconnectProtocolError) when int(request[0]) != msgServiceRequest
+		let wanted = try rq.readText()
+		if wanted != "ssh-userauth" {
+			t.disconnect(disconnectServiceNotAvailable, "service {wanted} is not available")
+			fail sshError("protocol", "client asked for service {wanted}")
+		}
+		try t.writePacket(new Writer(msgServiceAccept).putText(wanted).bytes())
+		if policy.banner != "" {
+			try t.writePacket(new Writer(msgUserauthBanner).putText(policy.banner).putText("").bytes())
+		}
+		let methods = ["publickey", "password", "keyboard-interactive"]
+		let failures = 0
+		for {
+			let payload = try t.readPacket()
+			fail sshError("protocol", "expected a login request", disconnectProtocolError) when int(payload[0]) != msgUserauthRequest
+			let r = new Reader(payload[1:])
+			let user = try r.readText()
+			let serviceName = try r.readText()
+			let method = try r.readText()
+			if serviceName != "ssh-connection" {
+				t.disconnect(disconnectServiceNotAvailable, "service {serviceName} is not available")
+				fail sshError("protocol", "client asked for service {serviceName}")
+			}
+			let auth = policy.authenticator
+			if auth is none {
+				try t.writePacket(message(msgUserauthSuccess))
+				return ServerLogin{user: user}
+			}
+			let accepted ?ServerLogin = none
+			switch {
+				case method == "password":
+					try r.readBool()
+					let password = try r.readText()
+					let ok = true
+					auth.password(user, password) onerror (err error) {
+						ok = false
+						recover none
+					}
+					accepted = ServerLogin{user: user} when ok
+				case method == "publickey":
+					let signed = try r.readBool()
+					let algorithm = try r.readText()
+					let blob = try r.readString()
+					let key = keyOf(blob) onerror recover none
+					if !(key is none) && keyFits(key, algorithm) {
+						let ok = true
+						let cert = key.certificate()
+						if cert is none {
+							auth.publicKey(user, key) onerror (err error) {
+								ok = false
+								recover none
+							}
+						} else {
+							ok = certificateLogsIn(cert, user, policy)
+						}
+						if ok && !signed {
+							// A query: the key would do; the client signs next.
+							try t.writePacket(new Writer(msgUserauthPkOk).putText(algorithm).putString(blob).bytes())
+							continue
+						}
+						if ok {
+							let signature = try r.readString()
+							let data = new Writer().putString(t.sessionId).putRaw(payload[:payload.len() - signature.len() - 4]).bytes()
+							accepted = ServerLogin{user: user, key: key} when key.verify(data, signature)
+						}
+					}
+				case method == "keyboard-interactive":
+					let ask = new Writer(msgUserauthInfoRequest).putText("").putText("").putText("").putUint32(1).putText("Password: ").putBool(false)
+					try t.writePacket(ask.bytes())
+					let response = try t.readPacket()
+					fail sshError("protocol", "expected keyboard-interactive answers", disconnectProtocolError) when int(response[0]) != msgUserauthInfoResponse
+					let rr = new Reader(response[1:])
+					let count = try rr.readUint32()
+					if count == 1 {
+						let password = try rr.readText()
+						let ok = true
+						auth.password(user, password) onerror (err error) {
+							ok = false
+							recover none
+						}
+						accepted = ServerLogin{user: user} when ok
+					}
+			}
+			if !(accepted is none) {
+				try t.writePacket(message(msgUserauthSuccess))
+				return accepted
+			}
+			if method != "none" {
+				failures++
+				// Slows password guessing down.
+				time.sleep(200ms) when method := "password" || "keyboard-interactive"
+			}
+			if failures >= policy.maxTries {
+				t.disconnect(disconnectNoMoreAuthMethods, "too many authentication failures")
+				fail sshError("auth", "{user} failed to log in {failures} times")
+			}
+			try t.writePacket(new Writer(msgUserauthFailure).putNames(methods).putBool(false).bytes())
+		}
+		fail "unreachable"
+	}
+
+	// The key a blob holds; fails as parsePublicKey does.
+	def keyOf(blob byte[]) !?PublicKey {
+		return try parsePublicKey(blob)
+	}
+
+	// Whether a key offered for a login fits the algorithm named with
+	// it: a certificate only under a certificate algorithm.
+	def keyFits(key PublicKey, algorithm string) bool {
+		let isCert = !(key.certificate() is none)
+		return false when isCertName(algorithm) != isCert
+		let kind = key.kind.value
+		let name = plainName(algorithm)
+		return name := "rsa-sha2-512" || "rsa-sha2-256" || "ssh-rsa" when kind == "ssh-rsa"
+		return kind == name
+	}
+
+	// Whether a user certificate logs `user` in: signed by a trusted
+	// authority, valid now for that user, from an allowed address.
+	def certificateLogsIn(cert Certificate, user string, policy ServerPolicy) bool {
+		let trusted = false
+		for let a in policy.authorities {
+			trusted = true when a.equals(cert.authority)
+		}
+		return false unless trusted
+		let valid = true
+		cert.validate(CertificateKind.User, user) onerror (err error) {
+			valid = false
+			recover none
+		}
+		let remote = policy.remote
+		return valid && (remote is none || cert.allowsSource(remote))
+	}
+}

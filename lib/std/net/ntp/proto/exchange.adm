@@ -1,0 +1,192 @@
+internal partial module std.net.ntp.proto {
+	use (
+		std.crypto::(rand)
+		std.net
+		std.net.ntp::(Key, NtpError)
+		std.net.udp
+		std.time
+	)
+
+	// The precision this side reports: about a microsecond.
+	const localPrecision = -20
+
+	// One client-mode exchange as measured (RFC 5905 §8): the answer and
+	// the offset, delay and dispersion it gives, in seconds.
+	struct Measured {
+		packet        Packet
+		offset        float     = 0.0
+		delay         float     = 0.0
+		dispersion    float     = 0.0
+		// Local monotonic seconds when the answer arrived.
+		at            float     = 0.0
+		arrived       time.Time
+		authenticated bool      = false
+	}
+
+	// Local monotonic time in seconds.
+	def monoSeconds() float {
+		return float(time.monoNs()) / 1000000000.0
+	}
+
+	// `a - b` in seconds; the seconds wrap as 32-bit numbers, so the
+	// difference survives an era change.
+	def stampDiff(a Stamp, b Stamp) float {
+		let secs = (a.seconds - b.seconds) & 0xffffffff
+		secs -= 4294967296 when secs >= 2147483648
+		return float(secs) + float(a.fraction - b.fraction) / 4294967296.0
+	}
+
+	// The address to send to: `host[:port]` resolved (IPv4 first), with
+	// port 123 when none is given. Fails when the name does not resolve.
+	def resolveTarget(server string) !string {
+		let target = net.withPort(server, 123)
+		let a = try net.parseAddress(target)
+		return target when isLiteral(a.host)
+		let found = try net.resolve(a.host)
+		fail NtpError{message: "ntp: {a.host} has no address", code: "protocol"} when found.len() == 0
+		let pick = found[0]
+		for let f in found {
+			if !f.contains(":") {
+				pick = f
+				break
+			}
+		}
+		return pick.contains(":") ?? ("[{pick}]:{a.port}", "{pick}:{a.port}")
+	}
+
+	// Every address of a name (a pool gives several), each with the port.
+	def resolveAll(server string, limit int) !string[] {
+		let target = net.withPort(server, 123)
+		let a = try net.parseAddress(target)
+		return [target] when isLiteral(a.host)
+		let out string[] = []
+		for let f in try net.resolve(a.host) {
+			break when out.len() >= limit
+			out.push(f.contains(":") ?? ("[{f}]:{a.port}", "{f}:{a.port}"))
+		}
+		return out
+	}
+
+	def isLiteral(host string) bool {
+		return true when host == "" || host.contains(":")
+		for let part in host.split(".") {
+			return false unless part.isNumeric()
+		}
+		return true
+	}
+
+	// Sends one client request to `target` and measures the answer.
+	// Fails when nothing valid comes back within `timeout`, the answer is
+	// a Kiss-o'-Death, fails authentication, or comes from an
+	// unsynchronized server.
+	// With `nts` the request carries a cookie and is authenticated (RFC
+	// 8915), and so must the answer be; it goes to the session's server,
+	// and the new cookies in the answer join the session. Fails with code
+	// `nts` when the session has no cookie left or the server answered
+	// with an NTS NAK: a new key exchange is due.
+	def exchange(target string, version int, key ?Key, timeout duration, nts ?NtsSession = none) !Measured {
+		let dest = nts is none ?? (target, try resolveTarget(nts.target))
+		let a = try net.parseAddress(dest)
+		let sock = new udp.Client()
+		try sock.start(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4))
+		let failed ?error = none
+		let got = exchangeOn(sock, dest, version, key, timeout, nts) onerror (err error) {
+			failed = err
+			recover Measured{packet: Packet{}, arrived: time.now()}
+		}
+		sock.close() onerror recover none
+		fail failed unless failed is none
+		return got
+	}
+
+	internal def exchangeOn(sock udp.Client, target string, version int, key ?Key, timeout duration, nts ?NtsSession) !Measured {
+		let sent = time.now()
+		let sentMono = monoSeconds()
+		let request = Packet{version: version, mode: modeClient, poll: 6, precision: localPrecision, transmit: stampOf(sent)}
+		let uniqueId byte[] = []
+		if !(nts is none) {
+			let cookie = nts.takeCookie()
+			fail ntsFailure("nts", "no NTS cookie left") when cookie is none
+			uniqueId = try rand(32)
+			let want = 8 - nts.cookieCount()
+			request.extensions = try ntsRequestFields(encodeHeader(request), uniqueId, cookie, want < 1 ?? (1, want), nts.c2s)
+		}
+		try sock.sendTo(encodePacket(request, key), target, timeout)
+		let deadline = time.now() + timeout
+		let buf byte[] = []
+		buf.len(2048)
+		for {
+			let left = deadline - time.now()
+			fail NtpError{message: "ntp: no answer from {target} within {timeout}", code: "timeout"} when left <= 0s
+			let (n, _) = sock.recvFrom(buf, left) onerror (err error) {
+				fail NtpError{message: "ntp: no answer from {target} within {timeout}", code: "timeout", cause: err}
+			}
+			let arrived = time.now()
+			let arrivedMono = monoSeconds()
+			let data = buf[:n].clone()
+			let p = decodePacket(data) onerror recover Packet{mode: 0}
+			// Only an answer to this request: server mode, our transmit
+			// time echoed as its origin (RFC 5905 §8 bogus check).
+			continue unless p.mode := modeServer || modeSymmetricPassive
+			continue unless sameStamp(p.origin, request.transmit)
+			let kiss = kissCode(p)
+			if !(nts is none) {
+				// Only the answer carrying our unique identifier counts.
+				continue unless hasUniqueId(p, uniqueId)
+				fail ntsFailure("nts", "{target} sent an NTS NAK") when kiss == "NTSN"
+				let cookies = ntsAnswerCookies(p, data, nts.s2c) onerror (err error) {
+					fail NtpError{message: "ntp: {target}: {err.message}", code: "auth", cause: err}
+				}
+				nts.addCookies(cookies)
+			}
+			fail NtpError{message: "ntp: {target} sent Kiss-o'-Death {kiss}", code: "kiss", kiss: kiss} when kiss != ""
+			fail NtpError{message: "ntp: {target} sent a crypto-NAK", code: "auth"} when p.hasMac && p.digest.len() == 0
+			let authenticated = !(nts is none)
+			let k = key
+			if !(k is none) {
+				fail NtpError{message: "ntp: {target} answered without authentication", code: "auth"} unless p.hasMac
+				fail NtpError{message: "ntp: {target} failed authentication", code: "auth"} unless macValid(k, data, p)
+				authenticated = true
+			}
+			fail NtpError{message: "ntp: {target} answered with a zero transmit time", code: "protocol"} when isZero(p.transmit)
+			fail NtpError{message: "ntp: {target} is not synchronized", code: "unsynchronized"} when p.leap == 3 || p.stratum == 0 || p.stratum >= maxStratum
+			// T1 sent, T2 received there, T3 sent there, T4 arrived here.
+			let t4 = stampOf(arrived)
+			let there = stampDiff(p.transmit, p.receive)
+			let offset = (stampDiff(p.receive, request.transmit) + stampDiff(p.transmit, t4)) / 2.0
+			let delay = (arrivedMono - sentMono) - there
+			let floor = precisionSeconds(localPrecision)
+			delay = floor when delay < floor
+			let dispersion = precisionSeconds(localPrecision) + precisionSeconds(p.precision) + phi * (arrivedMono - sentMono)
+			return Measured{packet: p, offset: offset, delay: delay, dispersion: dispersion, at: arrivedMono, arrived: arrived, authenticated: authenticated}
+		}
+		fail "unreachable"
+	}
+
+	// Whether the answer echoes our Unique Identifier field.
+	def hasUniqueId(p Packet, uniqueId byte[]) bool {
+		for let f in p.extensions {
+			return true when fieldKind(f) == fieldUniqueId && fieldValue(f)[:32].hex() == uniqueId.hex()
+		}
+		return false
+	}
+
+	// Checks an NTS answer's authenticator (over the header and the
+	// fields before it) and returns the cookies sealed inside. Fails when
+	// there is none or it does not authenticate.
+	def ntsAnswerCookies(p Packet, data byte[], s2c byte[]) !byte[][] {
+		let at = 48
+		for let f in p.extensions {
+			if fieldKind(f) == fieldAuthenticator {
+				let inner = try splitFields(try openAuthenticator(s2c, data[:at], f))
+				let cookies byte[][] = []
+				for let g in inner {
+					cookies.push(fieldValue(g).clone()) when fieldKind(g) == fieldCookie
+				}
+				return cookies
+			}
+			at += f.len()
+		}
+		fail ntsFailure("auth", "answer has no NTS authenticator")
+	}
+}

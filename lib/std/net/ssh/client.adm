@@ -1,4 +1,582 @@
 partial module std.net.ssh {
-	// Client is the SSH client; it has no members yet.
-	type Client {}
+	use (
+		std.io
+		std.net
+		std.net.ssh.auth::*
+		std.net.ssh.mux::*
+		std.net.ssh.transport::*
+		std.net.sshwire::*
+		std.services::(Policy, Runtime)
+		std.time
+	)
+
+	// Client is an SSH client: one connection to a server, over which it
+	// runs commands and shells, opens subsystems (SFTP) and forwards TCP
+	// connections both ways. The server's host key is checked against
+	// `knownHosts`; the login tries the agent's keys, `keys`, then the
+	// password.
+	//
+	// ```
+	// let client = new ssh.Client()
+	// try client.connect("example.com", "alice", password = "s3cret")
+	// let result = try client.run("uname -a")
+	// print(result.output)
+	// try client.close()
+	// ```
+	type Client {
+		// The hosts whose keys are trusted; none reads
+		// `~/.ssh/known_hosts` at `connect`.
+		knownHosts               ?KnownHosts                = none
+		// What to do with a host key `knownHosts` does not list.
+		hostKeyPolicy            HostKeyPolicy              = HostKeyPolicy.Strict
+		// Trust only this key, whatever `knownHosts` says.
+		hostKey                  ?PublicKey                 = none
+		// Identities to log in with, tried in order after the agent's.
+		keys                     Signer[]                   = []
+		// Try the keys of the agent in `SSH_AUTH_SOCK`.
+		useAgent                 bool                       = true
+		// Answers keyboard-interactive challenges (one-time codes and
+		// the like); without it the password answers hidden prompts.
+		answer                   ?def (Challenge) !string[] = none
+		algorithms               Algorithms
+		// How long connecting, logging in and each request may take.
+		timeout                  duration                   = 30s
+		// How often to check the server still answers while idle; 0s
+		// never checks.
+		keepAlive                duration                   = 0s
+		// Bytes after which the session keys are replaced (OpenSSH's
+		// `RekeyLimit`).
+		rekeyLimit               int64                      = 1073741824
+		// Let commands on the server use the local agent (`ssh -A`).
+		// Only for servers you trust: their root can use your keys.
+		forwardAgent             bool                       = false
+		// Environment variables sent with each command and shell; servers
+		// take only those they allow (OpenSSH: `AcceptEnv`).
+		environment              map<string, string>
+		internal transport       ?Transport                 = none
+		internal mux             ?Mux                       = none
+		internal password        string                     = ""
+		internal hasPassword     bool                       = false
+		internal user            string                     = ""
+		internal target          string                     = ""
+		internal greeting        string                     = ""
+		internal forwards        map<string, Forward>
+		internal atomic open     bool                       = false
+		internal atomic answered bool                       = false
+
+		def new(timeout duration = 30s) {
+			self.timeout = timeout
+		}
+
+		// Connects to `addr` (`host` or `host:port`, port 22 by default)
+		// and logs in as `user` (the local user when empty) with the
+		// agent's keys and `keys`. Fails when the server cannot be
+		// reached, its host key is not trusted, or every login is
+		// refused.
+		def connect(addr string, user string = "") !none {
+			return try dialAndLogin(addr, user)
+		}
+
+		// connect with a password as well; it is tried after the keys.
+		// Fails as `connect(addr, user)` does.
+		def connect(addr string, user string, password Secret<string>) !none {
+			self.password = password.reveal()
+			hasPassword = true
+			return try dialAndLogin(addr, user)
+		}
+
+		// connect with one key, tried before the agent's and `keys`.
+		// Fails as `connect(addr, user)` does.
+		def connect(addr string, user string, key Signer) !none {
+			keys.unshift(key)
+			return try dialAndLogin(addr, user)
+		}
+
+		internal def dialAndLogin(addr string, user string) !none {
+			fail sshError("closed", "already connected") when open
+			target = net.withPort(addr, 22)
+			self.user = user != "" ?? (user, localUser())
+			try Policy.validate("adm.network.connect", "std.services.EndpointSpec", "ssh://" + target)
+			let conn = try net.dialStream(target, timeout)
+			let t = new Transport(conn, true, algorithms, timeout)
+			t.rekeyBytes = rekeyLimit
+			t.verifyHost = def (key PublicKey) !none {
+				return try checkHostKey(key)
+			}
+			let failed ?error = none
+			establish(t) onerror (err error) {
+				failed = err
+				recover none
+			}
+			if !(failed is none) {
+				t.close()
+				fail failed
+			}
+			return none
+		}
+
+		internal def establish(t Transport) !none {
+			try t.handshake()
+			let creds = Credentials{user: user, signers: try identities(), password: password, hasPassword: hasPassword, answer: answer}
+			let login = try clientLogin(t, creds)
+			greeting = login.banner
+			t.loggedIn()
+			let m = new Mux(t)
+			m.onOpen = def (req OpenRequest) !none {
+				return try acceptOpen(req)
+			}
+			m.onAccepted = def (req OpenRequest) {
+				startAccepted(req)
+			}
+			transport = t
+			mux = m
+			open = true
+			let reader = async m.run()
+			reader.keepAlive()
+			if keepAlive > 0s {
+				let keeper = async keepAliveLoop(m)
+				keeper.keepAlive()
+			}
+			return none
+		}
+
+		// The agent's keys, then `keys`.
+		internal def identities() !Signer[] {
+			let out Signer[] = []
+			if useAgent {
+				let agent = new Agent()
+				if agent.available() {
+					let held = agent.keys() onerror recover AgentKey[]
+					for let k in held {
+						out.push(k)
+					}
+				}
+			}
+			for let k in keys {
+				out.push(k)
+			}
+			return out
+		}
+
+		// Decides the server's host key: a pinned key, else `knownHosts`
+		// under the policy.
+		internal def checkHostKey(shown PublicKey) !none {
+			let cert = shown.certificate()
+			let key = cert is none ?? (shown, cert.key)
+			let pinned = hostKey
+			if !(pinned is none) {
+				fail sshError("hostkey", "{target} presented {key.fingerprint()}, not the pinned {pinned.fingerprint()}") unless pinned.equals(key)
+				return none
+			}
+			return none when hostKeyPolicy == HostKeyPolicy.Insecure
+			let hosts = trusted()
+			if !(cert is none) && hosts.status(target, key) != HostKeyStatus.Revoked && hosts.isAuthority(target, cert.authority) {
+				// A certificate from a trusted authority must be valid for
+				// this host; one from another authority falls back to its key.
+				let host = net.parseAddress(target) onerror recover new net.Address()
+				let name = host.host == "" ?? (target, host.host)
+				cert.validate(CertificateKind.Host, name) onerror (err error) fail sshError("hostkey", "{target} presented a bad host certificate: {err.message}")
+				return none
+			}
+			let status = hosts.status(target, key)
+			return none when status == HostKeyStatus.Known
+			fail sshError("hostkey", "{target} presented the revoked key {key.fingerprint()}") when status == HostKeyStatus.Revoked
+			fail sshError("hostkey", "the host key of {target} changed to {key.fingerprint()}: someone may be in the middle; if the server's key was replaced, remove the old one with `ssh-keygen -R {hostEntryName(target)}`") when status == HostKeyStatus.Changed
+			if hostKeyPolicy == HostKeyPolicy.AcceptNew {
+				hosts.add(target, key) onerror recover none
+				return none
+			}
+			fail sshError("hostkey", "{target} is not in known_hosts (its key is {key.fingerprint()}); set hostKeyPolicy = HostKeyPolicy.AcceptNew to trust new hosts, or add it with `ssh-keyscan {hostEntryName(target)} >> ~/.ssh/known_hosts`")
+		}
+
+		// knownHosts, read from ~/.ssh/known_hosts on first use.
+		internal def trusted() KnownHosts {
+			let hosts = knownHosts
+			if hosts is none {
+				let fresh = new KnownHosts()
+				knownHosts = fresh
+				return fresh
+			}
+			return hosts
+		}
+
+		// The banner the server showed before the login; "" when none.
+		def banner() string {
+			return greeting
+		}
+
+		// The server's host key; none before `connect`.
+		def serverKey() ?PublicKey {
+			let t = transport
+			return none when t is none
+			return t.serverKey
+		}
+
+		// The server's software version line (`SSH-2.0-OpenSSH_9.6`).
+		def serverVersion() string {
+			let t = transport
+			return t is none ?? ("", t.remoteVersion)
+		}
+
+		// The algorithms the last key exchange settled on; none before
+		// `connect`.
+		def negotiation() ?Negotiation {
+			let t = transport
+			return none when t is none
+			return t.negotiation
+		}
+
+		// Runs `command` with `input` as its standard input and returns
+		// what it printed and how it ended. A command that fails is
+		// reported through `code`, not as an error. Fails when the
+		// connection breaks or the server refuses to run commands.
+		def run(command string, input string = "") !Result {
+			return try runWith(command, input.bytes(), none)
+		}
+
+		// run with bytes as its standard input. Fails as `run(string)` does.
+		def run(command string, input byte[]) !Result {
+			return try runWith(command, input, none)
+		}
+
+		// run with the standard input read from `input`. Fails as
+		// `run(string)` does.
+		def run(command string, input io.Reader) !Result {
+			return try runWith(command, [], input)
+		}
+
+		// Runs `command` and returns its standard output. Fails when it
+		// exits with a code other than 0 (the error names the code and its
+		// error output), or as `run` does.
+		def output(command string) !string {
+			let result = try run(command)
+			fail sshError("exit", "{command} exited with {result.code}: {result.errors.trim()}", result.code) when result.code != 0
+			return result.output
+		}
+
+		internal def runWith(command string, input byte[], reader ?io.Reader) !Result {
+			let p = try start(command)
+			// The input goes in its own task: a command that prints while it
+			// reads would otherwise stall once the window fills.
+			let feeder = async feed(p, input, reader)
+			let out = try p.output()
+			let errText = try p.errors()
+			let code = try p.wait()
+			await feeder
+			return Result{output: out, errors: errText, code: code, signal: p.exitSignal()}
+		}
+
+		internal def feed(p Process, input byte[], reader ?io.Reader) {
+			if !(reader is none) {
+				p.write(reader) onerror recover 0
+			} else if input.len() > 0 {
+				p.write(input) onerror recover 0
+			}
+			p.closeInput() onerror recover none
+		}
+
+		// Starts `command`; with a `terminal` it runs on a pseudo-terminal,
+		// as interactive programs want. Fails when the connection breaks
+		// or the server refuses.
+		def start(command string, terminal ?Terminal = none) !Process {
+			let ch = try session(terminal)
+			let ok = try ch.request("exec", true, new Writer().putText(command).bytes())
+			if !ok {
+				ch.close()
+				fail sshError("channel", "the server refused to run {command}")
+			}
+			return new Process(ch)
+		}
+
+		// Starts the user's login shell on a pseudo-terminal. Fails when
+		// the connection breaks or the server refuses.
+		def shell(terminal Terminal = Terminal{}) !Process {
+			let ch = try session(terminal)
+			let ok = try ch.request("shell", true, [])
+			if !ok {
+				ch.close()
+				fail sshError("channel", "the server refused a shell")
+			}
+			return new Process(ch)
+		}
+
+		// Starts a subsystem such as `sftp` and returns its byte stream.
+		// Fails when the server does not offer it.
+		def subsystem(name string) !Channel {
+			let ch = try session(none)
+			let ok = try ch.request("subsystem", true, new Writer().putText(name).bytes())
+			if !ok {
+				ch.close()
+				fail sshError("channel", "the server does not offer the {name} subsystem")
+			}
+			return new Channel(ch)
+		}
+
+		// A session channel with the environment, the agent and the
+		// terminal set up.
+		internal def session(terminal ?Terminal) !Chan {
+			let m = try connected()
+			let ch = try m.open("session", [])
+			for let (name, value) in environment {
+				try ch.request("env", false, new Writer().putText(name).putText(value).bytes())
+			}
+			if forwardAgent {
+				try ch.request("auth-agent-req@openssh.com", false, [])
+			}
+			if !(terminal is none) {
+				let w = new Writer().putText(terminal.name).putUint32(int64(terminal.columns)).putUint32(int64(terminal.rows)).putUint32(int64(terminal.width)).putUint32(int64(terminal.height))
+				let modes = new Writer()
+				for let (op, value) in terminal.modes {
+					modes.putByte(op).putUint32(int64(value))
+				}
+				modes.putByte(0)
+				w.putString(modes.bytes())
+				let ok = try ch.request("pty-req", true, w.bytes())
+				if !ok {
+					ch.close()
+					fail sshError("channel", "the server refused a terminal")
+				}
+			}
+			return ch
+		}
+
+		// Opens a TCP connection from the server to `addr` (`host:port`),
+		// as `ssh -W` does. Fails when the server refuses or cannot
+		// connect.
+		def dial(addr string) !Channel {
+			let m = try connected()
+			let a = try net.parseAddress(addr)
+			let extra = new Writer().putText(a.host).putUint32(int64(a.port)).putText("127.0.0.1").putUint32(0)
+			let ch = try m.open("direct-tcpip", extra.bytes())
+			return new Channel(ch)
+		}
+
+		// Listens on `local` (`host:port`; port 0 picks one) and carries
+		// each connection through the server to `remote`, as `ssh -L`
+		// does. Fails when the policy denies listening or the address is
+		// taken.
+		def forward(local string, remote string) !Forward {
+			try connected()
+			try Policy.validate("adm.network.listen", "std.services.EndpointSpec", "tcp://" + local)
+			let a = try net.parseAddress(local)
+			let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(local)
+			let ln = try sock.listen(64)
+			let fwd = new Forward(ln.address(), remote, ln)
+			let task = async acceptLocal(fwd, ln)
+			task.keepAlive()
+			return fwd
+		}
+
+		internal def acceptLocal(fwd Forward, ln net.Listener) {
+			for fwd.isOpen() {
+				let conn = acceptOrNone(ln) onerror recover none
+				break when conn is none
+				let task = async carryLocal(conn, fwd.target)
+				task.keepAlive()
+			}
+		}
+
+		internal def acceptOrNone(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		internal def dialOrNone(remote string) !?Channel {
+			return try dial(remote)
+		}
+
+		internal def carryLocal(conn net.Connection, remote string) {
+			let ch = dialOrNone(remote) onerror recover none
+			if ch is none {
+				conn.close() onerror recover none
+				return
+			}
+			pipe(conn, ch)
+		}
+
+		// Asks the server to listen on `remote` (`host:port`; port 0 lets
+		// it pick) and carries each connection it accepts to `local`, as
+		// `ssh -R` does. Fails when the server refuses (OpenSSH:
+		// `AllowTcpForwarding`).
+		def forwardRemote(remote string, local string) !Forward {
+			let m = try connected()
+			let a = try net.parseAddress(remote)
+			let reply = try m.globalRequest("tcpip-forward", true, new Writer().putText(a.host).putUint32(int64(a.port)).bytes())
+			fail sshError("channel", "the server refused to listen on {remote}") when reply is none
+			let port = a.port
+			port = int(uint32At(reply, 0)) when port == 0 && reply.len() >= 4
+			let bound = net.parseAddress(net.withPort(a.host == "" ?? ("0.0.0.0", a.host), port)) onerror recover new net.Address()
+			let fwd = new Forward(bound, local)
+			fwd.remoteHost = a.host
+			fwd.remotePort = port
+			fwd.client = self
+			registerForward("{a.host}:{port}", fwd)
+			return fwd
+		}
+
+		internal atomic def registerForward(key string, fwd Forward) {
+			forwards[key] = fwd
+		}
+
+		internal atomic def lookupForward(key string) ?Forward {
+			return forwards.get(key)
+		}
+
+		internal atomic def dropForward(key string) {
+			forwards.delete(key)
+		}
+
+		// Cancels a remote forward. Fails when the connection breaks.
+		def cancelRemote(fwd Forward) !none {
+			let m = try connected()
+			dropForward("{fwd.remoteHost}:{fwd.remotePort}")
+			try m.globalRequest("cancel-tcpip-forward", true, new Writer().putText(fwd.remoteHost).putUint32(int64(fwd.remotePort)).bytes())
+			return none
+		}
+
+		// Channels the server opens: forwarded connections, and the agent
+		// when it is forwarded.
+		internal def acceptOpen(req OpenRequest) !none {
+			if req.kind == "forwarded-tcpip" {
+				let r = new Reader(req.extra)
+				let host = try r.readText()
+				let port = int(try r.readUint32())
+				let fwd = lookupForward("{host}:{port}")
+				fail sshError("channel", "no forward for {host}:{port}", openAdministrativelyProhibited) when fwd is none
+				req.channel.kind = "forwarded-tcpip:" + fwd.target
+				return none
+			}
+			return none when req.kind == "auth-agent@openssh.com" && forwardAgent
+			fail sshError("channel", "{req.kind} channels are not accepted", openUnknownChannelType)
+		}
+
+		internal def startAccepted(req OpenRequest) {
+			let task = async serveAccepted(req.channel)
+			task.keepAlive()
+		}
+
+		internal def serveAccepted(ch Chan) {
+			let stream = new Channel(ch)
+			let agent = new Agent()
+			let address = ch.kind.startsWith("forwarded-tcpip:") ?? (ch.kind["forwarded-tcpip:".len():], agent.path)
+			let local = dialLocal(address) onerror recover none
+			if local is none {
+				ch.close()
+				return
+			}
+			pipe(local, stream)
+		}
+
+		internal def dialLocal(address string) !?net.Connection {
+			return none when address == ""
+			return try net.dialStream(address, timeout)
+		}
+
+		// Checks the server answers now and then; closes the connection
+		// when a check gets no answer.
+		internal def keepAliveLoop(m Mux) {
+			for !m.closed {
+				time.sleep(keepAlive)
+				break when m.closed
+				answered = false
+				let probe = async probeServer(m)
+				probe.keepAlive()
+				time.sleep(timeout)
+				if !answered && !m.closed {
+					m.transport.disconnect(disconnectByApplication, "keepalive timed out")
+					break
+				}
+			}
+		}
+
+		// Any reply, even a refusal, shows the server is alive.
+		internal def probeServer(m Mux) {
+			m.globalRequest("keepalive@openssh.com", true, []) onerror recover none
+			answered = true
+		}
+
+		internal def connected() !Mux {
+			let m = mux
+			fail sshError("closed", "not connected; call connect first") when m is none || !open
+			let err = m.failure
+			fail err unless err is none
+			return m
+		}
+
+		// Whether the connection is up.
+		def isOpen() bool {
+			let m = mux
+			return open && !(m is none) && !m.closed
+		}
+
+		// Ends the connection: running commands and forwards stop. A
+		// second call does nothing. Never fails.
+		def close() !none {
+			return none unless open
+			open = false
+			for let (_, fwd) in forwards {
+				fwd.close() onerror recover none
+			}
+			let t = transport
+			t.disconnect(disconnectByApplication, "closed") unless t is none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the client and its server.
+		def str() string {
+			return "ssh.Client({user}@{target})"
+		}
+	}
+
+	// Forward is a port forward a `Client` set up: `forward` listens
+	// locally, `forwardRemote` has the server listen.
+	type Forward {
+		// Where connections are accepted: the local listener, or the
+		// server's address and port.
+		address                 net.Address
+		// Where accepted connections go.
+		target                  string
+		remoteHost              string        = ""
+		remotePort              int           = 0
+		internal listener       ?net.Listener = none
+		weak client             ?Client
+		internal atomic stopped bool          = false
+
+		def new(address net.Address, target string, listener ?net.Listener = none) {
+			self.address = address
+			self.target = target
+			self.listener = listener
+		}
+
+		// Whether the forward still accepts connections.
+		def isOpen() bool {
+			return !stopped
+		}
+
+		// Stops accepting; connections already carried go on. Never fails.
+		def close() !none {
+			return none when stopped
+			stopped = true
+			let ln = listener
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			let c = client
+			if !(c is none) {
+				c.cancelRemote(self) onerror recover none
+			}
+			return none
+		}
+	}
+
+	// The local user name, for a login without one.
+	internal def localUser() string {
+		let user = Runtime.getEnv("USER")
+		return user is none ?? ("root", user)
+	}
 }

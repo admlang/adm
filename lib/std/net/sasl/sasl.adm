@@ -1,0 +1,399 @@
+partial module std.net.sasl {
+	use (
+		std.crypto::(constantTimeEqual, rand)
+		std.crypto.hash::(Hash, digest, hmac, pbkdf2)
+		std.data.encoding::(base64decode, base64encode)
+		std.errors
+	)
+
+	// SASL mechanisms shared by the protocols that authenticate with
+	// them (LDAP, IRC, IMAP, SMTP...): SCRAM (RFC 5802, RFC 7677) with
+	// SHA-1, SHA-256 and SHA-512, with or without channel binding
+	// (`-PLUS`). The protocol carries the messages; this module makes and
+	// checks them.
+
+	// SaslError is the payload of every SASL failure. `code` names the
+	// kind: `protocol` (a malformed or unexpected message), `auth` (the
+	// password or the server's proof is wrong, or the user is unknown)
+	// or `binding` (the channel binding does not match, or was stripped).
+	// `reply` is the `e=` value a server sends back (RFC 5802 §7), "" when
+	// none applies.
+	struct SaslError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		reply   string
+	}
+
+	// ScramMechanism is the hash a SCRAM exchange runs over; its value is
+	// the mechanism name without `-PLUS`.
+	enum ScramMechanism {
+		Sha1   = "SCRAM-SHA-1",
+		Sha256 = "SCRAM-SHA-256",
+		Sha512 = "SCRAM-SHA-512",
+	}
+
+	// ChannelBinding ties an exchange to the TLS connection it runs over
+	// (RFC 5056), so a man in the middle who terminates TLS cannot relay
+	// it: `tls-exporter` (RFC 9266), `tls-server-end-point` (RFC 5929) or
+	// `tls-unique`, and the data the connection gives for that type.
+	struct ChannelBinding {
+		kind string
+		data byte[]
+	}
+
+	// ScramCredentials are what a server keeps of a password to check a
+	// SCRAM login (RFC 5802 §3): the salt, the iteration count and two
+	// keys derived from them, never the password itself.
+	type ScramCredentials {
+		mechanism  ScramMechanism
+		salt       byte[]
+		iterations int
+		storedKey  byte[]
+		serverKey  byte[]
+
+		def new(mechanism ScramMechanism, salt byte[], iterations int, storedKey byte[], serverKey byte[]) {
+			self.mechanism = mechanism
+			self.salt = salt
+			self.iterations = iterations
+			self.storedKey = storedKey
+			self.serverKey = serverKey
+		}
+
+		// The credentials as an RFC 5803 `authPassword` value:
+		// `SCRAM-SHA-256$4096:salt$storedKey:serverKey`, Base64 inside.
+		def str() string {
+			return "{mechanism.value}${iterations}:{base64encode(salt)}${base64encode(storedKey)}:{base64encode(serverKey)}"
+		}
+	}
+
+	// scramCredentials derives the credentials of a password with
+	// `iterations` rounds of PBKDF2 over a random 16-byte salt. Fails when
+	// the system has no randomness to give.
+	def scramCredentials(password Secret<string>, mechanism ScramMechanism = ScramMechanism.Sha256, iterations int = 4096) !ScramCredentials {
+		return scramCredentials(password, try rand(16), iterations, mechanism)
+	}
+
+	// scramCredentials over a given salt, to rebuild stored ones.
+	def scramCredentials(password Secret<string>, salt byte[], iterations int, mechanism ScramMechanism = ScramMechanism.Sha256) ScramCredentials {
+		let h = hashOf(mechanism)
+		let salted = saltedPassword(h, password.reveal(), salt, iterations)
+		let clientKey = hmac(h, salted, "Client Key".bytes())
+		return new ScramCredentials(mechanism, salt, iterations, digest(h, clientKey), hmac(h, salted, "Server Key".bytes()))
+	}
+
+	// parseScramCredentials reads an RFC 5803 `authPassword` value (see
+	// `ScramCredentials.str`). Fails when it is not one.
+	def parseScramCredentials(text string) !ScramCredentials {
+		let parts = text.trim().split("$")
+		fail saslError("protocol", "not a SCRAM authPassword value") when parts.len() != 3
+		let mechanism = scramMechanismOf(parts[0])
+		fail saslError("protocol", "unknown SCRAM mechanism {parts[0]}") when mechanism is none
+		let info = parts[1].split(":")
+		let keys = parts[2].split(":")
+		fail saslError("protocol", "malformed SCRAM authPassword value") when info.len() != 2 || keys.len() != 2
+		let iterations = try parseCount(info[0])
+		return new ScramCredentials(mechanism, try decode(info[1]), iterations, try decode(keys[0]), try decode(keys[1]))
+	}
+
+	// The mechanism a name stands for, with or without `-PLUS`; none for
+	// another name.
+	def scramMechanismOf(name string) ?ScramMechanism {
+		let plain = name.upper().trimSuffix("-PLUS")
+		for let m in [ScramMechanism.Sha1, ScramMechanism.Sha256, ScramMechanism.Sha512] {
+			return m when m.value == plain
+		}
+		return none
+	}
+
+	// ScramClient is the client side of one SCRAM exchange: `first()`,
+	// then `final` of the server's challenge, then `verify` of the
+	// server's last message, which proves the server knew the password
+	// too.
+	//
+	// ```
+	// let scram = new sasl.ScramClient("alice", password)
+	// send(scram.mechanismName(), try scram.first())
+	// send(try scram.final(challenge))
+	// try scram.verify(outcome)
+	// ```
+	type ScramClient {
+		user              string
+		mechanism         ScramMechanism
+		// The identity to act as, "" for the user's own.
+		authzId           string          = ""
+		// The TLS channel binding at hand, if any.
+		binding           ?ChannelBinding = none
+		// Whether the server offered the `-PLUS` mechanism. With a binding
+		// at hand and no offer the client says it could bind (`y`), so a
+		// server that did offer it notices the offer was stripped.
+		bindingOffered    bool            = true
+		internal password Secret<string>
+		internal nonce    string          = ""
+		internal header   string          = ""
+		internal firstBare string         = ""
+		internal serverSig byte[]         = []
+
+		def new(user string, password Secret<string>, mechanism ScramMechanism = ScramMechanism.Sha256, binding ?ChannelBinding = none) {
+			self.user = user
+			self.password = password
+			self.mechanism = mechanism
+			self.binding = binding
+		}
+
+		// The mechanism name to ask for: `SCRAM-SHA-256`, with `-PLUS`
+		// when the exchange binds to the channel.
+		def mechanismName() string {
+			return bindsChannel() ?? (mechanism.value + "-PLUS", mechanism.value)
+		}
+
+		internal def bindsChannel() bool {
+			return !(binding is none) && bindingOffered
+		}
+
+		// The client-first message. Fails when the system has no
+		// randomness for the nonce.
+		def first() !string {
+			return first(base64encode(try rand(18)))
+		}
+
+		// The client-first message with a nonce of the caller's: printable
+		// ASCII without commas, fresh for every exchange.
+		def first(clientNonce string) string {
+			let b = binding
+			let flag = b is none ?? ("n", bindingOffered ?? ("p=" + b.kind, "y"))
+			header = flag + "," + (authzId == "" ?? ("", "a=" + scramName(authzId))) + ","
+			nonce = clientNonce
+			firstBare = "n={scramName(user)},r={nonce}"
+			return header + firstBare
+		}
+
+		// The client-final message answering the server-first one. Fails
+		// when the server's nonce does not extend ours, its parameters
+		// are missing or unreasonable, or it names a mandatory extension.
+		def final(serverFirst string) !string {
+			fail saslError("protocol", "SCRAM server-first before client-first") when firstBare == ""
+			fail saslError("protocol", "SCRAM server needs an extension: {serverFirst}") when serverFirst.startsWith("m=")
+			let attrs = scramAttrs(serverFirst)
+			let serverNonce = attrs.get("r")
+			let saltText = attrs.get("s")
+			let iterText = attrs.get("i")
+			fail saslError("protocol", "SCRAM server-first lacks a nonce") when serverNonce is none
+			fail saslError("protocol", "SCRAM server-first lacks a salt") when saltText is none
+			fail saslError("protocol", "SCRAM server-first lacks an iteration count") when iterText is none
+			fail saslError("protocol", "SCRAM server nonce does not extend ours") unless serverNonce.startsWith(nonce) && serverNonce.len() > nonce.len()
+			let iterations = try parseCount(iterText)
+			let salt = try decode(saltText)
+			let h = hashOf(mechanism)
+			let salted = saltedPassword(h, password.reveal(), salt, iterations)
+			let clientKey = hmac(h, salted, "Client Key".bytes())
+			let storedKey = digest(h, clientKey)
+			let withoutProof = "c={base64encode(channelData(header, binding, bindsChannel()))},r={serverNonce}"
+			let authMessage = "{firstBare},{serverFirst},{withoutProof}"
+			let proof = xorBytes(clientKey, hmac(h, storedKey, authMessage.bytes()))
+			serverSig = hmac(h, hmac(h, salted, "Server Key".bytes()), authMessage.bytes())
+			return "{withoutProof},p={base64encode(proof)}"
+		}
+
+		// Checks the server-final message. Fails with `auth` when the
+		// server refused (its `e=` reason in `reply`) or its signature
+		// does not prove it knows the password.
+		def verify(serverFinal string) !none {
+			let attrs = scramAttrs(serverFinal)
+			let refusal = attrs.get("e")
+			fail SaslError{message: "sasl: SCRAM server refused: {refusal}", code: "auth", reply: refusal} unless refusal is none
+			let v = attrs.get("v")
+			fail saslError("protocol", "SCRAM server-final lacks a signature") when v is none
+			fail saslError("auth", "SCRAM server signature does not match") unless serverSig.len() > 0 && constantTimeEqual(try decode(v), serverSig)
+			return none
+		}
+	}
+
+	// ScramServer is the server side of one SCRAM exchange: `first` of
+	// the client's first message gives the challenge, `final` of its
+	// answer checks the proof and gives the last message. `credentials`
+	// looks a user name up.
+	//
+	// ```
+	// let scram = new sasl.ScramServer(def (user string) !sasl.ScramCredentials {
+	// 	return try accounts.scram(user)
+	// })
+	// send(try scram.first(clientFirst))
+	// send(try scram.final(clientFinal))   // then the user is scram.user()
+	// ```
+	type ScramServer {
+		mechanism            ScramMechanism
+		// The channel bindings the connection offers, one per type, when
+		// it runs over TLS and the server offers the `-PLUS` mechanism.
+		bindings             ChannelBinding[]                  = []
+		// Whether the client picked the `-PLUS` mechanism.
+		plus                 bool                              = false
+		internal credentials def (string) !ScramCredentials
+		internal header      string                            = ""
+		internal firstBare   string                            = ""
+		internal serverFirst string                            = ""
+		internal nonce       string                            = ""
+		internal keys        ?ScramCredentials                 = none
+		internal name        string                            = ""
+		internal authz       string                            = ""
+		internal bound       ?ChannelBinding                   = none
+
+		def new(credentials def (string) !ScramCredentials, mechanism ScramMechanism = ScramMechanism.Sha256, bindings ChannelBinding[] = [], plus bool = false) {
+			self.credentials = credentials
+			self.mechanism = mechanism
+			self.bindings = bindings
+			self.plus = plus
+		}
+
+		// The user name the client gave, known after `first`.
+		def user() string {
+			return name
+		}
+
+		// The identity the client asked to act as, "" for its own.
+		def authzId() string {
+			return authz
+		}
+
+		// The server-first message answering the client's first. Fails
+		// with `protocol` on a malformed message, `binding` when the
+		// channel binding request does not fit this connection, or `auth`
+		// when `credentials` fails for the user; `reply` holds what to
+		// send back when the protocol has room for it.
+		def first(clientFirst string) !string {
+			return try first(clientFirst, base64encode(try rand(18)))
+		}
+
+		// first with the server's part of the nonce given. Fails as
+		// `first(clientFirst)` does.
+		def first(clientFirst string, serverNonce string) !string {
+			let parts = clientFirst.split(",")
+			fail saslError("protocol", "malformed SCRAM client-first", "other-error") when parts.len() < 4
+			let flag = parts[0]
+			if flag.startsWith("p=") {
+				fail saslError("binding", "client binds to the channel under a mechanism without -PLUS", "channel-binding-not-supported") unless plus
+				fail saslError("binding", "no channel binding on this connection", "channel-binding-not-supported") when bindings.len() == 0
+				for let b in bindings {
+					bound = b when b.kind == flag[2:]
+				}
+				fail saslError("binding", "channel binding {flag[2:]} is not offered", "unsupported-channel-binding-type") when bound is none
+			} else {
+				fail saslError("binding", "client asked for -PLUS without binding", "other-error") when plus
+				fail saslError("protocol", "bad SCRAM channel binding flag {flag}", "other-error") unless flag == "n" || flag == "y"
+				// `y`: the client could bind but saw no -PLUS offer.
+				fail saslError("binding", "client saw no -PLUS offer, but this server makes one", "server-does-support-channel-binding") when flag == "y" && bindings.len() > 0
+			}
+			fail saslError("protocol", "bad SCRAM authzid", "other-error") unless parts[1] == "" || parts[1].startsWith("a=")
+			authz = parts[1] == "" ?? ("", scramUnname(parts[1][2:]))
+			header = flag + "," + parts[1] + ","
+			fail saslError("protocol", "SCRAM client needs an extension", "extensions-not-supported") when parts[2].startsWith("m=")
+			firstBare = clientFirst[header.len():]
+			let attrs = scramAttrs(firstBare)
+			let user = attrs.get("n")
+			let clientNonce = attrs.get("r")
+			fail saslError("protocol", "SCRAM client-first lacks a user", "other-error") when user is none
+			fail saslError("protocol", "SCRAM client-first lacks a nonce", "other-error") when clientNonce is none
+			fail saslError("protocol", "SCRAM client-first has an empty nonce", "other-error") when clientNonce == ""
+			name = scramUnname(user)
+			let found = credentials(name) onerror (err error) fail SaslError{message: "unknown user {name}", code: "auth", cause: err, reply: "unknown-user"}
+			fail saslError("auth", "credentials of {name} are for {found.mechanism.value}", "unknown-user") when found.mechanism != mechanism
+			keys = found
+			nonce = clientNonce + serverNonce
+			serverFirst = "r={nonce},s={base64encode(found.salt)},i={found.iterations}"
+			return serverFirst
+		}
+
+		// The server-final message, once the client's proof checks out.
+		// Fails with `auth` (`invalid-proof`) on a wrong password, or
+		// `binding` when the channel binding data differs.
+		def final(clientFinal string) !string {
+			let k = keys
+			fail saslError("protocol", "SCRAM client-final before client-first", "other-error") when k is none
+			let at = clientFinal.indexOf(",p=")
+			fail saslError("protocol", "SCRAM client-final lacks a proof", "other-error") when at < 0
+			let withoutProof = clientFinal[:at]
+			let attrs = scramAttrs(withoutProof)
+			let c = attrs.get("c")
+			let r = attrs.get("r")
+			fail saslError("protocol", "SCRAM client-final lacks c= or r=", "other-error") when c is none || r is none
+			fail saslError("auth", "SCRAM nonce does not match", "other-error") when r != nonce
+			let expected = channelData(header, bound, header.startsWith("p="))
+			fail saslError("binding", "SCRAM channel binding does not match", "channel-bindings-dont-match") unless constantTimeEqual(try decode(c), expected)
+			let proof = try decode(clientFinal[at + 3:])
+			let h = hashOf(mechanism)
+			let authMessage = "{firstBare},{serverFirst},{withoutProof}"
+			let signature = hmac(h, k.storedKey, authMessage.bytes())
+			let clientKey = xorBytes(proof, signature)
+			fail saslError("auth", "SCRAM proof for {name} does not verify", "invalid-proof") unless proof.len() == signature.len() && constantTimeEqual(digest(h, clientKey), k.storedKey)
+			return "v={base64encode(hmac(h, k.serverKey, authMessage.bytes()))}"
+		}
+	}
+
+	internal def saslError(code string, text string, reply string = "") error {
+		return SaslError{message: "sasl: {text}", code: code, reply: reply}
+	}
+
+	internal def hashOf(mechanism ScramMechanism) Hash {
+		return Hash.SHA1 when mechanism == ScramMechanism.Sha1
+		return Hash.SHA512 when mechanism == ScramMechanism.Sha512
+		return Hash.SHA256
+	}
+
+	internal def saltedPassword(h Hash, password string, salt byte[], iterations int) byte[] {
+		return pbkdf2(h, password.bytes(), salt, iterations, digest(h, []).len())
+	}
+
+	// What `c=` carries: the GS2 header, and the binding data when the
+	// exchange binds to the channel.
+	internal def channelData(header string, binding ?ChannelBinding, binds bool) byte[] {
+		return header.bytes() when !binds || binding is none
+		return header.bytes() + binding.data
+	}
+
+	// An iteration count: digits, between 1 and ten million (a higher one
+	// is a server trying to burn the client's time).
+	internal def parseCount(text string) !int {
+		fail saslError("protocol", "bad SCRAM iteration count {text}") when text.len() == 0 || text.len() > 8
+		for let c in text.bytes() {
+			fail saslError("protocol", "bad SCRAM iteration count {text}") when c < byte(48) || c > byte(57)
+		}
+		let n = text.toInt<int>()
+		fail saslError("protocol", "SCRAM iteration count {n} out of range") when n < 1 || n > 10000000
+		return n
+	}
+
+	internal def decode(text string) !byte[] {
+		return base64decode(text) onerror fail saslError("protocol", "bad Base64 in a SCRAM message", "other-error")
+	}
+
+	// A user name as SCRAM writes it: `=` and `,` escaped.
+	def scramName(name string) string {
+		return name.replace("=", "=3D").replace(",", "=2C")
+	}
+
+	// A SCRAM user name read back.
+	def scramUnname(name string) string {
+		return name.replace("=2C", ",").replace("=3D", "=")
+	}
+
+	// The `k=v` attributes of a SCRAM message.
+	def scramAttrs(message string) map<string, string> {
+		let out = map<string, string>{}
+		for let part in message.split(",") {
+			continue when part.len() < 2 || part[1] != '='
+			out[part[:1]] = part[2:]
+		}
+		return out
+	}
+
+	internal def xorBytes(a byte[], b byte[]) byte[] {
+		let n = a.len() < b.len() ?? (a.len(), b.len())
+		let out byte[] = []
+		out.len(n)
+		for let i = 0; i < n; i++ {
+			out[i] = a[i] ^ b[i]
+		}
+		return out
+	}
+}

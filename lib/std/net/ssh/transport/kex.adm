@@ -1,0 +1,342 @@
+internal partial module std.net.ssh.transport {
+	use (
+		std.crypto::(MLKEMLevel, ecdh, ecdhKeyPair, generateMLKEMKey, marshalPoint, newMLKEMPublicKey, p256, p384, p521, rand, unmarshalPoint, x25519, x25519Base)
+		std.crypto.hash::(Hash, digest)
+		std.net.ssh::(parsePublicKey)
+		std.net.ssh.keyformat::(isCertName, plainName)
+		std.net.sshwire::*
+	)
+
+	// Key exchange (RFC 4253 §7-8): ML-KEM-768 with X25519
+	// (draft-ietf-sshm-mlkem-hybrid-kex, OpenSSH's default since 10.0),
+	// Curve25519 (RFC 8731), ECDH over the
+	// NIST curves (RFC 5656), Diffie-Hellman over the fixed MODP groups
+	// (RFC 8268) and group exchange (RFC 4419), with strict key exchange
+	// (OpenSSH's Terrapin countermeasure) and EXT_INFO (RFC 8308).
+
+	// The key exchange methods implemented.
+	def kexMethods() string[] {
+		return ["mlkem768x25519-sha256", "curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521", "diffie-hellman-group-exchange-sha256", "diffie-hellman-group16-sha512", "diffie-hellman-group18-sha512", "diffie-hellman-group14-sha256", "diffie-hellman-group14-sha1"]
+	}
+
+	// The hash of a key exchange method.
+	def kexHash(method string) Hash {
+		return Hash.SHA512 when method := "ecdh-sha2-nistp521" || "diffie-hellman-group16-sha512" || "diffie-hellman-group18-sha512"
+		return Hash.SHA384 when method == "ecdh-sha2-nistp384"
+		return Hash.SHA1 when method == "diffie-hellman-group14-sha1"
+		return Hash.SHA256
+	}
+
+	// The fixed group of a Diffie-Hellman method.
+	def fixedGroup(method string) bigint {
+		return modp4096 when method == "diffie-hellman-group16-sha512"
+		return modp8192 when method == "diffie-hellman-group18-sha512"
+		return modp2048
+	}
+
+	// The group a server answers a group-exchange request with: the
+	// smallest of its groups at least `wanted` bits, within the bounds.
+	def exchangeGroup(low int, wanted int, high int) !bigint {
+		for let group in [modp2048, modp4096, modp8192] {
+			let bits = group.bitLen()
+			return group when bits >= wanted && bits >= low && bits <= high
+		}
+		for let group in [modp8192, modp4096, modp2048] {
+			let bits = group.bitLen()
+			return group when bits >= low && bits <= high
+		}
+		fail sshError("kex", "no group between {low} and {high} bits", disconnectKeyExchangeFailed)
+	}
+
+	// Runs one key exchange after both KEXINITs are known: the method's
+	// messages, the host key check, then NEWKEYS both ways.
+	def runKex(t Transport, peerInit byte[]) !none {
+		let n = try t.negotiate(peerInit)
+		fail sshError("protocol", "strict key exchange needs KEXINIT first", disconnectProtocolError) when t.strict && t.kexCount == 0 && t.inbound.seq != 1
+		if n.skipGuess {
+			try t.readRaw()
+		}
+		let clientInit = t.client ?? (t.localInit, peerInit)
+		let serverInit = t.client ?? (peerInit, t.localInit)
+		let clientVersion = t.client ?? (t.localVersion, t.remoteVersion)
+		let serverVersion = t.client ?? (t.remoteVersion, t.localVersion)
+		let head = new Writer().putText(clientVersion).putText(serverVersion).putString(clientInit).putString(serverInit)
+		let hash = kexHash(n.kex)
+		let (secret, exchangeHash) = try exchange(t, n, head, hash)
+		t.sessionId = exchangeHash when t.sessionId.len() == 0
+		t.negotiation = Negotiation{kex: n.kex, hostKey: n.hostKey, cipherOut: n.cipherOut, cipherIn: n.cipherIn, macOut: n.macOut, macIn: n.macIn, compressionOut: n.compOut, compressionIn: n.compIn}
+		try switchKeys(t, n, secret, exchangeHash, hash)
+		return none
+	}
+
+	// The method's messages. Returns K as an mpint's bytes and H.
+	def exchange(t Transport, n Negotiated, head Writer, hash Hash) !(byte[], byte[]) {
+		let method = n.kex
+		return try hybridExchange(t, n, head, hash) when method == "mlkem768x25519-sha256"
+		if method.startsWith("curve25519-sha256") {
+			let own = try rand(32)
+			let ownPublic = try x25519Base(own)
+			return try ecdhExchange(t, n, head, hash, ownPublic, def (peer byte[]) !byte[] {
+				return try curveSecret(own, peer)
+			})
+		}
+		if method.startsWith("ecdh-sha2-") {
+			let curve = method == "ecdh-sha2-nistp384" ?? (p384, method == "ecdh-sha2-nistp521" ?? (p521, p256))
+			let pair = try ecdhKeyPair(curve)
+			return try ecdhExchange(t, n, head, hash, marshalPoint(curve, pair.public), def (peer byte[]) !byte[] {
+				let point = unmarshalPoint(curve, peer) onerror fail sshError("kex", "bad ECDH point", disconnectKeyExchangeFailed)
+				return ecdh(curve, pair.scalar, point) onerror fail sshError("kex", "bad ECDH point", disconnectKeyExchangeFailed)
+			})
+		}
+		return try groupExchange(t, n, head, hash) when method == "diffie-hellman-group-exchange-sha256"
+		return try dhExchange(t, n, head, hash, fixedGroup(method), [], msgKexEcdhInit, msgKexEcdhReply)
+	}
+
+	// Curve25519 and ECDH: Q_C and Q_S as strings, K the shared secret
+	// read as an unsigned number.
+	def ecdhExchange(t Transport, n Negotiated, head Writer, hash Hash, ownPublic byte[], agree def (byte[]) !byte[]) !(byte[], byte[]) {
+		if t.client {
+			try t.sendKex(new Writer(msgKexEcdhInit).putString(ownPublic).bytes())
+			let reply = try expect(t, msgKexEcdhReply)
+			let r = new Reader(reply[1:])
+			let hostBlob = try r.readString()
+			let peerPublic = try r.readString()
+			let signature = try r.readString()
+			let secret = mpintBytes(parseBigInt(try agree(peerPublic)))
+			head.putString(hostBlob).putString(ownPublic).putString(peerPublic).putString(secret)
+			let exchangeHash = digest(hash, head.bytes())
+			try checkServer(t, n, hostBlob, signature, exchangeHash)
+			return (secret, exchangeHash)
+		}
+		let init = try expect(t, msgKexEcdhInit)
+		let peerPublic = try new Reader(init[1:]).readString()
+		let secret = mpintBytes(parseBigInt(try agree(peerPublic)))
+		let key = t.hostKeyFor(n.hostKey)
+		fail sshError("kex", "no host key for {n.hostKey}", disconnectKeyExchangeFailed) when key is none
+		let hostBlob = t.hostBlobFor(n.hostKey, key)
+		head.putString(hostBlob).putString(peerPublic).putString(ownPublic).putString(secret)
+		let exchangeHash = digest(hash, head.bytes())
+		let signature = try key.sign(exchangeHash, plainName(n.hostKey))
+		try t.sendKex(new Writer(msgKexEcdhReply).putString(hostBlob).putString(ownPublic).putString(signature).bytes())
+		return (secret, exchangeHash)
+	}
+
+	// ML-KEM-768 with X25519: the client sends its ML-KEM encapsulation
+	// key and X25519 public key, the server a ciphertext for that key
+	// and its own X25519 key. K is SHA-256 over both shared secrets,
+	// encoded as a string rather than an mpint.
+	def hybridExchange(t Transport, n Negotiated, head Writer, hash Hash) !(byte[], byte[]) {
+		let own = try rand(32)
+		let ownPublic = try x25519Base(own)
+		if t.client {
+			let kem = try generateMLKEMKey(MLKEMLevel.MLKEM768)
+			let init = kem.publicKey().bytes() + ownPublic
+			try t.sendKex(new Writer(msgKexEcdhInit).putString(init).bytes())
+			let reply = try expect(t, msgKexEcdhReply)
+			let r = new Reader(reply[1:])
+			let hostBlob = try r.readString()
+			let answer = try r.readString()
+			let signature = try r.readString()
+			fail sshError("kex", "ML-KEM reply is {answer.len()} bytes, not 1120", disconnectKeyExchangeFailed) when answer.len() != 1088 + 32
+			let pq = try kem.decapsulate(answer[:1088])
+			let secret = digest(Hash.SHA256, pq + try curveSecret(own, answer[1088:]))
+			head.putString(hostBlob).putString(init).putString(answer).putString(secret)
+			let exchangeHash = digest(hash, head.bytes())
+			try checkServer(t, n, hostBlob, signature, exchangeHash)
+			return (secret, exchangeHash)
+		}
+		let request = try expect(t, msgKexEcdhInit)
+		let init = try new Reader(request[1:]).readString()
+		fail sshError("kex", "ML-KEM init is {init.len()} bytes, not 1216", disconnectKeyExchangeFailed) when init.len() != 1184 + 32
+		let peerKem = newMLKEMPublicKey(init[:1184]) onerror fail sshError("kex", "bad ML-KEM public key", disconnectKeyExchangeFailed)
+		let (pq, ciphertext) = try peerKem.encapsulate()
+		let secret = digest(Hash.SHA256, pq + try curveSecret(own, init[1184:]))
+		let answer = ciphertext + ownPublic
+		let key = t.hostKeyFor(n.hostKey)
+		fail sshError("kex", "no host key for {n.hostKey}", disconnectKeyExchangeFailed) when key is none
+		let hostBlob = t.hostBlobFor(n.hostKey, key)
+		head.putString(hostBlob).putString(init).putString(answer).putString(secret)
+		let exchangeHash = digest(hash, head.bytes())
+		let signature = try key.sign(exchangeHash, plainName(n.hostKey))
+		try t.sendKex(new Writer(msgKexEcdhReply).putString(hostBlob).putString(answer).putString(signature).bytes())
+		return (secret, exchangeHash)
+	}
+
+	// X25519 with the peer's key, refusing an all-zero result (RFC 8731
+	// §3).
+	def curveSecret(own byte[], peer byte[]) !byte[] {
+		let shared = x25519(own, peer) onerror fail sshError("kex", "bad Curve25519 key", disconnectKeyExchangeFailed)
+		let zero = true
+		for let b in shared {
+			zero = false when b != byte(0)
+		}
+		fail sshError("kex", "Curve25519 shared secret is zero", disconnectKeyExchangeFailed) when zero
+		return shared
+	}
+
+	// Diffie-Hellman over group p, generator 2: e and f as mpints.
+	// `extra` goes into the hash before them (the group exchange's
+	// request and group).
+	def dhExchange(t Transport, n Negotiated, head Writer, hash Hash, p bigint, extra byte[], initCode int, replyCode int) !(byte[], byte[]) {
+		let g = bigint(2)
+		let x = parseBigInt(try rand(64)).mod(p - 2) + 1
+		let own = g.modPow(x, p)
+		if t.client {
+			try t.sendKex(new Writer(initCode).putMpint(own).bytes())
+			let reply = try expect(t, replyCode)
+			let r = new Reader(reply[1:])
+			let hostBlob = try r.readString()
+			let f = try r.readMpint()
+			let signature = try r.readString()
+			try checkRange(f, p)
+			let secret = mpintBytes(f.modPow(x, p))
+			let full = new Writer().putRaw(head.bytes()).putString(hostBlob).putRaw(extra).putMpint(own).putMpint(f).putString(secret)
+			let exchangeHash = digest(hash, full.bytes())
+			try checkServer(t, n, hostBlob, signature, exchangeHash)
+			return (secret, exchangeHash)
+		}
+		let init = try expect(t, initCode)
+		let e = try new Reader(init[1:]).readMpint()
+		try checkRange(e, p)
+		let secret = mpintBytes(e.modPow(x, p))
+		let key = t.hostKeyFor(n.hostKey)
+		fail sshError("kex", "no host key for {n.hostKey}", disconnectKeyExchangeFailed) when key is none
+		let hostBlob = t.hostBlobFor(n.hostKey, key)
+		let full = new Writer().putRaw(head.bytes()).putString(hostBlob).putRaw(extra).putMpint(e).putMpint(own).putString(secret)
+		let exchangeHash = digest(hash, full.bytes())
+		let signature = try key.sign(exchangeHash, plainName(n.hostKey))
+		try t.sendKex(new Writer(replyCode).putString(hostBlob).putMpint(own).putString(signature).bytes())
+		return (secret, exchangeHash)
+	}
+
+	// A peer's DH value must lie in [2, p-2] (RFC 4253 §8).
+	def checkRange(v bigint, p bigint) !none {
+		fail sshError("kex", "Diffie-Hellman value out of range", disconnectKeyExchangeFailed) when v <= 1 || v >= p - 1
+		return none
+	}
+
+	// Group exchange (RFC 4419): the client asks for a size, the server
+	// picks a group, then DH over it.
+	def groupExchange(t Transport, n Negotiated, head Writer, hash Hash) !(byte[], byte[]) {
+		if t.client {
+			let low = 2048
+			let wanted = 4096
+			let high = 8192
+			try t.sendKex(new Writer(msgKexDhGexRequest).putUint32(int64(low)).putUint32(int64(wanted)).putUint32(int64(high)).bytes())
+			let group = try expect(t, msgKexDhGexGroup)
+			let r = new Reader(group[1:])
+			let p = try r.readMpint()
+			let g = try r.readMpint()
+			fail sshError("kex", "group of {p.bitLen()} bits outside {low}..{high}", disconnectKeyExchangeFailed) when p.bitLen() < low || p.bitLen() > high
+			fail sshError("kex", "only generator 2 is supported", disconnectKeyExchangeFailed) when g != bigint(2)
+			let extra = new Writer().putUint32(int64(low)).putUint32(int64(wanted)).putUint32(int64(high)).putMpint(p).putMpint(g).bytes()
+			return try dhExchange(t, n, head, hash, p, extra, msgKexDhGexInit, msgKexDhGexReply)
+		}
+		let request = try expect(t, msgKexDhGexRequest)
+		let r = new Reader(request[1:])
+		let low = int(try r.readUint32())
+		let wanted = int(try r.readUint32())
+		let high = int(try r.readUint32())
+		let p = try exchangeGroup(low, wanted, high)
+		try t.sendKex(new Writer(msgKexDhGexGroup).putMpint(p).putMpint(bigint(2)).bytes())
+		let extra = new Writer().putUint32(int64(low)).putUint32(int64(wanted)).putUint32(int64(high)).putMpint(p).putMpint(bigint(2)).bytes()
+		return try dhExchange(t, n, head, hash, p, extra, msgKexDhGexInit, msgKexDhGexReply)
+	}
+
+	// The next key exchange message, which must be `code`.
+	def expect(t Transport, code int) !byte[] {
+		let payload = try t.readRaw()
+		fail sshError("protocol", "expected message {code}, got {int(payload[0])}", disconnectProtocolError) when int(payload[0]) != code
+		return payload
+	}
+
+	// Client side: the host key signed H, and the key is trusted.
+	def checkServer(t Transport, n Negotiated, hostBlob byte[], signature byte[], exchangeHash byte[]) !none {
+		let key = parsePublicKey(hostBlob) onerror fail sshError("kex", "server host key does not parse", disconnectKeyExchangeFailed)
+		let plain = plainName(n.hostKey)
+		fail sshError("kex", "server host key does not fit {n.hostKey}", disconnectKeyExchangeFailed) unless hostKeyFits(key.kind.value, plain) && isCertName(n.hostKey) == !(key.certificate() is none)
+		let r = new Reader(signature)
+		let algorithm = try r.readText()
+		fail sshError("kex", "server signed with {algorithm}, not {plain}", disconnectKeyExchangeFailed) when algorithm != plain
+		fail sshError("kex", "server host key signature does not verify", disconnectKeyExchangeFailed) unless key.verify(exchangeHash, signature)
+		let known = t.serverKey
+		if !(known is none) {
+			// A re-exchange must present the same key.
+			fail sshError("hostkey", "server host key changed during the connection", disconnectHostKeyNotVerifiable) unless known.equals(key)
+			return none
+		}
+		let verify = t.verifyHost
+		if !(verify is none) {
+			let refused ?error = none
+			verify(key) onerror (err error) {
+				refused = err
+				recover none
+			}
+			if !(refused is none) {
+				t.disconnect(disconnectHostKeyNotVerifiable, "host key not verified")
+				fail refused
+			}
+		}
+		t.serverKey = key
+		return none
+	}
+
+	def hostKeyFits(kind string, algorithm string) bool {
+		return algorithm := "rsa-sha2-512" || "rsa-sha2-256" || "ssh-rsa" when kind == "ssh-rsa"
+		return kind == algorithm
+	}
+
+	// Derives the new keys (RFC 4253 §7.2), sends NEWKEYS, waits for the
+	// peer's and switches both directions.
+	def switchKeys(t Transport, n Negotiated, secret byte[], exchangeHash byte[], hash Hash) !none {
+		let k = new Writer().putString(secret).bytes()
+		let (outKey, outIv) = cipherSizes(n.cipherOut)
+		let (inKey, inIv) = cipherSizes(n.cipherIn)
+		let (_, outMac) = macSpec(n.macOut)
+		let (_, inMac) = macSpec(n.macIn)
+		let ivC2S = derive(k, exchangeHash, "A", t.sessionId, hash, t.client ?? (outIv, inIv))
+		let ivS2C = derive(k, exchangeHash, "B", t.sessionId, hash, t.client ?? (inIv, outIv))
+		let keyC2S = derive(k, exchangeHash, "C", t.sessionId, hash, t.client ?? (outKey, inKey))
+		let keyS2C = derive(k, exchangeHash, "D", t.sessionId, hash, t.client ?? (inKey, outKey))
+		let macC2S = derive(k, exchangeHash, "E", t.sessionId, hash, t.client ?? (outMac, inMac))
+		let macS2C = derive(k, exchangeHash, "F", t.sessionId, hash, t.client ?? (inMac, outMac))
+		let outbound = try newProtection(n.cipherOut, n.macOut, t.client ?? (keyC2S, keyS2C), t.client ?? (ivC2S, ivS2C), t.client ?? (macC2S, macS2C))
+		let inbound = try newProtection(n.cipherIn, n.macIn, t.client ?? (keyS2C, keyC2S), t.client ?? (ivS2C, ivC2S), t.client ?? (macS2C, macC2S))
+		outbound.compression = n.compOut
+		inbound.compression = n.compIn
+		try t.sendNewKeys(outbound)
+		try expect(t, msgNewKeys)
+		inbound.startCompression(false, t.authenticated)
+		t.inbound = inbound
+		t.inbound.seq = 0 when t.strict
+		if !t.client && t.wantsExtInfo && t.kexCount == 0 {
+			let algs = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"
+			try t.sendKex(new Writer(msgExtInfo).putUint32(1).putText("server-sig-algs").putText(algs).bytes())
+		}
+		t.kexDone()
+		return none
+	}
+
+	// One key of `size` bytes: HASH(K || H || letter || session_id),
+	// extended with HASH(K || H || key so far) (RFC 4253 §7.2).
+	def derive(k byte[], exchangeHash byte[], letter string, sessionId byte[], hash Hash, size int) byte[] {
+		return [] when size == 0
+		let id = sessionId.len() == 0 ?? (exchangeHash, sessionId)
+		let out = digest(hash, k + exchangeHash + letter.bytes() + id)
+		for out.len() < size {
+			out = out + digest(hash, k + exchangeHash + out)
+		}
+		return out[:size].clone()
+	}
+
+	let (
+		// The 2048-bit MODP group of RFC 3526, generator 2.
+		modp2048 = bigint(0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aacaa68ffffffffffffffff)
+
+		// The 4096-bit MODP group of RFC 3526, generator 2.
+		modp4096 = bigint(0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c934063199ffffffffffffffff)
+
+		// The 8192-bit MODP group of RFC 3526, generator 2.
+		modp8192 = bigint(0xffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dbe115974a3926f12fee5e438777cb6a932df8cd8bec4d073b931ba3bc832b68d9dd300741fa7bf8afc47ed2576f6936ba424663aab639c5ae4f5683423b4742bf1c978238f16cbe39d652de3fdb8befc848ad922222e04a4037c0713eb57a81a23f0c73473fc646cea306b4bcbc8862f8385ddfa9d4b7fa2c087e879683303ed5bdd3a062b3cf5b3a278a66d2a13f83f44f82ddf310ee074ab6a364597e899a0255dc164f31cc50846851df9ab48195ded7ea1b1d510bd7ee74d73faf36bc31ecfa268359046f4eb879f924009438b481c6cd7889a002ed5ee382bc9190da6fc026e479558e4475677e9aa9e3050e2765694dfc81f56e880b96e7160c980dd98edd3dfffffffffffffffff)
+	)
+}

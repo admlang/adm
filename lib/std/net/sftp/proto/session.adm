@@ -1,0 +1,440 @@
+internal partial module std.net.sftp.proto {
+	use (
+		std.fs
+		std.io
+		std.net
+		std.net.sshwire::*
+		std.os
+	)
+
+	// The server side: one SFTP session over a stream, answering from an
+	// `fs.FileStore` rooted at `/`, which is also the home directory.
+
+	// The largest READ or WRITE taken, and what limits@openssh.com says.
+	const maxTransfer = 261120
+
+	// An open file or directory.
+	type OpenFile {
+		path      string
+		dir       bool            = false
+		entries   fs.FileEntry[]  = []
+		sent      int             = 0
+		// Open flags; for a writable file, whether it was truncated.
+		flags     int             = 0
+		truncated bool            = false
+		reader    ?io.ReadCloser  = none
+		readAt    int64           = 0
+		writer    ?io.WriteCloser = none
+		writeAt   int64           = 0
+
+		def new(path string) {
+			self.path = path
+		}
+	}
+
+	// ServerSession answers one client.
+	type ServerSession {
+		stream   net.Stream
+		lines    net.LineReader
+		store    fs.FileStore
+		readOnly bool
+		files    map<string, OpenFile>
+		nextId   int                   = 1
+
+		def new(stream net.Stream, store fs.FileStore, readOnly bool) {
+			self.stream = stream
+			self.store = store
+			self.readOnly = readOnly
+			lines = new net.LineReader(stream, 1)
+		}
+
+		// Answers requests until the client closes the session. Fails
+		// when the stream breaks or the client does not speak SFTP.
+		def run() !none {
+			let init = try readFrame(lines)
+			fail protocolFailure("expected INIT") when init.len() == 0 || int(init[0]) != fxpInit
+			let w = new Writer(fxpVersion).putUint32(3)
+			for let name in ["posix-rename@openssh.com", "limits@openssh.com", "fsync@openssh.com", "expand-path@openssh.com", "home-directory"] {
+				w.putText(name).putText("1")
+			}
+			try send(w.bytes())
+			for {
+				let packet = readFrame(lines) onerror recover byte[]
+				break when packet.len() < 5
+				let kind = int(packet[0])
+				let id = uint32At(packet, 1)
+				let reply = answer(kind, id, new Reader(packet[5:])) onerror (err error) {
+					recover statusReply(id, err)
+				}
+				try send(reply)
+			}
+			for let (_, f) in files {
+				closeFile(f) onerror recover none
+			}
+			return none
+		}
+
+		internal def send(packet byte[]) !none {
+			let framed = frame(packet)
+			let off = 0
+			for off < framed.len() {
+				let n = try stream.write(framed[off:], 0s)
+				fail protocolFailure("wrote nothing") when n <= 0
+				off += n
+			}
+			return none
+		}
+
+		// The reply to one request. Fails with an SftpError for the
+		// client's STATUS reply.
+		internal def answer(kind int, id int64, r Reader) !byte[] {
+			switch {
+				case kind == fxpOpen:
+					let path = resolve(try r.readText())
+					let flags = int(try r.readUint32())
+					try readAttrs(r)
+					return try openFile(id, path, flags)
+				case kind == fxpClose:
+					let handle = string(try r.readString())
+					let f = takeFile(handle)
+					fail statusError(fxFailure, "no such handle", "close") when f is none
+					try closeFile(f)
+					return ok(id)
+				case kind == fxpRead:
+					let f = try fileOf(try r.readString())
+					let offset = int64(try r.readUint64())
+					let length = int(try r.readUint32())
+					return try readFile(id, f, offset, length)
+				case kind == fxpWrite:
+					let f = try fileOf(try r.readString())
+					let offset = int64(try r.readUint64())
+					let data = try r.readString()
+					try writeFile(f, offset, data)
+					return ok(id)
+				case kind == fxpStat || kind == fxpLstat:
+					let path = resolve(try r.readText())
+					return attrsReply(id, attrsOf(try statOf(path)))
+				case kind == fxpFstat:
+					let f = try fileOf(try r.readString())
+					let entry = try statOf(f.path)
+					entry.size = f.writeAt when !(f.writer is none) && f.writeAt > entry.size
+					return attrsReply(id, attrsOf(entry))
+				case kind == fxpSetstat:
+					let path = resolve(try r.readText())
+					try setAttrs(path, try readAttrs(r))
+					return ok(id)
+				case kind == fxpFsetstat:
+					let f = try fileOf(try r.readString())
+					try setAttrs(f.path, try readAttrs(r))
+					return ok(id)
+				case kind == fxpOpendir:
+					let path = resolve(try r.readText())
+					let entries = try listOf(path)
+					let f = new OpenFile(path)
+					f.dir = true
+					f.entries = entries
+					return handleReply(id, addFile(f))
+				case kind == fxpReaddir:
+					let f = try fileOf(try r.readString())
+					fail statusError(fxFailure, "not a directory handle", "readdir") unless f.dir
+					fail statusError(fxEof, "", "readdir") when f.sent >= f.entries.len()
+					let batch = f.entries[f.sent:].slice(0, 100)
+					f.sent += batch.len()
+					let w = new Writer(fxpName).putUint32(id).putUint32(int64(batch.len()))
+					for let e in batch {
+						w.putText(e.name).putText(longName(e))
+						writeAttrs(w, attrsOf(e))
+					}
+					return w.bytes()
+				case kind == fxpRemove:
+					try writable("remove")
+					let path = resolve(try r.readText())
+					try guard(path, "remove", () => store.remove(path))
+					return ok(id)
+				case kind == fxpMkdir:
+					try writable("mkdir")
+					let path = resolve(try r.readText())
+					store.makeDir(path) onerror (err error) {
+						fail statusError(fxFailure, err.message, "mkdir")
+					}
+					return ok(id)
+				case kind == fxpRmdir:
+					try writable("rmdir")
+					let path = resolve(try r.readText())
+					try guard(path, "rmdir", () => store.removeDir(path))
+					return ok(id)
+				case kind == fxpRealpath:
+					return nameReply(id, resolve(try r.readText()))
+				case kind == fxpRename:
+					try writable("rename")
+					let from = resolve(try r.readText())
+					let to = resolve(try r.readText())
+					let exists = true
+					store.stat(to) onerror (err error) {
+						exists = false
+						recover fs.FileEntry{}
+					}
+					fail statusError(fxFailure, "{to} exists", "rename") when exists
+					try guard(from, "rename", () => store.rename(from, to))
+					return ok(id)
+				case kind == fxpReadlink || kind == fxpSymlink:
+					fail statusError(fxOpUnsupported, "links are not supported", "link")
+				case kind == fxpExtended:
+					let name = try r.readText()
+					return try extended(id, name, r)
+			}
+			fail statusError(fxOpUnsupported, "request {kind} is not supported", "request")
+		}
+
+		internal def extended(id int64, name string, r Reader) !byte[] {
+			switch {
+				case name == "posix-rename@openssh.com":
+					try writable("rename")
+					let from = resolve(try r.readText())
+					let to = resolve(try r.readText())
+					try guard(from, "rename", () => store.rename(from, to))
+					return ok(id)
+				case name == "limits@openssh.com":
+					let w = new Writer(fxpExtendedReply).putUint32(id)
+					w.putUint64(uint64(maxTransfer + 1024)).putUint64(uint64(maxTransfer)).putUint64(uint64(maxTransfer)).putUint64(0)
+					return w.bytes()
+				case name == "fsync@openssh.com":
+					try fileOf(try r.readString())
+					return ok(id)
+				case name == "expand-path@openssh.com":
+					let path = try r.readText()
+					let expanded = path == "~" || path.startsWith("~/") ?? ("/" + path[1:], path)
+					return nameReply(id, resolve(expanded))
+				case name == "home-directory":
+					return nameReply(id, "/")
+			}
+			fail statusError(fxOpUnsupported, "extension {name} is not supported", name)
+		}
+
+		internal def openFile(id int64, path string, flags int) !byte[] {
+			let wantsWrite = (flags & (openWrite | openAppend | openCreate | openTrunc)) != 0
+			try writable("open") when wantsWrite
+			let f = new OpenFile(path)
+			f.flags = flags
+			let existing = statOf(path) onerror recover fs.FileEntry{}
+			let exists = existing.path != ""
+			fail statusError(fxFailure, "{path} is a directory", "open") when exists && existing.kind == fs.FileKind.Dir
+			if !wantsWrite {
+				fail statusError(fxNoSuchFile, "", "open {path}") unless exists
+				return handleReply(id, addFile(f))
+			}
+			fail statusError(fxFailure, "{path} exists", "open") when exists && (flags & openExcl) != 0
+			fail statusError(fxNoSuchFile, "", "open {path}") when !exists && (flags & openCreate) == 0
+			if (flags & openAppend) != 0 {
+				f.writer = store.create(path, true) onerror (err error) {
+					fail statusError(fxFailure, err.message, "open")
+				}
+				f.writeAt = existing.size
+			} else if !exists || (flags & openTrunc) != 0 {
+				f.writer = store.create(path, false) onerror (err error) {
+					fail statusError(fxFailure, err.message, "open")
+				}
+				f.truncated = true
+			} else {
+				f.writeAt = -1
+			}
+			return handleReply(id, addFile(f))
+		}
+
+		internal def readFile(id int64, f OpenFile, offset int64, length int) !byte[] {
+			fail statusError(fxFailure, "a directory handle", "read") when f.dir
+			let reader = try readerAt(f, offset)
+			let want = length > maxTransfer ?? (maxTransfer, length)
+			let buf byte[] = []
+			buf.len(want)
+			let got = 0
+			for got < want {
+				let n = reader.read(buf[got:]) onerror (err error) {
+					fail statusError(fxFailure, err.message, "read")
+				}
+				break when n <= 0
+				got += n
+			}
+			fail statusError(fxEof, "", "read") when got == 0
+			f.readAt += int64(got)
+			return new Writer(fxpData).putUint32(id).putString(buf[:got]).bytes()
+		}
+
+		internal def writeFile(f OpenFile, offset int64, data byte[]) !none {
+			fail statusError(fxFailure, "not open for writing", "write") when f.dir || (f.flags & (openWrite | openAppend)) == 0
+			let writer = try writerAt(f, offset)
+			let off = 0
+			for off < data.len() {
+				let n = writer.write(data[off:]) onerror (err error) {
+					fail statusError(fxFailure, err.message, "write")
+				}
+				fail statusError(fxFailure, "wrote nothing", "write") when n <= 0
+				off += n
+			}
+			f.writeAt += int64(data.len())
+			return none
+		}
+
+		// The reader of a file positioned at `offset`, reopened when the
+		// client reads elsewhere.
+		internal def readerAt(f OpenFile, offset int64) !io.ReadCloser {
+			let current = f.reader
+			if !(current is none) {
+				return current when f.readAt == offset
+				current.close() onerror recover none
+			}
+			let opened = store.open(f.path, offset) onerror (err error) {
+				fail statusError(fxFailure, err.message, "read")
+			}
+			f.reader = opened
+			f.readAt = offset
+			return opened
+		}
+
+		// The writer of a file positioned at `offset`: writes that jump
+		// finish the current writer and resume at the new offset, which
+		// drops what followed it.
+		internal def writerAt(f OpenFile, offset int64) !io.WriteCloser {
+			let current = f.writer
+			if !(current is none) {
+				return current when f.writeAt == offset || (f.flags & openAppend) != 0
+				current.close() onerror (err error) {
+					fail statusError(fxFailure, err.message, "write")
+				}
+			}
+			let opened = store.resume(f.path, offset) onerror (err error) {
+				fail statusError(fxFailure, err.message, "write")
+			}
+			f.writer = opened
+			f.writeAt = offset
+			return opened
+		}
+
+		internal def closeFile(f OpenFile) !none {
+			let reader = f.reader
+			if !(reader is none) {
+				reader.close() onerror recover none
+			}
+			let writer = f.writer
+			f.writer = none
+			if !(writer is none) {
+				writer.close() onerror (err error) {
+					fail statusError(fxFailure, err.message, "close")
+				}
+			}
+			return none
+		}
+
+		internal def setAttrs(path string, a Attrs) !none {
+			try writable("setstat")
+			let entry = try statOf(path)
+			if (a.flags & attrPermissions) != 0 {
+				store.chmod(path, int(a.permissions & 0o7777)) onerror (err error) {
+					fail statusError(fxFailure, err.message, "chmod")
+				}
+			}
+			if (a.flags & attrTimes) != 0 {
+				store.touch(path, timeOf(a.mtime)) onerror (err error) {
+					fail statusError(fxFailure, err.message, "touch")
+				}
+			}
+			if (a.flags & attrSize) != 0 && a.size != entry.size {
+				fail statusError(fxOpUnsupported, "files only shrink", "truncate") when a.size > entry.size
+				let w = store.resume(path, a.size) onerror (err error) {
+					fail statusError(fxFailure, err.message, "truncate")
+				}
+				w.close() onerror (err error) {
+					fail statusError(fxFailure, err.message, "truncate")
+				}
+			}
+			return none
+		}
+
+		// A path of the store: absolute, cleaned, `..` kept inside.
+		internal def resolve(path string) string {
+			let joined = path.startsWith("/") ?? (path, "/" + path)
+			let cleaned = os.clean(joined)
+			return cleaned == "" || cleaned == "." ?? ("/", cleaned)
+		}
+
+		internal def statOf(path string) !fs.FileEntry {
+			return store.stat(path) onerror (err error) {
+				fail statusError(fxNoSuchFile, err.message, "stat")
+			}
+		}
+
+		internal def listOf(path string) !fs.FileEntry[] {
+			let entry = try statOf(path)
+			fail statusError(fxFailure, "{path} is not a directory", "opendir") unless entry.kind == fs.FileKind.Dir
+			return store.list(path) onerror (err error) {
+				fail statusError(fxFailure, err.message, "opendir")
+			}
+		}
+
+		// Runs a store change: a missing path is NO_SUCH_FILE, any other
+		// failure FAILURE.
+		internal def guard(path string, op string, change def () !none) !none {
+			try statOf(path)
+			change() onerror (err error) {
+				fail statusError(fxFailure, err.message, op)
+			}
+			return none
+		}
+
+		internal def writable(op string) !none {
+			fail statusError(fxPermissionDenied, "read-only", op) when readOnly
+			return none
+		}
+
+		internal def addFile(f OpenFile) string {
+			let handle = "h{nextId}"
+			nextId++
+			files[handle] = f
+			return handle
+		}
+
+		internal def fileOf(handle byte[]) !OpenFile {
+			let f = files.get(string(handle))
+			fail statusError(fxFailure, "no such handle", "handle") when f is none
+			return f
+		}
+
+		internal def takeFile(handle string) ?OpenFile {
+			let f = files.get(handle)
+			files.delete(handle)
+			return f
+		}
+	}
+
+	def ok(id int64) byte[] {
+		return new Writer(fxpStatus).putUint32(id).putUint32(fxOk).putText("OK").putText("").bytes()
+	}
+
+	// The STATUS reply for a failure: its SftpError status, else FAILURE.
+	def statusReply(id int64, err error) byte[] {
+		let code = fxFailure
+		let text = err.message
+		if err is SftpError {
+			let e SftpError = err
+			code = e.status
+			text = text.trimPrefix("sftp: ")
+		}
+		return new Writer(fxpStatus).putUint32(id).putUint32(int64(code)).putText(text).putText("").bytes()
+	}
+
+	def handleReply(id int64, handle string) byte[] {
+		return new Writer(fxpHandle).putUint32(id).putText(handle).bytes()
+	}
+
+	def attrsReply(id int64, a Attrs) byte[] {
+		let w = new Writer(fxpAttrs).putUint32(id)
+		writeAttrs(w, a)
+		return w.bytes()
+	}
+
+	def nameReply(id int64, name string) byte[] {
+		let w = new Writer(fxpName).putUint32(id).putUint32(1).putText(name).putText("")
+		writeAttrs(w, Attrs{})
+		return w.bytes()
+	}
+}

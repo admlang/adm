@@ -1,0 +1,315 @@
+internal partial module std.net.snmp.proto {
+	use (
+		std.crypto::(constantTimeEqual, rand)
+		std.crypto.cipher
+		std.crypto.hash::(HMAC, Hash, digest, newHasher)
+		std.data.encoding
+		std.data.encoding::(ASN1Element, asn1Integer, asn1OctetString, asn1Sequence, berParse)
+		std.net.snmp::(AuthProtocol, PrivProtocol, SnmpError, User)
+	)
+
+	// SNMPv3 messages (RFC 3412 §6) and the User-based Security Model
+	// (RFC 3414): localized keys, HMAC authentication (RFC 3414, RFC 7860),
+	// DES (RFC 3414) and AES (RFC 3826) privacy.
+
+	// The Transport Security Model (RFC 6353).
+	const modelTsm = 4
+
+	// The contextEngineID a manager that has not learned the agent's
+	// engine sends (RFC 5343): the agent takes it for its own.
+	const localEngineId = byte[0x80, 0x00, 0x00, 0x00, 0x06]
+
+	const (
+		flagAuth       = 1
+		flagPriv       = 2
+		flagReportable = 4
+	)
+
+	// usmStats counters a Report carries (RFC 3414 §5).
+	const (
+		usmStatsUnsupportedSecLevels = "1.3.6.1.6.3.15.1.1.1.0"
+		usmStatsNotInTimeWindows     = "1.3.6.1.6.3.15.1.1.2.0"
+		usmStatsUnknownUserNames     = "1.3.6.1.6.3.15.1.1.3.0"
+		usmStatsUnknownEngineIDs     = "1.3.6.1.6.3.15.1.1.4.0"
+		usmStatsWrongDigests         = "1.3.6.1.6.3.15.1.1.5.0"
+		usmStatsDecryptionErrors     = "1.3.6.1.6.3.15.1.1.6.0"
+	)
+
+	// A decoded (or to be encoded) SNMPv3 message.
+	struct V3Message {
+		// The security model: 3 for USM, 4 for TSM (RFC 6353), where the
+		// transport protects the message and the security parameters are
+		// empty.
+		model           int     = 3
+		msgId           int     = 0
+		maxSize         int     = 65507
+		flags           int     = 0
+		engineId        byte[]  = []
+		boots           int     = 0
+		time            int     = 0
+		userName        string  = ""
+		authParams      byte[]  = []
+		privParams      byte[]  = []
+		contextEngineId byte[]  = []
+		contextName     string  = ""
+		pdu             ?PDU    = none
+		// The encrypted scoped PDU while it is not decrypted.
+		encrypted       ?byte[] = none
+		// The whole message and where its authentication parameters sit.
+		raw             byte[]  = []
+		authOffset      int     = -1
+	}
+
+	// A user's keys localized to one engine.
+	struct Keys {
+		auth    AuthProtocol
+		authKey byte[]
+		priv    PrivProtocol
+		privKey byte[]
+	}
+
+	def hashOf(p AuthProtocol) Hash {
+		return Hash.MD5 when p == AuthProtocol.MD5
+		return Hash.SHA224 when p == AuthProtocol.SHA224
+		return Hash.SHA256 when p == AuthProtocol.SHA256
+		return Hash.SHA384 when p == AuthProtocol.SHA384
+		return Hash.SHA512 when p == AuthProtocol.SHA512
+		return Hash.SHA1
+	}
+
+	// The length of msgAuthenticationParameters for a protocol.
+	def authLength(p AuthProtocol) int {
+		return 0 when p == AuthProtocol.None
+		return 16 when p == AuthProtocol.SHA224
+		return 24 when p == AuthProtocol.SHA256
+		return 32 when p == AuthProtocol.SHA384
+		return 48 when p == AuthProtocol.SHA512
+		return 12
+	}
+
+	// Password to key (RFC 3414 A.2): a megabyte of the password repeated,
+	// hashed.
+	def passwordToKey(password string, hash Hash) !byte[] {
+		let pw = password.bytes()
+		fail SnmpError{message: "snmp: passwords must have 8 characters at least", code: "config"} when pw.len() < 8
+		let h = newHasher(hash)
+		let chunk byte[] = []
+		chunk.len(64)
+		let at = 0
+		for let done = 0; done < 1048576; done += 64 {
+			for let i = 0; i < 64; i++ {
+				chunk[i] = pw[at]
+				at = (at + 1) % pw.len()
+			}
+			h.write(chunk)
+		}
+		return h.hash()
+	}
+
+	// Localizes a key to an engine: H(Ku || engineID || Ku).
+	def localize(key byte[], engineId byte[], hash Hash) byte[] {
+		return digest(hash, key + engineId + key)
+	}
+
+	// A user's keys for an engine. The privacy key follows the
+	// authentication hash; AES-192/256 keys are extended by hashing, the
+	// way Net-SNMP does.
+	def keysFor(user User, engineId byte[]) !Keys {
+		let keys = Keys{auth: user.authProtocol, authKey: [], priv: user.privProtocol, privKey: []}
+		return keys when user.authProtocol == AuthProtocol.None
+		let hash = hashOf(user.authProtocol)
+		keys.authKey = localize(try passwordToKey(user.authPassword.reveal(), hash), engineId, hash)
+		if user.privProtocol != PrivProtocol.None {
+			let priv = localize(try passwordToKey(user.privPassword.reveal(), hash), engineId, hash)
+			let need = privKeyLength(user.privProtocol)
+			for priv.len() < need {
+				priv = priv + digest(hash, priv)
+			}
+			keys.privKey = priv
+		}
+		return keys
+	}
+
+	def privKeyLength(p PrivProtocol) int {
+		return 24 when p == PrivProtocol.AES192
+		return 32 when p == PrivProtocol.AES256
+		return 16
+	}
+
+	// The truncated HMAC of a whole message whose authentication
+	// parameters are zeros.
+	def authDigest(keys Keys, message byte[]) byte[] {
+		let h = new HMAC(hashOf(keys.auth), keys.authKey)
+		h.write(message)
+		let sum = h.hash()
+		return sum[:authLength(keys.auth)].clone()
+	}
+
+	// Encrypts a scoped PDU; returns the ciphertext and the privacy
+	// parameters (the salt).
+	def encryptScoped(keys Keys, scoped byte[], boots int, time int, salt int64) !(byte[], byte[]) {
+		if keys.priv == PrivProtocol.DES {
+			let params = bigEndian(int64(boots), 4) + bigEndian(salt & 0xffffffff, 4)
+			let iv = keys.privKey[8:16].clone()
+			for let i = 0; i < 8; i++ {
+				iv[i] = iv[i] ^ params[i]
+			}
+			let padded = scoped.clone()
+			for padded.len() % 8 != 0 {
+				padded.push(0)
+			}
+			let cbc = try cipher.newCBC(try cipher.newDES(keys.privKey[:8]), iv)
+			return (try cbc.encrypt(padded), params)
+		}
+		let params = bigEndian(salt, 8)
+		let iv = bigEndian(int64(boots), 4) + bigEndian(int64(time), 4) + params
+		let cfb = try cipher.newCFB(try cipher.newAES(keys.privKey[:privKeyLength(keys.priv)]), iv)
+		return (cfb.encrypt(scoped), params)
+	}
+
+	def decryptScoped(keys Keys, data byte[], params byte[], boots int, time int) !byte[] {
+		fail SnmpError{message: "snmp: privacy parameters of {params.len()} bytes", code: "decryptionErrors"} when params.len() != 8
+		if keys.priv == PrivProtocol.DES {
+			fail SnmpError{message: "snmp: DES data not a multiple of 8", code: "decryptionErrors"} when data.len() % 8 != 0
+			let iv = keys.privKey[8:16].clone()
+			for let i = 0; i < 8; i++ {
+				iv[i] = iv[i] ^ params[i]
+			}
+			let cbc = try cipher.newCBC(try cipher.newDES(keys.privKey[:8]), iv)
+			return try cbc.decrypt(data)
+		}
+		let iv = bigEndian(int64(boots), 4) + bigEndian(int64(time), 4) + params
+		let cfb = try cipher.newCFB(try cipher.newAES(keys.privKey[:privKeyLength(keys.priv)]), iv)
+		return cfb.decrypt(data)
+	}
+
+	def bigEndian(v int64, size int) byte[] {
+		let out byte[] = []
+		for let i = size - 1; i >= 0; i-- {
+			out.push(byte(v >> int64(8 * i)))
+		}
+		return out
+	}
+
+	// ---- encoding ----
+
+	def scopedElement(m V3Message) !ASN1Element {
+		let p = m.pdu
+		fail protocolFailure("no PDU to send") when p is none
+		return asn1Sequence([asn1OctetString(m.contextEngineId), asn1OctetString(m.contextName.bytes()), try encodePDU(p)])
+	}
+
+	// The whole message: the scoped PDU encrypted when the flags ask for
+	// privacy, the authentication parameters filled in when they ask for
+	// authentication. `salt` makes the privacy IV unique.
+	def encodeV3(m V3Message, given ?Keys, salt int64) !byte[] {
+		if m.model == modelTsm {
+			let header = asn1Sequence([asn1Integer(m.msgId), asn1Integer(m.maxSize), asn1OctetString(byte[m.flags]), asn1Integer(modelTsm)])
+			return asn1Sequence([asn1Integer(3), header, asn1OctetString([]), try scopedElement(m)]).encode()
+		}
+		let keys = given is none ?? (Keys{auth: AuthProtocol.None, authKey: [], priv: PrivProtocol.None, privKey: []}, given)
+		let data ASN1Element = encoding.asn1Null()
+		let privParams byte[] = []
+		if (m.flags & flagPriv) != 0 {
+			fail protocolFailure("privacy without keys") when keys.priv == PrivProtocol.None
+			let (sealed, params) = try encryptScoped(keys, (try scopedElement(m)).encode(), m.boots, m.time, salt)
+			data = asn1OctetString(sealed)
+			privParams = params
+		} else {
+			data = try scopedElement(m)
+		}
+		let authLen = (m.flags & flagAuth) != 0 ?? (authLength(keys.auth), 0)
+		let zeroAuth byte[] = []
+		zeroAuth.len(authLen)
+		let build = def (auth byte[]) byte[] {
+			let security = asn1Sequence([asn1OctetString(m.engineId), asn1Integer(m.boots), asn1Integer(m.time), asn1OctetString(m.userName.bytes()), asn1OctetString(auth), asn1OctetString(privParams)])
+			let header = asn1Sequence([asn1Integer(m.msgId), asn1Integer(m.maxSize), asn1OctetString(byte[m.flags]), asn1Integer(3)])
+			return asn1Sequence([asn1Integer(3), header, asn1OctetString(security.encode()), data]).encode()
+		}
+		let blank = build(zeroAuth)
+		return blank when authLen == 0
+		return build(authDigest(keys, blank))
+	}
+
+	// ---- decoding ----
+
+	def decodeV3(top ASN1Element, raw byte[]) !V3Message {
+		let m = V3Message{raw: raw}
+		let header = try top.at(1)
+		m.msgId = int(try (try header.at(0)).asInt())
+		m.maxSize = int(try (try header.at(1)).asInt())
+		let flags = (try header.at(2)).content
+		m.flags = flags.len() > 0 ?? (int(flags[0]), 0)
+		let model = int(try (try header.at(3)).asInt())
+		fail protocolFailure("security model {model} is neither USM nor TSM") unless model == 3 || model == modelTsm
+		m.model = model
+		if model == modelTsm {
+			try readScoped(m, try top.at(3))
+			return m
+		}
+		let securityOctets = try top.at(2)
+		let (security, _) = try berParse(securityOctets.content)
+		m.engineId = (try security.at(0)).content
+		m.boots = int(try (try security.at(1)).asInt())
+		m.time = int(try (try security.at(2)).asInt())
+		m.userName = string((try security.at(3)).content)
+		let authElement = try security.at(4)
+		m.authParams = authElement.content
+		m.privParams = (try security.at(5)).content
+		// Where the authentication parameters sit in the message: the
+		// message header, the fields before the security parameters, the
+		// OCTET STRING header, then the fields of the inner SEQUENCE.
+		let offset = headerLength(top) + top.children[0].raw.len() + header.raw.len() + headerLength(securityOctets)
+		offset += headerLength(security)
+		for let i = 0; i < 4; i++ {
+			offset += security.children[i].raw.len()
+		}
+		m.authOffset = offset + headerLength(authElement)
+		let data = try top.at(3)
+		if (m.flags & flagPriv) != 0 {
+			m.encrypted = data.content
+			return m
+		}
+		try readScoped(m, data)
+		return m
+	}
+
+	def readScoped(m V3Message, scoped ASN1Element) !none {
+		m.contextEngineId = (try scoped.at(0)).content
+		m.contextName = string((try scoped.at(1)).content)
+		m.pdu = try decodePDU(try scoped.at(2))
+		return none
+	}
+
+	// Decrypts and reads the scoped PDU of an encrypted message.
+	def openScoped(m V3Message, keys Keys) !none {
+		let sealed = m.encrypted
+		return none when sealed is none
+		let plain = try decryptScoped(keys, sealed, m.privParams, m.boots, m.time)
+		let (scoped, _) = berParse(plain) onerror fail SnmpError{message: "snmp: the scoped PDU does not decrypt", code: "decryptionErrors"}
+		try readScoped(m, scoped)
+		m.encrypted = none
+		return none
+	}
+
+	// Whether the message's authentication parameters are its digest.
+	def verifyDigest(m V3Message, keys Keys) bool {
+		let size = authLength(keys.auth)
+		return false when m.authParams.len() != size || m.authOffset < 0
+		let blank = m.raw.clone()
+		for let i = 0; i < size; i++ {
+			blank[m.authOffset + i] = byte(0)
+		}
+		return constantTimeEqual(authDigest(keys, blank), m.authParams)
+	}
+
+	def headerLength(e ASN1Element) int {
+		return e.raw.len() - e.content.len()
+	}
+
+	// A fresh engine ID: the RFC 3411 format with the enterprise number
+	// 32473 and eight random bytes. Fails when the random source does.
+	def newEngineId() !byte[] {
+		return byte[0x80, 0x00, 0x7e, 0xd9, 0x05] + (try rand(8))
+	}
+}

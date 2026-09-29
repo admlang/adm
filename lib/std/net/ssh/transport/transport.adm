@@ -1,0 +1,455 @@
+internal partial module std.net.ssh.transport {
+	use (
+		std.crypto::(rand)
+		std.net
+		std.net.ssh::(Algorithms, Certificate, Negotiation, PrivateKey, PublicKey)
+		std.net.ssh.keyformat::(isCertName, plainName)
+		std.net.sshwire::*
+		std.time
+	)
+
+	// The SSH transport layer (RFC 4253): the version exchange, key
+	// exchange and re-exchange, and packets in both directions. One task
+	// reads (`readPacket`); any task may write (`writePacket`), and
+	// writes wait while a key exchange runs.
+
+	// The version this implementation announces.
+	const softwareVersion = "SSH-2.0-ADM_1.0"
+
+	// Names that ride in the key exchange list without being methods.
+	const (
+		extInfoClient = "ext-info-c"
+		extInfoServer = "ext-info-s"
+		strictClient  = "kex-strict-c-v00@openssh.com"
+		strictServer  = "kex-strict-s-v00@openssh.com"
+	)
+
+	// The algorithms both sides settled on in one key exchange.
+	struct Negotiated {
+		kex       string
+		hostKey   string
+		cipherOut string
+		cipherIn  string
+		macOut    string
+		macIn     string
+		compOut   string = "none"
+		compIn    string = "none"
+		// The peer sent a guessed first packet that must be dropped.
+		skipGuess bool   = false
+	}
+
+	// Transport is one SSH connection's transport layer.
+	type Transport {
+		stream                    net.Stream
+		lines                     net.LineReader
+		client                    bool
+		algorithms                Algorithms
+		timeout                   duration
+		localVersion              string                 = softwareVersion
+		remoteVersion             string                 = ""
+		// Server side: the host keys offered.
+		hostKeys                  PrivateKey[]           = []
+		// Server side: certificates of host keys, offered as such.
+		hostCerts                 Certificate[]          = []
+		// Client side: decides whether the server's host key is trusted.
+		// Fails to refuse it.
+		verifyHost                ?def (PublicKey) !none = none
+		// The server's host key, once a key exchange verified it.
+		serverKey                 ?PublicKey             = none
+		sessionId                 byte[]                 = []
+		// What the last key exchange settled on.
+		negotiation               ?Negotiation           = none
+		// The signature algorithms the server accepts for user keys
+		// (RFC 8308 `server-sig-algs`), empty when it did not say.
+		serverSigAlgs             string[]               = []
+		// Server side: the client asked for EXT_INFO.
+		wantsExtInfo              bool                   = false
+		outbound                  Protection
+		inbound                   Protection
+		// Strict key exchange (the Terrapin countermeasure) is on.
+		strict                    bool                   = false
+		kexCount                  int                    = 0
+		// Set once the user logged in: reads may then wait without end.
+		authenticated             bool                   = false
+		// Bytes after which keys are exchanged again.
+		rekeyBytes                int64                  = 1073741824
+		rekeyAfter                duration               = 3600s
+		lastKex                   time.Time
+		internal atomic kexActive bool                   = false
+		localInit                 byte[]                 = []
+		internal pendingOut       ?Protection            = none
+		internal signal           channel<none>
+		internal atomic closed    bool                   = false
+		internal failure          ?error                 = none
+
+		def new(stream net.Stream, client bool, algorithms Algorithms, timeout duration) {
+			self.stream = stream
+			self.client = client
+			self.algorithms = algorithms
+			self.timeout = timeout
+			lines = new net.LineReader(stream, 8192)
+			outbound = new Protection()
+			inbound = new Protection()
+			signal = new channel<none>(1)
+			lastKex = time.now()
+		}
+
+		// Exchanges versions and runs the first key exchange. Fails when
+		// the peer is not SSH-2, no algorithms match, or the host key is
+		// refused.
+		def handshake() !none {
+			try writeRaw((localVersion + "\r\n").bytes())
+			try readVersion()
+			try sendKexInit()
+			let peer = try readRaw()
+			fail sshError("protocol", "expected KEXINIT, got message {int(peer[0])}", disconnectProtocolError) when peer.len() == 0 || int(peer[0]) != msgKexInit
+			try runKex(self, peer)
+			return none
+		}
+
+		// Reads lines until the peer's version line. A server may send
+		// other lines first (RFC 4253 §4.2); a client may not.
+		internal def readVersion() !none {
+			for let i = 0; i < 64; i++ {
+				let line = try lines.readLine(timeout)
+				if line.startsWith("SSH-") {
+					fail sshError("protocol", "peer speaks {line}, not SSH-2.0") unless line.startsWith("SSH-2.0-") || line.startsWith("SSH-1.99-")
+					fail sshError("protocol", "version line too long") when line.len() > 253
+					remoteVersion = line
+					return none
+				}
+				fail sshError("protocol", "client sent text before its version") unless client
+			}
+			fail sshError("protocol", "no version line")
+		}
+
+		// The payload of our KEXINIT, sent. Blocks application writes
+		// until the exchange ends.
+		def sendKexInit() !none {
+			return none when !markKexStarted()
+			let kex = filterKnown(algorithms.kex, kexMethods())
+			if kexCount == 0 {
+				kex.push(client ?? (extInfoClient, extInfoServer))
+				kex.push(client ?? (strictClient, strictServer))
+			}
+			let hostAlgs = client ?? (filterKnown(algorithms.hostKeys, hostKeyAlgorithms()), serverHostAlgorithms())
+			let ciphers = filterKnown(algorithms.ciphers, cipherNames())
+			let macs = filterKnown(algorithms.macs, macNames())
+			let compression = filterKnown(algorithms.compression, compressionNames())
+			compression = ["none"] when compression.len() == 0
+			let w = new Writer(msgKexInit)
+			w.putRaw(try rand(16))
+			w.putNames(kex).putNames(hostAlgs)
+			w.putNames(ciphers).putNames(ciphers)
+			w.putNames(macs).putNames(macs)
+			w.putNames(compression).putNames(compression)
+			w.putNames([]).putNames([])
+			w.putBool(false).putUint32(0)
+			localInit = w.bytes()
+			try sendKex(localInit)
+			return none
+		}
+
+		// Whether this call started an exchange (false when one runs).
+		internal atomic def markKexStarted() bool {
+			return false when localInit.len() > 0
+			kexActive = true
+			return true
+		}
+
+		// The host key algorithms a server can sign with: each key's
+		// algorithm, RSA keys as rsa-sha2-512 and rsa-sha2-256.
+		def serverHostAlgorithms() string[] {
+			let out string[] = []
+			for let name in algorithms.hostKeys {
+				for let key in hostKeys {
+					out.push(name) when hostKeyServes(key, name) && !out.includes(name)
+				}
+			}
+			return out
+		}
+
+		// Whether a host key signs for an algorithm: its own, RSA's
+		// hashes, and the certificate forms when it has a certificate.
+		def hostKeyServes(key PrivateKey, algorithm string) bool {
+			return false when isCertName(algorithm) && hostCertFor(key) is none
+			let name = plainName(algorithm)
+			let kind = key.kind.value
+			return kind == "ssh-rsa" ?? (name := "rsa-sha2-512" || "rsa-sha2-256" || "ssh-rsa", name == kind)
+		}
+
+		// The certificate of a host key; none when it has none.
+		def hostCertFor(key PrivateKey) ?Certificate {
+			for let c in hostCerts {
+				return c when c.key.equals(key.publicKey())
+			}
+			return none
+		}
+
+		// The server's host key for an algorithm; none when it has none.
+		def hostKeyFor(algorithm string) ?PrivateKey {
+			for let key in hostKeys {
+				return key when hostKeyServes(key, algorithm)
+			}
+			return none
+		}
+
+		// What the server shows for `key` under an algorithm: the
+		// certificate's blob for a certificate algorithm, else the key's.
+		def hostBlobFor(algorithm string, key PrivateKey) byte[] {
+			let c = hostCertFor(key)
+			return c.blob() when isCertName(algorithm) && !(c is none)
+			return key.publicKey().blob()
+		}
+
+		// Picks the algorithms of an exchange from both KEXINITs.
+		def negotiate(peerInit byte[]) !Negotiated {
+			let mine = new Reader(localInit)
+			let theirs = new Reader(peerInit)
+			try mine.readByte()
+			try theirs.readByte()
+			mine.pos += 16
+			theirs.pos += 16
+			let lists string[][] = []
+			let peerLists string[][] = []
+			for let i = 0; i < 10; i++ {
+				lists.push(try mine.readNames())
+				peerLists.push(try theirs.readNames())
+			}
+			let guessFollows = try theirs.readBool()
+			// Client lists lead; the server picks the client's first match.
+			let c = client ?? (lists, peerLists)
+			let s = client ?? (peerLists, lists)
+			let n = Negotiated{}
+			n.kex = try pick(c[0], s[0], "key exchange")
+			n.hostKey = try pick(c[1], s[1], "host key")
+			let c2s = try pick(c[2], s[2], "client-to-server cipher")
+			let s2c = try pick(c[3], s[3], "server-to-client cipher")
+			let m2s = pickMac(c2s, c[4], s[4])
+			let m2c = pickMac(s2c, c[5], s[5])
+			fail sshError("kex", "no common client-to-server MAC", disconnectKeyExchangeFailed) when m2s == ""
+			fail sshError("kex", "no common server-to-client MAC", disconnectKeyExchangeFailed) when m2c == ""
+			let z2s = try pick(c[6], s[6], "client-to-server compression")
+			let z2c = try pick(c[7], s[7], "server-to-client compression")
+			n.compOut = client ?? (z2s, z2c)
+			n.compIn = client ?? (z2c, z2s)
+			n.cipherOut = client ?? (c2s, s2c)
+			n.cipherIn = client ?? (s2c, c2s)
+			n.macOut = client ?? (m2s, m2c)
+			n.macIn = client ?? (m2c, m2s)
+			// A guess is right when both first choices agree.
+			n.skipGuess = guessFollows && (c[0][0] != s[0][0] || c[1][0] != s[1][0])
+			if kexCount == 0 {
+				strict = (client ?? (peerLists[0].includes(strictServer), peerLists[0].includes(strictClient)))
+				wantsExtInfo = !client && peerLists[0].includes(extInfoClient)
+			}
+			return n
+		}
+
+		// Sends a key exchange message, which may go out while
+		// application writes wait.
+		def sendKex(payload byte[]) !none {
+			try send(payload, true)
+			return none
+		}
+
+		// Sends NEWKEYS and switches outgoing packets to the new keys.
+		atomic def sendNewKeys(next Protection) !none {
+			try writeRaw(try outbound.seal(message(msgNewKeys)))
+			next.startCompression(true, authenticated)
+			outbound = next
+			outbound.seq = 0 when strict
+			return none
+		}
+
+		// Ends an exchange: application writes resume.
+		def kexDone() {
+			finishKex()
+			signal <- none when signal.len() == 0
+		}
+
+		internal atomic def finishKex() {
+			kexActive = false
+			localInit = []
+			kexCount++
+			lastKex = time.now()
+		}
+
+		// Sends a packet. Waits while a key exchange runs; starts one when
+		// the keys have carried enough bytes or grown old. Fails when the
+		// connection is closed or the write fails.
+		def writePacket(payload byte[]) !none {
+			for {
+				fail sshError("closed", "connection is closed") when closed
+				let err = failure
+				fail err unless err is none
+				break when try send(payload, false)
+				select {
+					case signal:
+						signal.flush()
+				}
+				// Pass the wake-up on to the next waiting writer.
+				signal <- none when !kexActive && signal.len() == 0
+			}
+			if kexCount > 0 && localInit.len() == 0 && (outbound.bytes > rekeyBytes || time.now() - lastKex > rekeyAfter) {
+				try sendKexInit()
+			}
+			return none
+		}
+
+		// Seals and writes a packet unless a key exchange holds
+		// application writes; returns whether it went out.
+		internal atomic def send(payload byte[], kex bool) !bool {
+			fail sshError("closed", "connection is closed") when closed
+			return false when kexActive && !kex
+			try writeRaw(try outbound.seal(payload))
+			return true
+		}
+
+		internal def writeRaw(data byte[]) !none {
+			let off = 0
+			for off < data.len() {
+				let n = try stream.write(data[off:], timeout)
+				fail net.errorOf(net.ErrorCode.Pipe, "write", "", "wrote nothing") when n <= 0
+				off += n
+			}
+			return none
+		}
+
+		// The next packet of any kind, IGNORE and DEBUG dropped unless
+		// strict key exchange forbids them during the first exchange.
+		def readRaw() !byte[] {
+			for {
+				let payload = try inbound.open(lines, waitFor())
+				fail protocolError("empty packet") when payload.len() == 0
+				let code = int(payload[0])
+				if code := msgIgnore || msgDebug || msgUnimplemented {
+					fail sshError("protocol", "message {code} during strict key exchange", disconnectProtocolError) when strict && kexCount == 0
+					continue
+				}
+				if code == msgDisconnect {
+					let r = new Reader(payload[1:])
+					let reason = int(r.readUint32() onerror recover 0)
+					let text = r.readText() onerror recover ""
+					closed = true
+					fail sshError("disconnect", "peer disconnected: {text}", reason)
+				}
+				return payload
+			}
+			fail "unreachable"
+		}
+
+		// How long a read may wait: forever once the user logged in
+		// (idle sessions are normal), `timeout` until then.
+		internal def waitFor() duration {
+			return kexCount == 0 || !authenticated ?? (timeout, 87600h)
+		}
+
+		// The next packet above the transport layer. Runs key exchanges
+		// the peer starts, and takes EXT_INFO. Fails when the connection
+		// breaks or the peer disconnects.
+		def readPacket() !byte[] {
+			for {
+				let payload = readRaw() onerror (err error) {
+					failure = err
+					closed = true
+					recover byte[]
+				}
+				let err = failure
+				fail err unless err is none
+				let code = int(payload[0])
+				if code == msgKexInit {
+					try sendKexInit()
+					try runKex(self, payload)
+					continue
+				}
+				if code == msgExtInfo {
+					try readExtInfo(payload)
+					continue
+				}
+				fail sshError("protocol", "message {code} during key exchange", disconnectProtocolError) when code >= 20 && code < 50
+				return payload
+			}
+			fail "unreachable"
+		}
+
+		internal def readExtInfo(payload byte[]) !none {
+			let r = new Reader(payload[1:])
+			let count = try r.readUint32()
+			for let i = int64(0); i < count; i++ {
+				let name = try r.readText()
+				let value = try r.readText()
+				serverSigAlgs = value.split(",") when name == "server-sig-algs"
+			}
+			return none
+		}
+
+		// Marks the user logged in: reads may wait without end, and
+		// `zlib@openssh.com` compression starts both ways. Called right
+		// after the server sent USERAUTH_SUCCESS, or the client read it.
+		atomic def loggedIn() {
+			authenticated = true
+			outbound.startCompression(true, true)
+			inbound.startCompression(false, true)
+		}
+
+		// Sends DISCONNECT and closes. Never fails.
+		def disconnect(reason int, text string) {
+			if !closed {
+				let w = new Writer(msgDisconnect).putUint32(int64(reason)).putText(text).putText("")
+				send(w.bytes(), true) onerror recover false
+			}
+			close()
+		}
+
+		// Closes the stream; writers fail with `closed`. Never fails.
+		def close() {
+			closed = true
+			stream.close() onerror recover none
+			signal <- none when signal.len() == 0
+		}
+
+		def isOpen() bool {
+			return !closed
+		}
+	}
+
+	// The names of `wanted` this implementation knows, in order.
+	def filterKnown(wanted string[], known string[]) string[] {
+		return wanted.filter(name => known.includes(name))
+	}
+
+	// The client's first choice the server also offers.
+	def pick(clientList string[], serverList string[], what string) !string {
+		for let name in clientList {
+			return name when serverList.includes(name)
+		}
+		fail sshError("kex", "no common {what} algorithm", disconnectKeyExchangeFailed)
+	}
+
+	// The MAC for a cipher: none for an AEAD cipher, else the first
+	// common one; "" when none matches.
+	def pickMac(cipherName string, clientList string[], serverList string[]) string {
+		return "none" when cipherName := "chacha20-poly1305@openssh.com" || "aes128-gcm@openssh.com" || "aes256-gcm@openssh.com"
+		for let name in clientList {
+			return name when serverList.includes(name)
+		}
+		return ""
+	}
+
+	def cipherNames() string[] {
+		return ["chacha20-poly1305@openssh.com", "aes128-gcm@openssh.com", "aes256-gcm@openssh.com", "aes128-ctr", "aes192-ctr", "aes256-ctr"]
+	}
+
+	def macNames() string[] {
+		return ["hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com", "hmac-sha2-256", "hmac-sha2-512", "hmac-sha1-etm@openssh.com", "hmac-sha1"]
+	}
+
+	def compressionNames() string[] {
+		return ["none", "zlib@openssh.com", "zlib"]
+	}
+
+	def hostKeyAlgorithms() string[] {
+		return ["ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com", "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]
+	}
+}
