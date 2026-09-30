@@ -1,0 +1,504 @@
+partial module std.net.http.webdav.caldav {
+	use (
+		std.bytes
+		std.fs
+		std.time
+		std.data.encoding::(XML, XMLNode)
+		std.formats.calendar::*
+		std.net.http::(Context)
+		std.net.http.webdav::(Server, Ace, Privilege, davNamespace)
+		std.net.http.webdav.caldav.wire::*
+	)
+
+	// The namespace of CalendarServer's extensions (`getctag`).
+	internal const serverNamespace = "http://calendarserver.org/ns/"
+
+	// Calendars makes a `webdav.Server` a CalDAV server (RFC 4791):
+	// calendar collections (MKCALENDAR, or extended MKCOL with a
+	// `CALDAV:calendar` resource type), each user's calendar home on
+	// their principal (`calendar-home-set`), the `calendar-query`,
+	// `calendar-multiget` and `free-busy-query` reports with recurrence
+	// expansion, and the checks on what a client stores: one calendar
+	// object of one component type and one uid per resource, a uid no
+	// other resource of the calendar has, time zones for every `TZID`.
+	// Discovery needs principals, so turn on `Server.accessControl`.
+	type Calendars {
+		// The store path under which each user's home lies:
+		// `<home>/<user>/`.
+		home            string = "/calendars"
+		// The calendar made in a home the first time a client asks for
+		// it; "" makes none.
+		defaultCalendar string = "calendar"
+		// The largest object stored, in bytes; 0 for no limit.
+		maxSize         int64  = 0
+		// The most objects one query answers; more are cut with a 507 for
+		// the collection. 0 for no limit.
+		maxResults      int    = 0
+
+		def new() {}
+
+		// compliance implements Extension.
+		def compliance() string[] {
+			return ["calendar-access"]
+		}
+
+		// methods implements Extension.
+		def methods() string[] {
+			return ["MKCALENDAR"]
+		}
+
+		// collectionTypes implements Extension.
+		def collectionTypes() XMLNode[] {
+			return [calNode("calendar")]
+		}
+
+		// Makes `user`'s calendar home, only they may use, and the default
+		// calendar in it, unless they exist.
+		// Fails when the store cannot make them.
+		def provision(share Server, user string) !none {
+			let base = cleanPath(home)
+			try share.store.makeDir(base) unless exists(share, base)
+			let own = base + "/" + user
+			return none when exists(share, own)
+			try share.store.makeDir(own)
+			let url = share.userURL(user)
+			share.setAcl(own, [
+				Ace{principal: url, privileges: [Privilege.All]},
+				Ace{principal: url, privileges: [Privilege.All], grant: false, invert: true}
+			])
+			if defaultCalendar != "" {
+				try share.store.makeDir(own + "/" + defaultCalendar)
+				share.setCollectionTypes(own + "/" + defaultCalendar, [calNode("calendar")])
+			}
+			return none
+		}
+
+		// property implements Extension: `calendar-home-set` on a user
+		// principal (making the home first); on a calendar
+		// `supported-calendar-component-set` (unless one was set),
+		// `supported-calendar-data`, `supported-collation-set`,
+		// `max-resource-size` and CalendarServer's `getctag`.
+		def property(share Server, path string, name XMLNode) ?XMLNode {
+			let user = share.principalUser(path)
+			if user != "" {
+				return none unless name.namespace == calNamespace && name.localName == "calendar-home-set"
+				provision(share, user) onerror recover none
+				let n = calNode(name.localName)
+				n.add(davText("href", share.href(cleanPath(home) + "/" + user)))
+				return n
+			}
+			return none unless isCalendar(share, path)
+			if name.namespace == serverNamespace && name.localName == "getctag" {
+				let token = new XMLNode("CS:getctag", serverNamespace)
+				token.set("xmlns:CS", serverNamespace)
+				token.add(syncTokenOf(share, path))
+				return token
+			}
+			return none unless name.namespace == calNamespace
+			switch {
+				case name.localName == "supported-calendar-component-set":
+					return none unless share.deadProperty(path, calNamespace, name.localName) is none
+					let n = calNode(name.localName)
+					for let kind in ["VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY"] {
+						n.add(calNode("comp")).set("name", kind)
+					}
+					return n
+				case name.localName == "supported-calendar-data":
+					let n = calNode(name.localName)
+					let t = n.add(calNode("calendar-data"))
+					t.set("content-type", "text/calendar")
+					t.set("version", "2.0")
+					return n
+				case name.localName == "supported-collation-set":
+					let n = calNode(name.localName)
+					n.add(calText("supported-collation", "i;ascii-casemap"))
+					n.add(calText("supported-collation", "i;octet"))
+					return n
+				case name.localName == "max-resource-size" && maxSize > 0:
+					return calText(name.localName, maxSize.str())
+			}
+			return none
+		}
+
+		// propertyNames implements Extension.
+		def propertyNames(share Server, path string) XMLNode[] {
+			return [calNode("calendar-home-set")] when share.principalUser(path) != ""
+			return [] unless isCalendar(share, path)
+			let names = [calNode("supported-calendar-component-set"), calNode("supported-calendar-data"), calNode("supported-collation-set")]
+			names.push(calNode("max-resource-size")) when maxSize > 0
+			return names
+		}
+
+		// reports implements Extension: the three reports, on calendars
+		// and what they hold.
+		def reports(share Server, path string) XMLNode[] {
+			return [] unless isCalendar(share, path) || isCalendar(share, parentPath(path))
+			return [calNode("calendar-query"), calNode("calendar-multiget"), calNode("free-busy-query")]
+		}
+
+		// report implements Extension.
+		// Fails when writing the answer fails.
+		def report(share Server, ctx Context, path string, body XMLNode) !bool {
+			switch {
+				case isCal(body, "calendar-query"):
+					try query(share, ctx, path, body)
+				case isCal(body, "calendar-multiget"):
+					try multiget(share, ctx, body)
+				case isCal(body, "free-busy-query"):
+					try freeBusy(share, ctx, path, body)
+				default:
+					return false
+			}
+			return true
+		}
+
+		// request implements Extension: MKCALENDAR (RFC 4791 §5.3.1).
+		// Fails when writing the answer fails.
+		def request(share Server, ctx Context, method string, path string) !bool {
+			return false unless method == "MKCALENDAR"
+			let body = try ctx.bytes()
+			let props XMLNode[] = []
+			if body.len() > 0 {
+				let root = new XML().parse(body) onerror recover new XMLNode("")
+				if !isCal(root, "mkcalendar") {
+					try ctx.error(415)
+					return true
+				}
+				for let op in root.elements("set", davNamespace) {
+					let prop = op.child("prop", davNamespace)
+					props = props + prop.elements() unless prop is none
+				}
+			}
+			// A calendar holds no calendar at any depth (RFC 4791 §5.3.1.1).
+			let above = parentPath(path)
+			for {
+				if isCalendar(share, above) {
+					try share.refuse(ctx, 403, calNode("calendar-collection-location-ok"))
+					return true
+				}
+				break when above == "/"
+				above = parentPath(above)
+			}
+			for let p in props {
+				if p.namespace == davNamespace && p.localName != "displayname" {
+					try share.refuse(ctx, 403, davNode("cannot-modify-protected-property"))
+					return true
+				}
+			}
+			return true unless try share.createCollection(ctx, path, [calNode("calendar")], props)
+			try ctx.noContent(201)
+			return true
+		}
+
+		// validate implements Extension (RFC 4791 §5.3.2.1).
+		def validate(share Server, path string, contentType string, content byte[]) ?XMLNode {
+			let parent = parentPath(path)
+			return none unless isCalendar(share, parent)
+			let essence = contentType.split(";")[0].trim().lower()
+			return calNode("supported-calendar-data") unless essence := "" || "text/calendar"
+			return calNode("max-resource-size") when maxSize > 0 && int64(content.len()) > maxSize
+			let raws = new ICalendar().readComponents(new bytes.Reader(content)) onerror recover CalendarComponent[]
+			return calNode("valid-calendar-data") unless raws.len() == 1 && raws[0].name == "VCALENDAR"
+			let root = raws[0]
+			return calNode("valid-calendar-object-resource") when root.properties.filter(p => p.name == "METHOD").len() > 0
+			let items = root.components.filter(c => c.name != "VTIMEZONE")
+			return calNode("valid-calendar-object-resource") when items.len() == 0
+			let kind = items[0].name
+			let uid = uidOf(items[0])
+			for let c in items {
+				return calNode("valid-calendar-object-resource") unless c.name == kind && uidOf(c) == uid && uid != ""
+			}
+			let allowed = share.deadProperty(parent, calNamespace, "supported-calendar-component-set")
+			if !(allowed is none) {
+				let names = allowed.elements("comp", calNamespace).mapElem<string>(c => attr(c, "name").upper())
+				return calNode("supported-calendar-component") unless names.includes(kind)
+			}
+			// Every TZID needs its VTIMEZONE (RFC 4791 §4.1).
+			let zones = root.components.filter(c => c.name == "VTIMEZONE").mapElem<string>(c => zoneIdOf(c))
+			for let c in items {
+				for let id in zoneRefs(c) {
+					return calNode("valid-calendar-data") unless zones.includes(id)
+				}
+			}
+			let name = baseOf(path)
+			for let member in share.store.list(parent) onerror recover fs.FileEntry[] {
+				continue when member.kind == fs.FileKind.Dir || member.name == name
+				let other = parent + "/" + member.name
+				let data = readFile(share.store, other) onerror recover byte[]
+				let theirs = new ICalendar().readComponents(new bytes.Reader(data)) onerror recover CalendarComponent[]
+				for let r in theirs {
+					for let c in r.components {
+						if c.name != "VTIMEZONE" && uidOf(c) == uid {
+							let n = calNode("no-uid-conflict")
+							n.add(davText("href", share.href(other)))
+							return n
+						}
+					}
+				}
+			}
+			return none
+		}
+
+		// ---- internals ----
+
+		// Whether `path` is a calendar collection.
+		internal def isCalendar(share Server, path string) bool {
+			for let t in share.collectionTypes(path) {
+				return true when isCal(t, "calendar")
+			}
+			return false
+		}
+
+		internal def exists(share Server, path string) bool {
+			return statOf(share, path) onerror recover false
+		}
+
+		internal def statOf(share Server, path string) !bool {
+			try share.store.stat(path)
+			return true
+		}
+
+		internal def entryOf(share Server, path string) !?fs.FileEntry {
+			return try share.store.stat(path)
+		}
+
+		// A value that changes whenever a member of the calendar does.
+		internal def syncTokenOf(share Server, path string) string {
+			let parts string[] = []
+			for let m in share.store.list(path) onerror recover fs.FileEntry[] {
+				parts.push("{m.name}:{m.size}:{m.modified.unixNs()}")
+			}
+			parts.sort((a, b) => a < b)
+			return "\"" + hashOf(parts.join("|")) + "\""
+		}
+
+		// A short hash of text (FNV-1a).
+		internal def hashOf(text string) string {
+			let h = uint64(14695981039346656037)
+			for let c in text.bytes() {
+				h = (h ^ uint64(c)) * uint64(1099511628211)
+			}
+			return h.str()
+		}
+
+		// The calendar objects at `path` and, as `Depth` says, below it.
+		internal def members(share Server, path string, depth int) string[] {
+			let out string[] = []
+			let entry = entryOf(share, path) onerror recover none
+			return out when entry is none
+			if entry.kind != fs.FileKind.Dir {
+				out.push(path) when isCalendar(share, parentPath(path))
+				return out
+			}
+			return out when depth == 0
+			for let child in share.store.list(path) onerror recover fs.FileEntry[] {
+				let childPath = path == "/" ?? ("/" + child.name, path + "/" + child.name)
+				if child.kind == fs.FileKind.Dir {
+					out = out + members(share, childPath, depth < 0 ?? (-1, depth - 1)) when depth != 1
+				} else if isCalendar(share, path) {
+					out.push(childPath)
+				}
+			}
+			return out
+		}
+
+		// The properties a report asks for, and what it asks of
+		// `calendar-data`.
+		internal def wantedOf(body XMLNode) (XMLNode[], DataRequest) {
+			let prop = body.child("prop", davNamespace)
+			let wanted XMLNode[] = prop is none ?? (XMLNode[], prop.elements())
+			let request = DataRequest{}
+			for let w in wanted {
+				request = dataRequestOf(w) when isCal(w, "calendar-data")
+			}
+			return (wanted, request)
+		}
+
+		// The `calendar-data` of a member, for `describe`.
+		internal def lookupFor(share Server, path string, request DataRequest) def(XMLNode) ?XMLNode {
+			return def (w XMLNode) ?XMLNode {
+				return none unless isCal(w, "calendar-data")
+				let data = readFile(share.store, path) onerror recover byte[]
+				let stored = storedOf(data)
+				let text = stored is none ?? ("", calendarData(stored, request) onerror recover "")
+				return calText("calendar-data", text)
+			}
+		}
+
+		// The zone floating times are read in: the query's
+		// `CALDAV:timezone`, else the calendar's `calendar-timezone`.
+		internal def floatingZone(share Server, path string, body XMLNode) ?TimeZone {
+			let given = body.child("timezone", calNamespace)
+			let text = given is none ?? ("", given.text())
+			if text == "" {
+				let held = share.deadProperty(isCalendar(share, path) ?? (path, parentPath(path)), calNamespace, "calendar-timezone")
+				text = held is none ?? ("", held.text())
+			}
+			return none when text == ""
+			let cal = new ICalendar().read(new bytes.Reader(text.bytes())) onerror recover new Calendar()
+			return none when cal.timeZones.len() == 0
+			return cal.timeZones[0]
+		}
+
+		// calendar-query (RFC 4791 §7.8).
+		internal def query(share Server, ctx Context, path string, body XMLNode) !none {
+			let (wanted, request) = wantedOf(body)
+			return try share.refuse(ctx, 403, calNode("supported-calendar-data")) unless supported(request)
+			let filterNode = body.child("filter", calNamespace)
+			return try share.refuse(ctx, 403, calNode("valid-filter")) when filterNode is none
+			let top = filterNode.elements("comp-filter", calNamespace)
+			return try share.refuse(ctx, 403, calNode("valid-filter")) unless top.len() == 1
+			let (filter, problem) = parseCompFilter(top[0])
+			return try share.refuse(ctx, 403, calNode(problem.condition)) unless problem is none
+			let zone = floatingZone(share, path, body)
+			let limit = maxResults
+			let limitNode = body.child("limit", calNamespace)
+			if !(limitNode is none) {
+				let n = limitNode.child("nresults", calNamespace)
+				let asked = n is none ?? (0, n.text().trim().toInt<int>())
+				limit = asked when asked > 0 && (limit == 0 || asked < limit)
+			}
+			let depthText = ctx.header("Depth").trim().lower()
+			let depth = depthText == "infinity" ?? (-1, depthText == "1" ?? (1, 0))
+			let responses XMLNode[] = []
+			let truncated = false
+			for let member in members(share, path, depth) {
+				continue unless share.allows(ctx, member, Privilege.Read)
+				let data = readFile(share.store, member) onerror recover byte[]
+				let stored = storedOf(data)
+				continue when stored is none
+				floatIn(stored, zone) unless zone is none
+				continue unless passes(filter, stored)
+				if limit > 0 && responses.len() >= limit {
+					truncated = true
+					break
+				}
+				responses.push(share.describe(ctx, member, wanted, lookupFor(share, member, request)))
+			}
+			if truncated {
+				let cut = share.statusResponse(share.href(path), 507)
+				cut.add(davNode("error")).add(davNode("number-of-matches-within-limits"))
+				responses.push(cut)
+			}
+			return try share.answer(ctx, responses)
+		}
+
+		// Reads the floating times of a stored object in `zone`.
+		internal def floatIn(stored Stored, zone TimeZone) {
+			stored.calendar.timeZones.push(zone) unless stored.calendar.timeZones.filter(z => z.id == zone.id).len() > 0
+			for let e in stored.calendar.entries {
+				e.start = floated(e.start, zone.id)
+				e.end = floated(e.end, zone.id)
+				e.due = floated(e.due, zone.id)
+				e.recurrenceId = floated(e.recurrenceId, zone.id)
+			}
+		}
+
+		// A floating date-time put in a zone; others as they are.
+		internal def floated(t ?CalendarTime, zone string) ?CalendarTime {
+			return t when t is none
+			return t when t.utc || t.allDay || t.zone != ""
+			return CalendarTime{year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second, zone: zone}
+		}
+
+		// calendar-multiget (RFC 4791 §7.9).
+		internal def multiget(share Server, ctx Context, body XMLNode) !none {
+			let (wanted, request) = wantedOf(body)
+			return try share.refuse(ctx, 403, calNode("supported-calendar-data")) unless supported(request)
+			let responses XMLNode[] = []
+			for let h in body.elements("href", davNamespace) {
+				let href = h.text().trim()
+				let found = share.pathOf(href)
+				if found is none {
+					responses.push(share.statusResponse(href, 404))
+					continue
+				}
+				let member string = found
+				if !share.allows(ctx, member, Privilege.Read) {
+					responses.push(share.statusResponse(href, 403))
+					continue
+				}
+				responses.push(share.describe(ctx, member, wanted, lookupFor(share, member, request)))
+			}
+			return try share.answer(ctx, responses)
+		}
+
+		// free-busy-query (RFC 4791 §7.10): a VFREEBUSY of the busy time
+		// of the calendar's objects in the range.
+		internal def freeBusy(share Server, ctx Context, path string, body XMLNode) !none {
+			let rangeNode = body.child("time-range", calNamespace)
+			return try share.refuse(ctx, 403, calNode("valid-filter")) when rangeNode is none
+			let (r, problem) = parseTimeRange(rangeNode)
+			return try share.refuse(ctx, 403, calNode(problem.condition)) unless problem is none
+			let depthText = ctx.header("Depth").trim().lower()
+			let depth = depthText == "infinity" ?? (-1, depthText == "0" ?? (0, 1))
+			let objects Stored[] = []
+			for let member in members(share, path, depth) {
+				continue unless share.allows(ctx, member, Privilege.Read)
+				let stored = storedOf(readFile(share.store, member) onerror recover byte[])
+				objects.push(stored) unless stored is none
+			}
+			return try ctx.blob(200, "text/calendar; charset=utf-8", freeBusyText(busyTime(objects, r), r).bytes())
+		}
+	}
+
+	// The UID of a component, "" when it has none.
+	internal def uidOf(c CalendarComponent) string {
+		for let p in c.properties {
+			return p.value.trim() when p.name == "UID"
+		}
+		return ""
+	}
+
+	// The TZID of a VTIMEZONE.
+	internal def zoneIdOf(c CalendarComponent) string {
+		for let p in c.properties {
+			return p.value.trim() when p.name == "TZID"
+		}
+		return ""
+	}
+
+	// The TZIDs a component and its subcomponents name.
+	internal def zoneRefs(c CalendarComponent) string[] {
+		let out string[] = []
+		for let p in c.properties {
+			for let q in p.params {
+				continue unless q.name == "TZID"
+				for let v in q.values {
+					out.push(v) unless out.includes(v)
+				}
+			}
+		}
+		for let sub in c.components {
+			out = out + zoneRefs(sub)
+		}
+		return out
+	}
+
+	// A store path without a trailing slash, starting with one.
+	internal def cleanPath(path string) string {
+		return "/" + path.trim().trimPrefix("/").trimSuffix("/")
+	}
+
+	// The collection holding `path`.
+	internal def parentPath(path string) string {
+		let p = cleanPath(path)
+		let at = lastSlash(p)
+		return at <= 0 ?? ("/", string(p.bytes()[:at]))
+	}
+
+	// The last segment of `path`.
+	internal def baseOf(path string) string {
+		let p = cleanPath(path)
+		return string(p.bytes()[lastSlash(p) + 1:])
+	}
+
+	// The index of the last `/` of a path.
+	internal def lastSlash(path string) int {
+		let b = path.bytes()
+		for let i = b.len() - 1; i >= 0; i-- {
+			return i when b[i] == byte('/')
+		}
+		return -1
+	}
+}

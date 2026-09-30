@@ -1,0 +1,677 @@
+partial module std.ai.llm {
+	use (
+		std.formats.ai::(ModelFile, MetaArray)
+		std.ai.llm.text::*
+	)
+
+	// Reads the tokenizer from a model file's "tokenizer.ggml.*" metadata
+	// (SentencePiece-style BPE for Llama, byte-level GPT-2 BPE for Qwen and SmolLM).
+	// Fails when the metadata is missing or uses an unsupported tokenizer.
+	def loadTokenizer(file ModelFile) !Tokenizer {
+		let model = file.getString("tokenizer.ggml.model")
+		fail "llm: the model file has no tokenizer" when model is none
+		let tokens = file.getStrings("tokenizer.ggml.tokens")
+		fail "llm: the model file has no token list" when tokens.len() == 0
+		match model {
+			case "gpt2":
+				let pre = file.getString("tokenizer.ggml.pre")
+				let name = pre is none ?? ("default", pre)
+				fail "llm: the {name} pre-tokenizer is not supported yet" when preTokenizer(name) is none
+			case "llama":
+			default:
+				fail "llm: the {model} tokenizer is not supported yet"
+		}
+		return new Tokenizer(file)
+	}
+
+	// Text to token ids and back.
+	type Tokenizer {
+		internal tokens         string[]
+		internal ids            map<string, int>
+		internal bytePairs      bool
+		internal ranks          map<string, int>
+		internal scores         float[]
+		internal splitter       PreTokenizer
+		// Token types as GGUF numbers them (1 normal, 2 unknown, 3 control,
+		// 4 user-defined, 5 unused, 6 byte).
+		internal types          int[]
+		// Control and user-defined tokens, longest first, matched in the text as a whole.
+		internal specials       int[]
+		internal start          int
+		internal end            int
+		internal addStartToken  bool
+		internal addSpacePrefix bool
+		// Byte-level BPE: the character standing for each byte, and back.
+		internal byteChars      string[]
+		internal charBytes      map<int, int>
+		// Byte tokens of SentencePiece (<0x41>) by byte value.
+		internal byteTokens     int[]
+		internal cache          map<string, int[]>
+		internal ends           int[]
+
+		// A tokenizer from the model file's metadata; `loadTokenizer` checks
+		// the file is one this can read first.
+		def new(file ModelFile) {
+			tokens = file.getStrings("tokenizer.ggml.tokens")
+			ids = new map<string, int>()
+			for let (n, t) in tokens {
+				ids.set(t, n)
+			}
+			ranks = new map<string, int>()
+			charBytes = new map<int, int>()
+			cache = new map<string, int[]>()
+			let model = file.getString("tokenizer.ggml.model")
+			let spm = !(model is none) && model == "llama"
+			let preName = file.getString("tokenizer.ggml.pre")
+			let pre = preName is none ?? ("default", preName)
+			if spm {
+				useSentencePiece(scoresOf(file))
+			} else {
+				let named = preTokenizer(pre)
+				useBytePairs(file.getStrings("tokenizer.ggml.merges"), named is none ?? (new PreTokenizer(Digits.Runs, false), named))
+			}
+			useSpecials(typesOf(file, tokens.len()))
+			let first = file.getInt("tokenizer.ggml.bos_token_id")
+			let last = file.getInt("tokenizer.ggml.eos_token_id")
+			start = first is none ?? (-1, first)
+			end = last is none ?? (-1, last)
+			let addStart = file.metadata.get("tokenizer.ggml.add_bos_token")
+			let addSpace = file.metadata.get("tokenizer.ggml.add_space_prefix")
+			// Without the key, SentencePiece models and the byte-pair families
+			// llama.cpp opens with the start token (Llama 3 and its kin) add it.
+			let startFamily = pre := "llama3" || "llama-v3" || "llama-bpe" || "falcon3" || "falcon-h1" || "pixtral" || "midm-2.0" || "lfm2" || "jina-v5-nano" || "tekken" || "chameleon"
+			addStartToken = addStart is bool ?? (addStart, spm || startFamily)
+			addSpacePrefix = addSpace is bool ?? (addSpace, spm)
+			for let (_, key) in string["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+				let id = file.getInt(key)
+				ends.push(id) unless id is none || ends.includes(id)
+			}
+			for let (_, text) in string["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "<|endoftext|>", "<end_of_turn>", "</s>"] {
+				let id = ids.get(text)
+				continue when id is none
+				ends.push(id) when types[id] == 3 && !ends.includes(id)
+			}
+		}
+
+		internal def useBytePairs(merges string[], splitter PreTokenizer) {
+			bytePairs = true
+			self.splitter = splitter
+			for let (n, m) in merges {
+				ranks.set(m, n)
+			}
+			// GPT-2's printable stand-ins: bytes that are visible Latin-1
+			// characters stand for themselves, the rest take code points from 256 up.
+			byteChars.len(256)
+			let next = 256
+			for let b = 0; b < 256; b++ {
+				let visible = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF)
+				let c = visible ?? (b, next)
+				next += visible ?? (0, 1)
+				byteChars[b] = encodeRune(c)
+				charBytes.set(c, b)
+			}
+		}
+
+		internal def useSentencePiece(scores float[]) {
+			self.scores = scores
+			byteTokens.len(256)
+			for let b = 0; b < 256; b++ {
+				let id = ids.get(byteToken(b))
+				byteTokens[b] = id is none ?? (-1, id)
+			}
+		}
+
+		internal def useSpecials(types int[]) {
+			self.types = types
+			for let (n, kind) in types {
+				continue unless (kind := 3 || 4) && tokens[n].len() > 0
+				specials.push(n)
+			}
+			specials = specials.sort((a, b) => tokens[b].len() - tokens[a].len())
+		}
+
+		// Text to tokens. Control tokens written in the text (such as
+		// `<|im_start|>`) become their ids. `addStart` puts the start-of-text
+		// token first when the model uses one.
+		def encode(text string, addStart bool = true) int[] {
+			let out int[]
+			out.push(start) when addStart && addStartToken && start >= 0
+			let data = text.bytes()
+			let from = 0
+			let first = true
+			for from < data.len() {
+				let (at, special) = findSpecial(data, from)
+				encodePlain(data[from:at], first, out) when at > from
+				break when special < 0
+				out.push(special)
+				from = at + tokens[special].bytes().len()
+				first = false
+			}
+			return out
+		}
+
+		// The first control or user-defined token at or after `from`: its
+		// byte offset and id, or (data length, -1).
+		internal def findSpecial(data byte[], from int) (int, int) {
+			for let at = from; at < data.len(); at++ {
+				for let (_, id) in specials {
+					let t = tokens[id].bytes()
+					continue unless at + t.len() <= data.len() && data[at] == t[0]
+					let same = true
+					for let k = 1; k < t.len(); k++ {
+						if data[at + k] != t[k] {
+							same = false
+							break
+						}
+					}
+					return (at, id) when same
+				}
+			}
+			return (data.len(), -1)
+		}
+
+		// Tokens of text holding no control tokens.
+		internal def encodePlain(data byte[], first bool, out int[]) {
+			if !bytePairs {
+				encodePieces(data, first, out)
+				return
+			}
+			for let (_, word) in splitter.split(data) {
+				let key = string(word)
+				let known = cache.get(key)
+				if known is none {
+					let merged = mergeBytePairs(word)
+					cache.set(key, merged)
+					out.push(...merged)
+				} else {
+					out.push(...known)
+				}
+			}
+		}
+
+		// Byte-level BPE over one pre-token: start from one symbol per byte
+		// and merge the adjacent pair with the lowest merge rank until none is left.
+		internal def mergeBytePairs(word byte[]) int[] {
+			let symbols string[]
+			for let (_, b) in word {
+				symbols.push(byteChars[int(b)])
+			}
+			for symbols.len() > 1 {
+				let best = -1
+				let bestRank = 0
+				for let k = 0; k + 1 < symbols.len(); k++ {
+					let rank = ranks.get(symbols[k] + " " + symbols[k + 1])
+					continue when rank is none
+					if best < 0 || rank < bestRank {
+						best = k
+						bestRank = rank
+					}
+				}
+				break when best < 0
+				let left = symbols[best]
+				let right = symbols[best + 1]
+				// Merge every occurrence of the pair, left to right.
+				let merged string[]
+				let k = 0
+				for k < symbols.len() {
+					if k + 1 < symbols.len() && symbols[k] == left && symbols[k + 1] == right {
+						merged.push(left + right)
+						k += 2
+					} else {
+						merged.push(symbols[k])
+						k += 1
+					}
+				}
+				symbols = merged
+			}
+			let out int[]
+			for let (_, s) in symbols {
+				let id = ids.get(s)
+				if id is none {
+					// Not in the vocabulary: one token per stand-in character.
+					for let (_, r) in runesOf(s.bytes()) {
+						let single = ids.get(encodeRune(r))
+						out.push(single) unless single is none
+					}
+				} else {
+					out.push(id)
+				}
+			}
+			return out
+		}
+
+		// SentencePiece BPE: spaces become ▁, then the adjacent pair whose
+		// joined piece scores highest is merged until no join is in the
+		// vocabulary; pieces left unknown become byte tokens.
+		internal def encodePieces(data byte[], first bool, out int[]) {
+			let text = string(data).replace(" ", "▁", -1)
+			text = "▁" + text when first && addSpacePrefix
+			let symbols string[]
+			for let (_, r) in runesOf(text.bytes()) {
+				symbols.push(encodeRune(r))
+			}
+			for symbols.len() > 1 {
+				let best = -1
+				let bestScore = 0.0
+				for let k = 0; k + 1 < symbols.len(); k++ {
+					let id = ids.get(symbols[k] + symbols[k + 1])
+					continue when id is none
+					let score = id < scores.len() ?? (scores[id], 0.0)
+					if best < 0 || score > bestScore {
+						best = k
+						bestScore = score
+					}
+				}
+				break when best < 0
+				symbols[best] = symbols[best] + symbols[best + 1]
+				symbols.remove(best + 1)
+			}
+			for let (_, s) in symbols {
+				let id = ids.get(s)
+				if id is none {
+					for let (_, b) in s.bytes() {
+						let t = byteTokens[int(b)]
+						out.push(t) when t >= 0
+					}
+				} else {
+					out.push(id)
+				}
+			}
+		}
+
+		// The text of the tokens (control tokens left out).
+		def decode(tokens int[]) string {
+			let out byte[]
+			for let (_, t) in tokens {
+				out.push(...piece(t))
+			}
+			return string(out)
+		}
+
+		// The bytes of one token. A token can end partway through a UTF-8
+		// character; `Session.next` buffers for that. Control tokens give no bytes.
+		def piece(token int) byte[] {
+			return byte[] when token < 0 || token >= tokens.len()
+			let kind = token < types.len() ?? (types[token], 1)
+			return byte[] when kind == 3
+			let text = tokens[token]
+			return text.bytes() when kind == 4
+			if bytePairs {
+				let out byte[]
+				for let (_, r) in runesOf(text.bytes()) {
+					let b = charBytes.get(r)
+					out.push(byte(b)) unless b is none
+				}
+				return out
+			}
+			return byte[byte(hexValue(text.bytes(), 3))] when kind == 6 && text.len() == 6
+			return text.replace("▁", " ", -1).bytes()
+		}
+
+		// The token the model expects before any text; -1 when it has none.
+		def startToken() int {
+			return start
+		}
+
+		// The token the model emits when it has finished; -1 when it has none.
+		def endToken() int {
+			return end
+		}
+
+		// How many tokens the vocabulary has.
+		def size() int {
+			return tokens.len()
+		}
+
+		// Whether generating `token` ends the model's turn: the end token, an
+		// end-of-turn token the file names, or a control token chat models
+		// end a turn with (`<|im_end|>`, `<|eot_id|>`, ...).
+		def isEnd(token int) bool {
+			return ends.includes(token)
+		}
+	}
+
+	// Token scores of a SentencePiece vocabulary.
+	internal def scoresOf(file ModelFile) float[] {
+		let v = file.metadata.get("tokenizer.ggml.scores")
+		return v.getFloats() when v is MetaArray
+		return float[]
+	}
+
+	// Token types; normal for all when the file has none.
+	internal def typesOf(file ModelFile, count int) int[] {
+		let v = file.metadata.get("tokenizer.ggml.token_type")
+		if v is MetaArray {
+			let types = v.getInts()
+			return types when types.len() == count
+		}
+		let types int[]
+		types.len(count)
+		return types.fill(1)
+	}
+}
+
+internal partial module std.ai.llm.text {
+	use std.ai.llm.unicode::*
+
+	// How a pre-tokenizer groups digits.
+	enum Digits {
+		// Runs of digits, like letters (GPT-2).
+		Runs,
+		// Each digit alone (SmolLM, Qwen2).
+		Single,
+		// Up to three digits at a time (Llama 3).
+		Triples,
+	}
+
+	// A byte-level BPE pre-tokenizer: the regular expression llama.cpp uses
+	// for the model, written out as a scanner.
+	type PreTokenizer {
+		digits Digits
+		// Llama 3 style: case-insensitive contractions, one non-letter
+		// joined to a following word, newlines kept with punctuation.
+		wide   bool
+		// GPT-4o style: words split before an ASCII capital that follows
+		// lower case, contractions after the word.
+		cased  bool
+
+		def new(digits Digits, wide bool, cased bool = false) {
+			self.digits = digits
+			self.wide = wide
+			self.cased = cased
+		}
+
+		// The pre-tokens of `data`, in order; together they are all of it.
+		def split(data byte[]) byte[][] {
+			let runes = runesOf(data)
+			let offsets = runeOffsets(data)
+			let out byte[][]
+			let n = runes.len()
+			let i = 0
+			for i < n {
+				let end = cased ?? (matchCased(runes, i), wide ?? (matchWide(runes, i), matchGpt2(runes, i)))
+				out.push(data[offsets[i]:offsets[end]])
+				i = end
+			}
+			return out
+		}
+
+		// GPT-2: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+		// (with digits single or in runs). Returns where the match at `i` ends.
+		internal def matchGpt2(r int[], i int) int {
+			let n = r.len()
+			let contraction = matchContraction(r, i, false)
+			return contraction when contraction > i
+			let j = (r[i] == 0x20 && i + 1 < n && !isSpace(r[i + 1])) ?? (i + 1, i)
+			let c = r[j]
+			return runOf(r, j, 0) when isLetter(c)
+			if isNumber(c) {
+				// A digit split off alone does not take the space before it.
+				return i + 1 when digits == Digits.Single && j > i
+				return j + 1 when digits == Digits.Single
+				return runOf(r, j, 1)
+			}
+			return runOf(r, j, 2) unless isSpace(c)
+			return spaces(r, i)
+		}
+
+		// Llama 3: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+		internal def matchWide(r int[], i int) int {
+			let n = r.len()
+			let contraction = matchContraction(r, i, true)
+			return contraction when contraction > i
+			let c = r[i]
+			if !(c := 0x0D || 0x0A) && !isLetter(c) && !isNumber(c) && i + 1 < n && isLetter(r[i + 1]) {
+				return runOf(r, i + 1, 0)
+			}
+			return runOf(r, i, 0) when isLetter(c)
+			if isNumber(c) {
+				let limit = digits == Digits.Triples ?? (3, 1)
+				let j = i
+				for j < n && j - i < limit && isNumber(r[j]) {
+					j++
+				}
+				return j
+			}
+			let j = (c == 0x20 && i + 1 < n && !isSpace(r[i + 1]) && !isLetter(r[i + 1]) && !isNumber(r[i + 1])) ?? (i + 1, i)
+			if !isSpace(r[j]) {
+				let k = runOf(r, j, 2)
+				for k < n && (r[k] := 0x0D || 0x0A) {
+					k++
+				}
+				return k
+			}
+			// \s*[\r\n]+ : whitespace up to and including the last line break of the run.
+			let k = i
+			let lastBreak = -1
+			for k < n && isSpace(r[k]) {
+				lastBreak = k when r[k] := 0x0D || 0x0A
+				k++
+			}
+			return lastBreak + 1 when lastBreak >= 0
+			return spaces(r, i)
+		}
+
+		// GPT-4o, as llama.cpp runs it:
+		// [^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+		// |[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*(?:…)?
+		// |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+		// An "upper" letter is any letter but a–z, a "lower" one any but A–Z,
+		// so letters outside ASCII are both.
+		internal def matchCased(r int[], i int) int {
+			let n = r.len()
+			let c = r[i]
+			let lead = !(c := 0x0D || 0x0A) && !isLetter(c) && !isNumber(c)
+			// Each word alternative is tried with the lead character, then without.
+			for let (_, second) in bool[false, true] {
+				for let (_, withLead) in bool[true, false] {
+					continue when withLead && !lead
+					let j = withLead ?? (i + 1, i)
+					let end = second ?? (upperThenLower(r, j), lowerAfterUpper(r, j))
+					return matchContraction(r, end, true) when end > j
+				}
+			}
+			if isNumber(c) {
+				let j = i
+				for j < n && j - i < 3 && isNumber(r[j]) {
+					j++
+				}
+				return j
+			}
+			for let (_, skip) in int[1, 0] {
+				let j = i + skip
+				continue when skip == 1 && !(c == 0x20)
+				continue unless j < n && !isSpace(r[j]) && !isLetter(r[j]) && !isNumber(r[j])
+				let k = runOf(r, j, 2)
+				for k < n && (r[k] := 0x0D || 0x0A || 0x2F) {
+					k++
+				}
+				return k
+			}
+			// \s*[\r\n]+ : whitespace up to and including the last line break of the run.
+			let k = i
+			let lastBreak = -1
+			for k < n && isSpace(r[k]) {
+				lastBreak = k when r[k] := 0x0D || 0x0A
+				k++
+			}
+			return lastBreak + 1 when lastBreak >= 0
+			return spaces(r, i)
+		}
+
+		// upper* lower+ from `j`: the longest run of upper letters that still
+		// leaves a lower one after it, then the lower run. `j` when none.
+		internal def lowerAfterUpper(r int[], j int) int {
+			let u = j
+			for u < r.len() && isUpperish(r[u]) {
+				u++
+			}
+			for let k = u; k >= j; k-- {
+				if k < r.len() && isLowerish(r[k]) {
+					let e = k
+					for e < r.len() && isLowerish(r[e]) {
+						e++
+					}
+					return e
+				}
+			}
+			return j
+		}
+
+		// upper+ lower* from `j`; `j` when it does not start with an upper letter.
+		internal def upperThenLower(r int[], j int) int {
+			let u = j
+			for u < r.len() && isUpperish(r[u]) {
+				u++
+			}
+			return j when u == j
+			for u < r.len() && isLowerish(r[u]) {
+				u++
+			}
+			return u
+		}
+
+		// 's 't 're 've 'm 'll 'd at `i` (any case when `anyCase`): where it ends, or `i`.
+		internal def matchContraction(r int[], i int, anyCase bool) int {
+			return i unless i + 1 < r.len() && r[i] == 0x27
+			let a = lowered(r[i + 1], anyCase)
+			return i + 2 when a := 0x73 || 0x74 || 0x6D || 0x64
+			return i unless i + 2 < r.len()
+			let b = lowered(r[i + 2], anyCase)
+			return i + 3 when (a == 0x72 && b == 0x65) || (a == 0x76 && b == 0x65) || (a == 0x6C && b == 0x6C)
+			return i
+		}
+
+		// \s+(?!\S)|\s+ at `i`: a run of spaces, leaving its last one to the
+		// word that follows.
+		internal def spaces(r int[], i int) int {
+			let k = i
+			for k < r.len() && isSpace(r[k]) {
+				k++
+			}
+			return k - 1 when k < r.len() && k - i > 1
+			return k
+		}
+
+		// The end of the run from `j` of class 0 (letters), 1 (numbers) or
+		// 2 (neither, and not space).
+		internal def runOf(r int[], j int, kind int) int {
+			let k = j
+			for k < r.len() {
+				let c = r[k]
+				let ok = kind == 0 ?? (isLetter(c), kind == 1 ?? (isNumber(c), !isSpace(c) && !isLetter(c) && !isNumber(c)))
+				break unless ok
+				k++
+			}
+			return k.max(j + 1)
+		}
+	}
+
+	// The pre-tokenizer for a GGUF "tokenizer.ggml.pre" name, `none` for one
+	// not supported yet.
+	def preTokenizer(name string) ?PreTokenizer {
+		match name {
+			case "default", "gpt-2", "gpt2", "starcoder", "refact", "olmo", "falcon", "mpt":
+				return new PreTokenizer(Digits.Runs, false)
+			case "smollm", "smaug-bpe":
+				return new PreTokenizer(Digits.Single, false)
+			case "llama3", "llama-bpe", "llama-v3", "dbrx":
+				return new PreTokenizer(Digits.Triples, true)
+			case "qwen2", "deepseek-r1-qwen":
+				return new PreTokenizer(Digits.Single, true)
+			case "gpt-4o", "llama4", "kanana2", "talkie", "minimax-m2":
+				return new PreTokenizer(Digits.Triples, true, true)
+		}
+		return none
+	}
+
+	// A letter other than a–z.
+	def isUpperish(c int) bool {
+		return isLetter(c) && !(c >= 0x61 && c <= 0x7A)
+	}
+
+	// A letter other than A–Z.
+	def isLowerish(c int) bool {
+		return isLetter(c) && !(c >= 0x41 && c <= 0x5A)
+	}
+
+	// ASCII lower case when `anyCase`.
+	def lowered(c int, anyCase bool) int {
+		return c + 32 when anyCase && c >= 0x41 && c <= 0x5A
+		return c
+	}
+
+	// The code points of UTF-8 bytes; an invalid byte stands for itself.
+	def runesOf(data byte[]) int[] {
+		let out int[]
+		let i = 0
+		for i < data.len() {
+			let (r, size) = decodeRune(data, i)
+			out.push(r)
+			i += size
+		}
+		return out
+	}
+
+	// The byte offset of each code point, plus the end.
+	def runeOffsets(data byte[]) int[] {
+		let out int[]
+		let i = 0
+		for i < data.len() {
+			out.push(i)
+			let (_, size) = decodeRune(data, i)
+			i += size
+		}
+		out.push(data.len())
+		return out
+	}
+
+	// The code point at `i` and its byte length.
+	def decodeRune(data byte[], i int) (int, int) {
+		let b = int(data[i])
+		let n = data.len()
+		return (b, 1) when b < 0x80
+		return (((b & 0x1F) << 6) | (int(data[i + 1]) & 0x3F), 2) when b >= 0xC0 && b < 0xE0 && i + 1 < n
+		return (((b & 0x0F) << 12) | ((int(data[i + 1]) & 0x3F) << 6) | (int(data[i + 2]) & 0x3F), 3) when b >= 0xE0 && b < 0xF0 && i + 2 < n
+		return (((b & 0x07) << 18) | ((int(data[i + 1]) & 0x3F) << 12) | ((int(data[i + 2]) & 0x3F) << 6) | (int(data[i + 3]) & 0x3F), 4) when b >= 0xF0 && i + 3 < n
+		return (b, 1)
+	}
+
+	// The UTF-8 text of one code point.
+	def encodeRune(c int) string {
+		let out byte[]
+		if c < 0x80 {
+			out.push(byte(c))
+		} else if c < 0x800 {
+			out.push(byte(0xC0 | (c >> 6)))
+			out.push(byte(0x80 | (c & 0x3F)))
+		} else if c < 0x10000 {
+			out.push(byte(0xE0 | (c >> 12)))
+			out.push(byte(0x80 | ((c >> 6) & 0x3F)))
+			out.push(byte(0x80 | (c & 0x3F)))
+		} else {
+			out.push(byte(0xF0 | (c >> 18)))
+			out.push(byte(0x80 | ((c >> 12) & 0x3F)))
+			out.push(byte(0x80 | ((c >> 6) & 0x3F)))
+			out.push(byte(0x80 | (c & 0x3F)))
+		}
+		return string(out)
+	}
+
+	// SentencePiece's name for a byte token, like <0x0A>.
+	def byteToken(b int) string {
+		let digits = "0123456789ABCDEF"
+		return "<0x" + digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1) + ">"
+	}
+
+	// The value of two hex digits at `at`.
+	def hexValue(data byte[], at int) int {
+		let v = 0
+		for let k = at; k < at + 2; k++ {
+			let c = int(data[k])
+			let d = (c >= 0x30 && c <= 0x39) ?? (c - 0x30, (c | 0x20) - 0x61 + 10)
+			v = v * 16 + d
+		}
+		return v
+	}
+}

@@ -1,0 +1,239 @@
+internal partial module std.gfx.processing.transform.resampling {
+	use (
+		std.gfx::(Raster)
+		std.simd
+		std.gfx.processing.transform::*
+	)
+
+	// Resampling runs as two separable passes: each output row first sums
+	// the source rows its vertical taps cover, eight channel values a lane
+	// straight over the RGBA bytes, then each output pixel sums the
+	// horizontal taps of that row, one pixel (four channels) a lane. The taps
+	// of each axis are worked out once. Output rows are independent, so a
+	// large resize hands bands of them to tasks.
+
+	// Source pixels (at least) per task a resize hands out.
+	const resampleBandPixels = 65536
+	const resampleMaxTasks = 16
+
+	// The taps of one axis: output i reads `count[i]` source samples from
+	// `first[i]`, weighted by `weights[offset[i]:]`, and `total[i]` is the sum
+	// of those weights.
+	struct ResampleTaps {
+		first   int[]
+		count   int[]
+		offset  int[]
+		weights float32[]
+		total   float32[]
+	}
+
+	// The taps of `n` source samples resampled to `m` by `mode` (bilinear,
+	// bicubic or area). Bilinear and bicubic taps are normalised to sum to 1
+	// and sample at pixel centres with the edges clamped; area taps are the
+	// overlap of each source sample with the output cell.
+	def resampleTaps(n int, m int, mode ResizeMode) ResampleTaps {
+		let taps = ResampleTaps{first: int[], count: int[], offset: int[], weights: float32[], total: float32[]}
+		let f = float(n) / float(m)
+		let slot float[]
+		slot.len(4)
+		for let i = 0; i < m; i++ {
+			taps.offset.push(taps.weights.len())
+			if mode == ResizeMode.Area {
+				let x0 = float(i) * f
+				let x1 = float(i + 1) * f
+				let s0 = int(x0.floor())
+				let s1 = int(x1.ceil()).min(n)
+				let sum = 0.0
+				taps.first.push(s0)
+				taps.count.push(s1 - s0)
+				for let s = s0; s < s1; s++ {
+					let w = x1.min(float(s + 1)) - x0.max(float(s))
+					taps.weights.push(float32(w))
+					sum += w
+				}
+				taps.total.push(float32(sum))
+				continue
+			}
+			let sf = (float(i) + 0.5) * f - 0.5
+			if mode == ResizeMode.Bilinear {
+				let x0 = int(sf.floor()).clamp(0, n - 1)
+				let x1 = (x0 + 1).min(n - 1)
+				let t = (sf - float(x0)).clamp(0.0, 1.0)
+				taps.first.push(x0)
+				if x1 == x0 {
+					taps.count.push(1)
+					taps.weights.push(float32(1))
+				} else {
+					taps.count.push(2)
+					taps.weights.push(float32(1.0 - t))
+					taps.weights.push(float32(t))
+				}
+				taps.total.push(float32(1))
+				continue
+			}
+			// Bicubic: four Catmull-Rom taps; clamped taps at an edge fold
+			// onto the edge sample.
+			let base = int(sf.floor())
+			let lo = (base - 1).clamp(0, n - 1)
+			let hi = (base + 2).clamp(0, n - 1)
+			slot.fill(0.0)
+			let sum = 0.0
+			for let j = -1; j <= 2; j++ {
+				let w = cubicWeight(sf - float(base + j))
+				slot[(base + j).clamp(0, n - 1) - lo] += w
+				sum += w
+			}
+			sum = 1.0 when sum == 0.0
+			taps.first.push(lo)
+			taps.count.push(hi - lo + 1)
+			for let k = 0; k <= hi - lo; k++ {
+				taps.weights.push(float32(slot[k] / sum))
+			}
+			taps.total.push(float32(1))
+		}
+		return taps
+	}
+
+	// `target` resampled to a tight `w` x `h` buffer by `mode`: nearest
+	// neighbour copies, bilinear and bicubic filter, area averages with the
+	// colour weighted by alpha (so transparent pixels do not darken edges).
+	def resample(target Raster, w int, h int, mode ResizeMode) byte[] {
+		let sw = int(target.size().width)
+		let sh = int(target.size().height)
+		let out byte[]
+		out.len(w * h * 4)
+		return out when sw == 0 || sh == 0
+		let data = target.raw()
+		let stride = target.stride()
+		let tasks = ((sw * sh + w * h) / resampleBandPixels).clamp(1, resampleMaxTasks).min(h)
+		if mode == ResizeMode.NearestNeighbor {
+			let fx = float(sw) / float(w)
+			let sx int[]
+			for let x = 0; x < w; x++ {
+				sx.push(int(((float(x) + 0.5) * fx - 0.5 + 0.5).floor()).clamp(0, sw - 1) * 4)
+			}
+			if tasks == 1 {
+				nearestRows(data, stride, sh, w, h, sx, 0, h, out)
+				return out
+			}
+			let done = new channel<bool>(size = tasks)
+			for let t = 0; t < tasks; t++ {
+				async nearestTask(data, stride, sh, w, h, sx, h * t / tasks, h * (t + 1) / tasks, out, done)
+			}
+			for let t = 0; t < tasks; t++ {
+				<-done
+			}
+			return out
+		}
+		let tx = resampleTaps(sw, w, mode)
+		let ty = resampleTaps(sh, h, mode)
+		let area = mode == ResizeMode.Area
+		if tasks == 1 {
+			resampleRows(data, stride, sw, w, tx, ty, area, 0, h, out)
+			return out
+		}
+		let done = new channel<bool>(size = tasks)
+		for let t = 0; t < tasks; t++ {
+			async resampleTask(data, stride, sw, w, tx, ty, area, h * t / tasks, h * (t + 1) / tasks, out, done)
+		}
+		for let t = 0; t < tasks; t++ {
+			<-done
+		}
+		return out
+	}
+
+	async def nearestTask(data byte[], stride int, sh int, w int, h int, sx int[], from int, to int, out byte[], done channel<bool>) {
+		nearestRows(data, stride, sh, w, h, sx, from, to, out)
+		done <- true
+	}
+
+	def nearestRows(data byte[], stride int, sh int, w int, h int, sx int[], from int, to int, out byte[]) {
+		let fy = float(sh) / float(h)
+		for let y = from; y < to; y++ {
+			let row = int(((float(y) + 0.5) * fy - 0.5 + 0.5).floor()).clamp(0, sh - 1) * stride
+			let d = y * w * 4
+			for let x = 0; x < w; x++ {
+				let s = row + sx[x]
+				out[d] = data[s]
+				out[d + 1] = data[s + 1]
+				out[d + 2] = data[s + 2]
+				out[d + 3] = data[s + 3]
+				d += 4
+			}
+		}
+	}
+
+	async def resampleTask(data byte[], stride int, sw int, w int, tx ResampleTaps, ty ResampleTaps, area bool, from int, to int, out byte[], done channel<bool>) {
+		resampleRows(data, stride, sw, w, tx, ty, area, from, to, out)
+		done <- true
+	}
+
+	// Output rows `from` up to `to`. With `area` the colour channels are
+	// weighted by alpha before summing and divided by the summed alpha
+	// after, and alpha by the summed weight.
+	def resampleRows(data byte[], stride int, sw int, w int, tx ResampleTaps, ty ResampleTaps, area bool, from int, to int, out byte[]) {
+		let n = sw * 4
+		let acc float32[]
+		acc.len(n)
+		let zero = simd.splat8<float32>(float32(0))
+		// Alpha of each of the two pixels in all four of its lanes, and the
+		// alpha lanes themselves.
+		let alphaLanes = simd.splat8<byte>(byte(3)).withLane(4, byte(7)).withLane(5, byte(7)).withLane(6, byte(7)).withLane(7, byte(7))
+		let isAlpha = zero.withLane(3, float32(1)).withLane(7, float32(1)).gt(zero)
+		let half = simd.splat4<float32>(float32(0.5))
+		let lo = simd.splat4<float32>(float32(0))
+		let hi = simd.splat4<float32>(float32(255))
+		for let y = from; y < to; y++ {
+			let first = true
+			for let k = 0; k < ty.count[y]; k++ {
+				let row = (ty.first[y] + k) * stride
+				let weight = ty.weights[ty.offset[y] + k]
+				let wv = simd.splat8<float32>(weight)
+				let x = 0
+				for x + 8 <= n {
+					let v = simd.convert<byte, float32>(simd.load8<byte>(data, row + x))
+					v = isAlpha.blend(v, v * v.shuffle(alphaLanes)) when area
+					let sum = first ?? (v * wv, v.fma(wv, simd.load8<float32>(acc, x)))
+					simd.store8<float32>(acc, x, sum)
+					x += 8
+				}
+				for x < n {
+					let v = float32(data[row + x])
+					v *= float32(data[row + x - x % 4 + 3]) when area && x % 4 != 3
+					acc[x] = first ?? (v * weight, acc[x] + v * weight)
+					x++
+				}
+				first = false
+			}
+			let d = y * w * 4
+			for let i = 0; i < w; i++ {
+				let at = tx.offset[i]
+				let base = tx.first[i] * 4
+				let sum = simd.load4<float32>(acc, base) * simd.splat4<float32>(tx.weights[at])
+				for let k = 1; k < tx.count[i]; k++ {
+					sum = simd.load4<float32>(acc, base + k * 4).fma(simd.splat4<float32>(tx.weights[at + k]), sum)
+				}
+				if area {
+					let alpha = sum.lane(3)
+					if alpha <= float32(0) {
+						d += 4
+						continue
+					}
+					let total = tx.total[i] * ty.total[y]
+					sum = sum / simd.splat4<float32>(alpha).withLane(3, total)
+				}
+				let px = (sum.clamp(lo, hi) + half).floor()
+				simd.store4<byte>(out, d, simd.convert<float32, byte>(px))
+				d += 4
+			}
+		}
+	}
+
+	// Catmull-Rom weight for a distance `t` from the sample.
+	def cubicWeight(t float) float {
+		let x = t.abs()
+		return ((1.5 * x - 2.5) * x) * x + 1.0 when x < 1.0
+		return (((-0.5 * x + 2.5) * x) - 4.0) * x + 2.0 when x < 2.0
+		return 0.0
+	}
+}

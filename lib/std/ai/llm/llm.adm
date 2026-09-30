@@ -1,0 +1,1047 @@
+partial module std.ai.llm {
+	use (
+		std.time
+		std.formats.ai
+		std.ai.tensor::(Weights, RopeStyle, rmsNorm, softmax, silu, rope)
+		std.ai.llm.model::*
+	)
+
+	// Where the forward pass runs.
+	enum Device {
+		// GPU when std.gpu.available(), else CPU.
+		Auto,
+		Cpu,
+		Gpu,
+	}
+
+	// Loads a GGUF model.
+	// Fails when the file cannot be read, or its architecture or a weight
+	// type is not supported, or the GPU is asked for (not built yet).
+	def load(path string, device Device = Device.Auto) !LanguageModel {
+		expects {
+			assert device != Device.Gpu onerror fail "llm: the GPU path is not built yet"
+		}
+		let file = try ai.load(path)
+		let parts = readParts(file) onerror (err error) {
+			file.close()
+			return err
+		}
+		file.close()
+		return new LanguageModel(parts)
+	}
+
+	// Architecture numbers read from the file.
+	struct LanguageModelInfo {
+		// "llama", "qwen2", ...
+		architecture  string
+		name          string
+		layers        int
+		// Hidden size.
+		embedding     int
+		heads         int
+		kvHeads       int
+		contextLength int
+		vocabulary    int
+		parameters    int
+		// The type most weights are stored in, e.g. "Q4_0".
+		weightType    string
+	}
+
+	// A loaded model: weights resident in memory.
+	type LanguageModel {
+		info      LanguageModelInfo
+		tokenizer Tokenizer
+
+		internal parts ModelParts
+
+		// A model from the parts `load` read; use `load`.
+		def new(parts ModelParts) {
+			self.parts = parts
+			info = parts.info
+			tokenizer = parts.tokenizer
+		}
+
+		// A new conversation with its own KV cache. `context` of 0 uses the model's full length.
+		def session(context int = 0) Session {
+			let length = (context <= 0 || context > info.contextLength) ?? (info.contextLength, context)
+			return new Session(parts, length)
+		}
+
+		// Releases the model. The weights stay while a session made from
+		// it is still in use, and are freed with the last one.
+		def dispose() {}
+	}
+
+	// Timing since the last reset.
+	struct Stats {
+		promptTokens     int
+		promptSeconds    float
+		// Prompt tokens per second.
+		promptSpeed      float
+		generatedTokens  int
+		generatedSeconds float
+		// Generated tokens per second.
+		generateSpeed    float
+	}
+
+	// One conversation: the KV cache, the tokens so far, and how the next
+	// token is chosen. Change the settings any time; the next token uses them.
+	type Session {
+		// Randomness: 0 always picks the most likely token (same output every
+		// run); around 0.7–1.0 is normal; above 1 gets erratic.
+		temperature   float    = 0.8
+		// Only the `topK` most likely tokens are candidates; 0 turns it off.
+		topK          int      = 40
+		// Only the most likely tokens whose probabilities add up to `topP` are candidates; 1 turns it off.
+		topP          float    = 0.95
+		// Drops tokens less likely than `minP` times the best one; 0 turns it off.
+		minP          float    = 0.05
+		// Makes tokens already used in the last `repeatWindow` tokens less likely; 1 turns it off.
+		repeatPenalty float    = 1.1
+		repeatWindow  int      = 64
+		// Random seed; 0 picks a new one per session. The same seed and
+		// settings give the same text.
+		seed          uint     = 0
+		// Stops `next` and `generate` after this many new tokens.
+		limit         int      = 256
+		// Stops generation when the text ends with one of these.
+		stopAt        string[]
+
+		internal parts     ModelParts
+		internal context   int
+		internal state     ForwardState
+		internal history   int[]
+		internal pending   byte[]
+		internal produced  string
+		internal generated int
+		internal finished  bool
+		internal random    uint64
+		internal seeded    bool
+		internal timing    Stats
+
+		// A conversation over the model's parts; use `LanguageModel.session`.
+		def new(parts ModelParts, context int) {
+			self.parts = parts
+			self.context = context
+			state = new ForwardState(parts, context)
+		}
+
+		// Adds text to the context and runs it through the model.
+		// Fails when the context would overflow.
+		def append(text string) !none {
+			return append(parts.tokenizer.encode(text, history.len() == 0))
+		}
+
+		// Adds tokens to the context and runs them through the model.
+		// Fails when the context would overflow.
+		def append(tokens int[]) !none {
+			expects {
+				assert history.len() + tokens.len() <= context onerror fail "llm: {tokens.len()} more tokens overflow the context of {context} ({history.len()} used)"
+			}
+			let began = time.now()
+			for let (_, t) in tokens {
+				state.forward(t, history.len())
+				history.push(t)
+			}
+			timing.promptTokens += tokens.len()
+			timing.promptSeconds += time.since(began).seconds()
+			timing.promptSpeed = speed(timing.promptTokens, timing.promptSeconds)
+			generated = 0
+			finished = false
+			produced = ""
+			return none
+		}
+
+		// Generates the next piece of text: `none` at the end token, at `limit`,
+		// at a `stopAt` match, or when the context is full. Pieces are whole UTF-8 characters.
+		// Fails when the forward pass fails (device error).
+		def next() !?string {
+			for {
+				return none when finished
+				if history.len() == 0 {
+					let first = parts.tokenizer.startToken()
+					fail "llm: nothing to continue: append a prompt first" when first < 0
+					try append(int[first])
+				}
+				if generated >= limit || history.len() >= context {
+					finished = true
+					return flush()
+				}
+				let began = time.now()
+				let token = sample()
+				if parts.tokenizer.isEnd(token) {
+					finished = true
+					return flush()
+				}
+				state.forward(token, history.len())
+				history.push(token)
+				generated++
+				timing.generatedTokens++
+				timing.generatedSeconds += time.since(began).seconds()
+				timing.generateSpeed = speed(timing.generatedTokens, timing.generatedSeconds)
+				pending.push(...parts.tokenizer.piece(token))
+				let whole = completeUtf8(pending)
+				continue when whole == 0
+				let text = string(pending[:whole])
+				pending = pending[whole:].clone()
+				let before = produced.len()
+				produced = produced + text
+				for let (_, stop) in stopAt {
+					continue when stop.len() == 0
+					let at = produced.indexOf(stop)
+					if at >= 0 {
+						finished = true
+						return at > before ?? (produced.slice(before, at), "")
+					}
+				}
+				return text
+			}
+		}
+
+		// Appends `prompt`, then generates until `next` returns `none`; returns the text.
+		// Fails like `append` and `next`.
+		def generate(prompt string) !string {
+			try append(prompt)
+			let out = ""
+			for {
+				let piece = try next()
+				break when piece is none
+				out = out + piece
+			}
+			return out
+		}
+
+		// Tokens in the context now.
+		def length() int {
+			return history.len()
+		}
+
+		// Clears the KV cache and the token history; the settings stay.
+		def reset() {
+			history.len(0)
+			pending.len(0)
+			produced = ""
+			generated = 0
+			finished = false
+			timing = Stats{}
+		}
+
+		// Timing since the last reset.
+		def stats() Stats {
+			return timing
+		}
+
+		// What is left in `pending`, `none` when nothing is.
+		internal def flush() ?string {
+			return none when pending.len() == 0
+			let text = string(pending)
+			pending.len(0)
+			return text
+		}
+
+		// The next token from the last logits, by the session's settings.
+		internal def sample() int {
+			let logits = state.logits
+			let n = logits.len()
+			if repeatPenalty != 1.0 && repeatWindow > 0 {
+				let from = (history.len() - repeatWindow).max(0)
+				let penalty = float32(repeatPenalty)
+				for let k = from; k < history.len(); k++ {
+					let t = history[k]
+					logits[t] = logits[t] > float32(0) ?? (logits[t] / penalty, logits[t] * penalty)
+				}
+			}
+			if temperature <= 0.0 {
+				let best = 0
+				for let t = 1; t < n; t++ {
+					best = t when logits[t] > logits[best]
+				}
+				return best
+			}
+			let candidates = topCandidates(logits, (topK <= 0 || topK > n) ?? (n, topK))
+			// Probabilities at temperature 1 for the top-p and min-p cuts.
+			let top = float(logits[candidates[0]])
+			let probs float[]
+			let total = 0.0
+			for let (_, t) in candidates {
+				let p = expOf(float(logits[t]) - top)
+				probs.push(p)
+				total += p
+			}
+			let keep = candidates.len()
+			if topP < 1.0 {
+				let sum = 0.0
+				for let k = 0; k < candidates.len(); k++ {
+					sum += probs[k] / total
+					if sum >= topP {
+						keep = k + 1
+						break
+					}
+				}
+			}
+			if minP > 0.0 {
+				for let k = 1; k < keep; k++ {
+					if probs[k] < minP * probs[0] {
+						keep = k
+						break
+					}
+				}
+			}
+			// Sample the kept tokens at the session's temperature.
+			let weights float[]
+			let sum = 0.0
+			for let k = 0; k < keep; k++ {
+				let w = expOf((float(logits[candidates[k]]) - top) / temperature)
+				weights.push(w)
+				sum += w
+			}
+			let pick = uniform() * sum
+			for let k = 0; k < keep; k++ {
+				pick -= weights[k]
+				return candidates[k] when pick <= 0.0
+			}
+			return candidates[keep - 1]
+		}
+
+		// A uniform number in [0, 1) from the session's generator.
+		internal def uniform() float {
+			if !seeded {
+				random = seed != uint(0) ?? (uint64(seed), uint64(time.wallNs()) | uint64(1))
+				seeded = true
+			}
+			// xorshift64*
+			random = random ^ (random >> 12)
+			random = random ^ (random << 25)
+			random = random ^ (random >> 27)
+			let bits = (random * uint64(0x2545F4914F6CDD1D)) >> 11
+			return float(bits) / 9007199254740992.0
+		}
+	}
+
+	// Tokens per second.
+	internal def speed(tokens int, seconds float) float {
+		return seconds > 0.0 ?? (float(tokens) / seconds, 0.0)
+	}
+
+	// How many leading bytes of `data` are whole UTF-8 characters.
+	internal def completeUtf8(data byte[]) int {
+		let n = data.len()
+		// Look back at most three bytes for a character that is not finished.
+		for let back = 1; back <= 3 && back <= n; back++ {
+			let b = int(data[n - back])
+			continue when (b & 0xC0) == 0x80
+			let size = b >= 0xF0 ?? (4, b >= 0xE0 ?? (3, b >= 0xC0 ?? (2, 1)))
+			return size > back ?? (n - back, n)
+		}
+		return n
+	}
+}
+
+internal partial module std.ai.llm.model {
+	use (
+		std.simd
+		std.math
+		std.formats.ai
+		std.formats.ai::(ModelFile)
+		std.ai.tensor::(Weights, RopeStyle, loadWeights, rmsNorm, softmax, silu, gelu, rope)
+		std.ai.llm::*
+	)
+
+	// One transformer block's weights.
+	struct Layer {
+		attentionNorm   float32[]
+		query           Weights
+		key             Weights
+		value           Weights
+		output          Weights
+		// Biases of the projections (Qwen2); empty when the model has none.
+		queryBias       float32[]
+		keyBias         float32[]
+		valueBias       float32[]
+		// Per-head RMSNorm weights of the queries and keys (Qwen3, Gemma 3);
+		// empty when the model has none.
+		queryNorm       float32[]
+		keyNorm         float32[]
+		// RMSNorm of the attention output before the residual (Gemma 3).
+		attentionPost   float32[]
+		feedForwardNorm float32[]
+		gate            Weights
+		up              Weights
+		down            Weights
+		// RMSNorm of the feed-forward output before the residual (Gemma 3).
+		feedForwardPost float32[]
+		// A mixture of experts (Mixtral, Qwen3-MoE): the router scoring
+		// the experts, and each expert's gate, up and down; `none` and
+		// empty for a dense feed-forward (`gate`, `up`, `down`).
+		router          ?Weights
+		expertGate      Weights[]
+		expertUp        Weights[]
+		expertDown      Weights[]
+		// Biases of the attention output, the router and each expert's
+		// gate, up and down (gpt-oss); empty when the model has none.
+		outputBias      float32[]
+		routerBias      float32[]
+		expertGateBias  float32[][]
+		expertUpBias    float32[][]
+		expertDownBias  float32[][]
+		// A learned logit per head that joins each attention softmax and
+		// takes its share of the weight (gpt-oss); empty for none.
+		sinks           float32[]
+		// How many past positions the layer attends to, 0 for all
+		// (sliding-window layers of Gemma 3).
+		window          int
+		ropeBase        float32
+		// Multiplies the position (linear RoPE scaling).
+		ropeScale       float32
+		// YaRN's per-pair divisors and magnitude for this layer; empty
+		// factors when the model does not use YaRN.
+		ropeFactors     float32[]
+		ropeMagnitude   float32
+	}
+
+	// Everything a forward pass needs.
+	struct ModelParts {
+		info            LanguageModelInfo
+		tokenizer       Tokenizer
+		embedding       Weights
+		output          Weights
+		outputNorm      float32[]
+		layers          Layer[]
+		epsilon         float32
+		pairing         RopeStyle
+		headSize        int
+		// Per-pair RoPE frequency divisors (`rope_freqs.weight`); empty
+		// when the model has none.
+		ropeFactors     float32[]
+		// LongRoPE's divisors for contexts up to `originalContext` and
+		// beyond it (Phi-3); empty when the model has none.
+		ropeShort       float32[]
+		ropeLong        float32[]
+		originalContext int
+		// Head values RoPE turns, 0 for all; what the turned values are
+		// multiplied by.
+		rotated         int
+		ropeMagnitude   float32
+		// Multiplies the token embedding (√embedding for Gemma).
+		embeddingScale  float32
+		// Multiplies the attention scores.
+		attentionScale  float32
+		// GELU feed-forward (Gemma); SiLU otherwise.
+		gelu            bool
+		// Final logits are capped to ±softCap by tanh; 0 for none.
+		softCap         float32
+		// Attention scores are capped the same way (Gemma 2); 0 for none.
+		attentionCap    float32
+		// Experts each token goes through, and what their weights are
+		// multiplied by after normalising.
+		expertsUsed     int
+		expertScale     float32
+		// gpt-oss routing: the router's best logits picked first, their
+		// softmax as the weights; otherwise the softmax of all logits,
+		// renormalised over the picked experts.
+		pickThenSoftmax bool
+		// gpt-oss's SwiGLU: gate clamped to 7, up to ±7 plus one, and
+		// sigmoid(1.702·gate).
+		clampedSwiglu   bool
+	}
+
+	// Reads the hyperparameters, tokenizer and weights of a Llama-family
+	// model: Llama (and Mistral, Mixtral), Qwen2, Qwen3, Qwen3-MoE, Gemma 2,
+	// Gemma 3, Phi-3 (Phi-3.5, Phi-4) and gpt-oss.
+	// Fails when the architecture, its RoPE scaling or a weight type is not
+	// supported, or a read fails.
+	def readParts(file ModelFile) !ModelParts {
+		let arch = file.getString("general.architecture")
+		fail "llm: the model file names no architecture" when arch is none
+		fail "llm: the {arch} architecture is not supported yet" unless arch := "llama" || "qwen2" || "qwen3" || "qwen3moe" || "gemma2" || "gemma3" || "phi3" || "gpt-oss"
+		let gemma2 = arch == "gemma2"
+		let oss = arch == "gpt-oss"
+		// Gemma 2 and gpt-oss slide a window over every other layer, turning
+		// them with the global RoPE base and scale.
+		let alternating = gemma2 || oss
+		let gemma = gemma2 || arch == "gemma3"
+		let layers = try required(file, arch + ".block_count")
+		let embedding = try required(file, arch + ".embedding_length")
+		let heads = try required(file, arch + ".attention.head_count")
+		let kvHeadsValue = file.getInt(arch + ".attention.head_count_kv")
+		let kvHeads = kvHeadsValue is none ?? (heads, kvHeadsValue)
+		let keyLength = file.getInt(arch + ".attention.key_length")
+		let headSize = keyLength is none ?? (embedding / heads, keyLength)
+		let valueLength = file.getInt(arch + ".attention.value_length")
+		fail "llm: value heads of {valueLength} differ from key heads of {headSize}" unless valueLength is none || valueLength == headSize
+		let rotated = file.getInt(arch + ".rope.dimension_count")
+		fail "llm: RoPE over {rotated} of {headSize} head values" unless rotated is none || rotated > 0 && rotated <= headSize && rotated % 2 == 0
+		let scalingType = file.getString(arch + ".rope.scaling.type")
+		let scaling = scalingType is none ?? ("none", scalingType)
+		fail "llm: {scaling} RoPE scaling is not supported yet" unless scaling := "none" || "linear" || "longrope" || "yarn"
+		let magnitude = file.getFloat(arch + ".rope.scaling.attn_factor")
+		let original = file.getInt(arch + ".rope.scaling.original_context_length")
+		let factor = file.getFloat(arch + ".rope.scaling.factor")
+		let ropeScale = float32(factor is none || factor == 0.0 ?? (1.0, 1.0 / factor))
+		let contextValue = file.getInt(arch + ".context_length")
+		let base = file.getFloat(arch + ".rope.freq_base")
+		let ropeBase = float32(base is none ?? (10000.0, base))
+		let baseSwa = file.getFloat(arch + ".rope.freq_base_swa")
+		let eps = file.getFloat(arch + ".attention.layer_norm_rms_epsilon")
+		// Gemma 2 slides a window (4096 unless given) over every other
+		// layer, Gemma 3 over all but every sixth; the sliding layers of
+		// Gemma 3 turn with their own base, Gemma 2's with the global one.
+		let windowValue = file.getInt(arch + ".attention.sliding_window")
+		let window = windowValue is none ?? (gemma2 ?? (4096, 0), windowValue)
+		let patternValue = file.getInt(arch + ".attention.sliding_window_pattern")
+		let pattern = patternValue is none ?? (alternating ?? (2, 6), patternValue)
+		let slidingBase = float32(baseSwa is none ?? (alternating ?? (float(ropeBase), 10000.0), baseSwa))
+		let slidingScale = alternating ?? (ropeScale, float32(1))
+		let used = file.getInt(arch + ".expert_used_count")
+		let expertScale = file.getFloat(arch + ".expert_weights_scale")
+		let cap = file.getFloat(arch + ".final_logit_softcapping")
+		let attentionCap = file.getFloat(arch + ".attn_logit_softcapping")
+		// The 27B Gemmas scale attention by the model width per head, as
+		// Google's reference does.
+		let wideGemma = layers := 46 || 62
+		let scaleByWidth = gemma && wideGemma
+		let tokenizer = try loadTokenizer(file)
+
+		let parts = ModelParts{
+			tokenizer:       tokenizer,
+			embedding:       try loadWeights(file, "token_embd.weight"),
+			outputNorm:      try file.readFloats("output_norm.weight"),
+			epsilon:         float32(eps is none ?? (0.00001, eps)),
+			pairing:         arch == "llama" ?? (RopeStyle.Adjacent, RopeStyle.Halves),
+			headSize:        headSize,
+			ropeFactors:     try optionalFloats(file, "rope_freqs.weight"),
+			ropeShort:       try optionalFloats(file, "rope_factors_short.weight"),
+			ropeLong:        try optionalFloats(file, "rope_factors_long.weight"),
+			rotated:         rotated is none || rotated == headSize ?? (0, rotated),
+			ropeMagnitude:   float32(magnitude is none ?? (1.0, magnitude)),
+			embeddingScale:  gemma ?? (float32(sqrtOf(float(embedding))), float32(1)),
+			attentionScale:  float32(1) / float32(sqrtOf(float(scaleByWidth ?? (embedding / heads, headSize)))),
+			gelu:            gemma,
+			softCap:         float32(cap is none ?? (gemma2 ?? (30.0, 0.0), cap)),
+			attentionCap:    float32(attentionCap is none ?? (gemma2 ?? (50.0, 0.0), attentionCap)),
+			expertsUsed:     used is none ?? (0, used),
+			expertScale:     float32(expertScale is none || expertScale == 0.0 ?? (1.0, expertScale)),
+			pickThenSoftmax: oss,
+			clampedSwiglu:   oss,
+		}
+		parts.output = file.tensor("output.weight") is none ?? (parts.embedding, try loadWeights(file, "output.weight"))
+		let context = contextValue is none ?? (2048, contextValue)
+		parts.originalContext = original is none ?? (context, original)
+		let total = 0
+		let counts = new map<string, int>()
+		for let (_, t) in file.tensors {
+			total += t.count
+			let c = counts.get(t.kind.name)
+			counts.set(t.kind.name, (c is none ?? (0, c)) + t.count)
+		}
+		let dominant = ""
+		let most = 0
+		for let (name, c) in counts {
+			if c > most {
+				most = c
+				dominant = name
+			}
+		}
+		for let n = 0; n < layers; n++ {
+			let p = "blk.{n}."
+			// Phi-3 stores the query, key and value rows in one matrix, and
+			// the gate rows before the up rows in `ffn_up`.
+			let fused = !(file.tensor(p + "attn_qkv.weight") is none)
+			let qkv = fused ?? (try splitRows(file, p + "attn_qkv.weight", int[heads * headSize, kvHeads * headSize, kvHeads * headSize]), Weights[])
+			let routed = !(file.tensor(p + "ffn_gate_inp.weight") is none)
+			let paired = !routed && file.tensor(p + "ffn_gate.weight") is none
+			let gateUp = paired ?? (try splitRows(file, p + "ffn_up.weight", int[0, 0]), Weights[])
+			let expertGate = routed ?? (try splitExperts(file, p + "ffn_gate_exps.weight"), Weights[])
+			let expertUp = routed ?? (try splitExperts(file, p + "ffn_up_exps.weight"), Weights[])
+			let expertDown = routed ?? (try splitExperts(file, p + "ffn_down_exps.weight"), Weights[])
+			fail "llm: {p}ffn_gate_inp routes to {expertGate.len()} experts, fewer than the {parts.expertsUsed} used" when routed && expertGate.len() < parts.expertsUsed.max(1)
+			let sliding = (gemma || oss) && window > 0 && (pattern == 0 || n % pattern < pattern - 1)
+			// gpt-oss normalises before its experts with the tensor named
+			// for after attention.
+			let preExperts = oss ?? (try file.readFloats(p + "post_attention_norm.weight"), float32[])
+			parts.layers.push(Layer{
+				attentionNorm:   try file.readFloats(p + "attn_norm.weight"),
+				query:           fused ?? (qkv[0], try loadWeights(file, p + "attn_q.weight")),
+				key:             fused ?? (qkv[1], try loadWeights(file, p + "attn_k.weight")),
+				value:           fused ?? (qkv[2], try loadWeights(file, p + "attn_v.weight")),
+				output:          try loadWeights(file, p + "attn_output.weight"),
+				queryBias:       try optionalFloats(file, p + "attn_q.bias"),
+				keyBias:         try optionalFloats(file, p + "attn_k.bias"),
+				valueBias:       try optionalFloats(file, p + "attn_v.bias"),
+				queryNorm:       try optionalFloats(file, p + "attn_q_norm.weight"),
+				keyNorm:         try optionalFloats(file, p + "attn_k_norm.weight"),
+				attentionPost:   oss ?? (float32[], try optionalFloats(file, p + "post_attention_norm.weight")),
+				feedForwardNorm: oss ?? (preExperts, try file.readFloats(p + "ffn_norm.weight")),
+				gate:            routed ?? (expertGate[0], paired ?? (gateUp[0], try loadWeights(file, p + "ffn_gate.weight"))),
+				up:              routed ?? (expertUp[0], paired ?? (gateUp[1], try loadWeights(file, p + "ffn_up.weight"))),
+				down:            routed ?? (expertDown[0], try loadWeights(file, p + "ffn_down.weight")),
+				router:          routed ?? (try loadWeights(file, p + "ffn_gate_inp.weight"), none),
+				expertGate:      expertGate,
+				expertUp:        expertUp,
+				expertDown:      expertDown,
+				outputBias:      try optionalFloats(file, p + "attn_output.bias"),
+				routerBias:      try optionalFloats(file, p + "ffn_gate_inp.bias"),
+				expertGateBias:  try expertBiases(file, p + "ffn_gate_exps.bias", expertGate.len()),
+				expertUpBias:    try expertBiases(file, p + "ffn_up_exps.bias", expertUp.len()),
+				expertDownBias:  try expertBiases(file, p + "ffn_down_exps.bias", expertDown.len()),
+				sinks:           try optionalFloats(file, p + "attn_sinks.weight"),
+				feedForwardPost: try optionalFloats(file, p + "post_ffw_norm.weight"),
+				window:          sliding ?? (window, 0),
+				ropeBase:        sliding ?? (slidingBase, ropeBase),
+				ropeScale:       sliding ?? (slidingScale, ropeScale),
+			})
+			let layer = parts.layers[n]
+			layer.ropeMagnitude = parts.ropeMagnitude
+			yarn(layer, parts, file, arch, ropeScale) when scaling == "yarn"
+		}
+		parts.info = LanguageModelInfo{
+			architecture:  arch,
+			name:          orEmpty(file.getString("general.name")),
+			layers:        layers,
+			embedding:     embedding,
+			heads:         heads,
+			kvHeads:       kvHeads,
+			contextLength: context,
+			vocabulary:    tokenizer.size(),
+			parameters:    total,
+			weightType:    dominant,
+		}
+		return parts
+	}
+
+	// The rows of a 2D tensor split into consecutive matrices of `counts`
+	// rows, sharing the tensor's bytes; zero counts split it evenly.
+	// Fails when the counts do not add up to its rows, or the read fails.
+	def splitRows(file ModelFile, name string, counts int[]) !Weights[] {
+		let t = file.tensor(name)
+		fail "llm: no tensor named {name}" when t is none
+		fail "llm: {name} has {t.shape.len()} dimensions, weights have 2" unless t.shape.len() == 2
+		let data = try file.read(name)
+		let cols = t.shape[0]
+		let rows = t.shape[1]
+		let size = cols / ai.blockSize(t.kind) * ai.blockBytes(t.kind)
+		let parts Weights[]
+		let from = 0
+		for let (_, n) in counts {
+			let count = n == 0 ?? (rows / counts.len(), n)
+			parts.push(new Weights(t.kind, count, cols, data[from * size:(from + count) * size]))
+			from += count
+		}
+		fail "llm: {name} has {rows} rows, not {from}" unless from == rows
+		return parts
+	}
+
+	// The indices of the `k` largest logits, largest first.
+	def topCandidates(logits float32[], k int) int[] {
+		let out int[]
+		for let t = 0; t < logits.len(); t++ {
+			let v = logits[t]
+			if out.len() == k && v <= logits[out[k - 1]] {
+				continue
+			}
+			let at = out.len()
+			for at > 0 && logits[out[at - 1]] < v {
+				at--
+			}
+			out.push(0) when out.len() < k
+			for let m = out.len() - 1; m > at; m-- {
+				out[m] = out[m - 1]
+			}
+			out[at] = t
+		}
+		return out
+	}
+
+	// Turns YaRN scaling into what `rope` takes, as ggml computes it: pair
+	// i's angle mixes the interpolated (position times the layer's scale)
+	// and extrapolated angle by a ramp over the pairs between the
+	// `yarn_beta_fast` and `yarn_beta_slow` corrections, which is a
+	// divisor per pair; the magnitude grows by 1 + 0.1·ln(1/scale),
+	// corrected for the model's scale as llama.cpp does.
+	def yarn(layer Layer, parts ModelParts, file ModelFile, arch string, modelScale float32) {
+		let fast = file.getFloat(arch + ".rope.scaling.yarn_beta_fast")
+		let slow = file.getFloat(arch + ".rope.scaling.yarn_beta_slow")
+		let logMul = file.getFloat(arch + ".rope.scaling.yarn_log_multiplier")
+		let betaFast = fast is none ?? (32.0, fast)
+		let betaSlow = slow is none ?? (1.0, slow)
+		let dims = parts.rotated > 0 ?? (parts.rotated, parts.headSize)
+		let scale = float(layer.ropeScale)
+		let lnBase = math.ln(float(layer.ropeBase))
+		let original = float(parts.originalContext)
+		let low = (float(dims) * math.ln(original / (betaFast * 2.0 * 3.141592653589793)) / (2.0 * lnBase)).floor().max(0.0)
+		let high = (float(dims) * math.ln(original / (betaSlow * 2.0 * 3.141592653589793)) / (2.0 * lnBase)).ceil().min(float(dims - 1))
+		let factors float32[]
+		for let i = 0; i < dims / 2; i++ {
+			let y = (float(i) - low) / (high - low).max(0.001)
+			let ramp = 1.0 - y.max(0.0).min(1.0)
+			let base = i < parts.ropeFactors.len() ?? (float(parts.ropeFactors[i]), 1.0)
+			factors.push(float32(base / (scale * (1.0 - ramp) + ramp)))
+		}
+		layer.ropeFactors = factors
+		layer.ropeScale = float32(1)
+		let factor = 1.0 / float(modelScale)
+		let corrected = logMul is none || logMul == 0.0 ?? (mscale(factor, 1.0), mscale(factor, 1.0) / mscale(factor, logMul))
+		layer.ropeMagnitude = parts.ropeMagnitude * float32(corrected / (1.0 + 0.1 * math.ln(factor)) * (1.0 + 0.1 * math.ln(1.0 / scale)))
+	}
+
+	// Each expert's bias of a 2D expert bias tensor (one row per expert),
+	// empty when the file has none.
+	// Fails when the read fails.
+	def expertBiases(file ModelFile, name string, experts int) !float32[][] {
+		let out float32[][]
+		return out when file.tensor(name) is none || experts == 0
+		let all = try file.readFloats(name)
+		let size = all.len() / experts
+		for let e = 0; e < experts; e++ {
+			out.push(all[e * size:(e + 1) * size])
+		}
+		return out
+	}
+
+	// YaRN's magnitude for a scale factor.
+	def mscale(factor float, m float) float {
+		return factor <= 1.0 ?? (1.0, 0.1 * m * math.ln(factor) + 1.0)
+	}
+
+	// Each expert's matrix of a 3D expert tensor (one 2D matrix per
+	// expert, stored one after another), sharing the tensor's bytes.
+	// Fails when the tensor is missing or not 3D, or the read fails.
+	def splitExperts(file ModelFile, name string) !Weights[] {
+		let t = file.tensor(name)
+		fail "llm: no tensor named {name}" when t is none
+		fail "llm: {name} has {t.shape.len()} dimensions, expert weights have 3" unless t.shape.len() == 3
+		let data = try file.read(name)
+		let cols = t.shape[0]
+		let rows = t.shape[1]
+		let size = rows * (cols / ai.blockSize(t.kind) * ai.blockBytes(t.kind))
+		let experts Weights[]
+		for let e = 0; e < t.shape[2]; e++ {
+			experts.push(new Weights(t.kind, rows, cols, data[e * size:(e + 1) * size]))
+		}
+		return experts
+	}
+
+	// Fails when the key is missing.
+	def required(file ModelFile, key string) !int {
+		let v = file.getInt(key)
+		fail "llm: the model file has no {key}" when v is none
+		return v
+	}
+
+	// The tensor as float32, empty when the file has none.
+	// Fails when the read fails.
+	def optionalFloats(file ModelFile, name string) !float32[] {
+		return float32[] when file.tensor(name) is none
+		return file.readFloats(name)
+	}
+
+	def orEmpty(s ?string) string {
+		return "" when s is none
+		return s
+	}
+
+	// The KV cache and scratch vectors of one session.
+	type ForwardState {
+		parts     ModelParts
+		// The logits after the last forward pass.
+		logits    float32[]
+		keys      float32[][]
+		values    float32[][]
+		x         float32[]
+		normed    float32[]
+		query     float32[]
+		key       float32[]
+		value     float32[]
+		attended  float32[]
+		projected float32[]
+		gated     float32[]
+		upped     float32[]
+		scores    float32[]
+		kvSize    int
+		// The RoPE divisors this session's context calls for.
+		factors   float32[]
+		// The router's scores of the experts, and one expert's output.
+		routed    float32[]
+		expertOut float32[]
+
+		def new(parts ModelParts, context int) {
+			self.parts = parts
+			let info = parts.info
+			kvSize = info.kvHeads * parts.headSize
+			let ffn = parts.layers.len() > 0 ?? (parts.layers[0].gate.rows, 0)
+			logits.len(parts.output.rows)
+			x.len(info.embedding)
+			normed.len(info.embedding)
+			query.len(info.heads * parts.headSize)
+			key.len(kvSize)
+			value.len(kvSize)
+			attended.len(info.heads * parts.headSize)
+			projected.len(info.embedding)
+			gated.len(ffn)
+			upped.len(ffn)
+			// One more than the context: a sink's logit joins the softmax.
+			scores.len(context + 1)
+			expertOut.len(info.embedding)
+			let router = parts.layers.len() > 0 ?? (parts.layers[0].router, none)
+			routed.len(router is Weights ?? (router.rows, 0))
+			factors = parts.ropeFactors
+			factors = context > parts.originalContext && parts.ropeLong.len() > 0 ?? (parts.ropeLong, parts.ropeShort) when parts.ropeShort.len() > 0
+			for let n = 0; n < info.layers; n++ {
+				keys.push(float32[])
+				values.push(float32[])
+			}
+		}
+
+		// Runs `token` at `position` through the model, leaving the next
+		// token's logits in `logits`.
+		def forward(token int, position int) {
+			let info = parts.info
+			let hs = parts.headSize
+			let group = info.heads / info.kvHeads
+			let eps = parts.epsilon
+			parts.embedding.row(token, x)
+			scaleBy(x, parts.embeddingScale) unless parts.embeddingScale == float32(1)
+			for let (n, layer) in parts.layers {
+				copyInto(x, normed)
+				rmsNorm(normed, layer.attentionNorm, eps)
+				layer.query.multiply(normed, query)
+				layer.key.multiply(normed, key)
+				layer.value.multiply(normed, value)
+				addInto(query, layer.queryBias)
+				addInto(key, layer.keyBias)
+				addInto(value, layer.valueBias)
+				if layer.queryNorm.len() > 0 {
+					for let h = 0; h < info.heads; h++ {
+						rmsNorm(query[h * hs:(h + 1) * hs], layer.queryNorm, eps)
+					}
+				}
+				if layer.keyNorm.len() > 0 {
+					for let h = 0; h < info.kvHeads; h++ {
+						rmsNorm(key[h * hs:(h + 1) * hs], layer.keyNorm, eps)
+					}
+				}
+				let turns = layer.ropeFactors.len() > 0 ?? (layer.ropeFactors, factors)
+				rope(query, position, info.heads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+				rope(key, position, info.kvHeads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+				let kc = keys[n]
+				let vc = values[n]
+				let at = position * kvSize
+				if kc.len() < at + kvSize {
+					kc.len((at + kvSize) * 2)
+					vc.len((at + kvSize) * 2)
+					keys[n] = kc
+					values[n] = vc
+				}
+				copyAt(key, kc, at)
+				copyAt(value, vc, at)
+				let first = layer.window > 0 ?? ((position - layer.window + 1).max(0), 0)
+				let count = position + 1 - first
+				for let h = 0; h < info.heads; h++ {
+					let q = h * hs
+					let kv = (h / group) * hs
+					for let t = 0; t < count; t++ {
+						scores[t] = dot(query, q, kc, (first + t) * kvSize + kv, hs) * parts.attentionScale
+					}
+					softCap(scores[:count], parts.attentionCap) when parts.attentionCap > float32(0)
+					if layer.sinks.len() > 0 {
+						// The sink takes part in the softmax and is left out of the sum.
+						scores[count] = layer.sinks[h]
+						softmax(scores[:count + 1])
+					} else {
+						softmax(scores[:count])
+					}
+					clearRange(attended, q, hs)
+					for let t = 0; t < count; t++ {
+						addScaled(attended, q, vc, (first + t) * kvSize + kv, scores[t], hs)
+					}
+				}
+				layer.output.multiply(attended, projected)
+				addInto(projected, layer.outputBias)
+				rmsNorm(projected, layer.attentionPost, eps) when layer.attentionPost.len() > 0
+				addInto(x, projected)
+
+				copyInto(x, normed)
+				rmsNorm(normed, layer.feedForwardNorm, eps)
+				let router = layer.router
+				if router is Weights {
+					mixExperts(layer, router)
+				} else {
+					layer.gate.multiply(normed, gated)
+					layer.up.multiply(normed, upped)
+					if parts.gelu {
+						gelu(gated)
+					} else {
+						silu(gated)
+					}
+					multiplyInto(gated, upped)
+					layer.down.multiply(gated, projected)
+				}
+				rmsNorm(projected, layer.feedForwardPost, eps) when layer.feedForwardPost.len() > 0
+				addInto(x, projected)
+			}
+			rmsNorm(x, parts.outputNorm, eps)
+			parts.output.multiply(x, logits)
+			softCap(logits, parts.softCap) when parts.softCap > float32(0)
+		}
+
+		// The feed-forward of a mixture-of-experts layer on `normed` into
+		// `projected`: the router's softmax picks the `expertsUsed` best
+		// experts, whose SwiGLU outputs are summed, weighted by their
+		// probabilities renormalised over the picked ones.
+		internal def mixExperts(layer Layer, router Weights) {
+			router.multiply(normed, routed)
+			addInto(routed, layer.routerBias)
+			let weights float32[]
+			let picked int[]
+			if parts.pickThenSoftmax {
+				picked = topCandidates(routed, parts.expertsUsed)
+				for let (_, e) in picked {
+					weights.push(routed[e])
+				}
+				softmax(weights)
+			} else {
+				softmax(routed)
+				picked = topCandidates(routed, parts.expertsUsed)
+				let total = float32(0)
+				for let (_, e) in picked {
+					total += routed[e]
+				}
+				total = total.max(float32(0.00006103515625))
+				for let (_, e) in picked {
+					weights.push(routed[e] / total)
+				}
+			}
+			clearRange(projected, 0, projected.len())
+			for let (k, e) in picked {
+				layer.expertGate[e].multiply(normed, gated)
+				layer.expertUp[e].multiply(normed, upped)
+				if layer.expertGateBias.len() > 0 {
+					addInto(gated, layer.expertGateBias[e])
+					addInto(upped, layer.expertUpBias[e])
+				}
+				if parts.clampedSwiglu {
+					clampedSwiglu(gated, upped)
+				} else {
+					silu(gated)
+					multiplyInto(gated, upped)
+				}
+				layer.expertDown[e].multiply(gated, expertOut)
+				addInto(expertOut, layer.expertDownBias[e]) when layer.expertDownBias.len() > 0
+				addScaled(projected, 0, expertOut, 0, weights[k] * parts.expertScale, projected.len())
+			}
+		}
+	}
+
+	// gate = min(gate, 7) · sigmoid(1.702 · min(gate, 7)) · (clamp(up, ±7) + 1),
+	// gpt-oss's SwiGLU.
+	def clampedSwiglu(gate float32[], up float32[]) {
+		let limit = simd.splat8<float32>(float32(7))
+		let one = simd.splat8<float32>(float32(1))
+		let alpha = simd.splat8<float32>(float32(-1.702))
+		let n = gate.len()
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			let x = simd.min(simd.load8<float32>(gate, i), limit)
+			let y = simd.max(simd.min(simd.load8<float32>(up, i), limit), simd.splat8<float32>(float32(-7)))
+			simd.store8<float32>(gate, i, x / (one + simd.exp(alpha * x)) * (y + one))
+		}
+		for; i < n; i++ {
+			let x = gate[i].min(float32(7))
+			let y = up[i].max(float32(-7)).min(float32(7))
+			gate[i] = x / float32(1.0 + expOf(-1.702 * float(x))) * (y + float32(1))
+		}
+	}
+
+	// a *= s
+	def scaleBy(a float32[], s float32) {
+		for let k = 0; k < a.len(); k++ {
+			a[k] *= s
+		}
+	}
+
+	// Caps every value to ±cap smoothly: cap·tanh(v/cap).
+	def softCap(a float32[], cap float32) {
+		for let k = 0; k < a.len(); k++ {
+			let e = expOf(2.0 * float(a[k] / cap))
+			a[k] = cap * float32(1.0 - 2.0 / (e + 1.0))
+		}
+	}
+
+	def sqrtOf(v float) float {
+		return float(simd.lane(simd.sqrt(simd.splat4<float64>(float64(v))), 0))
+	}
+
+	def expOf(v float) float {
+		return float(simd.lane(simd.exp(simd.splat4<float64>(float64(v))), 0))
+	}
+
+	// to = from
+	def copyInto(from float32[], to float32[]) {
+		from.copy(to)
+	}
+
+	// to[at…] = from
+	def copyAt(from float32[], to float32[], at int) {
+		for let k = 0; k < from.len(); k++ {
+			to[at + k] = from[k]
+		}
+	}
+
+	// a += b; nothing when b is empty.
+	def addInto(a float32[], b float32[]) {
+		return when b.len() == 0
+		let n = a.len()
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(a, i, simd.load8<float32>(a, i) + simd.load8<float32>(b, i))
+		}
+		for; i < n; i++ {
+			a[i] += b[i]
+		}
+	}
+
+	// a *= b
+	def multiplyInto(a float32[], b float32[]) {
+		let n = a.len()
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(a, i, simd.load8<float32>(a, i) * simd.load8<float32>(b, i))
+		}
+		for; i < n; i++ {
+			a[i] *= b[i]
+		}
+	}
+
+	// The dot product of a[ao…ao+n] and b[bo…bo+n].
+	def dot(a float32[], ao int, b float32[], bo int, n int) float32 {
+		let acc = simd.splat8<float32>(float32(0))
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			acc = simd.fma(simd.load8<float32>(a, ao + i), simd.load8<float32>(b, bo + i), acc)
+		}
+		let s = simd.sum(acc)
+		for; i < n; i++ {
+			s += a[ao + i] * b[bo + i]
+		}
+		return s
+	}
+
+	// out[oo…oo+n] += v[vo…vo+n] * s
+	def addScaled(out float32[], oo int, v float32[], vo int, s float32, n int) {
+		let vs = simd.splat8<float32>(s)
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(out, oo + i, simd.fma(simd.load8<float32>(v, vo + i), vs, simd.load8<float32>(out, oo + i)))
+		}
+		for; i < n; i++ {
+			out[oo + i] += v[vo + i] * s
+		}
+	}
+
+	// a[from…from+n] = 0
+	def clearRange(a float32[], from int, n int) {
+		for let k = from; k < from + n; k++ {
+			a[k] = float32(0)
+		}
+	}
+}

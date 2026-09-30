@@ -1,0 +1,723 @@
+internal partial module std.formats.video.hevc {
+	use (
+		std.simd
+		std.formats.video::*
+		std.formats.video.h264::(H264Bits, h264Unescape, h264FindStart, h264Bytes)
+	)
+
+	// HevcDecoder turns NAL units into pictures: it keeps the parameter
+	// sets, derives picture order and reference sets, drives the CTU
+	// decoder and the loop filters, and hands out frames in output order.
+	type HevcDecoder {
+		spsById       map<int, HevcSps>
+		ppsById       map<int, HevcPps>
+		// The RBSP of each picture parameter set, read again when an SPS
+		// comes.
+		ppsRaw        map<int, byte[]>
+		spsSerial     int
+		sps           HevcSps
+		pps           HevcPps
+		sh            HevcSliceHeader
+		ctu           HevcCtu
+		filter        HevcFilter
+		bits          H264Bits
+		rbsp          byte[]
+		// The container's picture size, 0 when it declares none.
+		trackWidth    int
+		trackHeight   int
+		// The pictures kept for reference or output.
+		dpb           HevcPicture[]
+		cur           HevcPicture
+		hasCur        bool
+		// Whether the slices of the current picture are skipped (RASL
+		// pictures after a random access point, pictures before the first
+		// one).
+		skipping      bool
+		// POC of the previous TemporalId 0 picture (8.3.1).
+		prevTid0Poc   int
+		// Whether a random access point was decoded, and whether the
+		// next picture starts over (after end of sequence).
+		seenIrap      bool
+		afterEos      bool
+		// NoRaslOutputFlag of the latest IRAP picture.
+		noRaslOutput  bool
+		sequence      int
+		// The reference picture set of the current picture.
+		stBefore      HevcPicture[]
+		stAfter       HevcPicture[]
+		ltCurr        HevcPicture[]
+		// Bytes of the NAL length prefix for hvcC streams, 0 for Annex B.
+		lengthSize    int
+		pending       byte[]
+		pendingLen    int
+		pendingPos    int               = -1
+		scanFrom      int
+		pendingPts    duration
+		pendingLength duration
+		usedPts       duration
+		haveUsedPts   bool
+		lastTime      duration
+		haveTime      bool
+		frames        VideoFrame[]
+
+		def new() {
+			spsById = map<int, HevcSps>{}
+			ppsById = map<int, HevcPps>{}
+			ppsRaw = map<int, byte[]>{}
+			sps = new HevcSps()
+			pps = new HevcPps()
+			sh = new HevcSliceHeader()
+			ctu = new HevcCtu()
+			filter = new HevcFilter()
+			bits = new H264Bits()
+			rbsp = h264Bytes(4096)
+			cur = new HevcPicture(sps)
+			pending = h264Bytes(0)
+		}
+
+		// Reads an hvcC record: the NAL length size and the parameter sets.
+		// An empty record selects Annex B.
+		//
+		// Fails on a malformed record or parameter sets this decoder does
+		// not support.
+		def configure(config byte[]) !none {
+			if config.len() == 0 || config[0] != byte(1) {
+				lengthSize = 0
+				try packet(config, 0s, 0s) when config.len() > 0
+				return none
+			}
+			fail "hevc: hvcC record too short" when config.len() < 23
+			lengthSize = (int(config[21]) & 3) + 1
+			let count = int(config[22])
+			let p = 23
+			for let a = 0; a < count; a++ {
+				fail "hevc: truncated hvcC record" when p + 3 > config.len()
+				let n = (int(config[p + 1]) << 8) | int(config[p + 2])
+				p += 3
+				for let i = 0; i < n; i++ {
+					fail "hevc: truncated hvcC record" when p + 2 > config.len()
+					let len = (int(config[p]) << 8) | int(config[p + 1])
+					p += 2
+					fail "hevc: truncated hvcC record" when p + len > config.len()
+					try nal(config, p, p + len, 0s, false, 0s)
+					p += len
+				}
+			}
+			return none
+		}
+
+		// Decodes the NAL units of one packet.
+		//
+		// Fails on a malformed or unsupported stream.
+		def packet(data byte[], pts duration, length duration) !none {
+			if lengthSize > 0 {
+				let p = 0
+				for p + lengthSize <= data.len() {
+					let n = 0
+					for let k = 0; k < lengthSize; k++ {
+						n = (n << 8) | int(data[p + k])
+					}
+					p += lengthSize
+					if n > data.len() - p {
+						nal(data, p, data.len(), pts, true, length) onerror (err error) {
+							hasCur = false
+							recover none
+						}
+						break
+					}
+					try nal(data, p, p + n, pts, true, length)
+					p += n
+				}
+				return none
+			}
+			if pendingPos > 0 && pendingLen + data.len() > pending.len() {
+				pending[pendingPos:pendingLen].copy(pending)
+				pendingLen -= pendingPos
+				scanFrom -= pendingPos
+				pendingPos = 0
+			}
+			let need = pendingLen + data.len()
+			if pending.len() < need {
+				let grown = h264Bytes(need + need / 2 + 64)
+				pending[0:pendingLen].copy(grown)
+				pending = grown
+			}
+			data.copy(pending[pendingLen:])
+			pendingLen = need
+			if pendingPos < 0 {
+				let start = h264FindStart(pending, scanFrom, pendingLen)
+				if start < 0 {
+					if pendingLen > 3 {
+						pending[pendingLen - 3:pendingLen].copy(pending)
+						pendingLen = 3
+					}
+					scanFrom = 0
+					return none
+				}
+				pendingPos = start
+				scanFrom = start + 3
+				pendingPts = pts
+				pendingLength = length
+			}
+			for {
+				let next = h264FindStart(pending, scanFrom, pendingLen)
+				if next < 0 {
+					scanFrom = pendingLen - 2
+					scanFrom = pendingPos + 3 when scanFrom < pendingPos + 3
+					break
+				}
+				let from = pendingPos + 3
+				let end = next
+				for end > from && pending[end - 1] == byte(0) {
+					end--
+				}
+				try nal(pending, from, end, pendingPts, true, pendingLength) when end > from
+				pendingPos = next
+				scanFrom = next + 3
+				pendingPts = pts
+				pendingLength = length
+			}
+			return none
+		}
+
+		// Decodes what is left and outputs every picture still held back.
+		//
+		// Fails on a malformed stream.
+		def flush() !none {
+			if lengthSize == 0 && pendingPos >= 0 {
+				let from = pendingPos + 3
+				let end = pendingLen
+				for end > from && pending[end - 1] == byte(0) {
+					end--
+				}
+				if end > from {
+					// A stream cut short: decode what arrived of the last
+					// unit, and give up its picture if that fails.
+					nal(pending, from, end, pendingPts, true, pendingLength) onerror (err error) {
+						hasCur = false
+						recover none
+					}
+				}
+			}
+			pendingLen = 0
+			pendingPos = -1
+			scanFrom = 0
+			try finishPicture()
+			bumpAll()
+			dpb = HevcPicture[]
+			seenIrap = false
+			haveUsedPts = false
+			return none
+		}
+
+		// The frames decoded so far, handed over once.
+		def take() VideoFrame[] {
+			let out = frames
+			frames = VideoFrame[]
+			return out
+		}
+
+		// Handles one NAL unit at data[start:end].
+		def nal(data byte[], start int, end int, pts duration, hasPts bool, length duration) !none {
+			return none when end - start < 2
+			fail "hevc: forbidden_zero_bit set" when (int(data[start]) & 0x80) != 0
+			let t = (int(data[start]) >> 1) & 63
+			let layer = ((int(data[start]) & 1) << 5) | (int(data[start + 1]) >> 3)
+			let tid = (int(data[start + 1]) & 7) - 1
+			return none when layer != 0
+			if t <= 9 || (t >= 16 && t <= 21) {
+				rbsp = h264Bytes(end - start + (end - start) / 2 + 64) when rbsp.len() < end - start + 8
+				let n = h264Unescape(data, start + 2, end, rbsp)
+				try sliceNal(n, t, tid, pts, hasPts, length)
+				return none
+			}
+			if t == hevcNalSps || t == hevcNalPps {
+				rbsp = h264Bytes(end - start + (end - start) / 2 + 64) when rbsp.len() < end - start + 8
+				let n = h264Unescape(data, start + 2, end, rbsp)
+				bits.reset(rbsp, n)
+				if t == hevcNalSps {
+					let s = try hevcParseSps(bits)
+					spsSerial++
+					s.serial = spsSerial
+					spsById[s.id] = s
+					// Picture parameter sets are read against the SPS they
+					// name, which may come after them or change.
+					for let (_, raw) in ppsRaw {
+						parsePps(raw)
+					}
+				} else {
+					let raw = rbsp[:n + 8].clone()
+					bits.reset(raw, n)
+					let id = bits.ue()
+					fail "hevc: PPS id out of range" when id >= 64
+					ppsRaw[id] = raw
+					parsePps(raw)
+				}
+				return none
+			}
+			if t == hevcNalEos || t == hevcNalEob {
+				try finishPicture()
+				afterEos = true
+				return none
+			}
+			if t == hevcNalAud || t == hevcNalVps || t == hevcNalSeiPrefix {
+				try finishPicture()
+			}
+			return none
+		}
+
+		// Reads the picture parameter set RBSP `raw` (8 bytes of padding
+		// past its end) against the SPS it names; a set that does not
+		// parse yet is left out until the next SPS.
+		def parsePps(raw byte[]) {
+			let b = new H264Bits()
+			b.reset(raw, raw.len() - 8)
+			let p = hevcParsePps(b, spsById) onerror (err error) {
+				b.reset(raw, raw.len() - 8)
+				let id = b.ue()
+				ppsById = ppsById.delete(id) when ppsById.hasKey(id)
+				return
+			}
+			ppsById[p.id] = p
+		}
+
+		// Decodes the slice segment NAL unit now in `rbsp[:n]`.
+		def sliceNal(n int, t int, tid int, pts duration, hasPts bool, length duration) !none {
+			bits.reset(rbsp, n)
+			let first = (int(rbsp[0]) & 0x80) != 0
+			if first {
+				try finishPicture()
+			} else {
+				return none unless hasCur
+			}
+			try hevcParseSliceHeader(bits, sh, t, spsById, ppsById)
+			if sh.first {
+				try startPicture(t, tid, pts, hasPts, length)
+			}
+			return none when skipping || !hasCur
+			if !sh.dependent {
+				try setupSlice()
+			}
+			ctu.sh = sh
+			try ctu.decodeSegment(rbsp, sh.dataOffset, n)
+			return none
+		}
+
+		// Starts the picture whose first slice header is in `sh`.
+		def startPicture(t int, tid int, pts duration, hasPts bool, length duration) !none {
+			fail "hevc: slice names a missing PPS" unless ppsById.hasKey(sh.ppsId)
+			let p = ppsById[sh.ppsId]
+			fail "hevc: PPS names a missing SPS" unless spsById.hasKey(p.spsId)
+			let s = spsById[p.spsId]
+			let irap = t >= hevcNalBlaWLp && t <= 23
+			skipping = false
+			if !irap && !seenIrap {
+				skipping = true
+				return none
+			}
+			if irap {
+				noRaslOutput = t >= hevcNalBlaWLp && t <= hevcNalIdrNLp || !seenIrap || afterEos
+				seenIrap = true
+			}
+			// RASL pictures of a random access point that starts over.
+			if (t == 8 || t == hevcNalRaslR) && noRaslOutput {
+				skipping = true
+				return none
+			}
+			if p.setupSerial != s.serial {
+				p.setup(s)
+				p.setupSerial = s.serial
+			}
+			sps = s
+			pps = p
+			// Picture order count (8.3.1).
+			let maxLsb = 1 << s.log2MaxPocLsb
+			let msb = 0
+			if !(irap && noRaslOutput) {
+				let prevLsb = prevTid0Poc & (maxLsb - 1)
+				let prevMsb = prevTid0Poc - prevLsb
+				let lsb = sh.pocLsb
+				if lsb < prevLsb && prevLsb - lsb >= maxLsb / 2 {
+					msb = prevMsb + maxLsb
+				} else if lsb > prevLsb && lsb - prevLsb > maxLsb / 2 {
+					msb = prevMsb - maxLsb
+				} else {
+					msb = prevMsb
+				}
+			}
+			let poc = msb + sh.pocLsb
+			let subLayerNonRef = t <= 14 && (t & 1) == 0
+			prevTid0Poc = poc when tid == 0 && !(t >= 6 && t <= 9) && !subLayerNonRef
+			if irap && noRaslOutput {
+				if sh.noOutputOfPriorPics || (t == hevcNalCra && afterEos) {
+					for let q in dpb {
+						q.needOutput = false
+					}
+				}
+				bumpAll()
+				for let q in dpb {
+					q.refKind = 0
+				}
+				prune()
+				sequence++
+				afterEos = false
+			}
+			let pic = new HevcPicture(s)
+			pic.poc = poc
+			pic.sequence = sequence
+			pic.keyframe = irap
+			pic.needOutput = sh.picOutput
+			pic.length = length
+			if hasPts && (!haveUsedPts || pts != usedPts) {
+				pic.pts = pts
+				pic.hasPts = true
+				usedPts = pts
+				haveUsedPts = true
+			}
+			cur = pic
+			hasCur = true
+			try applyRps(t, poc, s)
+			// C.5.2.2: output what the reorder depth, the latency limit or
+			// a full buffer no longer holds back.
+			for needsBump(true) {
+				bumpOne()
+				prune()
+			}
+			ctu.startPicture(s, pic)
+			ctu.pps = p
+			return none
+		}
+
+		// Marks the reference pictures of the RPS of `sh` (8.3.2) and makes
+		// up the missing ones.
+		def applyRps(t int, poc int, s HevcSps) !none {
+			stBefore = HevcPicture[]
+			stAfter = HevcPicture[]
+			ltCurr = HevcPicture[]
+			if t == hevcNalIdrWRadl || t == hevcNalIdrNLp {
+				for let q in dpb {
+					q.refKind = 0
+				}
+				prune()
+				return none
+			}
+			let keep HevcPicture[]
+			let kinds int[]
+			let maxLsb = 1 << s.log2MaxPocLsb
+			let rps = sh.rps
+			if !(rps is none) {
+				let r HevcRps = rps
+				for let i = 0; i < r.numDeltas; i++ {
+					let want = poc + r.deltaPoc[i]
+					let f = cur
+					let found = findRef(want, lt = false, lsbOnly = false, maxLsb = maxLsb)
+					if found is none {
+						continue unless r.used[i]
+						f = missingRef(want, s)
+					} else {
+						let k HevcPicture = found
+						f = k
+					}
+					keep.push(f)
+					kinds.push(1)
+					if r.used[i] {
+						if i < r.numNegative {
+							stBefore.push(f)
+						} else {
+							stAfter.push(f)
+						}
+					}
+				}
+			}
+			for let i = 0; i < sh.numLt; i++ {
+				let want = sh.ltMsb[i] ?? (poc - sh.pocLsb + sh.ltPoc[i], sh.ltPoc[i])
+				let f = cur
+				let found = findRef(want, lt = true, lsbOnly = !sh.ltMsb[i], maxLsb = maxLsb)
+				if found is none {
+					continue unless sh.ltUsed[i]
+					f = missingRef(want, s)
+				} else {
+					let k HevcPicture = found
+					f = k
+				}
+				keep.push(f)
+				kinds.push(2)
+				ltCurr.push(f) when sh.ltUsed[i]
+			}
+			for let q in dpb {
+				let kind = 0
+				for let (i, k) in keep {
+					kind = kinds[i] > kind ?? (kinds[i], kind) when k.poc == q.poc && k.sequence == q.sequence
+				}
+				q.refKind = kind
+			}
+			prune()
+			return none
+		}
+
+		// The reference picture with POC `want` (only its LSBs when
+		// `lsbOnly`), long-term candidates included when `lt`.
+		def findRef(want int, lt bool, lsbOnly bool, maxLsb int) ?HevcPicture {
+			for let q in dpb {
+				continue when q.refKind == 0 || q.sequence != sequence
+				let hit = lsbOnly ?? ((q.poc & (maxLsb - 1)) == want, q.poc == want)
+				continue unless hit
+				return q when lt || q.refKind == 1
+			}
+			return none
+		}
+
+		// A grey stand-in for reference `poc` that never came.
+		def missingRef(poc int, s HevcSps) HevcPicture {
+			let q = new HevcPicture(s)
+			q.grey()
+			q.poc = poc
+			q.sequence = sequence
+			q.refKind = 1
+			q.needOutput = false
+			q.addSlice()
+			dpb.push(q)
+			return q
+		}
+
+		// Builds the reference lists of the slice in `sh` (8.3.4) for the
+		// CTU decoder.
+		def setupSlice() !none {
+			let c = ctu
+			let pic = cur
+			c.curSlice = pic.addSlice()
+			c.refs = HevcPicture[]
+			for let i = 0; i < 32; i++ {
+				c.refs.push(pic)
+			}
+			c.noBackward = true
+			if sh.sliceType != hevcSliceI {
+				let total = stBefore.len() + stAfter.len() + ltCurr.len()
+				fail "hevc: inter slice without reference pictures" when total == 0
+				let lists = sh.sliceType == hevcSliceB ?? (2, 1)
+				for let l = 0; l < lists; l++ {
+					let temp HevcPicture[]
+					let tempLt bool[]
+					let want = sh.numRefIdx[l] > sh.numPicTotalCurr ?? (sh.numRefIdx[l], sh.numPicTotalCurr)
+					want = total when want < total
+					let firstSet = l == 0 ?? (stBefore, stAfter)
+					let secondSet = l == 0 ?? (stAfter, stBefore)
+					for temp.len() < want {
+						for let q in firstSet {
+							temp.push(q)
+							tempLt.push(false)
+						}
+						for let q in secondSet {
+							temp.push(q)
+							tempLt.push(false)
+						}
+						for let q in ltCurr {
+							temp.push(q)
+							tempLt.push(true)
+						}
+					}
+					for let i = 0; i < sh.numRefIdx[l]; i++ {
+						let k = sh.listModified[l] ?? (sh.listEntry[l * 16 + i], i)
+						fail "hevc: list_entry out of range" when k >= temp.len()
+						let q = temp[k]
+						c.refs[l * 16 + i] = q
+						pic.refPoc[c.curSlice * 32 + l * 16 + i] = q.poc
+						pic.refLt[c.curSlice * 32 + l * 16 + i] = tempLt[k]
+						c.noBackward = false when q.poc > pic.poc
+					}
+				}
+				if sh.temporalMvp {
+					let l = (sh.sliceType == hevcSliceB && !sh.colFromL0) ?? (1, 0)
+					c.colPic = c.refs[l * 16 + sh.colRefIdx]
+				}
+			}
+			return none
+		}
+
+		// Filters the current picture and queues it for output.
+		def finishPicture() !none {
+			return none unless hasCur
+			hasCur = false
+			filter.run(ctu)
+			let pic = cur
+			pic.refKind = 1
+			for let q in dpb {
+				q.latency++ when q.needOutput
+			}
+			pic.latency = 0
+			dpb.push(pic)
+			// C.5.2.3: output what the reorder depth or the latency limit no
+			// longer holds back.
+			for needsBump(false) {
+				bumpOne()
+			}
+			prune()
+			return none
+		}
+
+		// Whether a picture waits for output beyond the reorder depth or
+		// the latency limit of the SPS, or (`full`) the buffer holds as
+		// many pictures as the SPS allows (C.5.2.2).
+		def needsBump(full bool) bool {
+			let waiting = 0
+			let late = false
+			let s = sps
+			let limit = s.numReorderPics + s.maxLatencyIncrease - 1
+			for let q in dpb {
+				continue unless q.needOutput
+				waiting++
+				late = true when s.maxLatencyIncrease != 0 && q.latency >= limit
+			}
+			return false when waiting == 0
+			return waiting > s.numReorderPics || late || (full && dpb.len() >= s.maxDecPicBuffering)
+		}
+
+		// Outputs the waiting picture with the lowest POC of the oldest
+		// sequence.
+		def bumpOne() {
+			let best = -1
+			for let (i, q) in dpb {
+				continue unless q.needOutput
+				best = i when best < 0 || q.sequence < dpb[best].sequence || (q.sequence == dpb[best].sequence && q.poc < dpb[best].poc)
+			}
+			return when best < 0
+			let q = dpb[best]
+			q.needOutput = false
+			let frame = toFrame(q)
+			frames.push(frame)
+		}
+
+		// Outputs every waiting picture.
+		def bumpAll() {
+			for {
+				let any = false
+				for let q in dpb {
+					if q.needOutput {
+						any = true
+						break
+					}
+				}
+				break unless any
+				bumpOne()
+			}
+		}
+
+		// Drops the pictures no longer needed for reference or output.
+		def prune() {
+			let kept HevcPicture[]
+			for let q in dpb {
+				kept.push(q) when q.refKind != 0 || q.needOutput
+			}
+			dpb = kept
+		}
+
+		// The cropped planes of `p` as a frame.
+		def toFrame(p HevcPicture) VideoFrame {
+			let s = p.sps
+			let mono = s.chromaFormat == 0
+			let sx = s.hshift[1]
+			let sy = s.vshift[1]
+			let left = s.cropLeft
+			let top = s.cropTop
+			let w = p.width - s.cropLeft - s.cropRight
+			let h = p.height - s.cropTop - s.cropBottom
+			let cw = mono ?? (0, w >> sx)
+			let ch = mono ?? (0, h >> sy)
+			let size = p.bitDepth == 8 ?? (1, 2)
+			let y = h264Bytes(w * h * size)
+			let u = h264Bytes(cw * ch * size)
+			let v = h264Bytes(cw * ch * size)
+			hevcPut(p.y, top * p.stride + left, p.stride, w, h, size, y)
+			if !mono {
+				let co = (top >> sy) * p.cstride + (left >> sx)
+				hevcPut(p.u, co, p.cstride, cw, ch, size, u)
+				hevcPut(p.v, co, p.cstride, cw, ch, size, v)
+			}
+			let step = p.length > 0s ?? (p.length, 40ms)
+			let time = p.pts
+			time = haveTime ?? (lastTime + step, 0s) unless p.hasPts
+			lastTime = time
+			haveTime = true
+			return VideoFrame{
+				width:     uint32(w),
+				height:    uint32(h),
+				y:         y,
+				u:         u,
+				v:         v,
+				yStride:   w * size,
+				uvStride:  cw * size,
+				time:      time,
+				length:    step,
+				keyframe:  p.keyframe,
+				matrix:    s.matrix,
+				chroma:    hevcChromaLayout(s.chromaFormat),
+				fullRange: s.fullRange,
+				bitDepth:  p.bitDepth,
+				onGpu:     false,
+				gpu:       none
+			}
+		}
+	}
+
+	// Writes the w x h samples at `off` of a plane to `out`: one byte each
+	// when `size` is 1, else two, little-endian.
+	def hevcPut(plane uint16[], off int, stride int, w int, h int, size int, out byte[]) {
+		let k = 0
+		for let j = 0; j < h; j++ {
+			let o = off + j * stride
+			if size == 1 {
+				let wide = w & ~15
+				for let i = 0; i < wide; i += 16 {
+					simd.store16<byte>(out, k + i, simd.convert<uint16, byte>(simd.load16<uint16>(plane, o + i)))
+				}
+				for let i = wide; i < w; i++ {
+					out[k + i] = byte(int(plane[o + i]))
+				}
+				k += w
+				continue
+			}
+			for let i = 0; i < w; i++ {
+				let v = int(plane[o + i])
+				out[k] = byte(v & 255)
+				out[k + 1] = byte(v >> 8)
+				k += 2
+			}
+		}
+	}
+
+	// The cropped picture size of the first sequence parameter set in the
+	// Annex B bytes `data`; (0, 0) when there is none or it does not
+	// parse.
+	def hevcStreamSize(data byte[]) (int, int) {
+		let at = h264FindStart(data, 0, data.len())
+		for at >= 0 {
+			let next = h264FindStart(data, at + 3, data.len())
+			let end = next < 0 ?? (data.len(), next)
+			if at + 5 < end && ((int(data[at + 3]) >> 1) & 63) == hevcNalSps {
+				let rbsp = h264Bytes(end - at + 8)
+				let n = h264Unescape(data, at + 5, end, rbsp)
+				let b = new H264Bits()
+				b.reset(rbsp, n)
+				let s = hevcParseSps(b) onerror (err error) {
+					return (0, 0)
+				}
+				return (s.width - s.cropLeft - s.cropRight, s.height - s.cropTop - s.cropBottom)
+			}
+			at = next
+		}
+		return (0, 0)
+	}
+
+	// The frame layout of a `chroma_format_idc`.
+	def hevcChromaLayout(format int) ChromaLayout {
+		match format {
+			case 0:
+				return ChromaLayout.Mono
+			case 2:
+				return ChromaLayout.Yuv422
+			case 3:
+				return ChromaLayout.Yuv444
+		}
+		return ChromaLayout.Yuv420
+	}
+}

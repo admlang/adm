@@ -1,0 +1,300 @@
+partial module std.net.http.webdav.carddav {
+	use (
+		std.bytes
+		std.crypto::(UUID)
+		std.data.encoding::(XMLNode)
+		std.formats.contacts::(Contact, VCard)
+		std.fs
+		std.net.http
+		std.net.http.webdav
+		std.net.http.webdav::(WebDavError, davNamespace)
+		std.net.http.webdav.carddav.wire::*
+	)
+
+	// Client reaches the address books of a CardDAV account: it finds
+	// them from the account's principal (RFC 6352 §7.1), reads contacts
+	// whole or by query, adds, updates and removes them with entity tags
+	// so another client's change is never overwritten, and follows
+	// changes with sync-collection (RFC 6578). `url` is the account's
+	// DAV root.
+	type Client {
+		// The vCard version `add` and `update` write: "3.0", which every
+		// server takes, or "4.0".
+		version       string        = "3.0"
+		internal dav  webdav.Client
+		internal home string        = ""
+
+		def new(url string, timeout duration = 30s) {
+			dav = new webdav.Client(url, timeout)
+		}
+
+		def new(url string, username string, password Secret<string>, timeout duration = 30s) {
+			dav = new webdav.Client(url, username, password, timeout)
+		}
+
+		// The address books in the account's home.
+		// Fails when the server has no CardDAV home for the login, or
+		// cannot be reached.
+		def addressBooks() !AddressBook[] {
+			let homePath = try homeOf()
+			let prop = davNode("prop")
+			prop.add(davNode("resourcetype"))
+			prop.add(davNode("displayname"))
+			prop.add(davNode("sync-token"))
+			prop.add(cardNode("addressbook-description"))
+			prop.add(cardNode("max-resource-size"))
+			let answers = try propfind(homePath, prop, "1")
+			let out AddressBook[] = []
+			for let a in answers {
+				continue unless hasType(a, cardNamespace, "addressbook")
+				let path = dav.pathOf(a.href)
+				continue when path is none
+				out.push(bookOf(path, a))
+			}
+			return out
+		}
+
+		// Makes an address book `name` in the account's home (extended
+		// MKCOL, RFC 5689).
+		// Fails with WebDavError `exists` when the name is taken, or when
+		// the server refuses.
+		def createAddressBook(name string, displayName string = "", description string = "") !AddressBook {
+			let homePath = try homeOf()
+			let path = homePath.trimSuffix("/") + "/" + name
+			let root = davNode("mkcol")
+			let prop = root.add(davNode("set")).add(davNode("prop"))
+			let kind = prop.add(davNode("resourcetype"))
+			kind.add(davNode("collection"))
+			kind.add(cardNode("addressbook"))
+			prop.add(davText("displayname", displayName)) when displayName != ""
+			prop.add(cardText("addressbook-description", description)) when description != ""
+			let res = try dav.request("MKCOL", path + "/", document(root), map<string, string>{"Content-Type": "application/xml; charset=utf-8"})
+			try expect(res, path, [201])
+			return AddressBook{path: path, displayName: displayName, description: description}
+		}
+
+		// Removes an address book and every contact in it.
+		// Fails when the server refuses.
+		def removeAddressBook(book AddressBook) !none {
+			return try dav.removeAll(book.path)
+		}
+
+		// Every contact of an address book.
+		// Fails when the server refuses the query.
+		def contacts(book AddressBook) !AddressObject[] {
+			return try query(book, CardFilter{})
+		}
+
+		// The contacts of an address book that pass `filter`, at most
+		// `limit` of them (0 for all the server gives).
+		// Fails when the server refuses the query (an unsupported filter
+		// or collation among the reasons).
+		def query(book AddressBook, filter CardFilter, limit int = 0) !AddressObject[] {
+			let root = cardNode("addressbook-query")
+			root.set("xmlns:D", davNamespace)
+			root.add(objectProps())
+			root.add(filterNode(filter))
+			root.add(cardNode("limit")).add(cardText("nresults", limit.str())) when limit > 0
+			let res = try dav.request("REPORT", book.path + "/", document(root), map<string, string>{"Content-Type": "application/xml; charset=utf-8", "Depth": "1"})
+			return try objectsOf(res, book.path)
+		}
+
+		// The contacts at `paths`, those that exist (addressbook-multiget).
+		// Fails when the server refuses the report.
+		def get(book AddressBook, paths string[]) !AddressObject[] {
+			let root = cardNode("addressbook-multiget")
+			root.set("xmlns:D", davNamespace)
+			root.add(objectProps())
+			for let p in paths {
+				root.add(davText("href", dav.href(p)))
+			}
+			let res = try dav.request("REPORT", book.path + "/", document(root), map<string, string>{"Content-Type": "application/xml; charset=utf-8", "Depth": "1"})
+			return try objectsOf(res, book.path)
+		}
+
+		// Adds a contact to an address book, giving it a `urn:uuid:` uid
+		// when it has none.
+		// Fails with WebDavError `forbidden` when the server refuses the
+		// card (another with the same uid, too large), or `precondition`
+		// when the name is taken.
+		def add(book AddressBook, contact Contact) !AddressObject {
+			let id = new UUID().str()
+			contact.uid = "urn:uuid:" + id when contact.uid == ""
+			let path = book.path + "/" + id + ".vcf"
+			let etag = try store(path, contact, "", true)
+			return AddressObject{path: path, etag: etag, contact: contact}
+		}
+
+		// Stores a changed contact over the version `object.etag` names;
+		// the answer carries the new tag.
+		// Fails with WebDavError `precondition` when another client
+		// changed or removed it since, or `forbidden` when the server
+		// refuses the card.
+		def update(object AddressObject) !AddressObject {
+			let etag = try store(object.path, object.contact, object.etag, false)
+			return AddressObject{path: object.path, etag: etag, contact: object.contact}
+		}
+
+		// Removes a contact, unless another client changed it since
+		// `object.etag`.
+		// Fails with WebDavError `precondition` when it changed, or
+		// `notFound` when it is gone.
+		def remove(object AddressObject) !none {
+			let headers = map<string, string>{}
+			headers["If-Match"] = object.etag when object.etag != ""
+			let res = try dav.request("DELETE", object.path, byte[], headers)
+			return try expect(res, object.path, [200, 204])
+		}
+
+		// What changed in an address book since `token` (none for
+		// everything now): the changed contacts read whole, the paths of
+		// those removed, and the token to pass next time.
+		// Fails with WebDavError `forbidden` when the token expired (sync
+		// again without one).
+		def sync(book AddressBook, token string = "") !Changes {
+			let result = try dav.sync(book.path, token, false)
+			let out = Changes{token: result.token, removed: result.removed}
+			let paths string[] = []
+			for let e in result.changed {
+				paths.push(e.path) unless e.kind == fs.FileKind.Dir
+			}
+			out.changed = try get(book, paths) when paths.len() > 0
+			return out
+		}
+
+		// Ends the connections.
+		// Fails when closing them does.
+		def close() !none {
+			return try dav.close()
+		}
+
+		// ---- internals ----
+
+		// The account's address book home, found once.
+		internal def homeOf() !string {
+			return home when home != ""
+			let prop = davNode("prop")
+			prop.add(davNode("current-user-principal"))
+			prop.add(cardNode("addressbook-home-set"))
+			let answers = try propfind("/", prop, "0")
+			let found = answers.len() > 0 ?? (hrefIn(answers[0], cardNamespace, "addressbook-home-set"), "")
+			if found == "" {
+				let principal = answers.len() > 0 ?? (hrefIn(answers[0], davNamespace, "current-user-principal"), "")
+				fail WebDavError{message: "carddav: the server names no principal for the login", code: "unsupported"} when principal == ""
+				let principalPath = dav.pathOf(principal)
+				fail WebDavError{message: "carddav: the principal {principal} lies outside the share", code: "unsupported"} when principalPath is none
+				let homes = try propfind(principalPath, prop, "0")
+				found = homes.len() > 0 ?? (hrefIn(homes[0], cardNamespace, "addressbook-home-set"), "")
+			}
+			fail WebDavError{message: "carddav: the account has no address book home", code: "unsupported"} when found == ""
+			let path = dav.pathOf(found)
+			fail WebDavError{message: "carddav: the home {found} lies outside the share", code: "unsupported"} when path is none
+			home = path
+			return home
+		}
+
+		// A PROPFIND of `prop` at `path`, as answers.
+		internal def propfind(path string, prop XMLNode, depth string) !Answer[] {
+			let root = davNode("propfind")
+			root.add(prop)
+			let target = path.endsWith("/") ?? (path, path + "/")
+			let res = try dav.request("PROPFIND", target, document(root), map<string, string>{"Content-Type": "application/xml; charset=utf-8", "Depth": depth})
+			try expectStatus(res, path, [207])
+			return try answersOf(try res.bytes())
+		}
+
+		// The `prop` of a report for contacts: the entity tag and the card.
+		internal def objectProps() XMLNode {
+			let prop = davNode("prop")
+			prop.add(davNode("getetag"))
+			prop.add(cardNode("address-data"))
+			return prop
+		}
+
+		// The contacts of a report's multistatus.
+		internal def objectsOf(res http.Response, path string) !AddressObject[] {
+			try expectStatus(res, path, [207])
+			let out AddressObject[] = []
+			for let a in try answersOf(try res.bytes()) {
+				continue unless a.status == 200
+				let data = textOf(a, cardNamespace, "address-data")
+				continue when data == ""
+				let found = dav.pathOf(a.href)
+				continue when found is none
+				let contacts = new VCard().read(new bytes.Reader(data.bytes())) onerror recover Contact[]
+				continue unless contacts.len() > 0
+				out.push(AddressObject{path: found, etag: textOf(a, davNamespace, "getetag"), contact: contacts[0]})
+			}
+			return out
+		}
+
+		// PUTs a contact: only when nothing is there (`create`), else only
+		// over `etag` when there is one. The new entity tag, "" when the
+		// server gives none.
+		internal def store(path string, contact Contact, etag string, create bool) !string {
+			let codec = new VCard()
+			codec.version = version
+			let out = new bytes.Buffer()
+			try codec.write([contact], out)
+			let headers = map<string, string>{"Content-Type": "text/vcard; charset=utf-8"}
+			headers["If-None-Match"] = "*" when create
+			headers["If-Match"] = etag when !create && etag != ""
+			let res = try dav.request("PUT", path, out.bytes(), headers)
+			let tag = res.headers.get("ETag")
+			try expect(res, path, [200, 201, 204])
+			return tag
+		}
+
+		// Fails with the WebDavError of an unexpected status, the response
+		// closed; leaves an expected one open.
+		internal def expectStatus(res http.Response, path string, ok int[]) !none {
+			return none when ok.includes(res.status)
+			let body = res.bytes() onerror recover byte[]
+			res.close() onerror recover none
+			fail errorOf(res.status, path, string(body))
+		}
+
+		// Checks the status and closes the response.
+		internal def expect(res http.Response, path string, ok int[]) !none {
+			try expectStatus(res, path, ok)
+			res.close() onerror recover none
+			return none
+		}
+	}
+
+	// An address book of a PROPFIND answer.
+	internal def bookOf(path string, a Answer) AddressBook {
+		let size = textOf(a, cardNamespace, "max-resource-size")
+		return AddressBook{path: path, displayName: textOf(a, davNamespace, "displayname"), description: textOf(a, cardNamespace, "addressbook-description"), syncToken: textOf(a, davNamespace, "sync-token"), maxSize: size.isNumeric() ?? (size.toInt<int64>(), int64(0))}
+	}
+
+	// A request body.
+	internal def document(root XMLNode) byte[] {
+		return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" + root.str()).bytes()
+	}
+
+	// The WebDavError of a failed status; a CardDAV precondition in the
+	// body names the reason.
+	internal def errorOf(status int, path string, body string) WebDavError {
+		let code = "status"
+		switch {
+			case status == 404:
+				code = "notFound"
+			case status == 403:
+				code = "forbidden"
+			case status == 409:
+				code = "conflict"
+			case status == 412:
+				code = "precondition"
+			case status == 423:
+				code = "locked"
+			case status == 405:
+				code = "exists"
+		}
+		let reason = ""
+		for let condition in ["no-uid-conflict", "valid-address-data", "supported-address-data", "max-resource-size", "supported-filter", "supported-collation"] {
+			reason = " ({condition})" when reason == "" && body.contains(condition)
+		}
+		return WebDavError{message: "carddav: {path}: status {status}{reason}", code: code, status: status, path: path}
+	}
+}

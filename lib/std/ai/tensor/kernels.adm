@@ -1,0 +1,912 @@
+internal partial module std.ai.tensor.kernels {
+	use (
+		std.simd
+		std.formats.ai::(TensorType)
+	)
+
+	// Fused dequantize-and-dot kernels: each returns row `r` of a matrix of
+	// `cols` columns stored as `data` times x, reading every scale from the
+	// blocks as it goes, so a matrix takes no more memory than its file.
+	// Grid and table types look their values up in `table` (`ai.grid(kind)`).
+
+	// Every half-precision value by its 16 bits, and half of every E8M0 and
+	// unsigned E4M3 byte (the FP4 scales, FP4 values being kept doubled).
+	const halves = halfTable()
+	const e8m0Halves = byteTable(false)
+	const ue4m3Halves = byteTable(true)
+
+	// ±1 per bit of a byte, 8 lanes per byte (256 bytes), and per nibble
+	// (4 lanes, 16 nibbles): a set bit negates.
+	const signs8 = signTable(8)
+	const signs4 = signTable(4)
+	// The sign byte of each 7-bit sign index: bit 7 makes the count of set
+	// bits even.
+	const ksigns = ksignTable()
+	// Lane k holds bit k.
+	const laneBits = byte[1, 2, 4, 8, 16, 32, 64, 128]
+	// Q2_0: the byte (of 16) each lane reads, per quarter of 16 lanes, the
+	// mask of the lane's 2 bits and the factor that shifts them down.
+	const q2Spread = byte[0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15]
+	const q2Mask = byte[3, 12, 48, 192, 3, 12, 48, 192, 3, 12, 48, 192, 3, 12, 48, 192]
+	const q2Shift = float32[1, 0.25, 0.0625, 0.015625, 1, 0.25, 0.0625, 0.015625, 1, 0.25, 0.0625, 0.015625, 1, 0.25, 0.0625, 0.015625]
+	const powers3 = int[1, 3, 9, 27, 81]
+
+	def signTable(width int) float32[] {
+		let out float32[]
+		for let v = 0; v < (1 << width); v++ {
+			for let k = 0; k < width; k++ {
+				out.push((v >> k) & 1 == 1 ?? (float32(-1), float32(1)))
+			}
+		}
+		return out
+	}
+
+	def ksignTable() int[] {
+		let out int[]
+		for let i = 0; i < 128; i++ {
+			let p = i ^ (i >> 4)
+			p = p ^ (p >> 2)
+			p = p ^ (p >> 1)
+			out.push(i | ((p & 1) << 7))
+		}
+		return out
+	}
+
+	def le16(data byte[], at int) int {
+		return int(data[at]) | (int(data[at + 1]) << 8)
+	}
+
+	def le32(data byte[], at int) int {
+		return le16(data, at) | (le16(data, at + 2) << 16)
+	}
+
+	// The half-precision value at `at`.
+	def half(data byte[], at int) float32 {
+		return halves[le16(data, at)]
+	}
+
+	def halfTable() float32[] {
+		let out float32[]
+		out.len(65536)
+		for let h = 0; h < 65536; h++ {
+			out[h] = halfValue(h)
+		}
+		return out
+	}
+
+	def byteTable(e4m3 bool) float32[] {
+		let out float32[]
+		for let b = 0; b < 256; b++ {
+			out.push(e4m3 ?? (ue4m3Half(b), e8m0Half(b)))
+		}
+		return out
+	}
+
+	// An IEEE half-precision value from its 16 bits.
+	def halfValue(h int) float32 {
+		let sign = (h >> 15) & 1
+		let exponent = (h >> 10) & 0x1F
+		let mantissa = h & 0x3FF
+		if exponent == 0 {
+			let v = float32(mantissa) * float32(5.9604644775390625e-8)
+			return sign == 1 ?? (-v, v)
+		}
+		let bits = exponent == 31 ?? (0x7F800000 | (mantissa << 13), ((exponent + 112) << 23) | (mantissa << 13))
+		return __bitcast_f32_from_u32(uint32((sign << 31) | bits))
+	}
+
+	// Half of the power of two an E8M0 byte encodes (FP4 values are kept
+	// doubled).
+	def e8m0Half(e int) float32 {
+		return __bitcast_f32_from_u32(uint32(e < 2 ?? (0x00200000 << e, (e - 1) << 23)))
+	}
+
+	// Half of an unsigned E4M3 value (bias 7); 0x7F reads as 0.
+	def ue4m3Half(x int) float32 {
+		return float32(0) when x := 0 || 0x7F
+		let exponent = (x >> 3) & 15
+		let mantissa = float32(x & 7)
+		return mantissa * float32(0.0009765625) when exponent == 0
+		return (float32(1) + mantissa / float32(8)) * __bitcast_f32_from_u32(uint32((exponent - 7 + 127) << 23)) * float32(0.5)
+	}
+
+	// Q8_0, Q8_1 and Q8_K: signed bytes, `groups` groups of 32 per block of
+	// `blockBytes` bytes whose values start at `offset`, under the block's
+	// scale: a half at its start, or a float32 when the block holds more
+	// than one group (Q8_K).
+	def dotInt8(data byte[], x float32[], out float32[], from int, to int, cols int, groups int, blockBytes int, offset int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 32 / groups
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let base = (r * blocks + b) * blockBytes
+				let bits = int(data[base]) | (int(data[base + 1]) << 8)
+				let d = groups == 1 ?? (halves[bits], __bitcast_f32_from_u32(uint32(bits | (int(data[base + 2]) << 16) | (int(data[base + 3]) << 24))))
+				for let g = 0; g < groups; g++ {
+					let at = base + offset + g * 32
+					let xi = (b * groups + g) * 32
+					let s = simd.convert<int8, float32>(simd.bitcast<byte, int8>(simd.load8<byte>(data, at))) * simd.load8<float32>(x, xi)
+					s = simd.fma(simd.convert<int8, float32>(simd.bitcast<byte, int8>(simd.load8<byte>(data, at + 8))), simd.load8<float32>(x, xi + 8), s)
+					s = simd.fma(simd.convert<int8, float32>(simd.bitcast<byte, int8>(simd.load8<byte>(data, at + 16))), simd.load8<float32>(x, xi + 16), s)
+					s = simd.fma(simd.convert<int8, float32>(simd.bitcast<byte, int8>(simd.load8<byte>(data, at + 24))), simd.load8<float32>(x, xi + 24), s)
+					acc = simd.fma(s, simd.splat8<float32>(d), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// out[r] = row r · x for rows `from` to `to` of a matrix of `cols`
+	// columns stored as `kind` in `data`; nothing for a type with no kernel
+	// (the plain and integer types). The kernels loop over the rows
+	// themselves, so the arrays are passed once per band.
+	def multiplyRows(kind TensorType, data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		match kind {
+			case TensorType.Q8_0:
+				dotInt8(data, x, out, from, to, cols, 1, 34, 2)
+			case TensorType.Q8_1:
+				dotInt8(data, x, out, from, to, cols, 1, 36, 4)
+			case TensorType.Q8_K:
+				dotInt8(data, x, out, from, to, cols, 8, 292, 4)
+			case TensorType.Q4_0:
+				dotQ4(data, x, out, from, to, cols)
+			case TensorType.Q4_1:
+				dotQ41(data, x, out, from, to, cols)
+			case TensorType.Q5_0:
+				dotQ50(data, x, out, from, to, cols)
+			case TensorType.Q5_1:
+				dotQ51(data, x, out, from, to, cols)
+			case TensorType.Q2_K:
+				dot2Bit(data, x, out, from, to, cols, true)
+			case TensorType.TQ2_0:
+				dot2Bit(data, x, out, from, to, cols, false)
+			case TensorType.Q3_K:
+				dotQ3K(data, x, out, from, to, cols)
+			case TensorType.Q4_K:
+				dotQ4K(data, x, out, from, to, cols)
+			case TensorType.Q5_K:
+				dotQ5K(data, x, out, from, to, cols)
+			case TensorType.Q6_K:
+				dotQ6K(data, x, out, from, to, cols)
+			case TensorType.TQ1_0:
+				dotTQ1(data, x, out, from, to, cols)
+			case TensorType.IQ4_NL, TensorType.IQ4_XS, TensorType.MXFP4:
+				dotTable(data, table, x, out, from, to, cols, kind)
+			case TensorType.NVFP4:
+				dotNVFP4(data, table, x, out, from, to, cols)
+			case TensorType.Q1_0:
+				dotQ1(data, x, out, from, to, cols)
+			case TensorType.Q2_0:
+				dotQ2(data, x, out, from, to, cols)
+			case TensorType.IQ2_XXS:
+				dotIQ2XXS(data, table, x, out, from, to, cols)
+			case TensorType.IQ2_XS:
+				dotIQ2XS(data, table, x, out, from, to, cols)
+			case TensorType.IQ2_S:
+				dotIQ2S(data, table, x, out, from, to, cols)
+			case TensorType.IQ3_XXS:
+				dotIQ3XXS(data, table, x, out, from, to, cols)
+			case TensorType.IQ3_S:
+				dotIQ3S(data, table, x, out, from, to, cols)
+			case TensorType.IQ1_S:
+				dotIQ1S(data, table, x, out, from, to, cols)
+			case TensorType.IQ1_M:
+				dotIQ1M(data, table, x, out, from, to, cols)
+			default:
+		}
+	}
+
+	// Row `r` of a Q4_0 matrix times x. A block's 16 bytes hold
+	// elements 0–15 in their low nibbles and 16–31 in their high ones,
+	// each stored plus 8.
+	def dotQ4(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 32
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let bias = simd.splat8<float32>(float32(8))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let at = (first + b) * 18 + 2
+				let xi = b * 32
+				let q0 = simd.load8<byte>(data, at)
+				let q1 = simd.load8<byte>(data, at + 8)
+				let s = (simd.convert<byte, float32>(q0 & low) - bias) * simd.load8<float32>(x, xi)
+				s = simd.fma(simd.convert<byte, float32>(q1 & low) - bias, simd.load8<float32>(x, xi + 8), s)
+				s = simd.fma(simd.convert<byte, float32>(q0 >> 4) - bias, simd.load8<float32>(x, xi + 16), s)
+				s = simd.fma(simd.convert<byte, float32>(q1 >> 4) - bias, simd.load8<float32>(x, xi + 24), s)
+				acc = simd.fma(s, simd.splat8<float32>(halves[int(data[(first + b) * 18]) | (int(data[(first + b) * 18 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q4_1 matrix times x: each element is its nibble
+	// times the block scale plus the block minimum, so a block adds
+	// scale·Σq·x + minimum·Σx.
+	def dotQ41(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 32
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let at = (first + b) * 20 + 4
+				let xi = b * 32
+				let x0 = simd.load8<float32>(x, xi)
+				let x1 = simd.load8<float32>(x, xi + 8)
+				let x2 = simd.load8<float32>(x, xi + 16)
+				let x3 = simd.load8<float32>(x, xi + 24)
+				let q0 = simd.load8<byte>(data, at)
+				let q1 = simd.load8<byte>(data, at + 8)
+				let s = simd.convert<byte, float32>(q0 & low) * x0
+				s = simd.fma(simd.convert<byte, float32>(q1 & low), x1, s)
+				s = simd.fma(simd.convert<byte, float32>(q0 >> 4), x2, s)
+				s = simd.fma(simd.convert<byte, float32>(q1 >> 4), x3, s)
+				acc = simd.fma(s, simd.splat8<float32>(halves[int(data[(first + b) * 20]) | (int(data[(first + b) * 20 + 1]) << 8)]), acc)
+				acc = simd.fma((x0 + x1) + (x2 + x3), simd.splat8<float32>(halves[int(data[(first + b) * 20 + 2]) | (int(data[(first + b) * 20 + 2 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q5_0 matrix times x. Like Q4_0, with a fifth bit per
+	// element in the 32-bit word before the nibbles (bit k for element
+	// k), each stored plus 16.
+	def dotQ50(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 32
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let one = simd.splat8<byte>(byte(1))
+			let bits = simd.load8<byte>(laneBits, 0)
+			let bias = simd.splat8<float32>(float32(16))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let at = (first + b) * 22
+				let xi = b * 32
+				let q0 = simd.load8<byte>(data, at + 6)
+				let q1 = simd.load8<byte>(data, at + 14)
+				let h0 = (simd.splat8<byte>(data[at + 2]) & bits).min(one) << 4
+				let h1 = (simd.splat8<byte>(data[at + 3]) & bits).min(one) << 4
+				let h2 = (simd.splat8<byte>(data[at + 4]) & bits).min(one) << 4
+				let h3 = (simd.splat8<byte>(data[at + 5]) & bits).min(one) << 4
+				let s = (simd.convert<byte, float32>((q0 & low) | h0) - bias) * simd.load8<float32>(x, xi)
+				s = simd.fma(simd.convert<byte, float32>((q1 & low) | h1) - bias, simd.load8<float32>(x, xi + 8), s)
+				s = simd.fma(simd.convert<byte, float32>((q0 >> 4) | h2) - bias, simd.load8<float32>(x, xi + 16), s)
+				s = simd.fma(simd.convert<byte, float32>((q1 >> 4) | h3) - bias, simd.load8<float32>(x, xi + 24), s)
+				acc = simd.fma(s, simd.splat8<float32>(halves[int(data[(first + b) * 22]) | (int(data[(first + b) * 22 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q5_1 matrix times x: Q5_0's layout after a scale and
+	// a minimum, the element being its 5 bits times the scale plus the
+	// minimum.
+	def dotQ51(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 32
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let one = simd.splat8<byte>(byte(1))
+			let bits = simd.load8<byte>(laneBits, 0)
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let at = (first + b) * 24
+				let xi = b * 32
+				let x0 = simd.load8<float32>(x, xi)
+				let x1 = simd.load8<float32>(x, xi + 8)
+				let x2 = simd.load8<float32>(x, xi + 16)
+				let x3 = simd.load8<float32>(x, xi + 24)
+				let q0 = simd.load8<byte>(data, at + 8)
+				let q1 = simd.load8<byte>(data, at + 16)
+				let h0 = (simd.splat8<byte>(data[at + 4]) & bits).min(one) << 4
+				let h1 = (simd.splat8<byte>(data[at + 5]) & bits).min(one) << 4
+				let h2 = (simd.splat8<byte>(data[at + 6]) & bits).min(one) << 4
+				let h3 = (simd.splat8<byte>(data[at + 7]) & bits).min(one) << 4
+				let s = simd.convert<byte, float32>((q0 & low) | h0) * x0
+				s = simd.fma(simd.convert<byte, float32>((q1 & low) | h1), x1, s)
+				s = simd.fma(simd.convert<byte, float32>((q0 >> 4) | h2), x2, s)
+				s = simd.fma(simd.convert<byte, float32>((q1 >> 4) | h3), x3, s)
+				acc = simd.fma(s, simd.splat8<float32>(halves[int(data[(first + b) * 24]) | (int(data[(first + b) * 24 + 1]) << 8)]), acc)
+				acc = simd.fma((x0 + x1) + (x2 + x3), simd.splat8<float32>(halves[int(data[(first + b) * 24 + 2]) | (int(data[(first + b) * 24 + 2 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q4_K matrix times x. A 256-element block holds four
+	// 64-element chunks of 32 bytes: elements 0–31 of a chunk in the low
+	// nibbles, 32–63 in the high ones, each sub-block of 32 with its own
+	// scale and minimum: sub-block adds scale·Σq·x − minimum·Σx.
+	def dotQ4K(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = first + b
+				let d = halves[int(data[block * 144]) | (int(data[block * 144 + 1]) << 8)]
+				let dmin = halves[int(data[block * 144 + 2]) | (int(data[block * 144 + 3]) << 8)]
+				for let c = 0; c < 4; c++ {
+					let at = block * 144 + 16 + c * 32
+					let xi = b * 256 + c * 64
+					// The 6-bit scales and minimums of sub-blocks 2c and 2c+1, packed
+					// in the 12 bytes at `q`: the first four directly, the last four
+					// from low nibbles plus the top bits of the first eight bytes.
+					let q = block * 144 + 4
+					let j = c * 2
+					let sc0 = j < 4 ?? (int(data[q + j]) & 63, (int(data[q + j + 4]) & 15) | ((int(data[q + j - 4]) >> 6) << 4))
+					let m0 = j < 4 ?? (int(data[q + j + 4]) & 63, (int(data[q + j + 4]) >> 4) | ((int(data[q + j]) >> 6) << 4))
+					let sc1 = j < 4 ?? (int(data[q + j + 1]) & 63, (int(data[q + j + 5]) & 15) | ((int(data[q + j - 3]) >> 6) << 4))
+					let m1 = j < 4 ?? (int(data[q + j + 5]) & 63, (int(data[q + j + 5]) >> 4) | ((int(data[q + j + 1]) >> 6) << 4))
+					let q0 = simd.load8<byte>(data, at)
+					let q1 = simd.load8<byte>(data, at + 8)
+					let q2 = simd.load8<byte>(data, at + 16)
+					let q3 = simd.load8<byte>(data, at + 24)
+					let x0 = simd.load8<float32>(x, xi)
+					let x1 = simd.load8<float32>(x, xi + 8)
+					let x2 = simd.load8<float32>(x, xi + 16)
+					let x3 = simd.load8<float32>(x, xi + 24)
+					let s = simd.convert<byte, float32>(q0 & low) * x0
+					s = simd.fma(simd.convert<byte, float32>(q1 & low), x1, s)
+					s = simd.fma(simd.convert<byte, float32>(q2 & low), x2, s)
+					s = simd.fma(simd.convert<byte, float32>(q3 & low), x3, s)
+					acc = simd.fma(s, simd.splat8<float32>(d * float32(sc0)), acc)
+					acc = simd.fma((x0 + x1) + (x2 + x3), simd.splat8<float32>(-dmin * float32(m0)), acc)
+					let y0 = simd.load8<float32>(x, xi + 32)
+					let y1 = simd.load8<float32>(x, xi + 40)
+					let y2 = simd.load8<float32>(x, xi + 48)
+					let y3 = simd.load8<float32>(x, xi + 56)
+					let t = simd.convert<byte, float32>(q0 >> 4) * y0
+					t = simd.fma(simd.convert<byte, float32>(q1 >> 4), y1, t)
+					t = simd.fma(simd.convert<byte, float32>(q2 >> 4), y2, t)
+					t = simd.fma(simd.convert<byte, float32>(q3 >> 4), y3, t)
+					acc = simd.fma(t, simd.splat8<float32>(d * float32(sc1)), acc)
+					acc = simd.fma((y0 + y1) + (y2 + y3), simd.splat8<float32>(-dmin * float32(m1)), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q5_K matrix times x: Q4_K with a fifth bit per element
+	// in 32 bytes before the nibbles; chunk c takes bit 2c of byte l for
+	// its element l and bit 2c+1 for element l+32.
+	def dotQ5K(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let one = simd.splat8<byte>(byte(1))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = first + b
+				let hat = block * 176 + 16
+				let h0 = simd.load8<byte>(data, hat)
+				let h1 = simd.load8<byte>(data, hat + 8)
+				let h2 = simd.load8<byte>(data, hat + 16)
+				let h3 = simd.load8<byte>(data, hat + 24)
+				let d = halves[int(data[block * 176]) | (int(data[block * 176 + 1]) << 8)]
+				let dmin = halves[int(data[block * 176 + 2]) | (int(data[block * 176 + 3]) << 8)]
+				for let c = 0; c < 4; c++ {
+					let at = block * 176 + 48 + c * 32
+					let xi = b * 256 + c * 64
+					// The 6-bit scales and minimums of sub-blocks 2c and 2c+1, packed
+					// in the 12 bytes at `q`: the first four directly, the last four
+					// from low nibbles plus the top bits of the first eight bytes.
+					let q = block * 176 + 4
+					let j = c * 2
+					let sc0 = j < 4 ?? (int(data[q + j]) & 63, (int(data[q + j + 4]) & 15) | ((int(data[q + j - 4]) >> 6) << 4))
+					let m0 = j < 4 ?? (int(data[q + j + 4]) & 63, (int(data[q + j + 4]) >> 4) | ((int(data[q + j]) >> 6) << 4))
+					let sc1 = j < 4 ?? (int(data[q + j + 1]) & 63, (int(data[q + j + 5]) & 15) | ((int(data[q + j - 3]) >> 6) << 4))
+					let m1 = j < 4 ?? (int(data[q + j + 5]) & 63, (int(data[q + j + 5]) >> 4) | ((int(data[q + j + 1]) >> 6) << 4))
+					let lo = 2 * c
+					let hi = 2 * c + 1
+					let q0 = simd.load8<byte>(data, at)
+					let q1 = simd.load8<byte>(data, at + 8)
+					let q2 = simd.load8<byte>(data, at + 16)
+					let q3 = simd.load8<byte>(data, at + 24)
+					let x0 = simd.load8<float32>(x, xi)
+					let x1 = simd.load8<float32>(x, xi + 8)
+					let x2 = simd.load8<float32>(x, xi + 16)
+					let x3 = simd.load8<float32>(x, xi + 24)
+					let s = simd.convert<byte, float32>((q0 & low) | (((h0 >> lo) & one) << 4)) * x0
+					s = simd.fma(simd.convert<byte, float32>((q1 & low) | (((h1 >> lo) & one) << 4)), x1, s)
+					s = simd.fma(simd.convert<byte, float32>((q2 & low) | (((h2 >> lo) & one) << 4)), x2, s)
+					s = simd.fma(simd.convert<byte, float32>((q3 & low) | (((h3 >> lo) & one) << 4)), x3, s)
+					acc = simd.fma(s, simd.splat8<float32>(d * float32(sc0)), acc)
+					acc = simd.fma((x0 + x1) + (x2 + x3), simd.splat8<float32>(-dmin * float32(m0)), acc)
+					let y0 = simd.load8<float32>(x, xi + 32)
+					let y1 = simd.load8<float32>(x, xi + 40)
+					let y2 = simd.load8<float32>(x, xi + 48)
+					let y3 = simd.load8<float32>(x, xi + 56)
+					let t = simd.convert<byte, float32>((q0 >> 4) | (((h0 >> hi) & one) << 4)) * y0
+					t = simd.fma(simd.convert<byte, float32>((q1 >> 4) | (((h1 >> hi) & one) << 4)), y1, t)
+					t = simd.fma(simd.convert<byte, float32>((q2 >> 4) | (((h2 >> hi) & one) << 4)), y2, t)
+					t = simd.fma(simd.convert<byte, float32>((q3 >> 4) | (((h3 >> hi) & one) << 4)), y3, t)
+					acc = simd.fma(t, simd.splat8<float32>(d * float32(sc1)), acc)
+					acc = simd.fma((y0 + y1) + (y2 + y3), simd.splat8<float32>(-dmin * float32(m1)), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Row `r` of a Q6_K matrix times x. A 256-element block is two
+	// halves of 128: 64 bytes of low nibbles, 32 bytes of 2-bit high
+	// parts, and a scale per 16 elements; each element is stored plus 32.
+	// Byte l of a half serves elements l, l+32, l+64 and l+96.
+	def dotQ6K(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let first = r * blocks
+			let low = simd.splat8<byte>(byte(15))
+			let three = simd.splat8<byte>(byte(3))
+			let bias = simd.splat8<float32>(float32(32))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = first + b
+				for let n = 0; n < 2; n++ {
+					let ql = block * 210 + n * 64
+					let qh = block * 210 + 128 + n * 32
+					let xi = b * 256 + n * 128
+					let sc = block * 210 + 192 + n * 8
+					let d = halves[int(data[block * 210 + 208]) | (int(data[block * 210 + 208 + 1]) << 8)]
+					for let g = 0; g < 2; g++ {
+						let s1 = simd.splat8<float32>(float32(0))
+						let s2 = s1
+						let s3 = s1
+						let s4 = s1
+						for let l = g * 16; l < g * 16 + 16; l += 8 {
+							let a = simd.load8<byte>(data, ql + l)
+							let c = simd.load8<byte>(data, ql + l + 32)
+							let h = simd.load8<byte>(data, qh + l)
+							s1 = simd.fma(simd.convert<byte, float32>((a & low) | ((h & three) << 4)) - bias, simd.load8<float32>(x, xi + l), s1)
+							s2 = simd.fma(simd.convert<byte, float32>((c & low) | (((h >> 2) & three) << 4)) - bias, simd.load8<float32>(x, xi + l + 32), s2)
+							s3 = simd.fma(simd.convert<byte, float32>((a >> 4) | (((h >> 4) & three) << 4)) - bias, simd.load8<float32>(x, xi + l + 64), s3)
+							s4 = simd.fma(simd.convert<byte, float32>((c >> 4) | ((h >> 6) << 4)) - bias, simd.load8<float32>(x, xi + l + 96), s4)
+						}
+						acc = simd.fma(s1, simd.splat8<float32>(d * float32(int8(data[sc + g]))), acc)
+						acc = simd.fma(s2, simd.splat8<float32>(d * float32(int8(data[sc + g + 2]))), acc)
+						acc = simd.fma(s3, simd.splat8<float32>(d * float32(int8(data[sc + g + 4]))), acc)
+						acc = simd.fma(s4, simd.splat8<float32>(d * float32(int8(data[sc + g + 6]))), acc)
+					}
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Q2_K and TQ2_0: 2-bit values, a scale and a minimum per 16 elements.
+	// Element h·128 + s·32 + l of a block is bits 2s of byte h·32 + l of
+	// the values. Q2_K (84 bytes): 16 scale bytes (low nibble times d,
+	// high nibble times dmin), the values, d and dmin; TQ2_0 (66 bytes):
+	// the values stored plus 1, then d.
+	def dot2Bit(data byte[], x float32[], out float32[], from int, to int, cols int, q2k bool) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let blockBytes = q2k ?? (84, 66)
+			let three = simd.splat8<byte>(byte(3))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let start = block * blockBytes
+				let base = start + (q2k ?? (16, 0))
+				let d = halves[int(data[start + (q2k ?? (80, 64))]) | (int(data[start + (q2k ?? (80, 64)) + 1]) << 8)]
+				let dmin = q2k ?? (halves[int(data[start + 82]) | (int(data[start + 82 + 1]) << 8)], d)
+				for let h = 0; h < 2; h++ {
+					for let s = 0; s < 4; s++ {
+						for let g = 0; g < 2; g++ {
+							let at = base + h * 32 + g * 16
+							let xi = b * 256 + h * 128 + s * 32 + g * 16
+							let sc = q2k ?? (int(data[start + h * 8 + s * 2 + g]), 0x11)
+							let x0 = simd.load8<float32>(x, xi)
+							let x1 = simd.load8<float32>(x, xi + 8)
+							let t = simd.convert<byte, float32>((simd.load8<byte>(data, at) >> (2 * s)) & three) * x0
+							t = simd.fma(simd.convert<byte, float32>((simd.load8<byte>(data, at + 8) >> (2 * s)) & three), x1, t)
+							acc = simd.fma(t, simd.splat8<float32>(d * float32(sc & 15)), acc)
+							acc = simd.fma(x0 + x1, simd.splat8<float32>(-dmin * float32(sc >> 4)), acc)
+						}
+					}
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Q3_K: Q2_K's layout 32 bytes in, plus a third bit per element from
+	// the first 32 bytes (bit h·4+s of byte l); the minimum is −4·scale.
+	def dotQ3K(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let three = simd.splat8<byte>(byte(3))
+			let one = simd.splat8<byte>(byte(1))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let base = block * 110
+				let d = halves[int(data[base + 108]) | (int(data[base + 108 + 1]) << 8)]
+				for let h = 0; h < 2; h++ {
+					for let s = 0; s < 4; s++ {
+						let bit = h * 4 + s
+						for let g = 0; g < 2; g++ {
+							let at = base + 32 + h * 32 + g * 16
+							let hm = base + g * 16
+							let xi = b * 256 + h * 128 + s * 32 + g * 16
+							let k = h * 8 + s * 2 + g
+							let low = (int(data[base + 96 + k % 8]) >> (4 * (k / 8))) & 15
+							let high = (int(data[base + 104 + k % 4]) >> (2 * (k / 4))) & 3
+							let scale = d * float32((low | (high << 4)) - 32)
+							let x0 = simd.load8<float32>(x, xi)
+							let x1 = simd.load8<float32>(x, xi + 8)
+							let q0 = ((simd.load8<byte>(data, at) >> (2 * s)) & three) | (((simd.load8<byte>(data, hm) >> bit) & one) << 2)
+							let q1 = ((simd.load8<byte>(data, at + 8) >> (2 * s)) & three) | (((simd.load8<byte>(data, hm + 8) >> bit) & one) << 2)
+							let t = simd.convert<byte, float32>(q0) * x0
+							t = simd.fma(simd.convert<byte, float32>(q1), x1, t)
+							acc = simd.fma(t, simd.splat8<float32>(scale), acc)
+							acc = simd.fma(x0 + x1, simd.splat8<float32>(scale * float32(-4)), acc)
+						}
+					}
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// TQ1_0: ternary digits, five per byte in the first 48 bytes and four
+	// per byte in the next 4; digit k of byte v is ((v·3^k mod 256)·3) >> 8,
+	// stored plus 1. Digit k of byte l is element k·32 + l (bytes 0–31),
+	// 160 + k·16 + l (bytes 32–47) or 240 + k·4 + l (bytes 48–51).
+	def dotTQ1(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let byteMask = simd.splat8<int32>(int32(255))
+			let three = simd.splat8<int32>(int32(3))
+			let one = simd.splat8<float32>(float32(1))
+			let acc = simd.splat8<float32>(float32(0))
+			let tail = float32(0)
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 54
+				let xb = b * 256
+				let s = simd.splat8<float32>(float32(0))
+				for let k = 0; k < 5; k++ {
+					let p = simd.splat8<int32>(int32(powers3[k]))
+					for let l = 0; l < 32; l += 8 {
+						let v = (simd.convert<byte, int32>(simd.load8<byte>(data, at + l)) * p) & byteMask
+						let q = simd.convert<int32, float32>((v * three) >> 8) - one
+						s = simd.fma(q, simd.load8<float32>(x, xb + k * 32 + l), s)
+					}
+					for let l = 0; l < 16; l += 8 {
+						let v = (simd.convert<byte, int32>(simd.load8<byte>(data, at + 32 + l)) * p) & byteMask
+						let q = simd.convert<int32, float32>((v * three) >> 8) - one
+						s = simd.fma(q, simd.load8<float32>(x, xb + 160 + k * 16 + l), s)
+					}
+				}
+				let rest = float32(0)
+				for let k = 0; k < 4; k++ {
+					for let l = 0; l < 4; l++ {
+						let v = (int(data[at + 48 + l]) * powers3[k]) & 255
+						rest += float32(((v * 3) >> 8) - 1) * x[xb + 240 + k * 4 + l]
+					}
+				}
+				let d = halves[int(data[at + 52]) | (int(data[at + 52 + 1]) << 8)]
+				acc = simd.fma(s, simd.splat8<float32>(d), acc)
+				tail += rest * d
+			}
+			out[r] = simd.sum(acc) + tail
+		}
+	}
+
+	// IQ4_NL, IQ4_XS and MXFP4: 4-bit indices into the 16 values of
+	// `table`, laid out as Q4_0's (16 bytes per 32 elements, low nibbles
+	// first). IQ4_NL: a half then the indices; MXFP4: an E8M0 exponent then
+	// the indices; IQ4_XS (256 elements): a half d, 2-bit high parts and
+	// 4-bit low parts of eight signed 6-bit scales, then the indices.
+	def dotTable(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int, kind TensorType) {
+		for let r = from; r < to; r++ {
+			let xs = kind == TensorType.IQ4_XS
+			let groups = xs ?? (8, 1)
+			let blockBytes = xs ?? (136, kind == TensorType.MXFP4 ?? (17, 18))
+			let count = cols / 32
+			let low = simd.splat16<byte>(byte(15))
+			let values = simd.convert<float32, int8>(simd.load16<float32>(table, 0))
+			let acc = simd.splat16<float32>(float32(0))
+			for let g = 0; g < count; g++ {
+				let block = (r * count + g) / groups
+				let sub = (r * count + g) % groups
+				let base = block * blockBytes
+				let scale = float32(0)
+				let at = base
+				if xs {
+					let high = ((int(data[base + 2]) | (int(data[base + 2 + 1]) << 8)) >> (2 * sub)) & 3
+					let lowBits = (int(data[base + 4 + sub / 2]) >> (4 * (sub % 2))) & 15
+					scale = halves[int(data[base]) | (int(data[base + 1]) << 8)] * float32((lowBits | (high << 4)) - 32)
+					at = base + 8 + sub * 16
+				} else if kind == TensorType.MXFP4 {
+					scale = e8m0Halves[int(data[base])]
+					at = base + 1
+				} else {
+					scale = halves[int(data[base]) | (int(data[base + 1]) << 8)]
+					at = base + 2
+				}
+				let q = simd.load16<byte>(data, at)
+				let xi = g * 32
+				let s = simd.convert<int8, float32>(simd.shuffle(values, q & low)) * simd.load16<float32>(x, xi)
+				s = simd.fma(simd.convert<int8, float32>(simd.shuffle(values, q >> 4)), simd.load16<float32>(x, xi + 16), s)
+				acc = simd.fma(s, simd.splat16<float32>(scale), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// NVFP4: per 16 elements a scale and 8 bytes, low nibbles (elements
+	// 0–7) then high (8–15), indexing the FP4 values of `table`.
+	def dotNVFP4(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 64
+			let low = simd.splat8<byte>(byte(15))
+			let seven = simd.splat8<byte>(byte(7))
+			let lower = simd.load8<float32>(table, 0)
+			let upper = simd.load8<float32>(table, 8)
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				for let s = 0; s < 4; s++ {
+					let q = simd.load8<byte>(data, block * 36 + 4 + s * 8)
+					let xi = b * 64 + s * 16
+					let n0 = q & low
+					let n1 = q >> 4
+					let l0 = simd.shuffle(lower, n0 & seven)
+					let l1 = simd.shuffle(lower, n1 & seven)
+					let v0 = simd.fma(simd.convert<byte, float32>(n0 >> 3), simd.shuffle(upper, n0 & seven) - l0, l0)
+					let v1 = simd.fma(simd.convert<byte, float32>(n1 >> 3), simd.shuffle(upper, n1 & seven) - l1, l1)
+					let t = simd.fma(v1, simd.load8<float32>(x, xi + 8), v0 * simd.load8<float32>(x, xi))
+					acc = simd.fma(t, simd.splat8<float32>(ue4m3Halves[int(data[block * 36 + s])]), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Q1_0: one bit per element, +scale when set, −scale when clear:
+	// a block adds scale·(2·Σset·x − Σx).
+	def dotQ1(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 128
+			let one = simd.splat8<byte>(byte(1))
+			let bits = simd.load8<byte>(laneBits, 0)
+			let two = simd.splat8<float32>(float32(2))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 18 + 2
+				let set = simd.splat8<float32>(float32(0))
+				let all = set
+				for let k = 0; k < 16; k++ {
+					let xs = simd.load8<float32>(x, b * 128 + k * 8)
+					set = simd.fma(simd.convert<byte, float32>((simd.splat8<byte>(data[at + k]) & bits).min(one)), xs, set)
+					all = all + xs
+				}
+				acc = simd.fma(set * two - all, simd.splat8<float32>(halves[int(data[block * 18]) | (int(data[block * 18 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// Q2_0: 2 bits per element, four consecutive elements per byte, stored
+	// plus 1. Lanes pick their byte by shuffle and their bits by mask, the
+	// masked value scaled back down.
+	def dotQ2(data byte[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 64
+			let mask = simd.load16<byte>(q2Mask, 0)
+			let down = simd.load16<float32>(q2Shift, 0)
+			let minusOne = simd.splat16<float32>(float32(-1))
+			let spread0 = simd.load16<byte>(q2Spread, 0)
+			let spread1 = simd.load16<byte>(q2Spread, 16)
+			let spread2 = simd.load16<byte>(q2Spread, 32)
+			let spread3 = simd.load16<byte>(q2Spread, 48)
+			let acc = simd.splat16<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let q = simd.load16<byte>(data, block * 18 + 2)
+				let xi = b * 64
+				let s = simd.fma(simd.convert<byte, float32>(simd.shuffle(q, spread0) & mask), down, minusOne) * simd.load16<float32>(x, xi)
+				s = simd.fma(simd.fma(simd.convert<byte, float32>(simd.shuffle(q, spread1) & mask), down, minusOne), simd.load16<float32>(x, xi + 16), s)
+				s = simd.fma(simd.fma(simd.convert<byte, float32>(simd.shuffle(q, spread2) & mask), down, minusOne), simd.load16<float32>(x, xi + 32), s)
+				s = simd.fma(simd.fma(simd.convert<byte, float32>(simd.shuffle(q, spread3) & mask), down, minusOne), simd.load16<float32>(x, xi + 48), s)
+				acc = simd.fma(s, simd.splat16<float32>(halves[int(data[block * 18]) | (int(data[block * 18 + 1]) << 8)]), acc)
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ2_XXS: per 32 elements two 32-bit words: four grid indices (8
+	// values each), then four 7-bit sign indices.
+	def dotIQ2XXS(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let d = halves[int(data[block * 66]) | (int(data[block * 66 + 1]) << 8)] * float32(0.25)
+				for let g = 0; g < 8; g++ {
+					let at = block * 66 + 2 + g * 8
+					let aux = (int(data[at + 4]) | (int(data[at + 4 + 1]) << 8) | (int(data[at + 4 + 2]) << 16) | (int(data[at + 4 + 3]) << 24))
+					let xi = b * 256 + g * 32
+					let s = simd.splat8<float32>(float32(0))
+					for let j = 0; j < 4; j++ {
+						let v = simd.load8<float32>(table, int(data[at + j]) * 8) * simd.load8<float32>(signs8, ksigns[(aux >> (7 * j)) & 127] * 8)
+						s = simd.fma(v, simd.load8<float32>(x, xi + j * 8), s)
+					}
+					acc = simd.fma(s, simd.splat8<float32>(d * (float32(0.5) + float32(aux >> 28))), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ2_XS: 16-bit words of a 9-bit grid index and a 7-bit sign index; a
+	// scale per two words.
+	def dotIQ2XS(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let d = halves[int(data[block * 74]) | (int(data[block * 74 + 1]) << 8)] * float32(0.25)
+				for let p = 0; p < 16; p++ {
+					let s = simd.splat8<float32>(float32(0))
+					for let e = 0; e < 2; e++ {
+						let i = p * 2 + e
+						let w = (int(data[block * 74 + 2 + i * 2]) | (int(data[block * 74 + 2 + i * 2 + 1]) << 8))
+						let v = simd.load8<float32>(table, (w & 511) * 8) * simd.load8<float32>(signs8, ksigns[w >> 9] * 8)
+						s = simd.fma(v, simd.load8<float32>(x, b * 256 + i * 8), s)
+					}
+					let sc = (int(data[block * 74 + 66 + p / 2]) >> (4 * (p % 2))) & 15
+					acc = simd.fma(s, simd.splat8<float32>(d * (float32(0.5) + float32(sc))), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ2_S: 10-bit grid indices (a byte plus 2 bits), a sign byte per 8
+	// elements; a scale per 16 elements.
+	def dotIQ2S(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 82
+				let d = halves[int(data[at]) | (int(data[at + 1]) << 8)] * float32(0.25)
+				for let p = 0; p < 16; p++ {
+					let s = simd.splat8<float32>(float32(0))
+					for let e = 0; e < 2; e++ {
+						let i = p * 2 + e
+						let index = int(data[at + 2 + i]) | (((int(data[at + 66 + i / 4]) >> (2 * (i % 4))) & 3) << 8)
+						let v = simd.load8<float32>(table, index * 8) * simd.load8<float32>(signs8, int(data[at + 34 + i]) * 8)
+						s = simd.fma(v, simd.load8<float32>(x, b * 256 + i * 8), s)
+					}
+					let sc = (int(data[at + 74 + p / 2]) >> (4 * (p % 2))) & 15
+					acc = simd.fma(s, simd.splat8<float32>(d * (float32(0.5) + float32(sc))), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ3_XXS: grid entries of 4 values, two per 8 elements; per 32
+	// elements a word of four 7-bit sign indices.
+	def dotIQ3XXS(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat4<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 98
+				let d = halves[int(data[at]) | (int(data[at + 1]) << 8)] * float32(0.5)
+				for let g = 0; g < 8; g++ {
+					let aux = (int(data[at + 66 + g * 4]) | (int(data[at + 66 + g * 4 + 1]) << 8) | (int(data[at + 66 + g * 4 + 2]) << 16) | (int(data[at + 66 + g * 4 + 3]) << 24))
+					let s = simd.splat4<float32>(float32(0))
+					for let j = 0; j < 4; j++ {
+						let sign = ksigns[(aux >> (7 * j)) & 127]
+						let xi = b * 256 + g * 32 + j * 8
+						let e = at + 2 + g * 8 + j * 2
+						s = simd.fma(simd.load4<float32>(table, int(data[e]) * 4) * simd.load4<float32>(signs4, (sign & 15) * 4), simd.load4<float32>(x, xi), s)
+						s = simd.fma(simd.load4<float32>(table, int(data[e + 1]) * 4) * simd.load4<float32>(signs4, (sign >> 4) * 4), simd.load4<float32>(x, xi + 4), s)
+					}
+					acc = simd.fma(s, simd.splat4<float32>(d * (float32(0.5) + float32(aux >> 28))), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ3_S: 9-bit grid indices (a byte plus a bit) of 4 values, a sign
+	// nibble each; a scale per 32 elements.
+	def dotIQ3S(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat4<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 110
+				let d = halves[int(data[at]) | (int(data[at + 1]) << 8)]
+				for let g = 0; g < 8; g++ {
+					let s = simd.splat4<float32>(float32(0))
+					for let m = 0; m < 8; m++ {
+						let i = g * 8 + m
+						let index = int(data[at + 2 + i]) | (((int(data[at + 66 + i / 8]) >> (i % 8)) & 1) << 8)
+						let sign = (int(data[at + 74 + i / 2]) >> (4 * (i % 2))) & 15
+						s = simd.fma(simd.load4<float32>(table, index * 4) * simd.load4<float32>(signs4, sign * 4), simd.load4<float32>(x, b * 256 + i * 4), s)
+					}
+					let sc = (int(data[at + 106 + g / 2]) >> (4 * (g % 2))) & 15
+					acc = simd.fma(s, simd.splat4<float32>(d * float32(1 + 2 * sc)), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ1_S: 11-bit grid indices of 8 values in {−1, 0, 1}, shifted by the
+	// group's ±1/8 and scaled per 32 elements, both from a 16-bit word per
+	// group that also holds the index high bits.
+	def dotIQ1S(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 50
+				let d = halves[int(data[at]) | (int(data[at + 1]) << 8)]
+				for let g = 0; g < 8; g++ {
+					let qh = (int(data[at + 34 + g * 2]) | (int(data[at + 34 + g * 2 + 1]) << 8))
+					let delta = simd.splat8<float32>(qh & 0x8000 == 0 ?? (float32(0.125), float32(-0.125)))
+					let s = simd.splat8<float32>(float32(0))
+					for let j = 0; j < 4; j++ {
+						let index = int(data[at + 2 + g * 4 + j]) | (((qh >> (3 * j)) & 7) << 8)
+						s = simd.fma(simd.load8<float32>(table, index * 8) + delta, simd.load8<float32>(x, b * 256 + g * 32 + j * 8), s)
+					}
+					acc = simd.fma(s, simd.splat8<float32>(d * float32(2 * ((qh >> 12) & 7) + 1)), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+
+	// IQ1_M: IQ1_S's grid, index high bits and shift sign in a nibble per
+	// 8 elements, a 3-bit scale per 16 elements; the half d is spread over
+	// the top nibbles of the four scale words.
+	def dotIQ1M(data byte[], table float32[], x float32[], out float32[], from int, to int, cols int) {
+		for let r = from; r < to; r++ {
+			let blocks = cols / 256
+			let up = simd.splat8<float32>(float32(0.125))
+			let down = simd.splat8<float32>(float32(-0.125))
+			let acc = simd.splat8<float32>(float32(0))
+			for let b = 0; b < blocks; b++ {
+				let block = r * blocks + b
+				let at = block * 56
+				let d = halves[((int(data[at + 48]) | (int(data[at + 48 + 1]) << 8)) >> 12) | (((int(data[at + 50]) | (int(data[at + 50 + 1]) << 8)) >> 8) & 0xF0) | (((int(data[at + 52]) | (int(data[at + 52 + 1]) << 8)) >> 4) & 0xF00) | ((int(data[at + 54]) | (int(data[at + 54 + 1]) << 8)) & 0xF000)]
+				for let p = 0; p < 16; p++ {
+					let s = simd.splat8<float32>(float32(0))
+					for let e = 0; e < 2; e++ {
+						let i = p * 2 + e
+						let nibble = (int(data[at + 32 + i / 2]) >> (4 * (i % 2))) & 15
+						let index = int(data[at + i]) | ((nibble & 7) << 8)
+						let delta = nibble & 8 == 0 ?? (up, down)
+						s = simd.fma(simd.load8<float32>(table, index * 8) + delta, simd.load8<float32>(x, b * 256 + i * 8), s)
+					}
+					let sc = ((int(data[at + 48 + (p / 4) * 2]) | (int(data[at + 48 + (p / 4) * 2 + 1]) << 8)) >> (3 * (p % 4))) & 7
+					acc = simd.fma(s, simd.splat8<float32>(d * float32(2 * sc + 1)), acc)
+				}
+			}
+			out[r] = simd.sum(acc)
+		}
+	}
+}

@@ -1,0 +1,651 @@
+internal partial module std.formats.video.av1 {
+	use (
+		std.simd
+		std.formats.video::*
+	)
+
+	// The decoding state across temporal units: sequence header, the
+	// eight reference slots and the frame in progress (dav1d obu.c and
+	// decode.c).
+	type Av1Decoder {
+		seq       Av1SeqHdr
+		haveSeq   bool
+		slots     Av1Frame[]
+		tile      Av1Tile
+		bits      Av1Bits
+		// The frame in progress: its header, whether its tiles are still
+		// coming, the CDFs its tiles start from and the context tile's
+		// CDFs at its end.
+		hdr       Av1FrameHdr
+		inFrame   bool
+		cur       Av1Frame
+		initCdf   int[]
+		ctxCdf    int[]
+		nextTile  int
+		frames    VideoFrame[]
+		pts       duration
+		hasPts    bool
+		length    duration
+		lastTime  duration
+		haveTime  bool
+		// The frame a multi-layer temporal unit shows so far.
+		heldFrame Av1Frame
+		held      bool
+
+		def new() {
+			seq = new Av1SeqHdr()
+			tile = new Av1Tile()
+			bits = new Av1Bits()
+			hdr = new Av1FrameHdr()
+			cur = new Av1Frame()
+			initCdf.len(av1CdfSize)
+			ctxCdf.len(av1CdfSize)
+			slots = Av1Frame[]
+			for let i = 0; i < 8; i++ {
+				slots.push(av1EmptySlot())
+			}
+			frames = VideoFrame[]
+			heldFrame = new Av1Frame()
+		}
+
+		def take() VideoFrame[] {
+			let out = frames
+			frames = VideoFrame[]
+			return out
+		}
+
+		// Reads the av1C record of an MP4/Matroska track: its config OBUs
+		// (the sequence header).
+		//
+		// Fails on a malformed record or sequence header.
+		def configure(config byte[]) !none {
+			return none when config.len() < 4
+			fail "av1: bad av1C record" when (int(config[0]) & 0x80) == 0
+			return none when config.len() == 4
+			try obus(config, 4, config.len())
+			return none
+		}
+
+		// Decodes the OBUs of one temporal unit timed `pts`.
+		//
+		// Fails on a malformed or unsupported stream.
+		def packet(data byte[], pts duration, length duration) !none {
+			self.pts = pts
+			self.hasPts = true
+			self.length = length
+			try obus(data, 0, data.len())
+			if held {
+				emit(heldFrame)
+				held = false
+			}
+			return none
+		}
+
+		def obus(data byte[], start int, end int) !none {
+			let at = start
+			for at < end {
+				let b0 = int(data[at])
+				fail "av1: forbidden OBU bit set" when (b0 & 0x80) != 0
+				let kind = (b0 >> 3) & 15
+				let ext = (b0 & 4) != 0
+				let hasSize = (b0 & 2) != 0
+				let p = at + 1
+				let tid = 0
+				let sid = 0
+				if ext {
+					fail "av1: truncated OBU header" when p >= end
+					tid = int(data[p]) >> 5
+					sid = (int(data[p]) >> 3) & 3
+					p++
+				}
+				let size = end - p
+				if hasSize {
+					let v = 0
+					let i = 0
+					for {
+						fail "av1: truncated OBU size" when p >= end || i >= 8
+						let c = int(data[p])
+						p++
+						v = v | ((c & 0x7F) << (i * 7))
+						i++
+						break when (c & 0x80) == 0
+					}
+					size = v
+				}
+				fail "av1: OBU overruns the packet" when p + size > end
+				let skip = false
+				if ext && haveSeq && seq.opIdc.len() > 0 {
+					let idc = seq.opIdc[0]
+					skip = ((idc >> tid) & 1) == 0 || ((idc >> (sid + 8)) & 1) == 0 when idc != 0
+				}
+				if !skip {
+					try obu(kind, data, p, p + size, tid, sid)
+				}
+				at = p + size
+			}
+			return none
+		}
+
+		def obu(kind int, data byte[], start int, end int, tid int, sid int) !none {
+			if kind == av1ObuSeqHdr {
+				bits.reset(data, start, end)
+				seq = try av1ParseSeqHdr(bits)
+				haveSeq = true
+				return none
+			}
+			if kind == av1ObuTd {
+				inFrame = false
+				return none
+			}
+			return none unless kind == av1ObuFrameHdr || kind == av1ObuFrame || kind == av1ObuTileGrp || kind == av1ObuRedundantFrameHdr
+			fail "av1: frame before the sequence header" unless haveSeq
+			let at = start
+			if kind != av1ObuTileGrp {
+				if inFrame {
+					// A redundant copy of the header of the frame in progress.
+					return none unless kind == av1ObuFrame
+				} else {
+					bits.reset(data, start, end)
+					let refs = Av1FrameHdr[]
+					for let i = 0; i < 8; i++ {
+						refs.push(slots[i].hdr)
+					}
+					let h = try av1ParseFrameHdr(bits, seq, refs, tid, sid)
+					if h.showExisting {
+						try showExisting(h)
+						return none
+					}
+					hdr = h
+					try startFrame()
+					inFrame = true
+					return none when kind == av1ObuFrameHdr || kind == av1ObuRedundantFrameHdr
+					bits.byteAlign()
+					at = bits.bytePos()
+				}
+			}
+			fail "av1: tile group outside a frame" unless inFrame
+			try tileGroup(data, at, end)
+			return none
+		}
+
+		// Outputs a shown-again frame; a key frame shown again also
+		// becomes every reference (7.21).
+		//
+		// Fails on an empty slot.
+		def showExisting(h Av1FrameHdr) !none {
+			let f = slots[h.existingIdx]
+			fail "av1: showing an empty reference" unless f.hdr.valid
+			output(f)
+			if f.hdr.frameType == av1FrameKey {
+				for let i = 0; i < 8; i++ {
+					slots[i] = f
+				}
+			}
+			return none
+		}
+
+		// Sets the tile decoder up for the frame whose header was read.
+		//
+		// Fails on a reference of an unsupported size or format.
+		def startFrame() !none {
+			let s = seq
+			let h = hdr
+			let t = tile
+			let layout = s.monochrome ?? (0, s.ssHor == 1 ?? ((s.ssVer == 1 ?? (1, 2)), 3))
+			let f = new Av1Frame()
+			f.alloc(h.width, h.height, h.upscaledWidth, s.bitDepth, layout)
+			f.hdr = h
+			f.renderWidth = h.renderWidth
+			f.renderHeight = h.renderHeight
+			f.pts = pts
+			f.hasPts = hasPts
+			f.length = length
+			hasPts = false
+			cur = f
+			t.seq = s
+			t.hdr = h
+			t.cur = f
+			t.layout = layout
+			t.ssHor = s.ssHor
+			t.ssVer = s.ssVer
+			t.bitDepth = s.bitDepth
+			let refs = Av1Frame[]
+			for let i = 0; i < 7; i++ {
+				let r = h.refIdx[i] >= 0 ?? (slots[h.refIdx[i]], f)
+				if !h.isIntra() {
+					fail "av1: reference of another format" when r.layout != layout || r.bitDepth != s.bitDepth
+					fail "av1: reference too different in size" when 2 * h.width < r.upWidth || 2 * h.height < r.height || h.width > 16 * r.upWidth || h.height > 16 * r.height
+				}
+				refs.push(r)
+			}
+			t.refs = refs
+			t.startFrame()
+			av1InitDq(t, h.yac, t.dqFrame)
+			let zero = int[0, 0, 0, 0]
+			av1CalcLfValues(t, t.lflvlFrame, zero)
+			for let i = 0; i < av1NRectTxSizes; i++ {
+				if h.qm {
+					t.qm[i] = av1QmAt(h.qmY, 0, i)
+					t.qm[av1NRectTxSizes + i] = av1QmAt(h.qmU, 1, i)
+					t.qm[2 * av1NRectTxSizes + i] = av1QmAt(h.qmV, 1, i)
+				} else {
+					t.qm[i] = -1
+					t.qm[av1NRectTxSizes + i] = -1
+					t.qm[2 * av1NRectTxSizes + i] = -1
+				}
+			}
+			av1FrameInterSetup(t, s, h)
+			// Segmentation map of the primary reference.
+			t.hasPrevSeg = false
+			if h.segEnabled {
+				if (h.segTemporal || !h.segUpdateMap) && h.primaryRefFrame != av1PrimaryRefNone {
+					let pr = refs[h.primaryRefFrame]
+					if pr.segValid && ((pr.width + 7) >> 3) << 1 == t.bw && ((pr.height + 7) >> 3) << 1 == t.bh {
+						t.prevSeg = pr.segmap
+						t.hasPrevSeg = true
+					}
+				}
+				if !h.segUpdateMap && t.hasPrevSeg {
+					for let i = 0; i < t.curSeg.len(); i++ {
+						t.curSeg[i] = t.prevSeg[i]
+					}
+				} else {
+					t.curSeg.fill(byte(0))
+				}
+			}
+			// Temporal motion references.
+			for let i = 0; i < 7; i++ {
+				let r = refs[i]
+				t.rpOk[i] = (!h.isIntra() && r.rpValid && ((r.width + 7) >> 3) << 1 == t.bw && ((r.height + 7) >> 3) << 1 == t.bh) ?? (1, 0)
+			}
+			av1MvsInit(t, t.mvs) when !h.isIntra() || h.allowIntrabc
+			// Loop restoration units.
+			av1SetupLr(t)
+			// Entropy contexts.
+			if h.primaryRefFrame == av1PrimaryRefNone {
+				let q = h.yac
+				let qcat = (q > 20 ?? (1, 0)) + (q > 60 ?? (1, 0)) + (q > 120 ?? (1, 0))
+				for let i = 0; i < av1CdfCoefSize; i++ {
+					initCdf[i] = av1DefaultCoefCdf[qcat * av1CdfCoefSize + i]
+				}
+				for let i = av1CdfCoefSize; i < av1CdfSize; i++ {
+					initCdf[i] = av1DefaultCdf[i - av1CdfCoefSize]
+				}
+			} else {
+				let pr = refs[h.primaryRefFrame]
+				fail "av1: primary reference without saved contexts" unless pr.cdfValid
+				for let i = 0; i < av1CdfSize; i++ {
+					initCdf[i] = pr.cdf[i]
+				}
+			}
+			nextTile = 0
+			return none
+		}
+
+		// A tile group OBU: the tiles it carries, and the end of the frame
+		// after its last tile.
+		//
+		// Fails on a malformed tile group or tile.
+		def tileGroup(data byte[], start int, end int) !none {
+			let h = hdr
+			let n = h.tileCols * h.tileRows
+			bits.reset(data, start, end)
+			let first = 0
+			let last = n - 1
+			if n > 1 && bits.flag() {
+				let tb = h.log2Cols + h.log2Rows
+				first = bits.bits(tb)
+				last = bits.bits(tb)
+			}
+			bits.byteAlign()
+			fail "av1: tile group out of order" when first != nextTile || last < first || last >= n
+			let at = bits.bytePos()
+			for let i = first; i <= last; i++ {
+				let size = end - at
+				if i != last {
+					fail "av1: truncated tile size" when at + h.tileSizeBytes > end
+					let v = 0
+					for let k = 0; k < h.tileSizeBytes; k++ {
+						v = v | (int(data[at + k]) << (8 * k))
+					}
+					at += h.tileSizeBytes
+					size = v + 1
+					fail "av1: tile overruns its group" when at + size > end
+				}
+				try tile.decodeTile(data, at, at + size, i / h.tileCols, i % h.tileCols, initCdf)
+				if i == h.contextTile {
+					for let k = 0; k < av1CdfSize; k++ {
+						ctxCdf[k] = tile.msac.cdf[k]
+					}
+				}
+				at += size
+			}
+			nextTile = last + 1
+			if nextTile == n {
+				finishFrame()
+				inFrame = false
+			}
+			return none
+		}
+
+		// Filters the decoded frame, stores it into the refreshed slots
+		// and outputs it when shown.
+		def finishFrame() {
+			let h = hdr
+			let t = tile
+			let f = cur
+			av1Deblock(t)
+			av1KeepDeblocked(t) when !av1Cdef(t) && av1LrActive(t)
+			av1SuperRes(t)
+			av1LoopRestoration(t)
+			f.cdf.len(av1CdfSize)
+			for let i = 0; i < av1CdfSize; i++ {
+				f.cdf[i] = initCdf[i]
+			}
+			av1CdfEndUpdate(f.cdf, ctxCdf, h.isIntra()) when h.refreshContext
+			f.cdfValid = true
+			if h.segEnabled {
+				f.segmap = t.curSeg.clone()
+				f.segValid = true
+			}
+			av1SaveTmvs(t, t.mvs, f) when !h.isIntra() && seq.refFrameMvs
+			for let i = 0; i < 7; i++ {
+				f.refPoc[i] = (h.isIntra() ?? (0, t.refs[i].hdr.frameOffset))
+			}
+			f.showable = h.showableFrame
+			for let i = 0; i < 8; i++ {
+				slots[i] = f when ((h.refreshFlags >> i) & 1) != 0
+			}
+			output(f) when h.showFrame
+		}
+
+		// Outputs `f`; with several spatial layers only the highest layer
+		// a temporal unit shows comes out, at the end of the unit.
+		def output(f Av1Frame) {
+			let idc = seq.opIdc.len() > 0 ?? (seq.opIdc[0], 0)
+			if (idc >> 8) > 1 {
+				if !held || f.hdr.spatialId >= heldFrame.hdr.spatialId {
+					heldFrame = f
+					held = true
+				}
+				return
+			}
+			emit(f)
+		}
+
+		// Queues `f` as an output frame, film grain applied.
+		def emit(f Av1Frame) {
+			let s = seq
+			let h = f.hdr
+			let w = h.upscaledWidth
+			let ht = h.height
+			let mono = f.layout == 0
+			let cw = mono ?? (0, (w + f.ssHor) >> f.ssHor)
+			let ch = mono ?? (0, (ht + f.ssVer) >> f.ssVer)
+			let size = f.bitDepth == 8 ?? (1, 2)
+			let y = av1Bytes(w * ht * size)
+			let u = av1Bytes(cw * ch * size)
+			let v = av1Bytes(cw * ch * size)
+			let src = f
+			src = av1ApplyGrain(f, h.filmGrain, s.matrix == 0) when h.filmGrain.present && s.filmGrain
+			av1Put(src.y, 0, src.stride, w, ht, size, y)
+			if !mono {
+				av1Put(src.u, 0, src.cstride, cw, ch, size, u)
+				av1Put(src.v, 0, src.cstride, cw, ch, size, v)
+			}
+			let step = f.length > 0s ?? (f.length, 40ms)
+			let time = f.pts
+			time = haveTime ?? (lastTime + step, 0s) unless f.hasPts
+			lastTime = time
+			haveTime = true
+			frames.push(VideoFrame{
+				width:     uint32(w),
+				height:    uint32(ht),
+				y:         y,
+				u:         u,
+				v:         v,
+				yStride:   w * size,
+				uvStride:  cw * size,
+				time:      time,
+				length:    step,
+				keyframe:  h.frameType == av1FrameKey,
+				matrix:    (s.matrix := 5 || 6) ?? (601, 709),
+				chroma:    mono ?? (ChromaLayout.Mono, f.layout == 1 ?? (ChromaLayout.Yuv420, f.layout == 2 ?? (ChromaLayout.Yuv422, ChromaLayout.Yuv444))),
+				fullRange: s.fullRange,
+				bitDepth:  f.bitDepth,
+				onGpu:     false,
+				gpu:       none
+			})
+		}
+	}
+
+	// A slot no frame has filled.
+	def av1EmptySlot() Av1Frame {
+		let f = new Av1Frame()
+		f.hdr.valid = false
+		return f
+	}
+
+	// The offset of quantizer matrix `level` for plane class `c` (0 luma,
+	// 1 chroma) and transform size `tx` in av1QmData; -1 for flat.
+	def av1QmAt(level int, c int, tx int) int {
+		return -1 when level >= 15
+		return av1QmOffset[(level * 2 + c) * av1NRectTxSizes + tx]
+	}
+
+	// Reference scale factors, usable global warps and compound weights.
+	def av1FrameInterSetup(t Av1Tile, s Av1SeqHdr, h Av1FrameHdr) {
+		for let i = 0; i < 7; i++ {
+			t.svcScale[i * 2] = 0
+			t.svcScale[i * 2 + 1] = 0
+			t.gmvWarp[i] = 0
+			continue when h.isIntra()
+			let r = t.refs[i]
+			if h.width != r.upWidth || h.height != r.height {
+				t.svcScale[i * 2] = ((r.upWidth << 14) + (h.width >> 1)) / h.width
+				t.svcScale[i * 2 + 1] = ((r.height << 14) + (h.height >> 1)) / h.height
+				t.svcStep[i * 2] = (t.svcScale[i * 2] + 8) >> 4
+				t.svcStep[i * 2 + 1] = (t.svcScale[i * 2 + 1] + 8) >> 4
+			}
+			let m = t.warpTmp
+			for let k = 0; k < 6; k++ {
+				m[k] = h.gmv[i * 6 + k]
+			}
+			let abcd = t.abcdTmp
+			let valid = av1ShearParams(m, abcd)
+			for let k = 0; k < 4; k++ {
+				t.gmvAbcd[i * 4 + k] = abcd[k]
+			}
+			t.gmvWarp[i] = (h.gmvType[i] > av1WmTranslation && !h.forceIntegerMv && valid && t.svcScale[i * 2] == 0) ?? (1, 0)
+		}
+		return when h.isIntra() || !h.switchableCompRefs
+		let bits = s.orderHintBits
+		let poc = h.frameOffset
+		let weight = int[2, 3, 2, 5, 2, 7]
+		let lookup = int[9, 7, 11, 5, 12, 4, 13, 3]
+		for let i = 0; i < 7; i++ {
+			let p0 = t.refs[i].hdr.frameOffset
+			for let j = i + 1; j < 7; j++ {
+				let p1 = t.refs[j].hdr.frameOffset
+				let d1 = av1Min(av1Abs(av1PocDiff(bits, p0, poc)), 31)
+				let d0 = av1Min(av1Abs(av1PocDiff(bits, p1, poc)), 31)
+				let order = d0 <= d1 ?? (1, 0)
+				let k = 0
+				for k < 3 {
+					let c0 = weight[k * 2 + order]
+					let c1 = weight[k * 2 + 1 - order]
+					break when (d0 > d1 && d0 * c0 < d1 * c1) || (d0 <= d1 && d0 * c0 > d1 * c1)
+					k++
+				}
+				t.jntW[i * 7 + j] = lookup[k * 2 + order]
+			}
+		}
+	}
+
+	// The loop restoration unit grid of each plane on the upscaled frame.
+	def av1SetupLr(t Av1Tile) {
+		let h = t.hdr
+		let total = 0
+		for let p = 0; p < 3; p++ {
+			let sh = p > 0 ?? (t.ssHor, 0)
+			let sv = p > 0 ?? (t.ssVer, 0)
+			let lg = h.lrUnit[p > 0 ?? (1, 0)]
+			let half = (1 << lg) >> 1
+			let pw = (h.upscaledWidth + sh) >> sh
+			let ph = (h.height + sv) >> sv
+			let active = h.lrType[p] != 0 && (p == 0 || t.layout != 0)
+			t.lrW[p] = active ?? (av1Max(1, (pw + half) >> lg), 0)
+			t.lrH[p] = active ?? (av1Max(1, (ph + half) >> lg), 0)
+			t.lrBase[p] = total
+			total += t.lrW[p] * t.lrH[p]
+		}
+		for t.lrUnits.len() < total {
+			t.lrUnits.push(new Av1LrUnit())
+		}
+		for let i = 0; i < total; i++ {
+			t.lrUnits[i].kind = av1Dav1dRestorationNone
+		}
+	}
+
+	def av1Max(a int, b int) int {
+		return a > b ?? (a, b)
+	}
+
+	// Zeroes the adaptation counters of `n` CDFs of `symbols` - 1
+	// probabilities each, `stride` apart from `at`.
+	def av1ZeroCounts(cdf int[], at int, n int, stride int, probs int) {
+		for let i = 0; i < n; i++ {
+			cdf[at + i * stride + probs] = 0
+		}
+	}
+
+	// dav1d_cdf_thread_update: the end-of-frame CDFs from the context
+	// tile's `src` into `dst` (which holds the frame's initial CDFs),
+	// adaptation counters cleared.
+	def av1CdfEndUpdate(dst int[], src int[], intra bool) {
+		for let i = 0; i < av1CdfMIntrabc; i++ {
+			dst[i] = src[i]
+		}
+		av1ZeroCounts(dst, av1CdfCoefEobBin16, 4, 8, 4)
+		av1ZeroCounts(dst, av1CdfCoefEobBin32, 4, 8, 5)
+		av1ZeroCounts(dst, av1CdfCoefEobBin64, 4, 8, 6)
+		av1ZeroCounts(dst, av1CdfCoefEobBin128, 4, 8, 7)
+		av1ZeroCounts(dst, av1CdfCoefEobBin256, 4, 16, 8)
+		av1ZeroCounts(dst, av1CdfCoefEobBin512, 2, 16, 9)
+		av1ZeroCounts(dst, av1CdfCoefEobBin1024, 2, 16, 10)
+		av1ZeroCounts(dst, av1CdfCoefEobBaseTok, 5 * 2 * 4, 4, 2)
+		av1ZeroCounts(dst, av1CdfCoefBaseTok, 5 * 2 * 41, 4, 3)
+		av1ZeroCounts(dst, av1CdfCoefBrTok, 4 * 2 * 21, 4, 3)
+		av1ZeroCounts(dst, av1CdfCoefEobHiBit, 5 * 2 * 9, 2, 1)
+		av1ZeroCounts(dst, av1CdfCoefSkip, 5 * 13, 2, 1)
+		av1ZeroCounts(dst, av1CdfCoefDcSign, 2 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMUvMode, 13, 16, 12)
+		av1ZeroCounts(dst, av1CdfMUvMode + 13 * 16, 13, 16, 13)
+		av1ZeroCounts(dst, av1CdfMPartition, 4, 16, 7)
+		av1ZeroCounts(dst, av1CdfMPartition + 4 * 16, 3 * 4, 16, 9)
+		av1ZeroCounts(dst, av1CdfMPartition + 16 * 16, 4, 16, 3)
+		av1ZeroCounts(dst, av1CdfMCflAlpha, 6, 16, 15)
+		av1ZeroCounts(dst, av1CdfMTxtpInter1, 2, 16, 15)
+		av1ZeroCounts(dst, av1CdfMTxtpInter2, 1, 16, 11)
+		av1ZeroCounts(dst, av1CdfMTxtpIntra1, 2 * 13, 8, 6)
+		av1ZeroCounts(dst, av1CdfMTxtpIntra2, 3 * 13, 8, 4)
+		av1ZeroCounts(dst, av1CdfMCflSign, 1, 8, 7)
+		av1ZeroCounts(dst, av1CdfMAngleDelta, 8, 8, 6)
+		av1ZeroCounts(dst, av1CdfMFilterIntra, 1, 8, 4)
+		av1ZeroCounts(dst, av1CdfMSegId, 3, 8, 7)
+		av1ZeroCounts(dst, av1CdfMPalSz, 2 * 7, 8, 6)
+		for let l = 0; l < 2; l++ {
+			for let k = 0; k < 7; k++ {
+				av1ZeroCounts(dst, av1CdfMColorMap + ((l * 7 + k) * 5) * 8, 5, 8, k + 1)
+			}
+		}
+		for let k = 0; k < 4; k++ {
+			av1ZeroCounts(dst, av1CdfMTxsz + k * 3 * 4, 3, 4, av1Min(k + 1, 2))
+		}
+		av1ZeroCounts(dst, av1CdfMDeltaQ, 1, 4, 3)
+		av1ZeroCounts(dst, av1CdfMDeltaLf, 5, 4, 3)
+		av1ZeroCounts(dst, av1CdfMRestoreSwitchable, 1, 4, 2)
+		av1ZeroCounts(dst, av1CdfMRestoreWiener, 1, 2, 1)
+		av1ZeroCounts(dst, av1CdfMRestoreSgrproj, 1, 2, 1)
+		av1ZeroCounts(dst, av1CdfMTxtpInter3, 4, 2, 1)
+		av1ZeroCounts(dst, av1CdfMUseFilterIntra, 22, 2, 1)
+		av1ZeroCounts(dst, av1CdfMTxpart, 7 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMSkip, 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMPalY, 7 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMPalUv, 2, 2, 1)
+		return when intra
+		for let i = av1CdfMYMode; i < av1CdfKfym; i++ {
+			dst[i] = src[i]
+		}
+		av1ZeroCounts(dst, av1CdfMYMode, 4, 16, 12)
+		av1ZeroCounts(dst, av1CdfMWedgeIdx, 9, 16, 15)
+		av1ZeroCounts(dst, av1CdfMCompInterMode, 8, 8, 7)
+		av1ZeroCounts(dst, av1CdfMFilter, 2 * 8, 4, 2)
+		av1ZeroCounts(dst, av1CdfMInterintraMode, 4, 4, 3)
+		av1ZeroCounts(dst, av1CdfMMotionMode, 22, 4, 2)
+		av1ZeroCounts(dst, av1CdfMSkipMode, 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMNewmvMode, 6, 2, 1)
+		av1ZeroCounts(dst, av1CdfMGlobalmvMode, 2, 2, 1)
+		av1ZeroCounts(dst, av1CdfMRefmvMode, 6, 2, 1)
+		av1ZeroCounts(dst, av1CdfMDrlBit, 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMIntra, 4, 2, 1)
+		av1ZeroCounts(dst, av1CdfMComp, 5, 2, 1)
+		av1ZeroCounts(dst, av1CdfMCompDir, 5, 2, 1)
+		av1ZeroCounts(dst, av1CdfMJntComp, 6, 2, 1)
+		av1ZeroCounts(dst, av1CdfMMaskComp, 6, 2, 1)
+		av1ZeroCounts(dst, av1CdfMWedgeComp, 9, 2, 1)
+		av1ZeroCounts(dst, av1CdfMRef, 6 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMCompFwdRef, 3 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMCompBwdRef, 2 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMCompUniRef, 3 * 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMSegPred, 3, 2, 1)
+		av1ZeroCounts(dst, av1CdfMInterintra, 4, 2, 1)
+		av1ZeroCounts(dst, av1CdfMInterintraWedge, 7, 2, 1)
+		av1ZeroCounts(dst, av1CdfMObmc, 22, 2, 1)
+		for let k = 0; k < 2; k++ {
+			let c = k == 0 ?? (av1CdfMvComp0Classes, av1CdfMvComp1Classes)
+			let d = c - av1CdfMvComp0Classes
+			av1ZeroCounts(dst, c, 1, 16, 10)
+			av1ZeroCounts(dst, av1CdfMvComp0Sign + d, 1, 2, 1)
+			av1ZeroCounts(dst, av1CdfMvComp0Class0 + d, 1, 2, 1)
+			av1ZeroCounts(dst, av1CdfMvComp0Class0Fp + d, 2, 4, 3)
+			av1ZeroCounts(dst, av1CdfMvComp0Class0Hp + d, 1, 2, 1)
+			av1ZeroCounts(dst, av1CdfMvComp0ClassN + d, 10, 2, 1)
+			av1ZeroCounts(dst, av1CdfMvComp0ClassNFp + d, 1, 4, 3)
+			av1ZeroCounts(dst, av1CdfMvComp0ClassNHp + d, 1, 2, 1)
+		}
+		av1ZeroCounts(dst, av1CdfMvJoint, 1, 4, 3)
+	}
+
+	def av1Bytes(n int) byte[] {
+		let a byte[]
+		a.len(n)
+		return a
+	}
+
+	// Writes the w x h samples at `off` of a plane to `out`: one byte each
+	// when `size` is 1, else two, little-endian.
+	def av1Put(plane uint16[], off int, stride int, w int, h int, size int, out byte[]) {
+		let k = 0
+		for let j = 0; j < h; j++ {
+			let o = off + j * stride
+			if size == 1 {
+				let wide = w & ~15
+				for let i = 0; i < wide; i += 16 {
+					simd.store16<byte>(out, k + i, simd.convert<uint16, byte>(simd.load16<uint16>(plane, o + i)))
+				}
+				for let i = wide; i < w; i++ {
+					out[k + i] = byte(int(plane[o + i]))
+				}
+				k += w
+				continue
+			}
+			for let i = 0; i < w; i++ {
+				let v = int(plane[o + i])
+				out[k] = byte(v & 255)
+				out[k + 1] = byte(v >> 8)
+				k += 2
+			}
+		}
+	}
+}

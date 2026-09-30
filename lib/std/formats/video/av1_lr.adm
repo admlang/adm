@@ -1,0 +1,362 @@
+internal partial module std.formats.video.av1 {
+	use std.simd
+
+	// Superres upscaling (dav1d resize_c) and loop restoration (7.17): the
+	// Wiener and self-guided filters per restoration unit and 64-row
+	// stripe, reading the CDEF output inside the stripe and the deblocked
+	// picture (t.cdefY/U/V, upscaled likewise) for the rows around it.
+
+	def av1LrActive(t Av1Tile) bool {
+		let h = t.hdr
+		return false unless t.seq.restoration
+		return h.lrType[0] != 0 || (t.layout != 0 && (h.lrType[1] != 0 || h.lrType[2] != 0))
+	}
+
+	// Keeps the deblocked planes for loop restoration when CDEF did not.
+	def av1KeepDeblocked(t Av1Tile) {
+		let f = t.cur
+		t.cdefY.len(f.y.len()) when t.cdefY.len() != f.y.len()
+		av1CopyPlane(t.cdefY, f.y)
+		return when t.layout == 0
+		if t.cdefU.len() != f.u.len() {
+			t.cdefU.len(f.u.len())
+			t.cdefV.len(f.v.len())
+		}
+		av1CopyPlane(t.cdefU, f.u)
+		av1CopyPlane(t.cdefV, f.v)
+	}
+
+	def av1UpscaleX0(inW int, outW int, step int) int {
+		let err = outW * step - (inW << 14)
+		let x0 = (-((outW - inW) << 13) + (outW >> 1)) / outW + 128 - (err / 2)
+		return x0 & 0x3FFF
+	}
+
+	// Upscales rows from..<to of `p` from inW to dstW samples in place,
+	// reading up to srcW (the decoded width) at the right edge.
+	def av1Resize(p uint16[], stride int, from int, to int, inW int, srcW int, dstW int, maxv int, line uint16[]) {
+		let step = ((inW << 14) + (dstW >> 1)) / dstW
+		let x0 = av1UpscaleX0(inW, dstW, step)
+		for let y = from; y < to; y++ {
+			let o = y * stride
+			for let x = 0; x < srcW; x++ {
+				line[x] = p[o + x]
+			}
+			let mx = x0
+			let sx = -1
+			for let x = 0; x < dstW; x++ {
+				let f = (mx >> 8) * 8
+				let s = 0
+				for let k = 0; k < 8; k++ {
+					s += av1ResizeFilter[f + k] * int(line[av1ClipI(sx - 3 + k, 0, srcW - 1)])
+				}
+				p[o + x] = uint16(av1ClipI((-s + 64) >> 7, 0, maxv))
+				mx += step
+				sx += mx >> 14
+				mx = mx & 0x3FFF
+			}
+		}
+	}
+
+	// Superres: upscales the frame (and the kept deblocked planes) to the
+	// upscaled width, in bands of rows.
+	def av1SuperRes(t Av1Tile) {
+		let h = t.hdr
+		return when h.width == h.upscaledWidth
+		let f = t.cur
+		let maxv = (1 << t.bitDepth) - 1
+		let rows = (h.height + 7) & ~7
+		let lr = av1LrActive(t)
+		av1ResizePlane(t, f.y, f.stride, rows, h.width, t.bw * 4, h.upscaledWidth, maxv)
+		av1ResizePlane(t, t.cdefY, f.stride, rows, h.width, t.bw * 4, h.upscaledWidth, maxv) when lr
+		return when t.layout == 0
+		let crows = rows >> t.ssVer
+		let sw = (4 * t.bw + t.ssHor) >> t.ssHor
+		let dw = (h.upscaledWidth + t.ssHor) >> t.ssHor
+		let cw = (h.width + t.ssHor) >> t.ssHor
+		av1ResizePlane(t, f.u, f.cstride, crows, cw, sw, dw, maxv)
+		av1ResizePlane(t, f.v, f.cstride, crows, cw, sw, dw, maxv)
+		if lr {
+			av1ResizePlane(t, t.cdefU, f.cstride, crows, cw, sw, dw, maxv)
+			av1ResizePlane(t, t.cdefV, f.cstride, crows, cw, sw, dw, maxv)
+		}
+	}
+
+	def av1ResizePlane(t Av1Tile, p uint16[], stride int, rows int, inW int, srcW int, dstW int, maxv int) {
+		let bands = av1BandCount(rows / 4)
+		for let b = 0; b < bands; b++ {
+			t.scratch[b].line.len(stride) when t.scratch[b].line.len() < stride
+		}
+		if bands == 1 {
+			av1Resize(p, stride, 0, rows, inW, srcW, dstW, maxv, t.scratch[0].line)
+			return
+		}
+		let done = new channel<bool>(size = bands)
+		for let b = 0; b < bands; b++ {
+			async av1ResizeTask(p, stride, rows * b / bands, rows * (b + 1) / bands, inW, srcW, dstW, maxv, t.scratch[b].line, done)
+		}
+		for let b = 0; b < bands; b++ {
+			<-done
+		}
+	}
+
+	// Loop restoration of every plane with a restoration type.
+	def av1LoopRestoration(t Av1Tile) {
+		return unless av1LrActive(t)
+		let h = t.hdr
+		let f = t.cur
+		for let p = 0; p < 3; p++ {
+			continue when h.lrType[p] == 0
+			continue when p > 0 && t.layout == 0
+			let pix = av1PlaneOf(f, p)
+			let deb = p == 0 ?? (t.cdefY, p == 1 ?? (t.cdefU, t.cdefV))
+			let stride = p == 0 ?? (f.stride, f.cstride)
+			// The CDEF output the filters read.
+			t.lrSrc.len(pix.len()) when t.lrSrc.len() < pix.len()
+			let src = t.lrSrc
+			av1CopyPlane(src, pix)
+			av1LrPlane(t, p, pix, src, deb, stride)
+		}
+	}
+
+	// The stripes of plane `p`, in bands on tasks.
+	def av1LrPlane(t Av1Tile, p int, dst uint16[], src uint16[], deb uint16[], stride int) {
+		let sy = p > 0 ?? (t.ssVer, 0)
+		let ph = (t.hdr.height + sy) >> sy
+		let stripes = (ph + (8 >> sy) + (64 >> sy) - 1) / (64 >> sy)
+		let bands = av1Min(av1BandCount(stripes * 16), stripes)
+		if bands <= 1 {
+			av1LrStripes(t, t.scratch[0], p, dst, src, deb, stride, 0, stripes)
+			return
+		}
+		let done = new channel<bool>(size = bands)
+		for let b = 0; b < bands; b++ {
+			async av1LrTask(t, t.scratch[b], p, dst, src, deb, stride, stripes * b / bands, stripes * (b + 1) / bands, done)
+		}
+		for let b = 0; b < bands; b++ {
+			<-done
+		}
+	}
+
+	// Loop restoration of stripes from..<to of plane `p` (stripe 0 is the
+	// 8 rows shorter first one).
+	def av1LrStripes(t Av1Tile, sc Av1Scratch, p int, dst uint16[], src uint16[], deb uint16[], stride int, from int, to int) {
+		let h = t.hdr
+		let sx = p > 0 ?? (t.ssHor, 0)
+		let sy = p > 0 ?? (t.ssVer, 0)
+		let pw = (h.upscaledWidth + sx) >> sx
+		let ph = (h.height + sy) >> sy
+		let lg = h.lrUnit[p > 0 ?? (1, 0)]
+		let unit = 1 << lg
+		let cols = t.lrW[p]
+		let rows = t.lrH[p]
+		let stripeH = 64 >> sy
+		let off = 8 >> sy
+		for let si = from; si < to; si++ {
+			let sy0 = si * stripeH - off
+			let y0 = sy0 < 0 ?? (0, sy0)
+			let y1 = av1Min(sy0 + stripeH, ph)
+			continue when y1 <= y0
+			let ur = av1Min(rows - 1, (y0 + off) >> lg)
+			for let uc = 0; uc < cols; uc++ {
+				let x0 = uc * unit
+				let x1 = uc == cols - 1 ?? (pw, av1Min(pw, x0 + unit))
+				continue when x1 <= x0
+				let u = t.lrUnits[t.lrBase[p] + ur * cols + uc]
+				continue when u.kind == av1Dav1dRestorationNone
+				av1LrFill(sc, src, deb, stride, x0, y0, x1 - x0, y1 - y0, sy0, sy0 + stripeH - 1, pw - 1, ph - 1)
+				if u.kind == av1Dav1dRestorationWiener {
+					av1Wiener(t, sc, dst, x0, y0, x1 - x0, y1 - y0, stride, u)
+				} else {
+					av1SelfGuided(t, sc, dst, src, x0, y0, x1 - x0, y1 - y0, stride, u)
+				}
+			}
+		}
+	}
+
+	// get_source_sample over the region grown by 3 on every side into
+	// sc.lrPad (row stride w + 6).
+	def av1LrFill(sc Av1Scratch, src uint16[], deb uint16[], stride int, x0 int, y0 int, w int, h int, stripeStart int, stripeEnd int, endX int, endY int) {
+		let pw = w + 6
+		sc.lrPad.len(pw * (h + 6)) when sc.lrPad.len() < pw * (h + 6)
+		let pad = sc.lrPad
+		for let r = 0; r < h + 6; r++ {
+			let y = av1ClipI(y0 + r - 3, 0, endY)
+			let plane = src
+			if y < stripeStart {
+				y = av1Max(stripeStart - 2, y)
+				plane = deb
+			} else if y > stripeEnd {
+				y = av1Min(stripeEnd + 2, y)
+				plane = deb
+			}
+			let o = y * stride
+			for let c = 0; c < pw; c++ {
+				pad[r * pw + c] = int32(int(plane[o + av1ClipI(x0 + c - 3, 0, endX)]))
+			}
+		}
+	}
+
+	// wiener_filter (7.17.4) of the region from sc.lrPad, eight columns
+	// per vector.
+	def av1Wiener(t Av1Tile, sc Av1Scratch, dst uint16[], x0 int, y0 int, w int, h int, stride int, u Av1LrUnit) {
+		let bd = t.bitDepth
+		let r0 = bd == 12 ?? (5, 3)
+		let r1 = bd == 12 ?? (9, 11)
+		let offset = 1 << (bd + 7 - r0 - 1)
+		let limit = (1 << (bd + 1 + 7 - r0)) - 1
+		let maxv = (1 << bd) - 1
+		let f0 = u.filterH[0]
+		let f1 = u.filterH[1]
+		let f2 = u.filterH[2]
+		let f3 = 128 - 2 * (f0 + f1 + f2)
+		let g0 = u.filterV[0]
+		let g1 = u.filterV[1]
+		let g2 = u.filterV[2]
+		let g3 = 128 - 2 * (g0 + g1 + g2)
+		let pad = sc.lrPad
+		let pw = w + 6
+		sc.lrMid.len(w * (h + 6)) when sc.lrMid.len() < w * (h + 6)
+		let mid = sc.lrMid
+		let hv0 = simd.splat8<int32>(int32(f0))
+		let hv1 = simd.splat8<int32>(int32(f1))
+		let hv2 = simd.splat8<int32>(int32(f2))
+		let hv3 = simd.splat8<int32>(int32(f3))
+		let vv0 = simd.splat8<int32>(int32(g0))
+		let vv1 = simd.splat8<int32>(int32(g1))
+		let vv2 = simd.splat8<int32>(int32(g2))
+		let vv3 = simd.splat8<int32>(int32(g3))
+		let hr = simd.splat8<int32>(int32(1 << (r0 - 1)))
+		let vr = simd.splat8<int32>(int32(1 << (r1 - 1)))
+		let mlo = simd.splat8<int32>(int32(-offset))
+		let mhi = simd.splat8<int32>(int32(limit - offset))
+		let lo = simd.splat8<int32>(int32(0))
+		let hi = simd.splat8<int32>(int32(maxv))
+		let wide = w & ~7
+		for let r = 0; r < h + 6; r++ {
+			let b = r * pw
+			for let c = 0; c < wide; c += 8 {
+				let q = b + c
+				let acc = hv0 * (simd.load8<int32>(pad, q) + simd.load8<int32>(pad, q + 6))
+				acc += hv1 * (simd.load8<int32>(pad, q + 1) + simd.load8<int32>(pad, q + 5))
+				acc += hv2 * (simd.load8<int32>(pad, q + 2) + simd.load8<int32>(pad, q + 4))
+				acc += hv3 * simd.load8<int32>(pad, q + 3)
+				simd.store8<int32>(mid, r * w + c, simd.clamp((acc + hr) >> r0, mlo, mhi))
+			}
+			for let c = wide; c < w; c++ {
+				let q = b + c
+				let sum = f0 * (int(pad[q]) + int(pad[q + 6])) + f1 * (int(pad[q + 1]) + int(pad[q + 5])) + f2 * (int(pad[q + 2]) + int(pad[q + 4])) + f3 * int(pad[q + 3])
+				mid[r * w + c] = int32(av1ClipI((sum + (1 << (r0 - 1))) >> r0, -offset, limit - offset))
+			}
+		}
+		for let r = 0; r < h; r++ {
+			let o = (y0 + r) * stride + x0
+			for let c = 0; c < wide; c += 8 {
+				let q = r * w + c
+				let acc = vv0 * (simd.load8<int32>(mid, q) + simd.load8<int32>(mid, q + 6 * w))
+				acc += vv1 * (simd.load8<int32>(mid, q + w) + simd.load8<int32>(mid, q + 5 * w))
+				acc += vv2 * (simd.load8<int32>(mid, q + 2 * w) + simd.load8<int32>(mid, q + 4 * w))
+				acc += vv3 * simd.load8<int32>(mid, q + 3 * w)
+				simd.store8<uint16>(dst, o + c, simd.convert<int32, uint16>(simd.clamp((acc + vr) >> r1, lo, hi)))
+			}
+			for let c = wide; c < w; c++ {
+				let q = r * w + c
+				let sum = g0 * (int(mid[q]) + int(mid[q + 6 * w])) + g1 * (int(mid[q + w]) + int(mid[q + 5 * w])) + g2 * (int(mid[q + 2 * w]) + int(mid[q + 4 * w])) + g3 * int(mid[q + 3 * w])
+				dst[o + c] = uint16(av1ClipI((sum + (1 << (r1 - 1))) >> r1, 0, maxv))
+			}
+		}
+	}
+
+	// box_filter (7.17.3) pass `pass` with strength `s` into flt (w x h).
+	def av1BoxFilter(t Av1Tile, sc Av1Scratch, src uint16[], stride int, x0 int, y0 int, w int, h int, r int, s int, pass int, flt int[]) {
+		let bd = t.bitDepth
+		let pad = sc.lrPad
+		let pw = w + 6
+		let n = (2 * r + 1) * (2 * r + 1)
+		let oneOverN = ((1 << 12) + (n >> 1)) / n
+		let aw = w + 2
+		sc.lrA.len(aw * (h + 2)) when sc.lrA.len() < aw * (h + 2)
+		let aa = sc.lrA
+		sc.lrB.len(aw * (h + 2)) when sc.lrB.len() < aw * (h + 2)
+		let bb = sc.lrB
+		for let i = -1; i < h + 1; i++ {
+			for let j = -1; j < w + 1; j++ {
+				let a = 0
+				let b = 0
+				for let dy = -r; dy <= r; dy++ {
+					let row = (i + dy + 3) * pw + j + 3
+					for let dx = -r; dx <= r; dx++ {
+						let c = int(pad[row + dx])
+						a += c * c
+						b += c
+					}
+				}
+				a = (a + (1 << (2 * (bd - 8) - 1))) >> (2 * (bd - 8)) when bd > 8
+				let d = bd > 8 ?? ((b + (1 << (bd - 9))) >> (bd - 8), b)
+				let pv = a * n - d * d
+				pv = 0 when pv < 0
+				let z = (pv * s + (1 << 19)) >> 20
+				let a2 = 0
+				if z >= 255 {
+					a2 = 256
+				} else if z == 0 {
+					a2 = 1
+				} else {
+					a2 = ((z << 8) + (z >> 1)) / (z + 1)
+				}
+				let b2 = ((1 << 8) - a2) * b * oneOverN
+				aa[(i + 1) * aw + j + 1] = a2
+				bb[(i + 1) * aw + j + 1] = (b2 + (1 << 11)) >> 12
+			}
+		}
+		for let i = 0; i < h; i++ {
+			let shift = (pass == 0 && ((y0 + i) & 1) == 1) ?? (4, 5)
+			for let j = 0; j < w; j++ {
+				let a = 0
+				let b = 0
+				for let dy = -1; dy <= 1; dy++ {
+					for let dx = -1; dx <= 1; dx++ {
+						let wt = 0
+						if pass == 0 {
+							wt = dx == 0 ?? (6, 5) when ((y0 + i + dy) & 1) == 1
+						} else {
+							wt = (dx == 0 || dy == 0) ?? (4, 3)
+						}
+						let k = (i + 1 + dy) * aw + j + 1 + dx
+						a += wt * aa[k]
+						b += wt * bb[k]
+					}
+				}
+				let v = a * int(src[(y0 + i) * stride + x0 + j]) + b
+				let sh = 8 + shift - 4
+				flt[i * w + j] = (v + (1 << (sh - 1))) >> sh
+			}
+		}
+	}
+
+	// self_guided_filter (7.17.3) of the region.
+	def av1SelfGuided(t Av1Tile, sc Av1Scratch, dst uint16[], src uint16[], x0 int, y0 int, w int, h int, stride int, u Av1LrUnit) {
+		let s0 = av1SgrParams[u.sgrIdx * 2]
+		let s1 = av1SgrParams[u.sgrIdx * 2 + 1]
+		sc.lrF0.len(w * h) when sc.lrF0.len() < w * h
+		let f0 = sc.lrF0
+		sc.lrF1.len(w * h) when sc.lrF1.len() < w * h
+		let f1 = sc.lrF1
+		av1BoxFilter(t, sc, src, stride, x0, y0, w, h, 2, s0, 0, f0) when s0 != 0
+		av1BoxFilter(t, sc, src, stride, x0, y0, w, h, 1, s1, 1, f1) when s1 != 0
+		let w0 = u.sgrWeights[0]
+		let w1 = u.sgrWeights[1]
+		let w2 = 128 - w0 - w1
+		let maxv = (1 << t.bitDepth) - 1
+		for let i = 0; i < h; i++ {
+			for let j = 0; j < w; j++ {
+				let o = (y0 + i) * stride + x0 + j
+				let uu = int(src[o]) << 4
+				let v = w1 * uu
+				v += s0 != 0 ?? (w0 * f0[i * w + j], w0 * uu)
+				v += s1 != 0 ?? (w2 * f1[i * w + j], w2 * uu)
+				dst[o] = uint16(av1ClipI((v + (1 << 10)) >> 11, 0, maxv))
+			}
+		}
+	}
+}

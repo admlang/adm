@@ -1,0 +1,961 @@
+partial module std.gfx.processing.analysis {
+	use (
+		std.bytes::(Endian)
+		std.gfx::(Raster)
+		std.math::(*)
+		std.math.geom::(Transform2D)
+		std.simd
+		std.gfx.processing.analysis.keypoints::*
+		std.gfx.processing.analysis.hashing::*
+	)
+
+	// One distinctive spot of an image: a corner that is found again after
+	// the image is scaled, rotated, cropped or recoloured.
+	struct Keypoint {
+		// Position in the source image's pixels.
+		x        float32
+		y        float32
+		// Diameter in source pixels of the patch the descriptor describes; it
+		// grows with the pyramid level the corner was found on.
+		size     float32
+		// Dominant orientation in radians, from the patch's intensity
+		// centroid; the descriptor is taken along it, which makes it
+		// rotation-proof.
+		angle    float32
+		// Corner strength (Harris); higher is more distinctive.
+		response float32
+	}
+
+	// Features are the keypoints of an image with a 256-bit descriptor each
+	// (ORB: FAST corners on an image pyramid, oriented BRIEF), for matching
+	// images that differ in size, crop, rotation, mirroring, colour or small
+	// edits such as watermarks. `compare` matches two sets.
+	type Features {
+		// Size of the image they came from.
+		width       int
+		height      int
+		keypoints   Keypoint[]
+		// 32 bytes per keypoint, in keypoint order. Bits 0-127 compare point
+		// pairs of the patch, bits 128-255 the same pairs mirrored, so a
+		// mirrored image's descriptor is this one with its halves swapped.
+		descriptors byte[]
+
+		// The number of keypoints.
+		def len() int {
+			return keypoints.len()
+		}
+
+		// The 32-byte descriptor of keypoint `i`.
+		def descriptor(i int) byte[] {
+			return descriptors[i * 32:(i + 1) * 32]
+		}
+
+		// A compact form to store, which `parseFeatures` reads back: "ADMF",
+		// a version byte, width, height and count as little-endian uint32,
+		// five float32 per keypoint, then the descriptors.
+		def bytes() byte[] {
+			let out = "ADMF".bytes()
+			out.push(byte(1))
+			for let (_, v) in [width, height, keypoints.len()] {
+				for let (_, b) in uint32(v).bytes() {
+					out.push(b)
+				}
+			}
+			for let (_, k) in keypoints {
+				for let (_, v) in [k.x, k.y, k.size, k.angle, k.response] {
+					for let (_, b) in v.bytes() {
+						out.push(b)
+					}
+				}
+			}
+			for let (_, b) in descriptors {
+				out.push(b)
+			}
+			return out
+		}
+
+		// compare matches these features against another set: nearest
+		// descriptors (with a ratio test), then the largest group of pairs
+		// one similarity transform explains (RANSAC, refined by least
+		// squares). Mirrored copies are tried too, through the descriptors'
+		// mirrored halves.
+		def compare(other Features) Match {
+			let noMatch = Match{score: 0.0, inliers: 0, transform: new Transform2D()}
+			return noMatch when len() == 0 || other.len() == 0
+			let flipped = mirroredDescriptors(other.descriptors, other.len())
+			let straight = fitMatches(self, other, other.descriptors, false)
+			let mirrored = fitMatches(self, other, flipped, true)
+			let best = mirrored.inliers > straight.inliers ?? (mirrored, straight)
+			return noMatch when best.inliers < minInliers
+			// Only keypoints that land inside the other image can match, so a
+			// crop scores on the part the two share.
+			let t = best.transform
+			let det = t.a * t.d - t.b * t.c
+			return noMatch when det.abs() < 1e-12
+			let inA = 0
+			for let (_, k) in keypoints {
+				let x = t.a * float(k.x) + t.c * float(k.y) + t.tx
+				let y = t.b * float(k.x) + t.d * float(k.y) + t.ty
+				inA++ when x >= 0.0 && y >= 0.0 && x < float(other.width) && y < float(other.height)
+			}
+			let inB = 0
+			for let (_, k) in other.keypoints {
+				let dx = float(k.x) - t.tx
+				let dy = float(k.y) - t.ty
+				let x = (t.d * dx - t.c * dy) / det
+				let y = (-t.b * dx + t.a * dy) / det
+				inB++ when x >= 0.0 && y >= 0.0 && x < float(width) && y < float(height)
+			}
+			let shared = inA.min(inB).max(best.inliers)
+			best.score = (float64(best.inliers) / float64(shared)).min(float64(1))
+			return best
+		}
+	}
+
+	// How well two feature sets match.
+	struct Match {
+		// 0.0-1.0: the share of the keypoints in the part both images show
+		// (the fewer of the two sides) that agree on one geometry; 0.0 below
+		// `minInliers` agreeing pairs, which chance alone can produce.
+		score     float64
+		// Matched pairs that fit `transform`.
+		inliers   int
+		// Maps points of the first image onto the second: scale, rotation,
+		// shift and, for a mirrored copy, a reflection. The identity when
+		// there is no match.
+		transform Transform2D
+	}
+
+	// features finds up to `limit` keypoints and their descriptors, spread
+	// over the image and its pyramid levels. An empty image has none.
+	def features(target Raster, limit int = 500) Features {
+		let w = int(target.size().width)
+		let h = int(target.size().height)
+		let out = new Features()
+		out.width = w
+		out.height = h
+		return out when w == 0 || h == 0 || limit <= 0
+
+		let longest = w.max(h)
+		let bw = w
+		let bh = h
+		if longest > featureSide {
+			bw = (w * featureSide / longest).max(1)
+			bh = (h * featureSide / longest).max(1)
+		}
+		let grid = lumaGrid(target, bw, bh)
+		let base float32[]
+		base.len(bw * bh)
+		for let i = 0; i < bw * bh; i++ {
+			base[i] = float32(grid[i])
+		}
+
+		// Per-level quotas: a geometric share, as ORB splits them.
+		let factor = 1.0 / pyramidScale
+		let levels = 0
+		let lw int[]
+		let lh int[]
+		let s = 1.0
+		for let l = 0; l < pyramidLevels; l++ {
+			let cw = int(float(bw) / s + 0.5)
+			let ch = int(float(bh) / s + 0.5)
+			break when cw < 2 * featureBorder + 8 || ch < 2 * featureBorder + 8
+			lw.push(cw)
+			lh.push(ch)
+			levels++
+			s *= pyramidScale
+		}
+		return out when levels == 0
+		let quotas int[]
+		let first = float(limit) * (1.0 - factor) / (1.0 - factor ** float(levels))
+		let assigned = 0
+		for let l = 0; l < levels; l++ {
+			let q = l == levels - 1 ?? (limit - assigned, int(first * factor ** float(l) + 0.5))
+			q = q.max(0)
+			quotas.push(q)
+			assigned += q
+		}
+
+		let pattern = briefPattern()
+		let results FeatureLevel[]
+		for let l = 0; l < levels; l++ {
+			let r = new FeatureLevel()
+			r.level = l
+			r.width = lw[l]
+			r.height = lh[l]
+			r.quota = quotas[l]
+			r.scaleX = float(w) / float(lw[l])
+			r.scaleY = float(h) / float(lh[l])
+			results.push(r)
+		}
+		let done = new channel<bool>(size = levels)
+		for let l = 0; l < levels; l++ {
+			async featureLevelTask(results[l], base, bw, bh, pattern, done)
+		}
+		for let l = 0; l < levels; l++ {
+			<-done
+		}
+		for let (_, r) in results {
+			for let (_, k) in r.keypoints {
+				out.keypoints.push(k)
+			}
+			for let (_, b) in r.descriptors {
+				out.descriptors.push(b)
+			}
+		}
+		return out
+	}
+
+	// parseFeatures reads what `Features.bytes` wrote. Fails when the data
+	// is not in that form or is cut short.
+	def parseFeatures(data byte[]) !Features {
+		expects {
+			assert data.len() >= 17 && string(data[0:4]) == "ADMF" && data[4] == byte(1) onerror fail "not a features record"
+		}
+		let w = int(uint32(0).fromBytes(data[5:9], Endian.Little))
+		let h = int(uint32(0).fromBytes(data[9:13], Endian.Little))
+		let n = int(uint32(0).fromBytes(data[13:17], Endian.Little))
+		fail "features record cut short" when data.len() != 17 + n * (20 + descriptorBytes)
+		let out = new Features()
+		out.width = w
+		out.height = h
+		let at = 17
+		for let i = 0; i < n; i++ {
+			let v float32[]
+			for let f = 0; f < 5; f++ {
+				v.push(float32(0.0).fromBytes(data[at:at + 4], Endian.Little))
+				at += 4
+			}
+			out.keypoints.push(Keypoint{x: v[0], y: v[1], size: v[2], angle: v[3], response: v[4]})
+		}
+		out.descriptors = data[at:at + n * descriptorBytes]
+		return out
+	}
+}
+
+internal partial module std.gfx.processing.analysis.keypoints {
+	use (
+		std.gfx.processing.analysis::*
+		std.bytes::(Endian)
+		std.gfx::(Raster)
+		std.math::(*)
+		std.math.geom::(Transform2D)
+		std.simd
+		std.gfx.processing.analysis.hashing::*
+	)
+
+	// Pairs that must agree on one geometry before `compare` scores above 0.
+	const minInliers = 12
+
+	// The longest side features are found on; larger images are shrunk first.
+	const featureSide = 1024
+
+	const pyramidLevels = 8
+
+	const pyramidScale = 1.2
+
+	const fastThreshold = float32(20)
+
+	// Keypoints keep this far from a level's edge: the orientation circle
+	// and the descriptor pattern stay inside.
+	const featureBorder = 16
+
+	const descriptorBytes = 32
+
+	// One pyramid level's work and results; each level runs as a task.
+	type FeatureLevel {
+		level       int
+		width       int
+		height      int
+		quota       int
+		scaleX      float
+		scaleY      float
+		keypoints   Keypoint[]
+		descriptors byte[]
+	}
+
+	async def featureLevelTask(r FeatureLevel, base float32[], bw int, bh int, pattern int[], done channel<bool>) {
+		detectLevel(r, base, bw, bh, pattern)
+		done <- true
+	}
+
+	def detectLevel(r FeatureLevel, base float32[], bw int, bh int, pattern int[]) {
+		let w = r.width
+		let h = r.height
+		let img = r.level == 0 ?? (base, resizeGrey(base, bw, bh, w, h))
+		let smooth = gaussianBlur(img, w, h)
+
+		// FAST corners, scored, then 3x3 non-maximum suppression.
+		let scores float32[]
+		scores.len(w * h)
+		let cx int[]
+		let cy int[]
+		fastCorners(img, w, h, scores, cx, cy)
+		let kx int[]
+		let ky int[]
+		let ks float32[]
+		for let i = 0; i < cx.len(); i++ {
+			let o = cy[i] * w + cx[i]
+			let v = scores[o]
+			let keep = v > scores[o - w - 1] && v > scores[o - w] && v > scores[o - w + 1] && v > scores[o - 1]
+			keep = keep && v >= scores[o + 1] && v >= scores[o + w - 1] && v >= scores[o + w] && v >= scores[o + w + 1]
+			if keep {
+				kx.push(cx[i])
+				ky.push(cy[i])
+				ks.push(v)
+			}
+		}
+		return when kx.len() == 0 || r.quota == 0
+
+		// The strongest by FAST score, ranked again by Harris response.
+		let order int[]
+		for let i = 0; i < kx.len(); i++ {
+			order.push(i)
+		}
+		order.sort((i int, j int) => ks[i] > ks[j] || (ks[i] == ks[j] && i < j))
+		let shortlist = order.len().min(r.quota * 4)
+		let hx int[]
+		let hy int[]
+		let hr float32[]
+		for let n = 0; n < shortlist; n++ {
+			let i = order[n]
+			hx.push(kx[i])
+			hy.push(ky[i])
+			hr.push(harris(img, w, kx[i], ky[i]))
+		}
+		let ranked int[]
+		for let i = 0; i < hx.len(); i++ {
+			ranked.push(i)
+		}
+		ranked.sort((i int, j int) => hr[i] > hr[j] || (hr[i] == hr[j] && i < j))
+
+		// Spread: a first pass caps each 32x32 cell, a second fills up.
+		let cellsX = (w + 31) / 32
+		let cellsY = (h + 31) / 32
+		let cells = cellsX * cellsY
+		let cap = ((2 * r.quota + cells - 1) / cells).max(1)
+		let used int[]
+		used.len(cells)
+		let taken bool[]
+		taken.len(ranked.len())
+		let chosen int[]
+		for let n = 0; n < ranked.len() && chosen.len() < r.quota; n++ {
+			let i = ranked[n]
+			let c = (hy[i] / 32) * cellsX + hx[i] / 32
+			continue when used[c] >= cap
+			used[c]++
+			taken[n] = true
+			chosen.push(i)
+		}
+		for let n = 0; n < ranked.len() && chosen.len() < r.quota; n++ {
+			continue when taken[n]
+			chosen.push(ranked[n])
+		}
+
+		for let (_, i) in chosen {
+			let angle = orientation(img, w, hx[i], hy[i])
+			r.keypoints.push(Keypoint{
+				x:        float32((float(hx[i]) + 0.5) * r.scaleX - 0.5),
+				y:        float32((float(hy[i]) + 0.5) * r.scaleY - 0.5),
+				size:     float32(31.0 * r.scaleX),
+				angle:    float32(angle),
+				response: hr[i],
+			})
+			describe(smooth, w, hx[i], hy[i], angle, pattern, r.descriptors)
+		}
+	}
+
+	// The level shrunk from the base image by area averaging: output rows
+	// sum their source rows eight lanes at a time, then the columns are
+	// binned.
+	def resizeGrey(src float32[], sw int, sh int, dw int, dh int) float32[] {
+		let out float32[]
+		out.len(dw * dh)
+		let acc float32[]
+		acc.len(sw)
+		let area = float(sw) * float(sh) / (float(dw) * float(dh))
+		let bins = areaBins(sw, dw)
+		for let j = 0; j < dh; j++ {
+			let y0 = float(j * sh) / float(dh)
+			let y1 = float((j + 1) * sh) / float(dh)
+			let yEnd = int(y1.ceil()).min(sh)
+			// The first source row stores, the rest add: no clearing pass.
+			let first = true
+			for let y = int(y0.floor()); y < yEnd; y++ {
+				let weight = float32(float(y + 1).min(y1) - float(y).max(y0))
+				continue when weight <= float32(0)
+				let row = y * sw
+				let wv = simd.splat8<float32>(weight)
+				let x = 0
+				if first {
+					for x + 8 <= sw {
+						simd.store8<float32>(acc, x, simd.load8<float32>(src, row + x) * wv)
+						x += 8
+					}
+					for x < sw {
+						acc[x] = src[row + x] * weight
+						x++
+					}
+					first = false
+					continue
+				}
+				for x + 8 <= sw {
+					simd.store8<float32>(acc, x, simd.load8<float32>(src, row + x).fma(wv, simd.load8<float32>(acc, x)))
+					x += 8
+				}
+				for x < sw {
+					acc[x] += src[row + x] * weight
+					x++
+				}
+			}
+			for let i = 0; i < dw; i++ {
+				let sum = 0.0
+				let at = bins.offset[i]
+				let x0 = bins.first[i]
+				for let k = 0; k < bins.count[i]; k++ {
+					sum += float(acc[x0 + k]) * float(bins.weights[at + k])
+				}
+				out[j * dw + i] = float32(sum / area)
+			}
+		}
+		return out
+	}
+
+	// A 7-tap Gaussian (sigma 2) both ways, eight pixels a lane, edges
+	// clamped: BRIEF compares smoothed pixels, so noise flips fewer bits.
+	def gaussianBlur(src float32[], w int, h int) float32[] {
+		let k float32[]
+		k.len(4)
+		let total = 0.0
+		for let i = -3; i <= 3; i++ {
+			total += E ** (-float(i * i) / 8.0)
+		}
+		for let i = 0; i < 4; i++ {
+			k[i] = float32(E ** (-float(i * i) / 8.0) / total)
+		}
+		// The kernel is symmetric: the centre, then the pairs at 1, 2, 3.
+		let k0 = simd.splat8<float32>(k[0])
+		let k1 = simd.splat8<float32>(k[1])
+		let k2 = simd.splat8<float32>(k[2])
+		let k3 = simd.splat8<float32>(k[3])
+		let tmp float32[]
+		tmp.len(w * h)
+		for let y = 0; y < h; y++ {
+			let row = y * w
+			let x = 0
+			for x < w {
+				if x >= 3 && x + 8 + 3 <= w {
+					let o = row + x
+					let acc = simd.load8<float32>(src, o) * k0
+					acc = (simd.load8<float32>(src, o - 1) + simd.load8<float32>(src, o + 1)).fma(k1, acc)
+					acc = (simd.load8<float32>(src, o - 2) + simd.load8<float32>(src, o + 2)).fma(k2, acc)
+					acc = (simd.load8<float32>(src, o - 3) + simd.load8<float32>(src, o + 3)).fma(k3, acc)
+					simd.store8<float32>(tmp, o, acc)
+					x += 8
+				} else {
+					let sum = src[row + x] * k[0]
+					for let t = 1; t < 4; t++ {
+						sum += (src[row + (x - t).max(0)] + src[row + (x + t).min(w - 1)]) * k[t]
+					}
+					tmp[row + x] = sum
+					x++
+				}
+			}
+		}
+		let out float32[]
+		out.len(w * h)
+		for let y = 0; y < h; y++ {
+			let row = y * w
+			// The rows of the taps, clamped at the edges.
+			let u1 = (y - 1).max(0) * w
+			let d1 = (y + 1).min(h - 1) * w
+			let u2 = (y - 2).max(0) * w
+			let d2 = (y + 2).min(h - 1) * w
+			let u3 = (y - 3).max(0) * w
+			let d3 = (y + 3).min(h - 1) * w
+			let x = 0
+			for x + 8 <= w {
+				let acc = simd.load8<float32>(tmp, row + x) * k0
+				acc = (simd.load8<float32>(tmp, u1 + x) + simd.load8<float32>(tmp, d1 + x)).fma(k1, acc)
+				acc = (simd.load8<float32>(tmp, u2 + x) + simd.load8<float32>(tmp, d2 + x)).fma(k2, acc)
+				acc = (simd.load8<float32>(tmp, u3 + x) + simd.load8<float32>(tmp, d3 + x)).fma(k3, acc)
+				simd.store8<float32>(out, row + x, acc)
+				x += 8
+			}
+			for x < w {
+				out[row + x] = tmp[row + x] * k[0] + (tmp[u1 + x] + tmp[d1 + x]) * k[1] + (tmp[u2 + x] + tmp[d2 + x]) * k[2] + (tmp[u3 + x] + tmp[d3 + x]) * k[3]
+				x++
+			}
+		}
+		return out
+	}
+
+	// FAST-9 corners inside the border: eight pixels at a time are first
+	// tested on the four compass points of the radius-3 circle (a run of
+	// nine of the sixteen covers two neighbouring ones), and only lanes that
+	// pass get the full test. Scores go into `scores`, positions into
+	// `cx`/`cy`.
+	def fastCorners(img float32[], w int, h int, scores float32[], cx int[], cy int[]) {
+		let circle = fastCircle(w)
+		let t = simd.splat8<float32>(fastThreshold)
+		let x1 = w - featureBorder
+		for let y = featureBorder; y < h - featureBorder; y++ {
+			let row = y * w
+			let x = featureBorder
+			for x + 8 <= x1 {
+				let o = row + x
+				let c = simd.load8<float32>(img, o)
+				let up = c + t
+				let down = c - t
+				let n = simd.load8<float32>(img, o - 3 * w)
+				let e = simd.load8<float32>(img, o + 3)
+				let s = simd.load8<float32>(img, o + 3 * w)
+				let wv = simd.load8<float32>(img, o - 3)
+				let bn = n.gt(up)
+				let be = e.gt(up)
+				let bs = s.gt(up)
+				let bw = wv.gt(up)
+				let dn = n.lt(down)
+				let de = e.lt(down)
+				let ds = s.lt(down)
+				let dw = wv.lt(down)
+				let pass = (bn & be) | (be & bs) | (bs & bw) | (bw & bn) | (dn & de) | (de & ds) | (ds & dw) | (dw & dn)
+				if !pass.any() {
+					x += 8
+					continue
+				}
+				// The full test for all eight: circle bits as exact float
+				// sums, then nine set bits in a row on the doubled mask.
+				let zero = simd.splat8<float32>(float32(0))
+				let brightBits = zero
+				let darkBits = zero
+				// The scores: summed excess over the threshold on each side.
+				let brightSum = zero
+				let darkSum = zero
+				for let i = 0; i < 16; i++ {
+					let p = simd.load8<float32>(img, o + circle[i])
+					let bit = simd.splat8<float32>(float32(1 << i))
+					brightBits = brightBits + p.gt(up).blend(bit, zero)
+					darkBits = darkBits + p.lt(down).blend(bit, zero)
+					brightSum = brightSum + (p - up).max(zero)
+					darkSum = darkSum + (down - p).max(zero)
+				}
+				let bm = simd.convert<float32, int32>(brightBits)
+				let dm = simd.convert<float32, int32>(darkBits)
+				bm = bm | (bm << 16)
+				dm = dm | (dm << 16)
+				let runB = bm
+				let runD = dm
+				for let k = 1; k < 9; k++ {
+					runB = runB & (bm >> k)
+					runD = runD & (dm >> k)
+				}
+				let none32 = simd.splat8<int32>(int32(0))
+				let brightLanes = runB.ne(none32).bits()
+				let lanes = brightLanes | runD.ne(none32).bits()
+				for lanes != uint64(0) {
+					let lane = int(lanes.trailingZeros())
+					lanes &= lanes - uint64(1)
+					let bright = (brightLanes >> uint64(lane)) & uint64(1) != uint64(0)
+					scores[o + lane] = bright ?? (brightSum.lane(lane), darkSum.lane(lane))
+					cx.push(x + lane)
+					cy.push(y)
+				}
+				x += 8
+			}
+			for x < x1 {
+				let v = fastScore(img, row + x, circle)
+				if v > float32(0) {
+					scores[row + x] = v
+					cx.push(x)
+					cy.push(y)
+				}
+				x++
+			}
+		}
+	}
+
+	// The offsets of the radius-3 Bresenham circle, clockwise from the top.
+	def fastCircle(w int) int[] {
+		let dx = int[0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1]
+		let dy = int[-3, -3, -2, -1, 0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3]
+		let out int[]
+		for let i = 0; i < 16; i++ {
+			out.push(dy[i] * w + dx[i])
+		}
+		return out
+	}
+
+	// The FAST score of the pixel at `o`: when nine contiguous circle
+	// pixels are all brighter or all darker than it by the threshold, the
+	// summed excess over the threshold of the circle's pixels on that side;
+	// 0 otherwise.
+	def fastScore(img float32[], o int, circle int[]) float32 {
+		let c = img[o]
+		let bright = 0
+		let dark = 0
+		let sb = float32(0)
+		let sd = float32(0)
+		for let i = 0; i < 16; i++ {
+			let p = img[o + circle[i]]
+			if p > c + fastThreshold {
+				bright |= 1 << i
+				sb += p - c - fastThreshold
+			} else if p < c - fastThreshold {
+				dark |= 1 << i
+				sd += c - p - fastThreshold
+			}
+		}
+		return sb when hasRun9(bright)
+		return sd when hasRun9(dark)
+		return float32(0)
+	}
+
+	// Whether the 16-bit circular mask holds nine set bits in a row.
+	def hasRun9(mask int) bool {
+		return false when mask == 0
+		let m = mask | (mask << 16)
+		let run = m
+		for let i = 1; i < 9; i++ {
+			run &= m >> i
+		}
+		return run != 0
+	}
+
+	// The Harris corner response over the 7x7 window around (x, y).
+	def harris(img float32[], w int, x int, y int) float32 {
+		let a = 0.0
+		let b = 0.0
+		let c = 0.0
+		for let dy = -3; dy <= 3; dy++ {
+			let row = (y + dy) * w + x
+			for let dx = -3; dx <= 3; dx++ {
+				let o = row + dx
+				let ix = float(img[o + 1] - img[o - 1])
+				let iy = float(img[o + w] - img[o - w])
+				a += ix * ix
+				b += iy * iy
+				c += ix * iy
+			}
+		}
+		return float32(a * b - c * c - 0.04 * (a + b) * (a + b))
+	}
+
+	// The angle from (x, y) to the intensity centroid of the radius-15
+	// disc around it.
+	def orientation(img float32[], w int, x int, y int) float {
+		let m10 = 0.0
+		let m01 = 0.0
+		for let v = -15; v <= 15; v++ {
+			let span = int(sqrt(float(225 - v * v)) + 0.5)
+			let row = (y + v) * w + x
+			for let u = -span; u <= span; u++ {
+				let p = float(img[row + u])
+				m10 += float(u) * p
+				m01 += float(v) * p
+			}
+		}
+		return atan2(m01, m10)
+	}
+
+	// Appends the 32-byte descriptor of the keypoint at (x, y): pattern
+	// pair k sets bit k when its first point is darker than its second,
+	// both rotated by `angle` and read from the smoothed level.
+	def describe(smooth float32[], w int, x int, y int, angle float, pattern int[], out byte[]) {
+		let ca = cos(angle)
+		let sa = sin(angle)
+		let o = y * w + x
+		let bits byte[]
+		bits.len(descriptorBytes)
+		for let k = 0; k < 256; k++ {
+			let px = float(pattern[k * 4])
+			let py = float(pattern[k * 4 + 1])
+			let qx = float(pattern[k * 4 + 2])
+			let qy = float(pattern[k * 4 + 3])
+			let p = smooth[o + int((px * sa + py * ca).round()) * w + int((px * ca - py * sa).round())]
+			let q = smooth[o + int((qx * sa + qy * ca).round()) * w + int((qx * ca - qy * sa).round())]
+			bits[k >> 3] = bits[k >> 3] | byte(1 << (k & 7)) when p < q
+		}
+		for let (_, b) in bits {
+			out.push(b)
+		}
+	}
+
+	// The 256 point pairs (px, py, qx, qy) the descriptor compares: 128
+	// pairs drawn around the centre (roughly Gaussian, sigma 6, inside
+	// radius 13, from a fixed seed), then the same pairs mirrored in y.
+	// Mirroring in y and rotating by the mirrored angle reads a mirrored
+	// patch the way the original reads the unmirrored one, which is what
+	// lets `compare` find mirrored copies by swapping descriptor halves.
+	def briefPattern() int[] {
+		let out int[]
+		let seed = uint32(0x9e3779b9)
+		for out.len() < 128 * 4 {
+			let v = 0.0
+			for let i = 0; i < 4; i++ {
+				seed = seed * uint32(1664525) + uint32(1013904223)
+				v += float(seed >> 8) / 16777216.0
+			}
+			// The sum of four uniforms: mean 2, variance 1/3.
+			let c = int(((v - 2.0) * sqrt(3.0) * 6.0).round())
+			continue when c < -13 || c > 13
+			out.push(c)
+			let n = out.len()
+			if n % 4 == 0 {
+				let px = out[n - 4]
+				let py = out[n - 3]
+				let qx = out[n - 2]
+				let qy = out[n - 1]
+				let bad = px * px + py * py > 169 || qx * qx + qy * qy > 169 || (px == qx && py == qy)
+				out.len(n - 4) when bad
+			}
+		}
+		for let k = 0; k < 128; k++ {
+			out.push(out[k * 4])
+			out.push(-out[k * 4 + 1])
+			out.push(out[k * 4 + 2])
+			out.push(-out[k * 4 + 3])
+		}
+		return out
+	}
+
+	// The descriptors of the mirrored image: each one's halves swapped.
+	def mirroredDescriptors(d byte[], n int) byte[] {
+		let out byte[]
+		out.len(d.len())
+		for let i = 0; i < n; i++ {
+			let o = i * descriptorBytes
+			for let k = 0; k < 16; k++ {
+				out[o + k] = d[o + k + 16]
+				out[o + k + 16] = d[o + k]
+			}
+		}
+		return out
+	}
+
+	// Nearest descriptors of `a` in `bd` (a's descriptors against b's, or
+	// b's mirrored ones), filtered by the ratio test, then the similarity
+	// transform most pairs agree on.
+	def fitMatches(a Features, b Features, bd byte[], mirror bool) Match {
+		let na = a.len()
+		let nb = b.len()
+		let best int[]
+		best.len(na)
+		let first int[]
+		first.len(na)
+		let second int[]
+		second.len(na)
+		let tasks = (na * nb / 32768).clamp(1, 16).min(na)
+		if tasks == 1 {
+			nearestDescriptors(a.descriptors, 0, na, bd, nb, best, first, second)
+		} else {
+			let done = new channel<bool>(size = tasks)
+			for let t = 0; t < tasks; t++ {
+				async nearestTask(a.descriptors, na * t / tasks, na * (t + 1) / tasks, bd, nb, best, first, second, done)
+			}
+			for let t = 0; t < tasks; t++ {
+				<-done
+			}
+		}
+
+		// Candidate pairs in a's order: close enough and clearly nearer than
+		// the runner-up.
+		let pa int[]
+		let pb int[]
+		for let i = 0; i < na; i++ {
+			continue when first[i] > 64
+			continue when nb > 1 && float(first[i]) >= 0.8 * float(second[i])
+			pa.push(i)
+			pb.push(best[i])
+		}
+		return fitSimilarity(a, b, pa, pb, mirror)
+	}
+
+	async def nearestTask(ad byte[], from int, to int, bd byte[], nb int, best int[], first int[], second int[], done channel<bool>) {
+		nearestDescriptors(ad, from, to, bd, nb, best, first, second)
+		done <- true
+	}
+
+	// For descriptors `from` up to `to` of `ad`: the index of the nearest in
+	// `bd`, its distance and the runner-up's (in bits), 32 bytes compared
+	// at once.
+	def nearestDescriptors(ad byte[], from int, to int, bd byte[], nb int, best int[], first int[], second int[]) {
+		for let i = from; i < to; i++ {
+			let q = simd.load32<byte>(ad, i * descriptorBytes)
+			let d1 = 1000
+			let d2 = 1000
+			let at = -1
+			for let j = 0; j < nb; j++ {
+				let x = q ^ simd.load32<byte>(bd, j * descriptorBytes)
+				let d = int(simd.convert<byte, uint16>(x.popcount()).sum())
+				if d < d1 {
+					d2 = d1
+					d1 = d
+					at = j
+				} else if d < d2 {
+					d2 = d
+				}
+			}
+			best[i] = at
+			first[i] = d1
+			second[i] = d2
+		}
+	}
+
+	// RANSAC over two-pair samples for q = A p + B (A a complex scale and
+	// rotation; p mirrored first when `mirror`), from a fixed seed, then a
+	// least-squares refit on the inliers. A pair must also turn its
+	// keypoint's angle by A's rotation.
+	def fitSimilarity(a Features, b Features, pa int[], pb int[], mirror bool) Match {
+		let noMatch = Match{score: 0.0, inliers: 0, transform: new Transform2D()}
+		let n = pa.len()
+		return noMatch when n < 2
+		let sx float[]
+		let sy float[]
+		let tx float[]
+		let ty float[]
+		let sang float[]
+		let tang float[]
+		// log(size of b's keypoint / size of a's).
+		let lsize float[]
+		for let k = 0; k < n; k++ {
+			let ka = a.keypoints[pa[k]]
+			let kb = b.keypoints[pb[k]]
+			sx.push(float(ka.x))
+			sy.push(mirror ?? (-float(ka.y), float(ka.y)))
+			sang.push(mirror ?? (-float(ka.angle), float(ka.angle)))
+			tx.push(float(kb.x))
+			ty.push(float(kb.y))
+			tang.push(float(kb.angle))
+			lsize.push(ln(float(kb.size) / float(ka.size)))
+		}
+		let tol = (0.01 * sqrt(float(b.width * b.width + b.height * b.height))).max(3.0)
+		let tol2 = tol * tol
+
+		let bestCount = 0
+		let bestRe = 1.0
+		let bestIm = 0.0
+		let bestX = 0.0
+		let bestY = 0.0
+		let seed = uint32(12345)
+		let iterations = n < 3 ?? (1, 400)
+		for let it = 0; it < iterations; it++ {
+			seed = seed * uint32(1664525) + uint32(1013904223)
+			let i = int(seed >> 8) % n
+			seed = seed * uint32(1664525) + uint32(1013904223)
+			let j = int(seed >> 8) % n
+			continue when i == j
+			let dpx = sx[j] - sx[i]
+			let dpy = sy[j] - sy[i]
+			let dp = dpx * dpx + dpy * dpy
+			continue when dp < 1.0
+			let dqx = tx[j] - tx[i]
+			let dqy = ty[j] - ty[i]
+			// A = dq / dp as complex numbers.
+			let re = (dqx * dpx + dqy * dpy) / dp
+			let im = (dqy * dpx - dqx * dpy) / dp
+			let scale2 = re * re + im * im
+			continue when scale2 < 1.0 / 256.0 || scale2 > 256.0
+			let bx = tx[i] - (re * sx[i] - im * sy[i])
+			let by = ty[i] - (im * sx[i] + re * sy[i])
+			let count = countInliers(sx, sy, tx, ty, sang, tang, lsize, re, im, bx, by, tol2)
+			if count > bestCount {
+				bestCount = count
+				bestRe = re
+				bestIm = im
+				bestX = bx
+				bestY = by
+			}
+		}
+		return noMatch when bestCount < 2
+
+		// Least squares on the inliers, A = sum (q - q̄) conj(p - p̄) /
+		// sum |p - p̄|², then the inliers again under it, three rounds: a
+		// two-pair sample leaves a small rotation or scale error that the
+		// tolerance still admits across a small image.
+		let re = bestRe
+		let im = bestIm
+		let bx = bestX
+		let by = bestY
+		let count = bestCount
+		for let round = 0; round < 3; round++ {
+			let rot = atan2(im, re)
+			let lscale = 0.5 * ln(re * re + im * im)
+			let mx = 0.0
+			let my = 0.0
+			let nx = 0.0
+			let ny = 0.0
+			let m = 0
+			let inlier bool[]
+			inlier.len(n)
+			for let k = 0; k < n; k++ {
+				if fits(sx[k], sy[k], tx[k], ty[k], sang[k], tang[k], lsize[k], re, im, bx, by, tol2, rot, lscale) {
+					inlier[k] = true
+					mx += sx[k]
+					my += sy[k]
+					nx += tx[k]
+					ny += ty[k]
+					m++
+				}
+			}
+			break when m < 2
+			mx /= float(m)
+			my /= float(m)
+			nx /= float(m)
+			ny /= float(m)
+			let numRe = 0.0
+			let numIm = 0.0
+			let den = 0.0
+			for let k = 0; k < n; k++ {
+				continue when !inlier[k]
+				let px = sx[k] - mx
+				let py = sy[k] - my
+				let qx = tx[k] - nx
+				let qy = ty[k] - ny
+				numRe += qx * px + qy * py
+				numIm += qy * px - qx * py
+				den += px * px + py * py
+			}
+			break when den <= 0.0
+			let fitRe = numRe / den
+			let fitIm = numIm / den
+			let fitX = nx - (fitRe * mx - fitIm * my)
+			let fitY = ny - (fitIm * mx + fitRe * my)
+			let fitCount = countInliers(sx, sy, tx, ty, sang, tang, lsize, fitRe, fitIm, fitX, fitY, tol2)
+			// A refit that loses most of the support went wrong; keep the last.
+			break when fitCount * 2 < count
+			re = fitRe
+			im = fitIm
+			bx = fitX
+			by = fitY
+			count = fitCount
+		}
+
+		// q = A p + B on complex numbers; p = (x, -y) when mirrored.
+		let t = mirror ?? (new Transform2D(a = re, b = im, c = im, d = -re, tx = bx, ty = by), new Transform2D(a = re, b = im, c = -im, d = re, tx = bx, ty = by))
+		return Match{score: 0.0, inliers: count, transform: t}
+	}
+
+	def countInliers(sx float[], sy float[], tx float[], ty float[], sang float[], tang float[], lsize float[], re float, im float, bx float, by float, tol2 float) int {
+		let rot = atan2(im, re)
+		let lscale = 0.5 * ln(re * re + im * im)
+		let count = 0
+		for let k = 0; k < sx.len(); k++ {
+			count++ when fits(sx[k], sy[k], tx[k], ty[k], sang[k], tang[k], lsize[k], re, im, bx, by, tol2, rot, lscale)
+		}
+		return count
+	}
+
+	// Whether the pair lands within the tolerance, its keypoint angles
+	// differ by the rotation (to 30 degrees) and its keypoint sizes by the
+	// scale (to a factor of 1.5, about two pyramid levels).
+	def fits(px float, py float, qx float, qy float, pa float, qa float, lsize float, re float, im float, bx float, by float, tol2 float, rot float, lscale float) bool {
+		let ex = re * px - im * py + bx - qx
+		let ey = im * px + re * py + by - qy
+		return false when ex * ex + ey * ey > tol2
+		return false when (lsize - lscale).abs() > 0.4054651081081644
+		let turn = qa - pa - rot
+		turn -= 2.0 * π * (turn / (2.0 * π)).round()
+		return turn.abs() < π / 6.0
+	}
+}
