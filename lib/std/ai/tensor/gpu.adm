@@ -1,0 +1,470 @@
+internal std.ai partial module std.ai.tensor.gpu {
+	use (
+		std.gpu
+		std.simd
+		std.math
+		std.formats.ai::(TensorType)
+		std.ai.tensor::(Weights)
+	)
+
+	// A weight matrix copied to the GPU as stored: quantized blocks, or
+	// F32, F16 and BF16 values, read in place by the multiply kernels.
+	type DeviceWeights {
+		kind TensorType
+		rows int
+		cols int
+		data gpu.DeviceBuffer<byte>
+
+		def new(kind TensorType, rows int, cols int, data gpu.DeviceBuffer<byte>) {
+			self.kind = kind
+			self.rows = rows
+			self.cols = cols
+			self.data = data
+		}
+
+		// out[oo + r] = row r · x[xo:xo + cols] for every row.
+		// Fails with the driver's error when the launch does.
+		// x[xo:] must start on a multiple of 4 values.
+		def multiply(x gpu.DeviceBuffer<float32>, xo int, out gpu.DeviceBuffer<float32>, oo int) !none {
+			let split = warpsPerRow()
+			return multiplyRows(data, form(kind), x, xo, out, oo, rows, cols, split, rows * 32 * split)
+		}
+
+		// out[i] = act(gate row i · x) · (up row i · x) for every row, where
+		// this is the gate and act is GELU (tanh form) when `gelu`, else SiLU.
+		// `up` must have this shape and type.
+		// Fails with the driver's error when the launch does.
+		def multiplyGated(up DeviceWeights, x gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, gelu bool) !none {
+			let split = warpsPerRow()
+			return multiplyPair(data, up.data, form(kind), x, out, rows, cols, gelu ?? (1, 0), split, rows * 32 * split)
+		}
+
+		// Warps sharing each row: enough warps in all to keep every SM
+		// busy (about 8192), at most 8 and at most one per 256 values.
+		internal def warpsPerRow() int {
+			let split = 1
+			for split < 8 && rows * split * 2 <= 8192 && split * 2 * 256 <= cols {
+				split *= 2
+			}
+			return split
+		}
+
+		// Frees the device memory.
+		def dispose() {
+			data.dispose()
+		}
+	}
+
+	// Whether weights of `kind` can be multiplied on the GPU.
+	def onDevice(kind TensorType) bool {
+		return kind := TensorType.Q4_K || TensorType.Q6_K || TensorType.Q8_0 || TensorType.F32 || TensorType.F16 || TensorType.BF16
+	}
+
+	// Copies `w` to the GPU.
+	// Fails when its type has no GPU kernel or the device memory cannot be
+	// allocated.
+	def upload(w Weights) !DeviceWeights {
+		fail "tensor: {w.kind.name} weights have no GPU kernel" unless onDevice(w.kind)
+		return new DeviceWeights(w.kind, w.rows, w.cols, try gpu.upload(w.data))
+	}
+
+	// The storage form rowDot reads: 0 F32, 1 F16, 2 BF16, 3 Q4_K, 4 Q6_K, 5 Q8_0.
+	def form(kind TensorType) int {
+		match kind {
+			case TensorType.F16:
+				return 1
+			case TensorType.BF16:
+				return 2
+			case TensorType.Q4_K:
+				return 3
+			case TensorType.Q6_K:
+				return 4
+			case TensorType.Q8_0:
+				return 5
+			default:
+				return 0
+		}
+	}
+
+	// RoPE's inverse frequency of each of the first dims/2 pairs of a head,
+	// scale · base^(−2i/dims) / factors[i] (factors past its end count as
+	// 1), as the float32 pairs (hi, lo) whose sum holds it to float64
+	// precision; prepareHeads turns by position · (hi + lo).
+	def ropeTable(dims int, base float32, scale float32, factors float32[]) float32[] {
+		let out float32[]
+		let lnBase = math.ln(float(base))
+		for let i = 0; i < dims / 2; i++ {
+			let freq = simd.lane(simd.exp(simd.splat4<float64>(-2.0 * float64(i) / float64(dims) * float64(lnBase))), 0)
+			let inverse = float(scale) * float(freq)
+			inverse = inverse / float(factors[i]) when i < factors.len()
+			let hi = float32(inverse)
+			out.push(hi)
+			out.push(float32(inverse - float(hi)))
+		}
+		return out
+	}
+
+	// Helpers pasted into the kernels.
+
+	// The IEEE half at p[0..1], little-endian.
+	@kernelOnly
+	cuda def half(p byte[]) float32 {
+		float f;
+		unsigned short h = (unsigned short) (p[0] | (p[1] << 8));
+		asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(f): "h"(h));
+		return f;
+	}
+
+	// The sum of the 32 lanes' values, in every lane.
+	@kernelOnly
+	cuda def warpSum(v float32) float32 {
+		for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+		return v;
+	}
+
+	// The sum of a 256-thread block's values, in every thread; `shared`
+	// (`shared`) holds 8 floats of shared memory.
+	@kernelOnly
+	cuda def blockSum(v float32, shared float32[]) float32 {
+		v = warpSum(v);
+		__syncthreads();
+		if ((threadIdx.x & 31) == 0) shared[threadIdx.x >> 5] = v;
+		__syncthreads();
+		float s = 0.0f;
+		for (int k = 0; k < 8; k++) s += shared[k];
+		return s;
+	}
+
+	// This lane's share of row `row` of w (stored as `form`, see `form`)
+	// times x, over the 256-value spans part, part + split, ...: the shares
+	// of `split` warps' lanes add up to the dot product. Each lane takes 8
+	// values of every 256.
+	@kernelOnly
+	cuda def rowDot(w byte[], form int, row int, cols int, x float32[], lane int, part int, split int) float32 {
+		float acc = 0.0f;
+		if (form == 3) {
+			// Q4_K: 144-byte blocks of 256; half d, half dmin, 12 bytes of
+			// 6-bit scales and mins, 128 bytes of nibbles.
+			int64_t blocks = cols / 256;
+			int g = lane >> 3, sub = lane & 7;
+			int j0 = 2 * g, j1 = 2 * g + 1;
+			for (int64_t b = part; b < blocks; b += split) {
+				uint8_t * blk = w + (row * blocks + b) * 144;
+				float d = half(blk, 2), dmin = half(blk + 2, 2);
+				uint8_t * sc = blk + 4;
+				int s0, m0, s1, m1;
+				if (j0 < 4) {
+					s0 = sc[j0] & 63; m0 = sc[j0 + 4] & 63;
+					s1 = sc[j1] & 63; m1 = sc[j1 + 4] & 63;
+				} else {
+					s0 = (sc[j0 + 4] & 0xF) | ((sc[j0 - 4] >> 6) << 4); m0 = (sc[j0 + 4] >> 4) | ((sc[j0] >> 6) << 4);
+					s1 = (sc[j1 + 4] & 0xF) | ((sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((sc[j1] >> 6) << 4);
+				}
+				uint32_t q = *(uint32_t*) (blk + 16 + g * 32 + sub * 4);
+				float4 a = *(float4*) (x + b * 256 + g * 64 + sub * 4);
+				float4 c = *(float4*) (x + b * 256 + g * 64 + 32 + sub * 4);
+				float lo = (float) (q & 0xF) * a.x + (float) ((q >> 8) & 0xF) * a.y + (float) ((q >> 16) & 0xF) * a.z + (float) ((q >> 24) & 0xF) * a.w;
+				float hi = (float) ((q >> 4) & 0xF) * c.x + (float) ((q >> 12) & 0xF) * c.y + (float) ((q >> 20) & 0xF) * c.z + (float) ((q >> 28) & 0xF) * c.w;
+				acc += d * (s0 * lo + s1 * hi) - dmin * (m0 * (a.x + a.y + a.z + a.w) + m1 * (c.x + c.y + c.z + c.w));
+			}
+		} else if (form == 4) {
+			// Q6_K: 210-byte blocks of 256; 128 bytes of low nibbles, 64 of
+			// high bit pairs, 16 signed 8-bit scales, half d.
+			int64_t blocks = cols / 256;
+			int n = lane >> 4, l = (lane & 15) * 2, is = l / 16;
+			for (int64_t b = part; b < blocks; b += split) {
+				uint8_t * blk = w + (row * blocks + b) * 210;
+				float d = half(blk + 208, 2);
+				uint8_t * ql = blk + 64 * n;
+				uint8_t * qh = blk + 128 + 32 * n;
+				int8_t * sc = (int8_t*) (blk + 192 + 8 * n);
+				float * xs = x + b * 256 + 128 * n + l;
+				float2 x0 = *(float2*) xs, x1 = *(float2*) (xs + 32), x2 = *(float2*) (xs + 64), x3 = *(float2*) (xs + 96);
+				int lo0 = ql[l], lo1 = ql[l + 1], lo2 = ql[l + 32], lo3 = ql[l + 33], h0 = qh[l], h1 = qh[l + 1];
+				float p1 = ((int) ((lo0 & 0xF) | ((h0 & 3) << 4)) - 32) * x0.x + ((int) ((lo1 & 0xF) | ((h1 & 3) << 4)) - 32) * x0.y;
+				float p2 = ((int) ((lo2 & 0xF) | (((h0 >> 2) & 3) << 4)) - 32) * x1.x + ((int) ((lo3 & 0xF) | (((h1 >> 2) & 3) << 4)) - 32) * x1.y;
+				float p3 = ((int) ((lo0 >> 4) | (((h0 >> 4) & 3) << 4)) - 32) * x2.x + ((int) ((lo1 >> 4) | (((h1 >> 4) & 3) << 4)) - 32) * x2.y;
+				float p4 = ((int) ((lo2 >> 4) | (((h0 >> 6) & 3) << 4)) - 32) * x3.x + ((int) ((lo3 >> 4) | (((h1 >> 6) & 3) << 4)) - 32) * x3.y;
+				acc += d * (sc[is] * p1 + sc[is + 2] * p2 + sc[is + 4] * p3 + sc[is + 6] * p4);
+			}
+		} else if (form == 5) {
+			// Q8_0: 34-byte blocks of 32; half d, 32 signed bytes. A lane
+			// takes a quarter of a block, a warp 8 blocks at a time.
+			int64_t blocks = cols / 32;
+			for (int64_t b = (lane >> 2) + 8 * part; b < blocks; b += 8 * split) {
+				uint8_t * blk = w + (row * blocks + b) * 34;
+				int8_t * qs = (int8_t*) (blk + 2 + (lane & 3) * 8);
+				float * xs = x + b * 32 + (lane & 3) * 8;
+				float part = 0.0f;
+				for (int k = 0; k < 8; k++) part += qs[k] * xs[k];
+				acc += half(blk, 2) * part;
+			}
+		} else if (form == 0) {
+			float * r = (float*) w + row * cols;
+			for (int64_t c0 = 256 * part; c0 < cols; c0 += 256 * split) {
+				for (int64_t c = c0 + lane; c < c0 + 256 && c < cols; c += 32) acc += r[c] * x[c];
+			}
+		} else {
+			unsigned short * r = (unsigned short*) w + row * cols;
+			for (int64_t c0 = 256 * part; c0 < cols; c0 += 256 * split) {
+				for (int64_t c = c0 + lane; c < c0 + 256 && c < cols; c += 32) {
+					float v;
+					if (form == 2) {
+						v = __int_as_float(((unsigned) r[c]) << 16);
+					} else {
+						asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(v): "h"(r[c]));
+					}
+					acc += v * x[c];
+				}
+			}
+		}
+		return acc;
+	}
+
+	// GELU (tanh form) of v when gelu is 1, else SiLU.
+	@kernelOnly
+	cuda def act(v float32, gelu int) float32 {
+		return gelu ? 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))): v / (1.0f + expf(-v));
+	}
+
+	// Kernels. `total` is the thread count: 32 per row for the multiplies
+	// (one warp each), 256 per row or head for the per-row ones (one block
+	// each). Offsets are in elements.
+
+	// out[oo + r] = row r of w · x[xo:] for rows rows, `split` warps per
+	// row.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def multiplyRows(w gpu.DeviceBuffer<byte>, form int, x gpu.DeviceBuffer<float32>, xo int, out gpu.DeviceBuffer<float32>, oo int, rows, cols, split, total int) !none {
+		__shared__ float sums[8];
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		int64_t row = (int64_t) blockIdx.x * (8 / split) + warp / split;
+		int part = warp % split;
+		float acc = row < rows ? warpSum(rowDot(w, w_len, form, row, cols, x + xo, cols, lane, part, split)): 0.0f;
+		if (split > 1) {
+			if (lane == 0) sums[warp] = acc;
+			__syncthreads();
+			if (part != 0) return;
+			for (int k = 1; k < split; k++) acc += sums[warp + k];
+		}
+		if (lane == 0 && row < rows) out[oo + row] = acc;
+	}
+
+	// out[r] = act(row r of gate · x) · (row r of up · x), `split` warps
+	// per row.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def multiplyPair(gate gpu.DeviceBuffer<byte>, up gpu.DeviceBuffer<byte>, form int, x gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, rows, cols, gelu, split, total int) !none {
+		__shared__ float sums[2][8];
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		int64_t row = (int64_t) blockIdx.x * (8 / split) + warp / split;
+		int part = warp % split;
+		float g = 0.0f, u = 0.0f;
+		if (row < rows) {
+			g = warpSum(rowDot(gate, gate_len, form, row, cols, x, cols, lane, part, split));
+			u = warpSum(rowDot(up, up_len, form, row, cols, x, cols, lane, part, split));
+		}
+		if (split > 1) {
+			if (lane == 0) {
+				sums[0][warp] = g;
+				sums[1][warp] = u;
+			}
+			__syncthreads();
+			if (part != 0) return;
+			for (int k = 1; k < split; k++) {
+				g += sums[0][warp + k];
+				u += sums[1][warp + k];
+			}
+		}
+		if (lane == 0 && row < rows) out[row] = act(g, gelu) * u;
+	}
+
+	// dst row r = src row r · inScale / rms(src row r · inScale) · weight,
+	// over rows of n values; wo < 0 for no weight. src may be dst.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def rmsNorm(src gpu.DeviceBuffer<float32>, so int, dst gpu.DeviceBuffer<float32>, dso int, n int, weight gpu.DeviceBuffer<float32>, wo int, inScale, epsilon float32, total int) !none {
+		__shared__ float partial[8];
+		int64_t r = blockIdx.x;
+		int t = threadIdx.x;
+		float * s = src + so + r * n;
+		float * d = dst + dso + r * n;
+		float acc = 0.0f;
+		for (int64_t i = t; i < n; i += 256) {
+			float v = s[i] * inScale;
+			acc += v * v;
+		}
+		float squares = blockSum(acc, partial, 8);
+		float scale = inScale / sqrtf(squares / (float) n + epsilon);
+		for (int64_t i = t; i < n; i += 256) {
+			float v = s[i] * scale;
+			d[i] = wo >= 0 ? v * weight[wo + i]: v;
+		}
+	}
+
+	// Per head of hs values at x[xo:]: an RMSNorm with weight[wo:wo + hs]
+	// when norm is 1 (wo < 0 for no weight), then rotary position embedding
+	// at `position` when turn is 1: pair i turns by position ·
+	// (table[to + 2i] + table[to + 2i + 1]) (see ropeTable) for the first
+	// `dims` values, pairs adjacent when halves is 0, else i and
+	// i + dims/2; `magnitude` multiplies the turned values. One block per head.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def prepareHeads(x gpu.DeviceBuffer<float32>, xo int, hs int, norm int, weight gpu.DeviceBuffer<float32>, wo int, epsilon float32, turn int, position int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, total int) !none {
+		__shared__ float partial[8];
+		int t = threadIdx.x;
+		float * h = x + xo + (int64_t) blockIdx.x * hs;
+		if (norm) {
+			float acc = 0.0f;
+			for (int64_t i = t; i < hs; i += 256) acc += h[i] * h[i];
+			float squares = blockSum(acc, partial, 8);
+			float s = 1.0f / sqrtf(squares / (float) hs + epsilon);
+			for (int64_t i = t; i < hs; i += 256) h[i] = wo >= 0 ? h[i] * s * weight[wo + i]: h[i] * s;
+			__syncthreads();
+		}
+		if (!turn) return;
+		int64_t pairs = dims / 2;
+		for (int64_t i = t; i < pairs; i += 256) {
+			double theta = (double) position * ((double) table[to + 2 * i] + (double) table[to + 2 * i + 1]);
+			theta -= 6.283185307179586 * rint(theta * 0.15915494309189535);
+			float sn, cs;
+			sincosf((float) theta, &sn, &cs);
+			cs *= magnitude;
+			sn *= magnitude;
+			int64_t a = halves ? i: 2 * i;
+			int64_t b = halves ? i + pairs: a + 1;
+			float va = h[a], vb = h[b];
+			h[a] = va * cs - vb * sn;
+			h[b] = va * sn + vb * cs;
+		}
+	}
+
+	// Positions an attendPart block takes.
+	const attentionChunk = 64
+
+	// Attention of one token: per query head, the scores against the
+	// cached keys at positions first .. first + count - 1 (times `scale`,
+	// capped to ±cap by tanh when cap > 0), their softmax, and the sum of
+	// the cached values they weight, into out. The caches hold kvHeads
+	// heads of hs values per position; `work` holds at least
+	// partsSize(heads, hs, count) values.
+	// Fails with the driver's error when a launch does.
+	def attention(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, work gpu.DeviceBuffer<float32>, heads int, kvHeads int, hs int, first int, count int, scale float32, cap float32) !none {
+		let chunks = (count + attentionChunk - 1) / attentionChunk
+		try attendPart(q, keys, values, work, heads, kvHeads, hs, first, count, chunks, scale, cap, heads * chunks * 256)
+		return attendCombine(work, out, hs, chunks, heads * 256)
+	}
+
+	// The values attention's `work` buffer needs for `count` positions.
+	def partsSize(heads int, hs int, count int) int {
+		return heads * ((count + attentionChunk - 1) / attentionChunk) * (hs + 2)
+	}
+
+	// One chunk of 64 positions of one head's attention (one block each,
+	// head-major): the chunk's largest score m, the sum of exp(score − m),
+	// and the values weighted by exp(score − m), into work at
+	// (head · chunks + chunk) · (hs + 2) as hs sums, m, the sum.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def attendPart(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, work gpu.DeviceBuffer<float32>, heads, kvHeads, hs, first, count, chunks int, scale, cap float32, total int) !none {
+		__shared__ float sc[64];
+		int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+		int64_t h = blockIdx.x / chunks, k = blockIdx.x % chunks;
+		int64_t p0 = k * 64;
+		int n = count - p0 < 64 ? (int) (count - p0): 64;
+		int64_t kvSize = kvHeads * hs;
+		int64_t kv = (h / (heads / kvHeads)) * hs;
+		float * qh = q + h * hs;
+		for (int p = warp; p < n; p += 8) {
+			float * key = keys + (first + p0 + p) * kvSize + kv;
+			float acc = 0.0f;
+			for (int64_t i = lane; i < hs; i += 32) acc += qh[i] * key[i];
+			acc = warpSum(acc);
+			if (lane == 0) {
+				float v = acc * scale;
+				if (cap > 0.0f) v = cap * tanhf(v / cap);
+				sc[p] = v;
+			}
+		}
+		__syncthreads();
+		float m = sc[0];
+		for (int p = 1; p < n; p++) m = fmaxf(m, sc[p]);
+		__syncthreads();
+		if (t < n) sc[t] = expf(sc[t] - m);
+		__syncthreads();
+		float * part = work + (h * chunks + k) * (hs + 2);
+		for (int64_t c = t; c < hs; c += 256) {
+			float * v = values + (first + p0) * kvSize + kv + c;
+			float acc = 0.0f;
+			for (int p = 0; p < n; p++) acc += sc[p] * v[p * kvSize];
+			part[c] = acc;
+		}
+		if (t == 0) {
+			float sum = 0.0f;
+			for (int p = 0; p < n; p++) sum += sc[p];
+			part[hs] = m;
+			part[hs + 1] = sum;
+		}
+	}
+
+	// Joins a head's chunks (one block each) into out[head · hs:].
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def attendCombine(work gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, hs, chunks, total int) !none {
+		int64_t h = blockIdx.x;
+		float * base = work + h * chunks * (hs + 2);
+		float top = base[hs];
+		for (int64_t k = 1; k < chunks; k++) top = fmaxf(top, base[k * (hs + 2) + hs]);
+		float sum = 0.0f;
+		for (int64_t k = 0; k < chunks; k++) sum += base[k * (hs + 2) + hs + 1] * expf(base[k * (hs + 2) + hs] - top);
+		float inv = 1.0f / sum;
+		for (int64_t c = threadIdx.x; c < hs; c += 256) {
+			float acc = 0.0f;
+			for (int64_t k = 0; k < chunks; k++) acc += base[k * (hs + 2) + c] * expf(base[k * (hs + 2) + hs] - top);
+			out[h * hs + c] = acc * inv;
+		}
+	}
+
+	// x = (x + rmsNorm(p) · weight[wo:]) · after over one row of n values
+	// (wo < 0 adds p as it is), then, when nw >= 0,
+	// normed = rmsNorm(x) · weight[nw:]. One block.
+	@launch(block = 256, x = "total", cpu = false)
+	cuda def addNormed(x gpu.DeviceBuffer<float32>, p gpu.DeviceBuffer<float32>, n int, weight gpu.DeviceBuffer<float32>, wo int, epsilon, after float32, normed gpu.DeviceBuffer<float32>, nw int, total int) !none {
+		__shared__ float partial[8];
+		int t = threadIdx.x;
+		float scale = 1.0f;
+		if (wo >= 0) {
+			float acc = 0.0f;
+			for (int64_t i = t; i < n; i += 256) acc += p[i] * p[i];
+			scale = 1.0f / sqrtf(blockSum(acc, partial, 8) / (float) n + epsilon);
+		}
+		float acc = 0.0f;
+		for (int64_t i = t; i < n; i += 256) {
+			float v = wo >= 0 ? p[i] * scale * weight[wo + i]: p[i];
+			float r = (x[i] + v) * after;
+			x[i] = r;
+			acc += r * r;
+		}
+		if (nw < 0) return;
+		float s = 1.0f / sqrtf(blockSum(acc, partial, 8) / (float) n + epsilon);
+		for (int64_t i = t; i < n; i += 256) normed[i] = x[i] * s * weight[nw + i];
+	}
+
+	// a[ao + i] = act(a[ao + i]) · b[bo + i] for i < n (see act).
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def activate(a gpu.DeviceBuffer<float32>, ao int, b gpu.DeviceBuffer<float32>, bo int, n int, gelu int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		a[ao + i] = act(a[ao + i], gelu) * b[bo + i];
+	}
+
+	// a[ao + i] = (a[ao + i] + b[bo + i] · bScale) · after for i < n.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def accumulate(a gpu.DeviceBuffer<float32>, ao int, b gpu.DeviceBuffer<float32>, bo int, n int, bScale, after float32) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		a[ao + i] = (a[ao + i] + b[bo + i] * bScale) * after;
+	}
+
+	// x[i] = cap · tanh(x[i] / cap) for i < n.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def capValues(x gpu.DeviceBuffer<float32>, n int, cap float32) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		x[i] = cap * tanhf(x[i] / cap);
+	}
+}

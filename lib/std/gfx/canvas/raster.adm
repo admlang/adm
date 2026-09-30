@@ -1,0 +1,874 @@
+partial module std.gfx.canvas {
+	use (
+		std.gfx.color::(BlendMode, Color, RGBA)
+		std.gfx.colorspace
+		std.gfx
+		std.gfx::Mask
+		std.math.geom::(FillRule, Path, PathVerb, Rect)
+		std.mem
+		std.simd
+		std.gfx.bands::*
+	)
+
+	// Rows a band of the rasterizer accumulates at once.
+	internal const rasterBandRows = 16
+
+	// Lane indices shifting a vec8 up by 1, 2 and 4 lanes with zeros coming
+	// in, for `shuffle2(zero, v, …)`: the steps of an in-register prefix sum.
+	internal const shiftOne = byte[0, 8, 9, 10, 11, 12, 13, 14]
+	internal const shiftTwo = byte[0, 0, 8, 9, 10, 11, 12, 13]
+	internal const shiftFour = byte[0, 0, 0, 0, 8, 9, 10, 11]
+
+	// Fills the device-space `path` with the colour under `rule` through
+	// the state's clip, alpha, blend and composite, anti-aliased by exact
+	// area coverage unless the state turns it off. Curves are flattened
+	// within a twentieth of a pixel, so chords cost no visible area.
+	internal def fillPath(c Canvas, path Path, rule FillRule, paint Paint, st DrawState) (int, int, int, int) {
+		return fillWith(c, path, rule, paint, shaderFor(paint, st.transform), !(paint is Color), st)
+	}
+
+	// fillPath with the colours from `shader` when `shaded`, else the plain
+	// colour `paint`. Returns the pixel box it may have changed (x0, y0,
+	// x1, y1; empty when x0 >= x1).
+	internal def fillWith(c Canvas, path Path, rule FillRule, paint Paint, shader Shader, shaded bool, st DrawState) (int, int, int, int) {
+		return (0, 0, 0, 0) when c.width <= 0 || c.height <= 0
+		let edges = pathEdges(path.flattened(0.05))
+		// The box drawing may touch: the canvas, narrowed by the clip.
+		let (
+			cx0 = 0
+			cy0 = 0
+			cx1 = c.width
+			cy1 = c.height
+		)
+		let clip = st.clip
+		if clip is ClipRegion {
+			cx0 = clip.left.max(0)
+			cy0 = clip.top.max(0)
+			cx1 = clip.right.min(c.width)
+			cy1 = clip.bottom.min(c.height)
+		}
+		return (0, 0, 0, 0) when cx0 >= cx1 || cy0 >= cy1
+		let op = st.composite
+		// These operators also clear what is outside the shape.
+		let unbounded = op := Composite.SourceIn || Composite.SourceOut || Composite.DestinationIn || Composite.DestinationAtop || Composite.Copy
+		let color = paint is Color ?? (paint, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}))
+		// A shader's colours carry their own alpha; the state's scales them.
+		let a = byte((float(color.rgba.a) * st.alpha.clamp(0.0, 1.0) + 0.5).floor())
+		let (
+			bx0 = cx0
+			by0 = cy0
+			bx1 = cx1
+			by1 = cy1
+		)
+		if !unbounded {
+			return (0, 0, 0, 0) when edges.len() == 0 || op == Composite.DestinationOver && a == 0 || a == 0 && op != Composite.Clear
+			let (minX, minY, maxX, maxY) = edgeBounds(edges)
+			bx0 = int(minX.floor()).max(cx0)
+			by0 = int(minY.floor()).max(cy0)
+			bx1 = int(maxX.ceil()).min(cx1)
+			by1 = int(maxY.ceil()).min(cy1)
+			return (0, 0, 0, 0) when bx0 >= bx1 || by0 >= by1
+		}
+		let rgba = color.rgba
+		let mode = st.blend
+		let simple = op == Composite.SourceOver && mode == BlendMode.Normal
+		let packed = new Color(RGBA{r: rgba.r, g: rgba.g, b: rgba.b, a: a}).pack()
+		let aa = st.antialias
+		// Solid source-over fills in a per-channel mode take the blend from
+		// a table over the destination byte.
+		let tabled = !shaded && op == Composite.SourceOver && perChannel(mode)
+		let table = tabled ?? (blendTable(mode, rgba.r, rgba.g, rgba.b), byte[])
+		// Shaded ones too once the box outweighs building the pair table.
+		let paired = shaded && op == Composite.SourceOver && perChannel(mode) && (bx1 - bx0) * (by1 - by0) >= pairTableArea
+		let pairs = paired ?? (blendPairTable(mode), byte[])
+		rasterize(edges, bx0, by0, bx1, by1, rule, unbounded, def (y int, cov byte[], lo int, end int) {
+			if !aa {
+				hardenCoverage(cov, lo, end)
+			}
+			let rowStart = (y * c.width + bx0) * 4
+			if clip is ClipRegion && !unbounded {
+				// Bounded operators leave the destination alone where the
+				// source is clear, so the clip just scales coverage.
+				clipCoverage(cov, lo, end, clip, bx0, y)
+			}
+			let from = unbounded ?? (0, lo)
+			let to = unbounded ?? (bx1 - bx0, end)
+			if shaded {
+				return when to <= from
+				let src byte[]
+				src.len((to - from + 4) * 4)
+				shader.shade(bx0 + from, y, to - from, src)
+				if paired {
+					blendedPairRow(c.pixels, rowStart + from * 4, src, pairs, to - from)
+				}
+				if simple || paired {
+					compositeShadedRow(c.pixels, rowStart + from * 4, src, cov, from, to - from, int(a))
+					return
+				}
+				for let x = from; x < to; x++ {
+					let k = x >= lo && x < end ?? (int(cov[x]), 0)
+					continue when k == 0 && !unbounded
+					let m = 255
+					if unbounded && clip is ClipRegion {
+						m = clipByte(clip, bx0 + x, y)
+						continue when m == 0
+					}
+					let s = (x - from) * 4
+					composePixel(c.pixels, rowStart + x * 4, src[s], src[s + 1], src[s + 2], canvasDiv255(canvasDiv255(int(src[s + 3]) * k) * int(a)), op, mode, m)
+				}
+				return
+			}
+			if simple {
+				compositeRow(c, y * c.width + bx0, cov, lo, end, rgba.r, rgba.g, rgba.b, a, packed)
+				return
+			}
+			if tabled {
+				return when end <= lo
+				let blended byte[]
+				blendedRow(c.pixels, rowStart + lo * 4, table, rgba.r, rgba.g, rgba.b, a, end - lo, blended)
+				compositeShadedRow(c.pixels, rowStart + lo * 4, blended, cov, lo, end - lo, 255)
+				return
+			}
+			for let x = from; x < to; x++ {
+				let k = x >= lo && x < end ?? (int(cov[x]), 0)
+				continue when k == 0 && !unbounded
+				let m = 255
+				if unbounded && clip is ClipRegion {
+					m = clipByte(clip, bx0 + x, y)
+					continue when m == 0
+				}
+				composePixel(c.pixels, rowStart + x * 4, rgba.r, rgba.g, rgba.b, canvasDiv255(int(a) * k), op, mode, m)
+			}
+		})
+		return (bx0, by0, bx1, by1)
+	}
+
+	// The clip `old` narrowed to the device-space path: coverage bytes over
+	// the box both share, the old clip's coverage multiplied in.
+	internal def clipToPath(c Canvas, path Path, rule FillRule, antialias bool, old ?ClipRegion) ClipRegion {
+		let edges = pathEdges(path.flattened(0.05))
+		return new ClipRegion(0, 0, 0, 0) when edges.len() == 0
+		let (minX, minY, maxX, maxY) = edgeBounds(edges)
+		let (
+			x0 = int(minX.floor()).max(0)
+			y0 = int(minY.floor()).max(0)
+			x1 = int(maxX.ceil()).min(c.width)
+			y1 = int(maxY.ceil()).min(c.height)
+		)
+		if old is ClipRegion {
+			x0 = x0.max(old.left)
+			y0 = y0.max(old.top)
+			x1 = x1.min(old.right)
+			y1 = y1.min(old.bottom)
+		}
+		return new ClipRegion(0, 0, 0, 0) when x0 >= x1 || y0 >= y1
+		let w = x1 - x0
+		let mask byte[]
+		mask.len(w * (y1 - y0))
+		rasterize(edges, x0, y0, x1, y1, rule, false, def (y int, cov byte[], lo int, end int) {
+			hardenCoverage(cov, lo, end) when !antialias
+			if old is ClipRegion {
+				clipCoverage(cov, lo, end, old, x0, y)
+			}
+			let row = (y - y0) * w
+			mem.copyN(mask[row + lo:row + end], cov[lo:end], end - lo)
+		})
+		return new ClipRegion(x0, y0, x1, y1, mask)
+	}
+
+	// The clip `old` (or the whole canvas) narrowed by a mask read in device
+	// pixels.
+	internal def clipToMask(c Canvas, m Mask, old ?ClipRegion) ClipRegion {
+		let (
+			x0 = 0
+			y0 = 0
+			x1 = c.width
+			y1 = c.height
+		)
+		if old is ClipRegion {
+			x0 = old.left.max(0)
+			y0 = old.top.max(0)
+			x1 = old.right.min(c.width)
+			y1 = old.bottom.min(c.height)
+		}
+		// Nothing outside the mask's own box can be kept.
+		let reach = gfx.coverageBounds(m)
+		if reach is Rect {
+			x0 = x0.max(int(reach.left.floor()))
+			y0 = y0.max(int(reach.top.floor()))
+			x1 = x1.min(int(reach.right.ceil()))
+			y1 = y1.min(int(reach.bottom.ceil()))
+		}
+		return new ClipRegion(0, 0, 0, 0) when x0 >= x1 || y0 >= y1
+		let w = x1 - x0
+		let mask byte[]
+		mask.len(w * (y1 - y0))
+		forRows(w, y1 - y0, def (from int, to int) {
+			let row byte[]
+			row.len(w)
+			for let y = y0 + from; y < y0 + to; y++ {
+				coverageBytes(m, old, x0, y, row)
+				mem.copyN(mask[(y - y0) * w:(y - y0 + 1) * w], row, w)
+			}
+		})
+		return new ClipRegion(x0, y0, x1, y1, mask)
+	}
+
+	// The coverage of the clip times the mask's (none covers all) along the
+	// row from (x, y) into `out`, 0..255 per pixel. Rows from the RowMask
+	// interface, combined eight pixels a vector.
+	internal def coverageBytes(mask ?Mask, clip ?ClipRegion, x int, y int, out byte[]) {
+		let n = out.len()
+		let a float32[]
+		a.len(n)
+		let b float32[]
+		b.len(n)
+		let i = 0
+		for i < n {
+			a[i] = float32(1.0)
+			b[i] = float32(1.0)
+			i++
+		}
+		if !(mask is none) {
+			gfx.coverageRow(mask, x, y, a)
+		}
+		if clip is ClipRegion {
+			clip.coverage(x, y, b)
+		}
+		let full = simd.splat8<float32>(float32(255.0))
+		let half = simd.splat8<float32>(float32(0.5))
+		let round = simd.splat8<int32>(int32(128))
+		i = 0
+		for i + 8 <= n {
+			let ka = simd.convert<float32, int32>((simd.load8<float32>(a, i) * full + half).floor())
+			let kb = simd.convert<float32, int32>((simd.load8<float32>(b, i) * full + half).floor())
+			let v = ka * kb + round
+			simd.store8<byte>(out, i, simd.convert<int32, byte>((v + (v >> 8)) >> 8))
+			i += 8
+		}
+		for i < n {
+			let ka = int((a[i] * float32(255.0) + float32(0.5)).floor())
+			let kb = int((b[i] * float32(255.0) + float32(0.5)).floor())
+			out[i] = byte(canvasDiv255(ka * kb))
+			i++
+		}
+	}
+
+	// The smallest box holding every edge end.
+	internal def edgeBounds(edges float[]) (float, float, float, float) {
+		let (
+			minX = edges[0]
+			minY = edges[1]
+			maxX = edges[0]
+			maxY = edges[1]
+		)
+		for let i = 0; i < edges.len(); i += 2 {
+			minX = minX.min(edges[i])
+			maxX = maxX.max(edges[i])
+			minY = minY.min(edges[i + 1])
+			maxY = maxY.max(edges[i + 1])
+		}
+		return (minX, minY, maxX, maxY)
+	}
+
+	// Coverage of the device-space `edges` over the pixel box bx0..bx1,
+	// by0..by1: `row(y, cov, lo, end)` gets each canvas row y whose coverage
+	// bytes (indexed from bx0) are non-zero only in lo..end. Rows go in bands
+	// on tasks, and a row is handed out once, from one task, so `row` may
+	// write that row. `everyRow` also hands out rows the shape misses, with
+	// an empty range.
+	internal def rasterize(edges float[], bx0 int, by0 int, bx1 int, by1 int, rule FillRule, everyRow bool, row def(int, byte[], int, int)) {
+		let wa = bx1 - bx0
+		let rows = by1 - by0
+		return when wa <= 0 || rows <= 0
+		// Rows padded to whole vectors, with room for the cell right of the
+		// last pixel that an edge on the right border writes.
+		let stride = (wa + 2 + 7) / 8 * 8 + 8
+		let bands = (rows + rasterBandRows - 1) / rasterBandRows
+		// Each band's edges, so a band only walks what crosses it.
+		let buckets int[][]
+		for let b = 0; b < bands; b++ {
+			buckets.push(int[])
+		}
+		for let i = 0; i < edges.len(); i += 4 {
+			let ya = edges[i + 1].min(edges[i + 3]) - float(by0)
+			let yb = edges[i + 1].max(edges[i + 3]) - float(by0)
+			continue when yb <= 0.0 || ya >= float(rows) || ya == yb
+			let first = int(ya.max(0.0)) / rasterBandRows
+			let last = (int(yb.ceil()).min(rows) - 1) / rasterBandRows
+			for let b = first; b <= last && b < bands; b++ {
+				buckets[b].push(i)
+			}
+		}
+		// Bands of rows on tasks: each band writes only its own rows.
+		forBands(bands, wa * rows, def (from int, to int) {
+			let acc float32[]
+			acc.len(stride * rasterBandRows)
+			let cov byte[]
+			cov.len(stride + 16)
+			for let b = from; b < to; b++ {
+				let y0 = b * rasterBandRows
+				let h = (rows - y0).min(rasterBandRows)
+				let (
+					lo = wa
+					hi = 0
+				)
+				for let (_, i) in buckets[b] {
+					let (l, r) = addEdge(acc, stride, h, wa, edges[i] - float(bx0), edges[i + 1] - float(by0 + y0), edges[i + 2] - float(bx0), edges[i + 3] - float(by0 + y0))
+					lo = lo.min(l)
+					hi = hi.max(r)
+				}
+				if lo > hi {
+					if everyRow {
+						for let y = 0; y < h; y++ {
+							row(by0 + y0 + y, cov, 0, 0)
+						}
+					}
+					continue
+				}
+				hi = (hi + 1).min(stride - 8)
+				for let y = 0; y < h; y++ {
+					coverageRow(acc, y * stride, lo, hi, rule, cov)
+					row(by0 + y0 + y, cov, lo, (hi + 1).min(wa))
+				}
+			}
+		})
+	}
+
+	// Rounds coverage to all or nothing, for drawing without anti-aliasing:
+	// a pixel is in when at least half of it is.
+	internal def hardenCoverage(cov byte[], lo int, end int) {
+		let half = simd.splat16<byte>(byte(128))
+		let full = simd.splat16<byte>(byte(255))
+		let zero = simd.splat16<byte>(byte(0))
+		let x = lo
+		for x + 16 <= end {
+			let v = simd.load16<byte>(cov, x)
+			simd.store16<byte>(cov, x, simd.blend(simd.ge(v, half), full, zero))
+			x += 16
+		}
+		for x < end {
+			cov[x] = cov[x] >= 128 ?? (byte(255), byte(0))
+			x++
+		}
+	}
+
+	// Scales coverage bytes lo..end of canvas row y (from pixel bx0) by the
+	// clip's coverage there.
+	internal def clipCoverage(cov byte[], lo int, end int, clip ClipRegion, bx0 int, y int) {
+		let m = clip.mask
+		return when m is none
+		let base = (y - clip.top) * (clip.right - clip.left) + (bx0 - clip.left)
+		let x = lo
+		let round = simd.splat16<uint16>(uint16(128))
+		for x + 16 <= end {
+			let p = simd.convert<byte, uint16>(simd.load16<byte>(cov, x)) * simd.convert<byte, uint16>(simd.load16<byte>(m, base + x)) + round
+			simd.store16<byte>(cov, x, simd.convert<uint16, byte>((p + (p >> 8)) >> 8))
+			x += 16
+		}
+		for x < end {
+			cov[x] = byte(canvasDiv255(int(cov[x]) * int(m[base + x])))
+			x++
+		}
+	}
+
+	// One pixel of a fill under a Porter-Duff operator and a blend mode:
+	// source r, g, b at alpha sa (coverage and state alpha applied) with the
+	// straight-alpha pixel at byte offset i, the result then mixed with the
+	// old pixel by the clip coverage m (0..255). Colours blend as W3C
+	// compositing says: where the backdrop is opaque the source colour is
+	// replaced by the blend of the two.
+	internal def composePixel(px byte[], i int, r byte, g byte, b byte, sa8 int, op Composite, mode BlendMode, m int) {
+		let full = simd.splat4<float32>(float32(255.0))
+		let sa = float32(sa8) / float32(255.0)
+		let da = float32(px[i + 3]) / float32(255.0)
+		let cd = simd.convert<byte, float32>(simd.load4<byte>(px, i)) / full
+		let cs = simd.convert<byte, float32>(simd.loadBytes4(byte[r, g, b, 255], 0)) / full
+		if mode != BlendMode.Normal && da > float32(0.0) {
+			let (br, bg, bb) = colorspace.blendRGB(mode, r, g, b, px[i], px[i + 1], px[i + 2])
+			if mode := BlendMode.Hue || BlendMode.Saturation || BlendMode.Color || BlendMode.Luminosity {
+				(br, bg, bb) = colorspace.blendNonSeparable(mode, r, g, b, px[i], px[i + 1], px[i + 2])
+			}
+			let mixed = simd.convert<byte, float32>(simd.loadBytes4(byte[br, bg, bb, 255], 0)) / full
+			cs = cs * simd.splat4<float32>(float32(1.0) - da) + mixed * simd.splat4<float32>(da)
+		}
+		let (fa, fb) = porterDuff(op, sa, da)
+		// Premultiplied result, lanes r, g, b, and alpha in the last lane.
+		let one = float32(1.0)
+		let ao = (sa * fa + da * fb).min(one)
+		let co = cs * simd.splat4<float32>(sa * fa) + cd * simd.splat4<float32>(da * fb)
+		if m < 255 {
+			let t = float32(m) / float32(255.0)
+			co = co * simd.splat4<float32>(t) + cd * simd.splat4<float32>(da * (one - t))
+			ao = ao * t + da * (one - t)
+		}
+		if ao <= float32(0.0) {
+			px[i + 0] = 0
+			px[i + 1] = 0
+			px[i + 2] = 0
+			px[i + 3] = 0
+			return
+		}
+		let out = (co / simd.splat4<float32>(ao)).min(simd.splat4<float32>(one)) * full + simd.splat4<float32>(float32(0.5))
+		simd.store4<byte>(px, i, simd.convert<float32, byte>(out))
+		px[i + 3] = byte(int(ao * float32(255.0) + float32(0.5)))
+	}
+
+	// Whether the mode's colour is worked out channel by channel.
+	internal def perChannel(mode BlendMode) bool {
+		return !(mode := BlendMode.Normal || BlendMode.DarkerColor || BlendMode.LighterColor || BlendMode.Hue || BlendMode.Saturation || BlendMode.Color || BlendMode.Luminosity)
+	}
+
+	// The per-channel mode's colour for source r, g, b over every
+	// destination byte d, at d * 4 + channel.
+	internal def blendTable(mode BlendMode, r byte, g byte, b byte) byte[] {
+		let t byte[]
+		t.len(1024)
+		for let d = 0; d < 256; d++ {
+			let (br, bg, bb) = colorspace.blendRGB(mode, r, g, b, byte(d), byte(d), byte(d))
+			t[d * 4] = br
+			t[d * 4 + 1] = bg
+			t[d * 4 + 2] = bb
+		}
+		return t
+	}
+
+	// The source colours of n pixels from byte offset `row`: the fill
+	// colour r, g, b mixed with the table's blend by each destination's
+	// alpha, alpha a. Four pixels a vector, the blend gathered from the
+	// table.
+	internal def blendedRow(px byte[], row int, table byte[], r byte, g byte, b byte, a byte, n int, out byte[]) {
+		out.len(n * 4)
+		let byAlpha = simd.load16<byte>(alphaOfFour, 0)
+		let alphaLane = simd.ne(simd.load16<uint16>(alphaLaneFlags, 0), simd.splat16<uint16>(uint16(0)))
+		let lanes = simd.load16<int>(channelOfLane, 0)
+		let four = simd.splat16<int>(4)
+		let full = simd.splat16<uint16>(uint16(255))
+		let round = simd.splat16<uint16>(uint16(128))
+		let sa = simd.splat16<uint16>(uint16(a))
+		let colour byte[]
+		colour.len(16)
+		for let p = 0; p < 16; p += 4 {
+			colour[p] = r
+			colour[p + 1] = g
+			colour[p + 2] = b
+		}
+		let cs = simd.convert<byte, uint16>(simd.load16<byte>(colour, 0))
+		let i = 0
+		for i + 4 <= n {
+			let p8 = simd.load16<byte>(px, row + i * 4)
+			let bl = simd.convert<byte, uint16>(simd.gather16<byte>(table, 0, simd.convert<byte, int>(p8) * four + lanes))
+			let da = simd.convert<byte, uint16>(p8.shuffle(byAlpha))
+			let y = cs * (full - da) + bl * da + round
+			let v = simd.blend(alphaLane, sa, (y + (y >> 8)) >> 8)
+			simd.store16<byte>(out, i * 4, simd.convert<uint16, byte>(v))
+			i += 4
+		}
+		for i < n {
+			let d = row + i * 4
+			let da = int(px[d + 3])
+			let o = i * 4
+			out[o] = byte(canvasDiv255(int(r) * (255 - da) + int(table[int(px[d]) * 4]) * da))
+			out[o + 1] = byte(canvasDiv255(int(g) * (255 - da) + int(table[int(px[d + 1]) * 4 + 1]) * da))
+			out[o + 2] = byte(canvasDiv255(int(b) * (255 - da) + int(table[int(px[d + 2]) * 4 + 2]) * da))
+			out[o + 3] = a
+			i++
+		}
+	}
+
+	// The box a shaded blended fill needs before the pair table pays off.
+	internal const pairTableArea = 128 * 128
+
+	// The per-channel mode's colour for every source byte s over every
+	// destination byte d, at s * 256 + d.
+	internal def blendPairTable(mode BlendMode) byte[] {
+		let t byte[]
+		t.len(65536)
+		for let sv = 0; sv < 256; sv++ {
+			let cs = float(sv) / 255.0
+			for let d = 0; d < 256; d++ {
+				t[sv * 256 + d] = mode == BlendMode.Xor ?? (byte(sv ^ d), colorspace.clampU8(colorspace.blendSeparable(mode, cs, float(d) / 255.0) * 255.0))
+			}
+		}
+		return t
+	}
+
+	// The shaded colours src[0..n), in place, mixed with the pair table's
+	// blend over the row from byte offset `row` by each destination's
+	// alpha; alpha stays the source's. Four pixels a vector.
+	internal def blendedPairRow(px byte[], row int, src byte[], table byte[], n int) {
+		let byAlpha = simd.load16<byte>(alphaOfFour, 0)
+		let alphaLane = simd.ne(simd.load16<uint16>(alphaLaneFlags, 0), simd.splat16<uint16>(uint16(0)))
+		let hi = simd.splat16<int>(256)
+		let full = simd.splat16<uint16>(uint16(255))
+		let round = simd.splat16<uint16>(uint16(128))
+		let i = 0
+		for i + 4 <= n {
+			let p8 = simd.load16<byte>(px, row + i * 4)
+			let s8 = simd.load16<byte>(src, i * 4)
+			let bl = simd.convert<byte, uint16>(simd.gather16<byte>(table, 0, simd.convert<byte, int>(s8) * hi + simd.convert<byte, int>(p8)))
+			let cs = simd.convert<byte, uint16>(s8)
+			let da = simd.convert<byte, uint16>(p8.shuffle(byAlpha))
+			let y = cs * (full - da) + bl * da + round
+			let v = simd.blend(alphaLane, cs, (y + (y >> 8)) >> 8)
+			simd.store16<byte>(src, i * 4, simd.convert<uint16, byte>(v))
+			i += 4
+		}
+		for i < n {
+			let d = row + i * 4
+			let da = int(px[d + 3])
+			for let ch = 0; ch < 3; ch++ {
+				let cs = int(src[i * 4 + ch])
+				src[i * 4 + ch] = byte(canvasDiv255(cs * (255 - da) + int(table[cs * 256 + int(px[d + ch])]) * da))
+			}
+			i++
+		}
+	}
+
+	// Per lane of four pixels, the channel.
+	internal const channelOfLane = int[0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
+
+	// The share of source and destination an operator keeps, for source
+	// alpha sa and destination alpha da.
+	internal def porterDuff(op Composite, sa float32, da float32) (float32, float32) {
+		let one = float32(1.0)
+		let zero = float32(0.0)
+		match op {
+			case Composite.SourceOver:
+				return (one, one - sa)
+			case Composite.SourceIn:
+				return (da, zero)
+			case Composite.SourceOut:
+				return (one - da, zero)
+			case Composite.SourceAtop:
+				return (da, one - sa)
+			case Composite.DestinationOver:
+				return (one - da, one)
+			case Composite.DestinationIn:
+				return (zero, sa)
+			case Composite.DestinationOut:
+				return (zero, one - sa)
+			case Composite.DestinationAtop:
+				return (one - da, sa)
+			case Composite.Xor:
+				return (one - da, one - sa)
+			case Composite.Copy:
+				return (one, zero)
+			case Composite.Clear:
+				return (zero, zero)
+			case Composite.Plus:
+				return (one, one)
+		}
+		return (one, one - sa)
+	}
+
+	// The line segments of a flattened path as x0, y0, x1, y1, open subpaths
+	// closed, as filling does.
+	internal def pathEdges(flat Path) float[] {
+		let out float[]
+		let pts = flat.coords
+		let j = 0
+		let (
+			sx    = 0.0
+			sy    = 0.0
+			px    = 0.0
+			py    = 0.0
+			inSub = false
+		)
+		for let (_, op) in flat.verbs {
+			match op {
+				case PathVerb.Move:
+					edgeTo(out, px, py, sx, sy) when inSub
+					sx = pts[j]
+					sy = pts[j + 1]
+					px = sx
+					py = sy
+					inSub = true
+					j += 2
+				case PathVerb.Line:
+					edgeTo(out, px, py, pts[j], pts[j + 1])
+					px = pts[j]
+					py = pts[j + 1]
+					j += 2
+				case PathVerb.Close:
+					edgeTo(out, px, py, sx, sy)
+					px = sx
+					py = sy
+					inSub = false
+				default:
+			}
+		}
+		edgeTo(out, px, py, sx, sy) when inSub
+		return out
+	}
+
+	// Appends the segment unless it is horizontal or empty: those add no
+	// coverage.
+	internal def edgeTo(out float[], x0, y0, x1, y1 float) {
+		return when y0 == y1
+		out.push(x0)
+		out.push(y0)
+		out.push(x1)
+		out.push(y1)
+	}
+
+	// Accumulates the edge, in band coordinates (x in pixels from the box's
+	// left, y in rows from the band's top), into `acc`. Parts left of the box
+	// count at its left edge and parts right of it at its right edge, so the
+	// winding is kept. Returns the first and last cells written.
+	internal def addEdge(acc float32[], stride int, rows int, wa int, x0, y0, x1, y1 float) (int, int) {
+		let w = float(wa)
+		// Where the edge crosses the box's sides, as parameters along it.
+		let t1 = 2.0
+		let t2 = 2.0
+		if x0 != x1 {
+			let ta = (0.0 - x0) / (x1 - x0)
+			let tb = (w - x0) / (x1 - x0)
+			t1 = ta when ta > 0.0 && ta < 1.0
+			t2 = tb when tb > 0.0 && tb < 1.0
+			if t2 < t1 {
+				let t = t1
+				t1 = t2
+				t2 = t
+			}
+		}
+		let lo = stride
+		let hi = 0
+		let ta = 0.0
+		for let k = 0; k < 3; k++ {
+			let tb = k == 0 ?? (t1.min(1.0), k == 1 ?? (t2.min(1.0), 1.0))
+			if tb > ta {
+				let ya = y0 + (y1 - y0) * ta
+				let yb = y0 + (y1 - y0) * tb
+				let xa = (x0 + (x1 - x0) * ta).clamp(0.0, w)
+				let xb = (x0 + (x1 - x0) * tb).clamp(0.0, w)
+				let (l, r) = accumulate(acc, stride, rows, xa, ya, xb, yb)
+				lo = lo.min(l)
+				hi = hi.max(r)
+				ta = tb
+			}
+		}
+		return (lo, hi)
+	}
+
+	// The signed area a line adds to each cell it crosses (font-rs): each
+	// row's cells, summed left to right, give the winding-weighted coverage.
+	// Returns the first and last cells written.
+	internal def accumulate(acc float32[], stride int, rows int, x0, y0, x1, y1 float) (int, int) {
+		return (stride, 0) when y0 == y1
+		let dir = 1.0
+		if y0 > y1 {
+			dir = -1.0
+			let (tx, ty) = (x0, y0)
+			x0 = x1
+			y0 = y1
+			x1 = tx
+			y1 = ty
+		}
+		let dxdy = (x1 - x0) / (y1 - y0)
+		let h = float(rows)
+		if y0 < 0.0 {
+			x0 -= y0 * dxdy
+			y0 = 0.0
+		}
+		if y1 > h {
+			x1 -= (y1 - h) * dxdy
+			y1 = h
+		}
+		return (stride, 0) when y0 >= y1
+		let lo = stride
+		let hi = 0
+		let x = x0
+		let yEnd = int(y1.ceil())
+		for let y = int(y0.floor()); y < yEnd; y++ {
+			let line = y * stride
+			let dy = float(y + 1).min(y1) - float(y).max(y0)
+			let xnext = x + dxdy * dy
+			let d = dy * dir
+			let xa = x.min(xnext)
+			let xb = x.max(xnext)
+			let xaf = xa.floor()
+			let xai = int(xaf)
+			let xbc = xb.ceil()
+			let xbi = int(xbc)
+			lo = lo.min(xai)
+			if xbi <= xai + 1 {
+				let xmf = 0.5 * (x + xnext) - xaf
+				acc[line + xai] += float32(d - d * xmf)
+				acc[line + xai + 1] += float32(d * xmf)
+				hi = hi.max(xai + 1)
+			} else {
+				let s = 1.0 / (xb - xa)
+				let x0f = xa - xaf
+				let a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
+				let x1f = xb - xbc + 1.0
+				let am = 0.5 * s * x1f * x1f
+				acc[line + xai] += float32(d * a0)
+				if xbi == xai + 2 {
+					acc[line + xai + 1] += float32(d * (1.0 - a0 - am))
+				} else {
+					let a1 = s * (1.5 - x0f)
+					acc[line + xai + 1] += float32(d * (a1 - a0))
+					let ds = float32(d * s)
+					for let xi = xai + 2; xi < xbi - 1; xi++ {
+						acc[line + xi] += ds
+					}
+					let a2 = a1 + float(xbi - xai - 3) * s
+					acc[line + xbi - 1] += float32(d * (1.0 - a2 - am))
+				}
+				acc[line + xbi] += float32(d * am)
+				hi = hi.max(xbi)
+			}
+			x = xnext
+		}
+		return (lo, hi)
+	}
+
+	// Sums one accumulated row from cell `lo` through `hi` into coverage
+	// bytes under the rule, and clears those cells: eight cells a vector,
+	// the prefix sum in three shifted adds.
+	internal def coverageRow(acc float32[], row int, lo int, hi int, rule FillRule, cov byte[]) {
+		let zero = simd.splat8<float32>(float32(0.0))
+		let one = simd.splat8<float32>(float32(1.0))
+		let two = simd.splat8<float32>(float32(2.0))
+		let half = simd.splat8<float32>(float32(0.5))
+		let scale = simd.splat8<float32>(float32(255.0))
+		let s1 = simd.load8<byte>(shiftOne, 0)
+		let s2 = simd.load8<byte>(shiftTwo, 0)
+		let s4 = simd.load8<byte>(shiftFour, 0)
+		let evenOdd = rule == FillRule.EvenOdd
+		let carry = float32(0.0)
+		for let x = lo; x <= hi; x += 8 {
+			let v = simd.load8<float32>(acc, row + x)
+			simd.store8<float32>(acc, row + x, zero)
+			v = v + zero.shuffle2(v, s1)
+			v = v + zero.shuffle2(v, s2)
+			v = v + zero.shuffle2(v, s4)
+			v = v + simd.splat8<float32>(carry)
+			carry = v.lane(7)
+			let a = v.abs()
+			if evenOdd {
+				// Winding modulo two, folded so edges stay anti-aliased.
+				a = a - two * (a * half).floor()
+				a = a.min(two - a)
+			} else {
+				a = a.min(one)
+			}
+			let bytes = simd.convert<int32, byte>(simd.convert<float32, int32>(a * scale + half))
+			simd.store8<byte>(cov, x, bytes)
+		}
+	}
+
+	// Composites the colour into the canvas row starting at pixel `start`,
+	// weighted by the coverage bytes from `lo` up to `end`: runs of full cover
+	// take the span fast path, partial pixels blend one by one.
+	internal def compositeRow(c Canvas, start int, cov byte[], lo int, end int, r byte, g byte, b byte, a byte, packed uint32) {
+		let x = lo
+		for x < end {
+			let k = cov[x]
+			if k == 0 {
+				x++
+				continue
+			}
+			if k == 255 {
+				let run = x
+				for run < end && cov[run] == 255 {
+					run++
+				}
+				let i = (start + x) * 4
+				if a == 255 {
+					mem.set32(c.pixels[i:i + (run - x) * 4], packed)
+				} else {
+					blendRun(c.pixels, i, run - x, r, g, b, a)
+				}
+				x = run
+				continue
+			}
+			blendPixel(c.pixels, (start + x) * 4, r, g, b, byte(canvasDiv255(int(a) * int(k))))
+			x++
+		}
+	}
+
+	// x / 255, rounded, for x up to 255 * 255.
+	internal def canvasDiv255(x int) int {
+		let y = x + 128
+		return (y + (y >> 8)) >> 8
+	}
+
+	// Blends the straight-alpha colour r, g, b, a over the straight-alpha
+	// pixel at byte offset i of `px` (source over).
+	internal def blendPixel(px byte[], i int, r byte, g byte, b byte, a byte) {
+		let da = int(px[i + 3])
+		if a >= 255 || da == 0 {
+			return when a == 0
+			px[i + 0] = r
+			px[i + 1] = g
+			px[i + 2] = b
+			px[i + 3] = a
+			return
+		}
+		return when a == 0
+		let sa = int(a)
+		let inv = 255 - sa
+		if da == 255 {
+			px[i + 0] = byte(canvasDiv255(int(r) * sa + int(px[i + 0]) * inv))
+			px[i + 1] = byte(canvasDiv255(int(g) * sa + int(px[i + 1]) * inv))
+			px[i + 2] = byte(canvasDiv255(int(b) * sa + int(px[i + 2]) * inv))
+			return
+		}
+		// Over a translucent pixel the colours mix by their share of the
+		// result's alpha: out = (src·sa + dst·da·(1 − sa)) / outA.
+		let dw = da * inv
+		let total = sa * 255 + dw
+		let half = total / 2
+		px[i + 0] = byte((int(r) * sa * 255 + int(px[i + 0]) * dw + half) / total)
+		px[i + 1] = byte((int(g) * sa * 255 + int(px[i + 1]) * dw + half) / total)
+		px[i + 2] = byte((int(b) * sa * 255 + int(px[i + 2]) * dw + half) / total)
+		px[i + 3] = byte((total + 127) / 255)
+	}
+
+	// blendPixel over `count` pixels from byte offset i: four opaque
+	// destination pixels a vector, 16-bit lanes (the largest sum,
+	// 255 * 255 + 128 + 254, fits); groups with a translucent pixel go
+	// one by one.
+	internal def blendRun(px byte[], i int, count int, r byte, g byte, b byte, a byte) {
+		return when a == 0 || count <= 0
+		let end = i + count * 4
+		let off = i
+		if a < 255 && count >= 4 {
+			let sa = int(a)
+			// Per lane: the colour's share, and what is added after the
+			// division (alpha keeps sa + div255(da * inv)).
+			let share uint16[]
+			share.len(16)
+			let after uint16[]
+			after.len(16)
+			for let p = 0; p < 16; p += 4 {
+				share[p + 0] = uint16(int(r) * sa + 128)
+				share[p + 1] = uint16(int(g) * sa + 128)
+				share[p + 2] = uint16(int(b) * sa + 128)
+				share[p + 3] = uint16(128)
+				after[p + 3] = uint16(sa)
+			}
+			let s = simd.load16<uint16>(share, 0)
+			let add = simd.load16<uint16>(after, 0)
+			let inv = simd.splat16<uint16>(uint16(255 - sa))
+			for off + 16 <= end {
+				if (px[off + 3] & px[off + 7] & px[off + 11] & px[off + 15]) == 255 {
+					let y = simd.convert<byte, uint16>(simd.load16<byte>(px, off)) * inv + s
+					let out = ((y + (y >> 8)) >> 8) + add
+					simd.store16<byte>(px, off, simd.convert<uint16, byte>(out))
+				} else {
+					for let k = off; k < off + 16; k += 4 {
+						blendPixel(px, k, r, g, b, a)
+					}
+				}
+				off += 16
+			}
+		}
+		for off < end {
+			blendPixel(px, off, r, g, b, a)
+			off += 4
+		}
+	}
+}

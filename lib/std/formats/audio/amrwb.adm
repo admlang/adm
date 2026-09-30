@@ -1,0 +1,422 @@
+partial module std.formats.audio {
+	use (
+		std.io
+		std.formats.audio.amrwb::*
+	)
+
+	// AMR-WB (Adaptive Multi-Rate wideband, 3GPP TS 26.190, ITU-T G.722.2)
+	// is the wideband speech codec of HD voice calls and of `.awb` and
+	// `.3gp` recordings: 16 kHz speech at 6.60 to 23.85 kbit/s. Decoding is
+	// bit-exact to the PacketVideo fixed-point decoder that
+	// libopencore-amrwb carries, in every mode, with the comfort noise of
+	// silent stretches (TS 26.193), the concealment of lost and damaged
+	// frames (TS 26.191) and decoder homing. `.awb` files of one channel
+	// and multichannel ones (RFC 4867 section 5) are read; channels come
+	// out in the order the file stores them.
+	//
+	// Encoding is not implemented yet.
+	@codec("AMRWB")
+	type AMRWB {
+		mimeType string[] {
+			def get() string[] {
+				return string["audio/amr-wb"]
+			}
+		}
+		extension string[] {
+			def get() string[] {
+				return string[".awb"]
+			}
+		}
+
+		// matchSignature reports whether the reader starts with the magic
+		// line of a wideband `.awb` file, of one channel or several.
+		def matchSignature(r io.Reader) bool {
+			let head byte[]
+			head.len(amrWbMagicMulti.len())
+			let n = 0
+			for n < head.len() {
+				let got = r.read(head[n:]) onerror recover 0
+				break when got <= 0
+				n += got
+			}
+			return amrWbMagicLength(head[0:n]) > 0
+		}
+
+		// open returns a stream decoding the frames read from the reader. A
+		// live stream keeps only the frames still to decode.
+		// Fails when the data is no wideband `.awb` file, or the reader
+		// fails.
+		def open(reader io.Reader, live bool = false) !AudioStream {
+			let s = new AmrWbStream(reader, live)
+			try s.start()
+			return s
+		}
+
+		// info reads the stream's description, counting its frames. Fails
+		// when the data is no wideband `.awb` file, or the reader fails.
+		def info(reader io.Reader) !AudioInfo {
+			let s = new AmrWbStream(reader, false)
+			defer s.close()
+			try s.start()
+			return s.info()
+		}
+
+		// decoder returns a decoder of AMR-WB frames as a 3GPP or MP4 file
+		// stores them: each packet holds whole frames of the storage
+		// format. The `config` bytes (the `damr` box) are not needed and
+		// are ignored.
+		//
+		// Does not fail.
+		def decoder(config byte[]) !AudioDecoder {
+			return new AmrWbPacketDecoder()
+		}
+
+		// encode is not implemented yet: it always fails.
+		def encode(stream AudioStream, writer io.Writer) !none {
+			fail "amr-wb: encoding is not implemented"
+		}
+	}
+}
+
+internal partial module std.formats.audio.amrwb {
+	use (
+		std.io
+		std.formats.audio.seek::*
+		std.formats.audio::*
+	)
+
+	// The magic lines of single and multichannel wideband files.
+	const amrWbMagic = "#!AMR-WB\n"
+	const amrWbMagicMulti = "#!AMR-WB_MC1.0\n"
+
+	// Bytes read from the reader at a time.
+	const amrWbReadChunk = 1 << 16
+
+	// Blocks a live stream decodes between dropping the ones behind it.
+	const amrWbLiveBlocks = 1024
+
+	// Blocks decoded and dropped before a seek target, so the decoder's
+	// memory has settled when the target is reached.
+	const amrWbSeekPreroll = 16
+
+	// Bit rate of each speech mode in bit/s.
+	const amrWbBitrates = int[6600, 8850, 12650, 14250, 15850, 18250, 19850, 23050, 23850]
+
+	// The magic line's length when `head` starts with one, else 0.
+	def amrWbMagicLength(head byte[]) int {
+		return amrWbMagicMulti.len() when amrWbStartsWith(head, amrWbMagicMulti)
+		return amrWbMagic.len() when amrWbStartsWith(head, amrWbMagic)
+		return 0
+	}
+
+	// Whether `data` starts with the bytes of `text`.
+	def amrWbStartsWith(data byte[], text string) bool {
+		let b = text.bytes()
+		return data.len() >= b.len() && data[0:b.len()].equals(b)
+	}
+
+	// Bytes of the frame whose header byte is `header`, header included.
+	def amrWbFrameSize(header int) int {
+		return 1 + wbFrameBytes[(header >> 3) & 15]
+	}
+
+	// Samples as floats in -1..1.
+	def amrWbToFloat(samples int[], out float32[], at int, stride int) {
+		for let i = 0; i < samples.len(); i++ {
+			out[at + i * stride] = float32(samples[i]) / 32768.0
+		}
+	}
+
+	// A stream over the blocks of an `.awb` file: one frame of each
+	// channel, 20 ms of speech. The bytes read so far are kept, so seeking
+	// backwards needs no rewindable reader; a live stream drops them once
+	// decoded and cannot seek.
+	type AmrWbStream {
+		reader        io.Reader
+		live          bool
+		ended         bool
+		closed        bool
+		data          byte[]
+		dataLen       int
+		channels      int
+		decoders      AmrWbDecoder[]
+		described     AudioInfo
+		// Byte offset of each block found so far.
+		offsets       int[]
+		scanAt        int
+		// Frame bytes of the blocks found, for the bit rate.
+		frameBytes    int
+		// One decoded block and how much of it has been handed out.
+		pcm           float32[]
+		pcmUsed       int
+		pcmFrames     int
+		// Index of the next block to decode.
+		next          int
+		// Decoded frames still to drop before a seek target.
+		dropFrames    int
+		// The frame the next read starts at.
+		framePosition uint64
+
+		def new(reader io.Reader, live bool) {
+			self.reader = reader
+			self.live = live
+		}
+
+		// Reads the magic line and channel count; unless live, reads the
+		// whole data and counts the blocks. Fails when the data is no
+		// wideband `.awb` file, or the reader fails.
+		def start() !none {
+			try fill(amrWbMagicMulti.len() + 4)
+			let magic = amrWbMagicLength(data[0:dataLen])
+			fail "amr-wb: not an AMR-WB file" when magic == 0
+			channels = 1
+			scanAt = magic
+			if magic == amrWbMagicMulti.len() {
+				fail "amr-wb: the file ends in its header" when dataLen < magic + 4
+				channels = int(data[magic + 3]) & 15
+				fail "amr-wb: the file declares no channels" when channels == 0
+				scanAt += 4
+			}
+			for let c = 0; c < channels; c++ {
+				decoders.push(new AmrWbDecoder())
+			}
+			let firstBlock = scanAt
+			if !live {
+				try fill(1 << 62)
+				for try scan() {}
+			}
+			let blocks = offsets.len()
+			let frames = blocks * wbFrame16k
+			let bitrate = 0
+			if blocks > 0 {
+				bitrate = frameBytes * 8 * 50 / blocks
+			} else if firstBlock < dataLen {
+				let ft = (int(data[firstBlock]) >> 3) & 15
+				bitrate = ft < 9 ?? (amrWbBitrates[ft] * channels, 0)
+			}
+			described = AudioInfo{
+				sampleRate: uint32(16000),
+				channels:   uint16(channels),
+				bitDepth:   16,
+				format:     SampleFormat.Float32,
+				frames:     uint64(frames),
+				length:     duration(int64(frames) * 1000000000 / 16000),
+				codec:      "amr-wb",
+				bitrate:    uint32(bitrate),
+				seekable:   !live,
+			}
+			return none
+		}
+
+		// Reads from the reader until `size` bytes are held or it ends.
+		// Fails when the reader does.
+		def fill(size int) !none {
+			for dataLen < size && !ended {
+				data.len((data.len() * 2).max(dataLen + amrWbReadChunk)) when data.len() < dataLen + amrWbReadChunk
+				let n = try reader.read(data[dataLen:dataLen + amrWbReadChunk])
+				if n <= 0 {
+					ended = true
+				} else {
+					dataLen += n
+				}
+			}
+			return none
+		}
+
+		// Finds the block after the last one found. Returns false at the
+		// end of the data; a block cut off by the end is not decoded.
+		def scan() !bool {
+			let at = scanAt
+			let bytes = 0
+			for let c = 0; c < channels; c++ {
+				try fill(at + 1)
+				return false when at >= dataLen
+				let size = amrWbFrameSize(int(data[at]))
+				try fill(at + size)
+				return false when at + size > dataLen
+				at += size
+				bytes += size
+			}
+			offsets.push(scanAt)
+			frameBytes += bytes
+			scanAt = at
+			return true
+		}
+
+		// Decodes the next block into `pcm`. Returns false at the end.
+		def decodeNext() !bool {
+			if offsets.len() <= next {
+				return false unless try scan()
+			}
+			let at = offsets[next]
+			pcm.len(wbFrame16k * channels)
+			for let c = 0; c < channels; c++ {
+				let header = int(data[at])
+				amrWbToFloat(decoders[c].decodeStored(header, data, at + 1), pcm, c, channels)
+				at += amrWbFrameSize(header)
+			}
+			pcmFrames = wbFrame16k
+			pcmUsed = 0
+			next++
+			compact() when live && next >= amrWbLiveBlocks
+			return true
+		}
+
+		// Drops the bytes and offsets of the blocks decoded so far.
+		def compact() {
+			let cut = next < offsets.len() ?? (offsets[next], scanAt)
+			let kept byte[]
+			kept.len(dataLen - cut + amrWbReadChunk)
+			data[cut:dataLen].copy(kept) when dataLen > cut
+			data = kept
+			dataLen -= cut
+			scanAt -= cut
+			let rest int[]
+			for let i = next; i < offsets.len(); i++ {
+				rest.push(offsets[i] - cut)
+			}
+			offsets = rest
+			next = 0
+		}
+
+		def info() AudioInfo {
+			return described
+		}
+
+		// Fills `buf` with the next interleaved frames and returns their
+		// count, 0 at the end. Fails when the stream is closed, `buf` is not
+		// whole frames, or the reader fails.
+		def read(buf float32[]) !int {
+			fail "amr-wb: the stream is closed" when closed
+			fail "amr-wb: the buffer is not a whole number of frames" when buf.len() % channels != 0
+			let want = buf.len() / channels
+			let written = 0
+			for written < want {
+				if pcmUsed >= pcmFrames {
+					break unless try decodeNext()
+					continue
+				}
+				if dropFrames > 0 {
+					let drop = dropFrames.min(pcmFrames - pcmUsed)
+					pcmUsed += drop
+					dropFrames -= drop
+					continue
+				}
+				let n = (want - written).min(pcmFrames - pcmUsed)
+				pcm[pcmUsed * channels:(pcmUsed + n) * channels].copy(buf[written * channels:(written + n) * channels])
+				pcmUsed += n
+				written += n
+			}
+			framePosition += uint64(written)
+			return written
+		}
+
+		// Positions the stream at `frame`; past the end, at the end.
+		// Decoding restarts from reset decoders `amrWbSeekPreroll` blocks
+		// earlier, so their memory has settled at the target.
+		// Fails when the stream is closed or live.
+		def seek(frame uint64) !none {
+			fail "amr-wb: the stream is closed" when closed
+			fail "amr-wb: a live stream cannot seek" when live
+			let target = int(frame).min(offsets.len() * wbFrame16k)
+			let restart = (target / wbFrame16k - amrWbSeekPreroll).max(0)
+			for let c = 0; c < channels; c++ {
+				decoders[c] = new AmrWbDecoder()
+			}
+			next = restart
+			pcmFrames = 0
+			pcmUsed = 0
+			dropFrames = target - restart * wbFrame16k
+			framePosition = uint64(target)
+			return none
+		}
+
+		// Positions the stream at `time` from its start.
+		//
+		// Fails when the stream cannot seek there.
+		def seek(time duration) !none {
+			return seek(frameAt(time, info()))
+		}
+
+		// Moves the stream by `offset`, back when negative.
+		//
+		// Fails when the stream cannot seek there.
+		def skip(offset duration) !none {
+			return seek(skipTarget(framePosition, offset, info()))
+		}
+
+		// The frame the next read starts at.
+		def position() uint64 {
+			return framePosition
+		}
+
+		// close releases the stream's buffers; reading after it fails. The
+		// reader stays with its owner. Does not fail.
+		def close() !none {
+			closed = true
+			ended = true
+			data.len(0)
+			dataLen = 0
+			offsets.len(0)
+			return none
+		}
+	}
+
+	// Decodes the AMR-WB frames of a container's track (3GPP TS 26.244): each
+	// packet holds whole frames of the storage format, one channel.
+	type AmrWbPacketDecoder {
+		decoder AmrWbDecoder
+
+		def new() {
+			decoder = new AmrWbDecoder()
+		}
+
+		// info implements AudioDecoder: 16 kHz mono.
+		def info() AudioInfo {
+			return AudioInfo{
+				sampleRate: uint32(16000),
+				channels:   uint16(1),
+				bitDepth:   uint16(16),
+				format:     SampleFormat.Float32,
+				codec:      "amr-wb",
+			}
+		}
+
+		// decode implements AudioDecoder: 320 samples for each frame in the
+		// packet. A frame cut off by the packet's end is decoded as a lost
+		// frame.
+		//
+		// Does not fail.
+		def decode(packet byte[]) !float32[] {
+			let out float32[]
+			let at = 0
+			for at < packet.len() {
+				let header = int(packet[at])
+				let size = amrWbFrameSize(header)
+				let samples int[]
+				if at + size > packet.len() {
+					samples = decoder.decodeStored(0x7C, packet, at + 1)
+				} else {
+					samples = decoder.decodeStored(header, packet, at + 1)
+				}
+				let start = out.len()
+				out.len(start + wbFrame16k)
+				amrWbToFloat(samples, out, start, 1)
+				at += size
+			}
+			return out
+		}
+
+		// flush implements AudioDecoder: AMR-WB holds nothing back.
+		//
+		// Does not fail.
+		def flush() !float32[] {
+			return float32[]
+		}
+
+		// reset implements AudioDecoder.
+		def reset() {
+			decoder = new AmrWbDecoder()
+		}
+	}
+}

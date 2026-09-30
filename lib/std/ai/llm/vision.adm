@@ -1,0 +1,463 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.math
+		std.simd
+		std.math.geom
+		std.formats.ai
+		std.formats.ai::(ModelFile, TensorType)
+		std.formats.image
+		std.formats.image::(Image)
+		std.formats.docs
+		std.gfx.processing.transform
+		std.ai.tensor::(Weights, loadWeights, rmsNorm, softmax, gelu)
+		std.ai.llm::*
+	)
+
+	// One picture or sound of a message as the model reads it: the ids of
+	// its encoder rows (see ForwardState.rows).
+	struct MediaRun {
+		image bool
+		ids   int[]
+	}
+
+	// `m` with its documents written as Markdown before its text.
+	def withDocuments(m Message) Message {
+		return m when m.documents.len() == 0
+		let text = ""
+		for let (_, doc) in m.documents {
+			text += new docs.Markdown().encode(doc) + "\n\n"
+		}
+		return Message{role: m.role, text: text + m.text, images: m.images, audio: m.audio, thinking: m.thinking, calls: m.calls, callId: m.callId}
+	}
+
+	// The pictures `m` shows the model: its images, then, when the
+	// projector sees, those its documents hold that decode.
+	def picturesOf(m Message, projector ?Projector) Image[] {
+		let out = m.images.clone()
+		return out unless projector is Projector && !(projector.vision is none)
+		for let (_, doc) in m.documents {
+			for let (_, data) in doc.resources {
+				let picture = image.load(data) onerror (err error) {
+					continue
+				}
+				out.push(picture)
+			}
+		}
+		return out
+	}
+
+	// The encoders of a projector file (llama.cpp's mmproj), turning
+	// images and sounds into rows the language model reads in place of
+	// token embeddings.
+	type Projector {
+		vision ?VisionEncoder
+
+		def new(vision ?VisionEncoder) {
+			self.vision = vision
+		}
+	}
+
+	// Reads a projector file for a model whose embedding is `width` wide.
+	// Fails when the file cannot be read, is not a projector, has no
+	// encoder this library supports, or projects to another width.
+	def readProjector(path string, width int) !Projector {
+		let file = try ai.load(path)
+		let arch = file.getString("general.architecture")
+		if arch is none || arch != "clip" {
+			file.close()
+			fail "llm: {path} is not a projector file (its architecture is {arch is none ?? ("missing", arch)})"
+		}
+		let kind = file.getString("clip.vision.projector_type")
+		let vision ?VisionEncoder = none
+		if !(kind is none) {
+			if kind != "gemma4v" {
+				file.close()
+				fail "llm: the {kind} image encoder is not supported"
+			}
+			vision = readGemma4Vision(file, width) onerror (err error) {
+				file.close()
+				return err
+			}
+		}
+		file.close()
+		fail "llm: {path} has no image encoder this library supports" when vision is none
+		return new Projector(vision)
+	}
+
+	// A linear layer whose input and output are clamped to ranges learned
+	// in training (Gemma 4's clippable linear); ±max float32 when the file
+	// gives none.
+	struct ClampedLinear {
+		weights Weights
+		inMin   float32
+		inMax   float32
+		outMin  float32
+		outMax  float32
+	}
+
+	// The clamped linear `name` (without ".weight").
+	// Fails when the weights are missing or cannot be read.
+	def readClamped(file ModelFile, name string) !ClampedLinear {
+		return ClampedLinear{
+			weights: try loadWeights(file, name + ".weight"),
+			inMin:   try scalar(file, name + ".input_min", -maxFloat32),
+			inMax:   try scalar(file, name + ".input_max", maxFloat32),
+			outMin:  try scalar(file, name + ".output_min", -maxFloat32),
+			outMax:  try scalar(file, name + ".output_max", maxFloat32),
+		}
+	}
+
+	const maxFloat32 = float32(3.4028234663852886e38)
+
+	// The one value of tensor `name`, or `otherwise` when it is missing.
+	// Fails when the read fails.
+	def scalar(file ModelFile, name string, otherwise float32) !float32 {
+		return otherwise when file.tensor(name) is none
+		let v = try file.readFloats(name)
+		return v.len() > 0 ?? (v[0], otherwise)
+	}
+
+	// Every row of `x` through `layer` into `out`, on tasks.
+	def applyClamped(layer ClampedLinear, x matrix<float32>, out matrix<float32>) {
+		let clipped = x.clone()
+		clampAll(clipped.data(), layer.inMin, layer.inMax)
+		multiplyRows(layer.weights, clipped, out)
+		clampAll(out.data(), layer.outMin, layer.outMax)
+	}
+
+	// w times each row of x into the same row of out.
+	def multiplyRows(w Weights, x matrix<float32>, out matrix<float32>) {
+		if x.rows == 1 {
+			w.multiply(x.row(0), out.row(0))
+		} else {
+			w.multiply(x, out)
+		}
+	}
+
+	def clampAll(values float32[], low float32, high float32) {
+		for let i = 0; i < values.len(); i++ {
+			values[i] = values[i].clamp(low, high)
+		}
+	}
+
+	// One block of the Gemma 4 vision transformer.
+	struct VisionLayer {
+		norm1           float32[]
+		query           ClampedLinear
+		key             ClampedLinear
+		value           ClampedLinear
+		output          ClampedLinear
+		queryNorm       float32[]
+		keyNorm         float32[]
+		postAttention   float32[]
+		norm2           float32[]
+		gate            ClampedLinear
+		up              ClampedLinear
+		down            ClampedLinear
+		postFeedForward float32[]
+	}
+
+	// Gemma 4's image encoder: 16×16 patches through a ViT with 2D RoPE,
+	// averaged over `merge`×`merge` patches, normed and projected to the
+	// language model's width.
+	type VisionEncoder {
+		// Output channels × (3 · patch²), as the convolution stores them.
+		patches       Weights
+		// Per axis (x then y), `positionCount` rows of `width` values.
+		positions     float32[]
+		positionCount int
+		layers        VisionLayer[]
+		projection    Weights
+		width         int
+		heads         int
+		patch         int
+		merge         int
+		epsilon       float32
+		ropeBase      float32
+		// The fewest and most tokens an image becomes.
+		minTokens     int
+		maxTokens     int
+
+		def new(patches Weights, positions float32[], projection Weights) {
+			self.patches = patches
+			self.positions = positions
+			self.projection = projection
+		}
+
+		// The rows `img` becomes, `projection.rows` wide.
+		def encode(img Image) matrix<float32> {
+			let align = patch * merge
+			let (w, h) = targetSize(int(img.size().width), int(img.size().height), align, minTokens * align * align, maxTokens * align * align)
+			let pixels = img.raw()
+			let stride = img.stride()
+			if w != int(img.size().width) || h != int(img.size().height) {
+				let resized = transform.resize(img, new geom.Size<uint>(uint(w), uint(h)), transform.ResizeMode.Bicubic)
+				pixels = resized.raw()
+				stride = resized.stride()
+			}
+			let nx = w / patch
+			let ny = h / patch
+			let n = nx * ny
+			let area = patch * patch
+			// Each patch's pixels, channel-major, scaled to [-1, 1].
+			let raw = matrix<float32>[].size(n, 3 * area)
+			for let py = 0; py < ny; py++ {
+				for let px = 0; px < nx; px++ {
+					let row = raw.row(py * nx + px)
+					for let ky = 0; ky < patch; ky++ {
+						for let kx = 0; kx < patch; kx++ {
+							let at = (py * patch + ky) * stride + (px * patch + kx) * 4
+							for let c = 0; c < 3; c++ {
+								row[c * area + ky * patch + kx] = float32(pixels[at + c]) / float32(127.5) - float32(1)
+							}
+						}
+					}
+				}
+			}
+			let x = matrix<float32>[].size(n, width)
+			multiplyRows(patches, raw, x)
+			let table = positionCount * width
+			for let i = 0; i < n; i++ {
+				let row = x.row(i)
+				let px = i % nx
+				let py = i / nx
+				for let e = 0; e < width; e++ {
+					row[e] += positions[px * width + e] + positions[table + py * width + e]
+				}
+			}
+			for let (_, layer) in layers {
+				runLayer(layer, x, nx)
+			}
+			// Average merge × merge patches, scaled by √width.
+			let ox = nx / merge
+			let oy = ny / merge
+			let pooled = matrix<float32>[].size(ox * oy, width)
+			let scale = float32(math.sqrt(float(width))) / float32(merge * merge)
+			for let y = 0; y < oy; y++ {
+				for let xo = 0; xo < ox; xo++ {
+					let out = pooled.row(y * ox + xo)
+					for let dy = 0; dy < merge; dy++ {
+						for let dx = 0; dx < merge; dx++ {
+							let from = x.row((y * merge + dy) * nx + xo * merge + dx)
+							for let e = 0; e < width; e++ {
+								out[e] += from[e]
+							}
+						}
+					}
+					for let e = 0; e < width; e++ {
+						out[e] *= scale
+					}
+				}
+			}
+			for let i = 0; i < pooled.rows; i++ {
+				normalize(pooled.row(i), epsilon)
+			}
+			let projected = matrix<float32>[].size(pooled.rows, projection.rows)
+			multiplyRows(projection, pooled, projected)
+			return projected
+		}
+
+		// One transformer block over every patch of `x` (rows of a grid
+		// `nx` wide), in place.
+		internal def runLayer(layer VisionLayer, x matrix<float32>, nx int) {
+			let n = x.rows
+			let hs = width / heads
+			let normed = x.clone()
+			for let i = 0; i < n; i++ {
+				rmsNorm(normed.row(i), layer.norm1, epsilon)
+			}
+			let q = matrix<float32>[].size(n, width)
+			let k = matrix<float32>[].size(n, width)
+			let v = matrix<float32>[].size(n, width)
+			applyClamped(layer.query, normed, q)
+			applyClamped(layer.key, normed, k)
+			applyClamped(layer.value, normed, v)
+			let half = hs / 2
+			let tasks = (n / 16).clamp(1, 32)
+			forall let t in 0..tasks {
+				for let i = n * t / tasks; i < n * (t + 1) / tasks; i++ {
+					let qr = q.row(i)
+					let kr = k.row(i)
+					let vr = v.row(i)
+					for let h = 0; h < heads; h++ {
+						let o = h * hs
+						rmsNorm(qr[o:o + hs], layer.queryNorm, epsilon)
+						rmsNorm(kr[o:o + hs], layer.keyNorm, epsilon)
+						normalize(vr[o:o + hs], epsilon)
+						// x position turns the first half of the head, y the second.
+						turnHalves(qr, o, half, i % nx, ropeBase)
+						turnHalves(qr, o + half, half, i / nx, ropeBase)
+						turnHalves(kr, o, half, i % nx, ropeBase)
+						turnHalves(kr, o + half, half, i / nx, ropeBase)
+					}
+				}
+			}
+			let attended = matrix<float32>[].size(n, width)
+			let qd = q.data()
+			let kd = k.data()
+			let vd = v.data()
+			let ad = attended.data()
+			forall let t in 0..tasks {
+				let scores float32[]
+				scores.len(n)
+				for let i = n * t / tasks; i < n * (t + 1) / tasks; i++ {
+					for let h = 0; h < heads; h++ {
+						attendHead(qd, kd, vd, ad, scores, i, h * hs, hs, width, n)
+					}
+				}
+			}
+			let projected = matrix<float32>[].size(n, width)
+			applyClamped(layer.output, attended, projected)
+			for let i = 0; i < n; i++ {
+				let p = projected.row(i)
+				rmsNorm(p, layer.postAttention, epsilon)
+				addInto(x.row(i), p)
+				let r = normed.row(i)
+				copyInto(x.row(i), r)
+				rmsNorm(r, layer.norm2, epsilon)
+			}
+			let ffn = layer.gate.weights.rows
+			let gated = matrix<float32>[].size(n, ffn)
+			let upped = matrix<float32>[].size(n, ffn)
+			applyClamped(layer.gate, normed, gated)
+			applyClamped(layer.up, normed, upped)
+			for let i = 0; i < n; i++ {
+				let g = gated.row(i)
+				gelu(g)
+				multiplyInto(g, upped.row(i))
+			}
+			applyClamped(layer.down, gated, projected)
+			for let i = 0; i < n; i++ {
+				let p = projected.row(i)
+				rmsNorm(p, layer.postFeedForward, epsilon)
+				addInto(x.row(i), p)
+			}
+		}
+	}
+
+	// x = x / rms(x), without a weight.
+	def normalize(x float32[], epsilon float32) {
+		let squares = 0.0
+		for let i = 0; i < x.len(); i++ {
+			squares += float(x[i]) * float(x[i])
+		}
+		let s = float32(1.0 / math.sqrt(squares / float(x.len()) + float(epsilon)))
+		for let i = 0; i < x.len(); i++ {
+			x[i] *= s
+		}
+	}
+
+	// One head of one patch's attention over all n patches: the scores of
+	// q's row i against every key row, their softmax, and the values they
+	// weight summed into out's row i. The head is hs values at `o` of rows
+	// `width` wide.
+	def attendHead(q float32[], k float32[], v float32[], out float32[], scores float32[], i int, o int, hs int, width int, n int) {
+		let qo = i * width + o
+		for let j = 0; j < n; j++ {
+			let ko = j * width + o
+			let acc = simd.splat8<float32>(float32(0))
+			for let e = 0; e < hs; e += 8 {
+				acc = simd.fma(simd.load8<float32>(q, qo + e), simd.load8<float32>(k, ko + e), acc)
+			}
+			scores[j] = simd.sum(acc)
+		}
+		softmax(scores)
+		for let j = 0; j < n; j++ {
+			let s = simd.splat8<float32>(scores[j])
+			let vo = j * width + o
+			for let e = 0; e < hs; e += 8 {
+				simd.store8<float32>(out, qo + e, simd.fma(simd.load8<float32>(v, vo + e), s, simd.load8<float32>(out, qo + e)))
+			}
+		}
+	}
+
+	// NeoX rotary embedding of the `dims` values at x[at:] at `position`:
+	// value i pairs with i + dims/2.
+	def turnHalves(x float32[], at int, dims int, position int, base float32) {
+		let pairs = dims / 2
+		for let i = 0; i < pairs; i++ {
+			let theta = float(position) * float(simd.lane(simd.exp(simd.splat4<float64>(-2.0 * float64(i) / float64(dims) * float64(math.ln(float(base))))), 0))
+			let c = float32(math.cos(theta))
+			let s = float32(math.sin(theta))
+			let a = x[at + i]
+			let b = x[at + i + pairs]
+			x[at + i] = a * c - b * s
+			x[at + i + pairs] = a * s + b * c
+		}
+	}
+
+	// The size an image is resized to: each side rounded to a multiple of
+	// `align`, then scaled down to at most `most` pixels or up to at least
+	// `least`, keeping the aspect ratio (llama.cpp's
+	// calc_size_preserved_ratio).
+	def targetSize(width int, height int, align int, least int, most int) (int, int) {
+		let w = align.max(roundTo(float(width), align))
+		let h = align.max(roundTo(float(height), align))
+		if w * h > most {
+			let beta = math.sqrt(float(height) * float(width) / float(most))
+			return (align.max(int(float(width) / beta / float(align)) * align), align.max(int(float(height) / beta / float(align)) * align))
+		}
+		if w * h < least {
+			let beta = math.sqrt(float(least) / (float(height) * float(width)))
+			return (ceilTo(float(width) * beta, align), ceilTo(float(height) * beta, align))
+		}
+		return (w, h)
+	}
+
+	// v rounded to the nearest multiple of align (halves up); v >= 0.
+	def roundTo(v float, align int) int {
+		return int(v / float(align) + 0.5) * align
+	}
+
+	// v rounded up to a multiple of align; v >= 0.
+	def ceilTo(v float, align int) int {
+		let q = v / float(align)
+		let whole = int(q)
+		return (float(whole) < q ?? (whole + 1, whole)) * align
+	}
+
+	// Gemma 4's image encoder from a projector file.
+	// Fails when a tensor is missing or cannot be read.
+	def readGemma4Vision(file ModelFile, width int) !VisionEncoder {
+		let size = try required(file, "clip.vision.embedding_length")
+		let patch = try required(file, "clip.vision.patch_size")
+		let patchTensor = file.tensor("v.patch_embd.weight")
+		fail "llm: the projector has no v.patch_embd.weight" when patchTensor is none
+		let patches = new Weights(TensorType.F32, size, 3 * patch * patch, try file.read("v.patch_embd.weight"))
+		let positionTensor = file.tensor("v.position_embd.weight")
+		fail "llm: the projector has no v.position_embd.weight" when positionTensor is none
+		let projection = try loadWeights(file, "mm.input_projection.weight")
+		fail "llm: the projector's images project to {projection.rows} values, the model reads {width}" unless projection.rows == width
+		let encoder = new VisionEncoder(patches, try file.readFloats("v.position_embd.weight"), projection)
+		encoder.positionCount = positionTensor.shape[1]
+		encoder.width = size
+		encoder.heads = try required(file, "clip.vision.attention.head_count")
+		encoder.patch = patch
+		encoder.merge = 3
+		let eps = file.getFloat("clip.vision.attention.layer_norm_epsilon")
+		encoder.epsilon = float32(eps is none ?? (0.000001, eps))
+		encoder.ropeBase = float32(100)
+		encoder.minTokens = 70
+		encoder.maxTokens = 1120
+		let count = try required(file, "clip.vision.block_count")
+		for let n = 0; n < count; n++ {
+			let p = "v.blk.{n}."
+			encoder.layers.push(VisionLayer{
+				norm1:           try file.readFloats(p + "ln1.weight"),
+				query:           try readClamped(file, p + "attn_q"),
+				key:             try readClamped(file, p + "attn_k"),
+				value:           try readClamped(file, p + "attn_v"),
+				output:          try readClamped(file, p + "attn_out"),
+				queryNorm:       try file.readFloats(p + "attn_q_norm.weight"),
+				keyNorm:         try file.readFloats(p + "attn_k_norm.weight"),
+				postAttention:   try file.readFloats(p + "attn_post_norm.weight"),
+				norm2:           try file.readFloats(p + "ln2.weight"),
+				gate:            try readClamped(file, p + "ffn_gate"),
+				up:              try readClamped(file, p + "ffn_up"),
+				down:            try readClamped(file, p + "ffn_down"),
+				postFeedForward: try file.readFloats(p + "ffn_post_norm.weight"),
+			})
+		}
+		return encoder
+	}
+}

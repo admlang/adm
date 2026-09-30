@@ -1,0 +1,379 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.gpu
+		std.ai.tensor::(Weights, RopeStyle)
+		std.ai.tensor.gpu::*
+		std.ai.llm::*
+	)
+
+	// One layer's weights on the GPU, and where its vectors (norm weights,
+	// biases, RoPE divisors) start in `DeviceModel.vectors`; -1 for none.
+	struct DeviceLayer {
+		query           DeviceWeights
+		// `none` for a layer attending over an earlier layer's cache.
+		key             ?DeviceWeights
+		value           ?DeviceWeights
+		output          DeviceWeights
+		gate            DeviceWeights
+		up              DeviceWeights
+		down            DeviceWeights
+		inputGate       ?DeviceWeights
+		inputProjection ?DeviceWeights
+		attentionNorm   int
+		queryBias       int
+		keyBias         int
+		valueBias       int
+		queryNorm       int
+		keyNorm         int
+		valueNorm       int
+		attentionPost   int
+		outputBias      int
+		feedForwardNorm int
+		feedForwardPost int
+		inputPost       int
+	}
+
+	// A model's weights on the GPU. The token embeddings stay in host
+	// memory: a token reads one row of them.
+	type DeviceModel {
+		layers          DeviceLayer[]
+		output          DeviceWeights
+		layerProjection ?DeviceWeights
+		// Every vector the layers use, one after another.
+		vectors         gpu.DeviceBuffer<float32>
+		outputNorm      int
+		layerNorm       int
+
+		def new(layers DeviceLayer[], output DeviceWeights, layerProjection ?DeviceWeights, vectors gpu.DeviceBuffer<float32>) {
+			self.layers = layers
+			self.output = output
+			self.layerProjection = layerProjection
+			self.vectors = vectors
+		}
+	}
+
+	// Why the GPU cannot run `parts`, or none when it can.
+	def deviceGap(parts ModelParts) ?string {
+		return "{parts.output.kind.name} output weights have no GPU kernel" unless onDevice(parts.output.kind)
+		let projection = parts.layerProjection
+		return "{projection.kind.name} per-layer projection has no GPU kernel" when projection is Weights && !onDevice(projection.kind)
+		for let (n, layer) in parts.layers {
+			return "layer {n} is recurrent (Gated DeltaNet)" unless layer.recurrent is none
+			return "layer {n} routes to experts" unless layer.router is none
+			return "layer {n} has attention sinks" when layer.sinks.len() > 0
+			return "layer {n} gates its attention output" when layer.gatedQuery
+			for let (_, w) in Weights[layer.query, layer.key, layer.value, layer.output, layer.gate, layer.up, layer.down] {
+				return "layer {n} has {w.kind.name} weights, which have no GPU kernel" unless onDevice(w.kind)
+			}
+			let gate = layer.inputGate
+			return "layer {n} has {gate.kind.name} input gate weights, which have no GPU kernel" when gate is Weights && !onDevice(gate.kind)
+			let input = layer.inputProjection
+			return "layer {n} has {input.kind.name} input weights, which have no GPU kernel" when input is Weights && !onDevice(input.kind)
+		}
+		return none
+	}
+
+	// Copies the weights of `parts` to the GPU.
+	// Fails when a part has no GPU kernel or the device memory runs out.
+	def uploadModel(parts ModelParts) !DeviceModel {
+		let gap = deviceGap(parts)
+		fail "llm: the GPU cannot run this model: {gap}" unless gap is none
+		let all float32[]
+		let layers DeviceLayer[]
+		for let (_, layer) in parts.layers {
+			let own = layer.sharedCache < 0
+			let gate = layer.inputGate
+			let projection = layer.inputProjection
+			layers.push(DeviceLayer{
+				query:           try upload(layer.query),
+				key:             own ?? (try upload(layer.key), none),
+				value:           own ?? (try upload(layer.value), none),
+				output:          try upload(layer.output),
+				gate:            try upload(layer.gate),
+				up:              try upload(layer.up),
+				down:            try upload(layer.down),
+				inputGate:       gate is Weights ?? (try upload(gate), none),
+				inputProjection: projection is Weights ?? (try upload(projection), none),
+				attentionNorm:   place(all, layer.attentionNorm),
+				queryBias:       place(all, layer.queryBias),
+				keyBias:         place(all, layer.keyBias),
+				valueBias:       place(all, layer.valueBias),
+				queryNorm:       place(all, layer.queryNorm),
+				keyNorm:         place(all, layer.keyNorm),
+				valueNorm:       place(all, layer.valueNorm),
+				attentionPost:   place(all, layer.attentionPost),
+				outputBias:      place(all, layer.outputBias),
+				feedForwardNorm: place(all, layer.feedForwardNorm),
+				feedForwardPost: place(all, layer.feedForwardPost),
+				inputPost:       place(all, layer.inputPost),
+			})
+		}
+		let outputNorm = place(all, parts.outputNorm)
+		let layerNorm = place(all, parts.layerNorm)
+		all.push(float32(0))
+		let layerProjection = parts.layerProjection
+		let model = new DeviceModel(layers, try upload(parts.output), layerProjection is Weights ?? (try upload(layerProjection), none), try gpu.upload(all))
+		model.outputNorm = outputNorm
+		model.layerNorm = layerNorm
+		return model
+	}
+
+	// The weights of `parts` on the GPU, or none when the GPU cannot run
+	// them or its memory runs out.
+	def uploadIfPossible(parts ModelParts) ?DeviceModel {
+		return none unless deviceGap(parts) is none
+		let model = uploadModel(parts) onerror (err error) {
+			return none
+		}
+		return model
+	}
+
+	// Appends `v` to `all` and returns where it starts, or -1 when empty.
+	def place(all float32[], v float32[]) int {
+		return -1 when v.len() == 0
+		let at = all.len()
+		all.push(...v)
+		return at
+	}
+
+	// A session's forward pass on the GPU: its KV caches and the
+	// activations of the token being run, all resident on the device.
+	type DeviceState {
+		parts     ModelParts
+		model     DeviceModel
+		context   int
+		// Positions the caches hold room for; they grow up to `context`.
+		capacity  int
+		// Per layer, its cached keys and values (one value for a layer
+		// sharing another's cache).
+		keys      gpu.DeviceBuffer<float32>[]
+		values    gpu.DeviceBuffer<float32>[]
+		// The residual stream, its normed copy, queries, attention output,
+		// projections, feed-forward halves, per-layer inputs and one
+		// layer's gated input, the token's per-layer embedding, attention's
+		// partial sums and the logits.
+		x         gpu.DeviceBuffer<float32>
+		normed    gpu.DeviceBuffer<float32>
+		q         gpu.DeviceBuffer<float32>
+		attended  gpu.DeviceBuffer<float32>
+		projected gpu.DeviceBuffer<float32>
+		gated     gpu.DeviceBuffer<float32>
+		upped     gpu.DeviceBuffer<float32>
+		inputs    gpu.DeviceBuffer<float32>
+		input     gpu.DeviceBuffer<float32>
+		embedded  gpu.DeviceBuffer<float32>
+		work      gpu.DeviceBuffer<float32>
+		logits    gpu.DeviceBuffer<float32>
+		// Per layer, its RoPE table (see ropeTable) one after another, and
+		// where each starts.
+		turns     gpu.DeviceBuffer<float32>
+		turnAt    int[]
+		// Host rows the embeddings are read into.
+		row       float32[]
+		layerRow  float32[]
+
+		def new(parts ModelParts, model DeviceModel, context int) {
+			self.parts = parts
+			self.model = model
+			self.context = context
+		}
+
+		// Allocates the buffers.
+		// Fails when the device memory runs out.
+		def open() !none {
+			let info = parts.info
+			let widest = 0
+			let widestHead = 0
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.gate.rows)
+				widestHead = widestHead.max(layer.headSize)
+			}
+			let width = parts.layerWidth
+			x = try zeros(info.embedding)
+			normed = try zeros(info.embedding)
+			q = try zeros(info.heads * widestHead)
+			attended = try zeros(info.heads * widestHead)
+			projected = try zeros(info.embedding)
+			gated = try zeros(widest)
+			upped = try zeros(widest)
+			inputs = try zeros((info.layers * width).max(1))
+			input = try zeros(width.max(1))
+			embedded = try zeros((info.layers * width).max(1))
+			logits = try zeros(parts.output.rows)
+			row.len(info.embedding)
+			layerRow.len(info.layers * width)
+			// The divisors this context calls for, as ForwardState picks them.
+			let long = context > parts.originalContext && parts.ropeLong.len() > 0
+			let factors = parts.ropeShort.len() > 0 ?? (long ?? (parts.ropeLong, parts.ropeShort), parts.ropeFactors)
+			let tables float32[]
+			for let (_, layer) in parts.layers {
+				turnAt.push(tables.len())
+				let dims = parts.rotated > 0 ?? (parts.rotated, layer.headSize)
+				tables.push(...ropeTable(dims, layer.ropeBase, layer.ropeScale, layer.ropeFactors.len() > 0 ?? (layer.ropeFactors, factors)))
+			}
+			tables.push(float32(0))
+			turns = try gpu.upload(tables)
+			capacity = context.min(1024)
+			for let (_, layer) in parts.layers {
+				let size = layer.sharedCache < 0 ?? (capacity * info.kvHeads * layer.headSize, 1)
+				keys.push(try zeros(size))
+				values.push(try zeros(size))
+			}
+			work = try zeros(partsSize(info.heads, widestHead(), capacity))
+			return none
+		}
+
+		// Runs `tokens` at positions from `start` on, leaving the last
+		// one's next-token logits in `out`.
+		// Fails when a launch or copy fails.
+		// Negative tokens stand for the `rows` they key.
+		def forward(tokens int[], start int, out float32[], rows map<int, float32[]>) !none {
+			try open() when capacity == 0
+			for let (i, token) in tokens {
+				try step(token, start + i, i == tokens.len() - 1, rows)
+			}
+			try logits.download(out)
+			return none
+		}
+
+		// One token through every layer; the logits only when `last`.
+		internal def step(token int, position int, last bool, rows map<int, float32[]>) !none {
+			let info = parts.info
+			let e = info.embedding
+			let eps = parts.epsilon
+			let v = model.vectors
+			try grow(position + 1) when position >= capacity
+			if token < 0 {
+				let held = rows.get(token)
+				copyInto(held, row) unless held is none
+			} else {
+				parts.embedding.row(token, row)
+				scaleBy(row, parts.embeddingScale) unless parts.embeddingScale == float32(1)
+			}
+			try x.write(row)
+			let width = parts.layerWidth
+			let projection = model.layerProjection
+			let layerEmbedding = parts.layerEmbedding
+			if projection is DeviceWeights && layerEmbedding is Weights {
+				// Gemma 4's per-layer inputs, as in ForwardState.layerInputs.
+				layerEmbedding.row(token.max(0), layerRow)
+				try embedded.write(layerRow)
+				try projection.multiply(x, 0, inputs, 0)
+				let scale = float32(1) / float32(sqrtOf(float(e)))
+				try rmsNorm(inputs, 0, inputs, 0, width, v, model.layerNorm, scale, eps, info.layers * 256)
+				try accumulate(inputs, 0, embedded, 0, info.layers * width, float32(sqrtOf(float(width))), float32(1) / float32(sqrtOf(2.0)))
+			}
+			let halves = parts.pairing == RopeStyle.Halves ?? (1, 0)
+			let count = parts.layers.len()
+			try rmsNorm(x, 0, normed, 0, e, v, model.layers[0].attentionNorm, float32(1), eps, 256) when count > 0
+			for let (index, layer) in parts.layers {
+				let d = model.layers[index]
+				let hs = layer.headSize
+				let kvSize = info.kvHeads * hs
+				let dims = parts.rotated > 0 ?? (parts.rotated, hs)
+				let turnAt = self.turnAt[index]
+				// `normed` holds the attention norm of x.
+				try d.query.multiply(normed, 0, q, 0)
+				try bias(q, 0, d.queryBias, info.heads * hs)
+				try prepareHeads(q, 0, hs, d.queryNorm >= 0 ?? (1, 0), v, d.queryNorm, eps, 1, position, turns, turnAt, dims, halves, layer.ropeMagnitude, info.heads * 256)
+				let key = d.key
+				let value = d.value
+				if key is DeviceWeights && value is DeviceWeights {
+					let at = position * kvSize
+					let kc = keys[index]
+					let vc = values[index]
+					try key.multiply(normed, 0, kc, at)
+					try bias(kc, at, d.keyBias, kvSize)
+					try prepareHeads(kc, at, hs, d.keyNorm >= 0 ?? (1, 0), v, d.keyNorm, eps, 1, position, turns, turnAt, dims, halves, layer.ropeMagnitude, info.kvHeads * 256)
+					try value.multiply(normed, 0, vc, at)
+					try bias(vc, at, d.valueBias, kvSize)
+					if d.valueNorm >= 0 {
+						try prepareHeads(vc, at, hs, 1, v, d.valueNorm, eps, 0, position, turns, turnAt, dims, halves, layer.ropeMagnitude, info.kvHeads * 256)
+					}
+				}
+				let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
+				let first = layer.window > 0 ?? ((position - layer.window + 1).max(0), 0)
+				try attention(q, keys[cache], values[cache], attended, work, info.heads, info.kvHeads, hs, first, position + 1 - first, parts.attentionScale, parts.attentionCap)
+				try d.output.multiply(attended, 0, projected, 0)
+				try bias(projected, 0, d.outputBias, e)
+				try addNormed(x, projected, e, v, d.attentionPost, eps, float32(1), normed, d.feedForwardNorm, 256)
+				if d.gate.kind == d.up.kind {
+					try d.gate.multiplyGated(d.up, normed, gated, parts.gelu)
+				} else {
+					try d.gate.multiply(normed, 0, gated, 0)
+					try d.up.multiply(normed, 0, upped, 0)
+					try activate(gated, 0, upped, 0, layer.gate.rows, parts.gelu ?? (1, 0))
+				}
+				try d.down.multiply(gated, 0, projected, 0)
+				// The last residual add of the layer leaves the next norm in `normed`.
+				let next = index + 1 < count ?? (model.layers[index + 1].attentionNorm, model.outputNorm)
+				let gate = d.inputGate
+				let inputProjection = d.inputProjection
+				if gate is DeviceWeights && inputProjection is DeviceWeights {
+					try addNormed(x, projected, e, v, d.feedForwardPost, eps, float32(1), normed, -1, 256)
+					try gate.multiply(x, 0, input, 0)
+					try activate(input, 0, inputs, index * width, width, 1)
+					try inputProjection.multiply(input, 0, projected, 0)
+					try addNormed(x, projected, e, v, d.inputPost, eps, layer.outputScale, normed, next, 256)
+				} else {
+					try addNormed(x, projected, e, v, d.feedForwardPost, eps, layer.outputScale, normed, next, 256)
+				}
+			}
+			return none unless last
+			try model.output.multiply(normed, 0, logits, 0)
+			try capValues(logits, logits.len(), parts.softCap) when parts.softCap > float32(0)
+			return none
+		}
+
+		// The widest attention head of any layer.
+		internal def widestHead() int {
+			let widest = 0
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.headSize)
+			}
+			return widest
+		}
+
+		// a[at:at + n] += the vector at `from` in `model.vectors`, if any.
+		internal def bias(a gpu.DeviceBuffer<float32>, at int, from int, n int) !none {
+			return none when from < 0
+			return accumulate(a, at, model.vectors, from, n, float32(1), float32(1))
+		}
+
+		// Makes room in the caches for `needed` positions, keeping what
+		// they hold.
+		internal def grow(needed int) !none {
+			let info = parts.info
+			let room = needed.max(capacity * 2).min(context)
+			for let (index, layer) in parts.layers {
+				continue unless layer.sharedCache < 0
+				let kvSize = info.kvHeads * layer.headSize
+				keys[index] = try regrow(keys[index], room * kvSize)
+				values[index] = try regrow(values[index], room * kvSize)
+			}
+			work.dispose()
+			work = try zeros(partsSize(info.heads, widestHead(), room))
+			capacity = room
+			return none
+		}
+	}
+
+	// A buffer of `n` values holding `old`'s at its start; frees `old`.
+	// Fails when the copy or the allocation fails.
+	def regrow(old gpu.DeviceBuffer<float32>, n int) !gpu.DeviceBuffer<float32> {
+		let held float32[]
+		held.len(old.len())
+		try old.download(held)
+		old.dispose()
+		held.len(n)
+		return gpu.upload(held)
+	}
+
+	// A device buffer of `n` zeros.
+	// Fails when the allocation fails.
+	def zeros(n int) !gpu.DeviceBuffer<float32> {
+		let host float32[]
+		host.len(n)
+		return gpu.upload(host)
+	}
+}

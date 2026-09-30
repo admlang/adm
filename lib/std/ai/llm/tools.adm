@@ -1,0 +1,1407 @@
+partial module std.ai.llm {
+	use (
+		std.reflection
+		std.data.encoding::(JSON)
+	)
+
+	// One call the model asked for.
+	type ToolCall {
+		// The model's id for the call, or one the session makes up when the
+		// format has none.
+		id        string
+		name      string
+		// The arguments as the model wrote them: a JSON object.
+		arguments string
+
+		def new(id string, name string, arguments string) {
+			self.id = id
+			self.name = name
+			self.arguments = arguments
+		}
+
+		// Decodes the arguments into `target` (a struct whose fields are
+		// the parameters), as `JSON.decode` does.
+		// Fails when the arguments are not JSON or do not fit `target`.
+		def decode(target any) !none {
+			try (new JSON()).decode(arguments, target)
+			return none
+		}
+	}
+
+	// The JSON type of a parameter.
+	enum ParameterKind {
+		String,
+		Integer,
+		Number,
+		Boolean,
+		Array,
+		Object,
+	}
+
+	// One parameter of a tool, as a JSON Schema property.
+	struct ToolParameter {
+		name        string
+		kind        ParameterKind
+		description string
+		required    bool            = true
+		// The values a string parameter may take; empty for any.
+		choices     string[]
+		// The kind of an array's items.
+		items       ParameterKind   = ParameterKind.String
+		// The fields of an object.
+		fields      ToolParameter[]
+	}
+
+	// A function the model may call.
+	struct Tool {
+		name        string
+		description string
+		parameters  ToolParameter[]
+		// Runs a call and returns the text the model reads as its result.
+		// When it fails, the error message goes back to the model instead.
+		// `none`: the session stops the reply at the call, so the program
+		// runs it and answers with `Session.answer`.
+		run         ?def (call ToolCall) !string
+	}
+
+	// Makes a method a tool that `Session.use` offers the model. The
+	// method's doc comment is the tool's description and each `@param name
+	// text` tag its parameter's; the parameters' names, types and defaults
+	// are the tool's parameters (a default makes one optional, an enum lists
+	// its members as the choices). The result is the method's value as text;
+	// a failure goes back to the model as its message. `name` replaces the
+	// method's name.
+	meta def tool(ctx reflection.DiscoveryMetaContext<reflection.MethodMetaContext>, name string = "") {}
+}
+
+internal partial module std.ai.llm.calls {
+	use (
+		std.time
+		std.reflection
+		std.reflection::(FieldKind, FunctionDescriptor, AttrHit)
+		std.data.encoding::(JSON)
+		std.text.templates.jinja
+		std.ai.llm::*
+	)
+
+	// JSON values ---------------------------------------------------------
+
+	// Parses JSON text into plain values: objects as `map<string, any>`
+	// (keys in order), arrays as `any[]`, strings, `int`, `float`, `bool`
+	// and `none`.
+	def parseJson(text string) !any {
+		let reader = new JsonReader(text.bytes())
+		let value = try reader.value(0)
+		reader.skipSpace()
+		fail "json: unexpected text after the value" unless reader.pos == reader.data.len()
+		return value
+	}
+
+	type JsonReader {
+		data byte[]
+		pos  int
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def skipSpace() {
+			for pos < data.len() && isSpace(data[pos]) {
+				pos++
+			}
+		}
+
+		internal def peek() int {
+			return pos < data.len() ?? (int(data[pos]), -1)
+		}
+
+		internal def expect(b int, what string) !none {
+			skipSpace()
+			fail "json: expected {what} at byte {pos}" unless peek() == b
+			pos++
+			return none
+		}
+
+		def value(depth int) !any {
+			expects {
+				assert depth <= 64 onerror fail "json: nested too deep"
+			}
+			skipSpace()
+			let b = peek()
+			if b == 123 {
+				pos++
+				let out = new map<string, any>()
+				skipSpace()
+				if peek() == 125 {
+					pos++
+					return out
+				}
+				for {
+					skipSpace()
+					let key = try text()
+					try expect(58, "':'")
+					out.set(key, try value(depth + 1))
+					skipSpace()
+					if peek() == 44 {
+						pos++
+						continue
+					}
+					try expect(125, "',' or '\}'")
+					return out
+				}
+			}
+			if b == 91 {
+				pos++
+				let out any[] = []
+				skipSpace()
+				if peek() == 93 {
+					pos++
+					return out
+				}
+				for {
+					out.push(try value(depth + 1))
+					skipSpace()
+					if peek() == 44 {
+						pos++
+						continue
+					}
+					try expect(93, "',' or ']'")
+					return out
+				}
+			}
+			return try text() when b == 34
+			return true when word("true")
+			return false when word("false")
+			return none when word("null")
+			let start = pos
+			for pos < data.len() && (data[pos] == byte(45) || data[pos] == byte(43) || data[pos] == byte(46) || data[pos] == byte(101) || data[pos] == byte(69) || (data[pos] >= byte(48) && data[pos] <= byte(57))) {
+				pos++
+			}
+			fail "json: expected a value at byte {start}" when pos == start
+			let number = string(data[start:pos])
+			return parseFloat<float>(number) when number.contains(".") || number.contains("e") || number.contains("E")
+			return parseInt<int>(number)
+		}
+
+		internal def word(w string) bool {
+			let bytes = w.bytes()
+			return false unless pos + bytes.len() <= data.len() && string(data[pos:pos + bytes.len()]) == w
+			pos += bytes.len()
+			return true
+		}
+
+		// A quoted string with JSON's escapes.
+		def text() !string {
+			fail "json: expected a string at byte {pos}" unless peek() == 34
+			pos++
+			let out byte[]
+			for pos < data.len() {
+				let b = data[pos]
+				pos++
+				return string(out) when b == byte(34)
+				if b != byte(92) {
+					out.push(b)
+					continue
+				}
+				fail "json: string ends in an escape" when pos >= data.len()
+				let e = int(data[pos])
+				pos++
+				match e {
+					case 110:
+						out.push(byte(10))
+					case 116:
+						out.push(byte(9))
+					case 114:
+						out.push(byte(13))
+					case 98:
+						out.push(byte(8))
+					case 102:
+						out.push(byte(12))
+					case 117:
+						let code = try hex4()
+						if code >= 0xD800 && code < 0xDC00 && pos + 1 < data.len() && data[pos] == byte(92) && data[pos + 1] == byte(117) {
+							pos += 2
+							let low = try hex4()
+							code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+						}
+						out.push(...utf8(code))
+					default:
+						out.push(byte(e))
+				}
+			}
+			fail "json: string is not closed"
+		}
+
+		internal def hex4() !int {
+			fail "json: short \\u escape" when pos + 4 > data.len()
+			let code = 0
+			for let k = 0; k < 4; k++ {
+				let c = int(data[pos + k])
+				let v = c >= 48 && c <= 57 ?? (c - 48, c >= 97 && c <= 102 ?? (c - 87, c >= 65 && c <= 70 ?? (c - 55, -1)))
+				fail "json: bad \\u escape" when v < 0
+				code = code * 16 + v
+			}
+			pos += 4
+			return code
+		}
+	}
+
+	def utf8(c int) byte[] {
+		let out byte[]
+		if c < 0x80 {
+			out.push(byte(c))
+		} else if c < 0x800 {
+			out.push(byte(0xC0 | (c >> 6)), byte(0x80 | (c & 0x3F)))
+		} else if c < 0x10000 {
+			out.push(byte(0xE0 | (c >> 12)), byte(0x80 | ((c >> 6) & 0x3F)), byte(0x80 | (c & 0x3F)))
+		} else {
+			out.push(byte(0xF0 | (c >> 18)), byte(0x80 | ((c >> 12) & 0x3F)), byte(0x80 | ((c >> 6) & 0x3F)), byte(0x80 | (c & 0x3F)))
+		}
+		return out
+	}
+
+	// JSON text of a plain value, compact.
+	def toJson(value any) string {
+		return string((new JSON()).encode(value))
+	}
+
+	// The byte offset just after the JSON value starting at `from` (an
+	// object or array, tracking strings), or -1 when it does not close.
+	def jsonEnd(data byte[], from int) int {
+		let depth = 0
+		let inString = false
+		for let k = from; k < data.len(); k++ {
+			let b = data[k]
+			if inString {
+				if b == byte(92) {
+					k++
+				} else if b == byte(34) {
+					inString = false
+				}
+				continue
+			}
+			if b == byte(34) {
+				inString = true
+			} else if b == byte(123) || b == byte(91) {
+				depth++
+			} else if b == byte(125) || b == byte(93) {
+				depth--
+				return k + 1 when depth == 0
+			}
+		}
+		return -1
+	}
+
+	// Tool schemas and messages as chat templates read them --------------
+
+	// The OpenAI-style function schema of a tool.
+	def toolSchema(t Tool) map<string, any> {
+		let properties = new map<string, any>()
+		let required any[] = []
+		for let (_, p) in t.parameters {
+			properties.set(p.name, parameterSchema(p))
+			required.push(p.name) when p.required
+		}
+		let parameters = map<string, any>{"type": "object", "properties": properties, "required": required}
+		let function = map<string, any>{"name": t.name, "description": t.description, "parameters": parameters}
+		return map<string, any>{"type": "function", "function": function}
+	}
+
+	def parameterSchema(p ToolParameter) map<string, any> {
+		let out = map<string, any>{"type": kindName(p.kind)}
+		out.set("description", p.description) when p.description.len() > 0
+		if p.choices.len() > 0 {
+			let choices any[] = []
+			for let (_, c) in p.choices {
+				choices.push(c)
+			}
+			out.set("enum", choices)
+		}
+		out.set("items", map<string, any>{"type": kindName(p.items)}) when p.kind == ParameterKind.Array
+		if p.kind == ParameterKind.Object && p.fields.len() > 0 {
+			let properties = new map<string, any>()
+			let required any[] = []
+			for let (_, f) in p.fields {
+				properties.set(f.name, parameterSchema(f))
+				required.push(f.name) when f.required
+			}
+			out.set("properties", properties)
+			out.set("required", required)
+		}
+		return out
+	}
+
+	def kindName(kind ParameterKind) string {
+		match kind {
+			case ParameterKind.String:
+				return "string"
+			case ParameterKind.Integer:
+				return "integer"
+			case ParameterKind.Number:
+				return "number"
+			case ParameterKind.Boolean:
+				return "boolean"
+			case ParameterKind.Array:
+				return "array"
+			case ParameterKind.Object:
+				return "object"
+		}
+	}
+
+	// A message as chat templates read it: role, content (`text` in place
+	// of the message's), the reasoning (`reasoning_content`), tool calls
+	// with their arguments as a dict, and for a tool result the call's id
+	// and the tool's name.
+	def messageValue(m Message, toolNames map<string, string>, text string) map<string, any> {
+		let out = map<string, any>{"role": roleText(m.role), "content": text}
+		if m.images.len() > 0 || m.audio.len() > 0 {
+			// Content parts: the template writes a marker for each picture and
+			// sound, which the session replaces with the encoder's rows.
+			let content any[] = []
+			for let k = 0; k < m.images.len(); k++ {
+				content.push(map<string, any>{"type": "image"})
+			}
+			for let k = 0; k < m.audio.len(); k++ {
+				content.push(map<string, any>{"type": "audio"})
+			}
+			content.push(map<string, any>{"type": "text", "text": text})
+			out.set("content", content)
+		}
+		out.set("reasoning_content", m.thinking) when m.thinking.len() > 0
+		if m.calls.len() > 0 {
+			let calls any[] = []
+			for let (_, c) in m.calls {
+				let arguments any = parseJson(c.arguments) onerror recover c.arguments
+				let function = map<string, any>{"name": c.name, "arguments": arguments}
+				calls.push(map<string, any>{"id": c.id, "type": "function", "function": function})
+			}
+			out.set("tool_calls", calls)
+		}
+		if m.role == Role.Tool {
+			out.set("tool_call_id", m.callId)
+			let name = toolNames.get(m.callId)
+			out.set("name", name) unless name is none
+		}
+		return out
+	}
+
+	def roleText(role Role) string {
+		match role {
+			case Role.System:
+				return "system"
+			case Role.User:
+				return "user"
+			case Role.Assistant:
+				return "assistant"
+			case Role.Tool:
+				return "tool"
+		}
+	}
+
+	// Call formats --------------------------------------------------------
+
+	enum CallShape {
+		// The template writes no calls and no known markup was found.
+		None,
+		// JSON objects (or a JSON list of them) between markers.
+		Json,
+		// The name, a separator, then the arguments as JSON.
+		NameJson,
+		// The name, then key and value pairs between markers.
+		Pairs,
+		// gpt-oss: `to=functions.name` on a commentary message.
+		Harmony,
+		// `[name(key="value", ...)]` (LFM2).
+		Pythonic,
+		// `name{key:value,...}` with strings between `<|"|>` and numbers,
+		// booleans, null, lists and objects bare (Gemma 4).
+		Gemma4,
+	}
+
+	// How a model writes its tool calls, learned from its template. The
+	// fields a shape uses:
+	//
+	//   Json      start + JSON + end; nameKey, argsKey, idKey, nameAsKey, nested
+	//   NameJson  start + name + separator + JSON + end
+	//   Pairs     start + name + nameEnd + (keyStart + key + keyEnd + value + valueEnd)* + end
+	//   Pythonic  start + [name(k=v, ...), ...] + end
+	//   Gemma4    start + name{k:v,...} + end
+	struct CallFormat {
+		shape     CallShape
+		start     string
+		end       string
+		separator string
+		nameKey   string
+		argsKey   string
+		idKey     string
+		// Json: `{"name": {args}}`.
+		nameAsKey bool
+		// Json: the name and arguments sit in a "function" object.
+		nested    bool
+		nameEnd   string
+		keyStart  string
+		keyEnd    string
+		valueEnd  string
+	}
+
+	// The probe names learned formats look for in a rendered call.
+	const probeName = "PROBEFN"
+	const probeKey1 = "PROBEKA"
+	const probeKey2 = "PROBEKB"
+	const probeValue1 = "PROBEVA"
+	const probeValue2 = "PROBEVB"
+	const probeId = "call_PROBE1"
+
+	// Learns how a template writes tool calls: renders a conversation holding
+	// a known call, finds the call's markup, and reads its shape from it.
+	// `extra` holds the template's other variables (bos_token, ...).
+	def learnCallFormat(template jinja.Template, source string, extra map<string, any>) CallFormat {
+		let plain = renderProbe(template, extra, false)
+		let called = renderProbe(template, extra, true)
+		if called.len() > 0 && plain.len() > 0 {
+			let region = callRegion(plain, called)
+			let learned = shapeOf(region, called)
+			return learned unless learned.shape == CallShape.None
+		}
+		return knownFormat(source)
+	}
+
+	def renderProbe(template jinja.Template, extra map<string, any>, withCall bool) string {
+		let values = new map<string, any>()
+		for let (k, v) in extra {
+			values.set(k, v)
+		}
+		let schema = toolSchema(Tool{
+			name:        probeName,
+			description: "probe",
+			parameters:  ToolParameter[
+				ToolParameter{name: probeKey1, kind: ParameterKind.String},
+				ToolParameter{name: probeKey2, kind: ParameterKind.String},
+			],
+		})
+		let tools any[] = [schema]
+		values.set("tools", tools)
+		let assistant = map<string, any>{"role": "assistant", "content": withCall ?? ("", "PROBETEXT")}
+		if withCall {
+			let arguments = map<string, any>{probeKey1: probeValue1, probeKey2: probeValue2}
+			let function = map<string, any>{"name": probeName, "arguments": arguments}
+			let calls any[] = [map<string, any>{"id":probeId, "type":"function", "function":function}]
+			assistant.set("tool_calls", calls)
+		}
+		let messages any[] = []
+		messages.push(map<string, any>{"role": "user", "content": "PROBEASK"})
+		messages.push(assistant)
+		messages.push(map<string, any>{"role": "tool", "tool_call_id": probeId, "name": probeName, "content": "PROBERESULT"}) when withCall
+		messages.push(map<string, any>{"role": "user", "content": "PROBEAGAIN"})
+		values.set("messages", messages)
+		values.set("add_generation_prompt", true)
+		return template.render(values) onerror recover ""
+	}
+
+	// The call's markup in `called`: what follows the assistant header both
+	// renders share, up to where the plain render's end of turn starts.
+	def callRegion(plain string, called string) string {
+		let ask = called.indexOf("PROBEASK")
+		return "" when ask < 0 || plain.indexOf("PROBEASK") != ask
+		let a = plain.slice(ask)
+		let b = called.slice(ask)
+		let shared = 0
+		let n = a.len().min(b.len())
+		for shared < n && a.slice(shared, shared + 1) == b.slice(shared, shared + 1) {
+			shared++
+		}
+		// The header ends where the plain render's text starts.
+		let text = a.indexOf("PROBETEXT")
+		shared = shared.min(text) when text >= 0
+		let rest = b.slice(shared)
+		let result = rest.indexOf("PROBERESULT")
+		rest = rest.slice(0, result) when result >= 0
+		// Cut before the end-of-turn markup the plain render writes after its text.
+		let after = text >= 0 ?? (a.slice(text + "PROBETEXT".len()), "")
+		let turnEnd = firstMarkup(after)
+		if turnEnd.len() > 0 {
+			let at = lastIndex(rest, turnEnd)
+			rest = rest.slice(0, at) when at > 0
+		}
+		return rest
+	}
+
+	// The leading markup of `text`: a `<...>` or `[...]` tag, or "".
+	def firstMarkup(text string) string {
+		let t = text.trimStart()
+		return "" when t.len() == 0
+		let open = t.slice(0, 1)
+		let close = open == "<" ?? (">", open == "[" ?? ("]", ""))
+		return "" when close.len() == 0
+		let at = t.indexOf(close)
+		return at > 0 ?? (t.slice(0, at + 1), "")
+	}
+
+	def shapeOf(region string, called string) CallFormat {
+		return CallFormat{shape: CallShape.Harmony} when called.contains("to=functions.{probeName}")
+		let name = region.indexOf(probeName)
+		return CallFormat{} when name < 0
+		if region.contains(probeKey1 + ":" + gemmaQuote + probeValue1 + gemmaQuote) {
+			let data = region.bytes()
+			let open = region.slice(0, name).bytes().len() + probeName.bytes().len()
+			let (value, close) = gemmaValue(data, open)
+			return CallFormat{} when close < 0 || !isMap(value)
+			return CallFormat{shape: CallShape.Gemma4, start: region.slice(0, name), end: firstMarkup(string(data[close:]))}
+		}
+		let quoted = region.indexOf("\"{probeName}\"")
+		return jsonShape(region) when quoted >= 0
+		let key1 = region.indexOf(probeKey1)
+		let value1 = region.indexOf(probeValue1)
+		return CallFormat{} when key1 < 0 || value1 < 0
+		let beforeKey = region.slice(name + probeName.len(), key1)
+		if beforeKey.trimEnd().endsWith("\{\"") || beforeKey.trimEnd().endsWith("\{ \"") {
+			// The arguments follow the name as JSON.
+			let brace = lastIndex(region.slice(0, key1), "\{")
+			let data = region.bytes()
+			let braceByte = region.slice(0, brace).bytes().len()
+			let endByte = jsonEnd(data, braceByte)
+			return CallFormat{} when endByte < 0
+			return CallFormat{
+				shape:     CallShape.NameJson,
+				start:     region.slice(0, name),
+				separator: region.slice(name + probeName.len(), brace),
+				end:       string(data[endByte:]),
+			}
+		}
+		let key2 = region.indexOf(probeKey2)
+		let value2 = region.indexOf(probeValue2)
+		return CallFormat{} when key2 < 0 || value2 < 0
+		let a = region.slice(name + probeName.len(), key1)
+		let c = region.slice(value1 + probeValue1.len(), key2)
+		let d = region.slice(value2 + probeValue2.len())
+		let valueEnd = commonPrefix(c, d)
+		let keyStart = c.slice(valueEnd.len())
+		let nameEnd = a.endsWith(keyStart) ?? (a.slice(0, a.len() - keyStart.len()), a)
+		return CallFormat{
+			shape:    CallShape.Pairs,
+			start:    region.slice(0, name),
+			nameEnd:  nameEnd,
+			keyStart: keyStart,
+			keyEnd:   region.slice(key1 + probeKey1.len(), value1),
+			valueEnd: valueEnd,
+			end:      d.slice(valueEnd.len()),
+		}
+	}
+
+	// A call written as a JSON object (or list of them) holding the name.
+	def jsonShape(region string) CallFormat {
+		let data = region.bytes()
+		for let k = 0; k < data.len(); k++ {
+			continue unless data[k] == byte(123) || data[k] == byte(91)
+			let endByte = jsonEnd(data, k)
+			continue when endByte < 0
+			let value = parseJson(string(data[k:endByte])) onerror recover none
+			continue when value is none
+			let item = firstObject(value)
+			continue when item is none
+			let format = CallFormat{shape: CallShape.Json, start: string(data[:k]), end: string(data[endByte:])}
+			let inner any = item
+			let function = entry(item, "function")
+			if isMap(function) {
+				format.nested = true
+				inner = function
+			}
+			for let (_, key) in reflection.keysOf(inner) {
+				let v = entry(inner, key)
+				if textOf(v) == probeName {
+					format.nameKey = key
+				} else if textOf(v) == probeId {
+					format.idKey = key
+				} else if isMap(v) && !(entry(v, probeKey1) is none) {
+					if key == probeName {
+						format.nameAsKey = true
+					} else {
+						format.argsKey = key
+					}
+				} else if isText(v) && textOf(v).contains(probeKey1) {
+					format.argsKey = key
+				}
+			}
+			for let (_, key) in reflection.keysOf(item) {
+				format.idKey = key when textOf(entry(item, key)) == probeId
+			}
+			return format when format.nameAsKey || (format.nameKey.len() > 0 && format.argsKey.len() > 0)
+		}
+		return CallFormat{}
+	}
+
+	// A JSON object, or the first object of a JSON list; `none` otherwise.
+	def firstObject(value any) ?any {
+		return value when isMap(value)
+		if reflection.kindOf(value) == FieldKind.Array {
+			let items = reflection.elements(value)
+			return items[0] when items.len() > 0 && isMap(items[0])
+		}
+		return none
+	}
+
+	def isMap(value any) bool {
+		return false when value is none
+		return reflection.kindOf(value) == FieldKind.Map
+	}
+
+	def isText(value any) bool {
+		return false when value is none
+		return reflection.kindOf(value) == FieldKind.String
+	}
+
+	// The value of `key` in a parsed JSON object; `none` when absent.
+	def entry(object any, key string) any {
+		return none unless isMap(object)
+		let found = reflection.entryOf(object, key)
+		return found is none ?? (none, found)
+	}
+
+	// Where `sub` last starts in `s`; -1 when it does not.
+	def lastIndex(s string, sub string) int {
+		let at = -1
+		for {
+			let next = s.indexOf(sub, at + 1)
+			return at when next < 0
+			at = next
+		}
+		return at
+	}
+
+	def commonPrefix(a string, b string) string {
+		let n = 0
+		let m = a.len().min(b.len())
+		for n < m && a.slice(n, n + 1) == b.slice(n, n + 1) {
+			n++
+		}
+		return a.slice(0, n)
+	}
+
+	// The call formats of templates that describe tools but write no calls,
+	// by the markup their template or vocabulary names.
+	def knownFormat(source string) CallFormat {
+		return CallFormat{shape: CallShape.Pythonic, start: "<|tool_call_start|>", end: "<|tool_call_end|>"} when source.contains("<|tool_call_start|>")
+		return CallFormat{shape: CallShape.NameJson, start: "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>", separator: "\n```json\n", end: "\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"} when source.contains("<｜tool▁call▁begin｜>")
+		return CallFormat{shape: CallShape.Json, start: "<|tool_call|>", end: "<|/tool_call|>", nameKey: "name", argsKey: "arguments"} when source.contains("<|tool_call|>") || source.contains("<|tool|>")
+		return CallFormat{shape: CallShape.Json, start: "<tool_call>\n", end: "\n</tool_call>", nameKey: "name", argsKey: "arguments"} when source.contains("<tool_call>")
+		return CallFormat{}
+	}
+
+	// Reading calls ---------------------------------------------------------
+
+	// Where the call markup starts in a reply: the first place `format`'s
+	// opening could begin. -1 when it does not appear; for a format that
+	// opens with bare JSON, 0 when the reply opens with `{` or `[`.
+	def callStart(format CallFormat, text string) int {
+		match format.shape {
+			case CallShape.None:
+				return -1
+			case CallShape.Harmony:
+				return -1
+			default:
+		}
+		let marker = openingMarker(format)
+		if marker.len() == 0 {
+			let t = text.trimStart()
+			let skipped = text.len() - t.len()
+			return skipped when t.startsWith("\{") || t.startsWith("[") || t.startsWith("<|python_tag|>")
+			return -1
+		}
+		let data = text.bytes()
+		let (at, _) = findMarker(data, 0, marker)
+		return at < 0 ?? (-1, string(data[:at]).len())
+	}
+
+	// How many characters at the end of `text` could be the start of
+	// `format`'s opening marker; 0 when none could (or it has no marker).
+	def openingTail(format CallFormat, text string) int {
+		return 0 when format.shape := CallShape.None || CallShape.Harmony
+		let marker = openingMarker(format)
+		for let n = (marker.len() - 1).min(text.len()); n > 0; n-- {
+			return n when text.endsWith(marker.slice(0, n))
+		}
+		return 0
+	}
+
+	// The start marker without its trailing whitespace and id: what a reply
+	// shows first when it starts a call.
+	def openingMarker(format CallFormat) string {
+		let s = format.start.trim()
+		let id = s.indexOf(probeId)
+		return id >= 0 ?? (s.slice(0, id).trim(), s)
+	}
+
+	// The calls in a finished reply, and the reply's text before them.
+	// `parameters` gives each tool's parameter kinds, to type the values of
+	// formats that write them as text.
+	def readCalls(format CallFormat, reply string, parameters map<string, ToolParameter[]>) (string, ToolCall[]) {
+		let calls ToolCall[]
+		match format.shape {
+			case CallShape.Harmony:
+				return readHarmony(reply)
+			case CallShape.None:
+				return (reply, calls)
+			default:
+		}
+		let data = reply.bytes()
+		let first = -1
+		let pos = 0
+		for pos < data.len() {
+			let (at, after) = startOf(format, data, pos)
+			break when at < 0
+			let (next, found) = readOne(format, data, after, parameters)
+			break when next < 0
+			first = at when first < 0
+			calls.push(...found)
+			pos = next
+		}
+		return (reply, calls) when first < 0
+		return (string(data[:first]).trimEnd(), calls)
+	}
+
+	// The next call opening at or after `from`: where it starts and where
+	// its body begins.
+	def startOf(format CallFormat, data byte[], from int) (int, int) {
+		if format.start.trim().len() == 0 {
+			let k = from
+			for k < data.len() && isSpace(data[k]) {
+				k++
+			}
+			let tag = "<|python_tag|>".bytes()
+			return (k, k + tag.len()) when k + tag.len() <= data.len() && string(data[k:k + tag.len()]) == "<|python_tag|>"
+			return (k < data.len() && (data[k] == byte(123) || data[k] == byte(91))) ?? ((k, k), (-1, -1))
+		}
+		return findMarker(data, from, format.start)
+	}
+
+	// Reads the call body at `from`; returns where it ends (-1 when it does
+	// not parse) and the calls it holds.
+	def readOne(format CallFormat, data byte[], from int, parameters map<string, ToolParameter[]>) (int, ToolCall[]) {
+		let calls ToolCall[]
+		match format.shape {
+			case CallShape.Json:
+				let k = skipSpace(data, from)
+				let endByte = jsonEnd(data, k)
+				return (-1, calls) when endByte < 0
+				let value = parseJson(string(data[k:endByte])) onerror recover none
+				return (-1, calls) when value is none
+				let single any[] = [value]
+				let items = reflection.kindOf(value) == FieldKind.Array ?? (reflection.elements(value), single)
+				for let (_, item) in items {
+					let call = jsonCall(format, item)
+					calls.push(call) unless call is none
+				}
+				return (skipMarker(data, endByte, format.end), calls)
+			case CallShape.NameJson:
+				let (name, afterName) = readName(data, from)
+				return (-1, calls) when name.len() == 0
+				let (sepStart, sepEnd) = findMarker(data, afterName, format.separator)
+				return (-1, calls) unless sepStart >= 0 && sepStart <= afterName + 8
+				let k = skipSpace(data, sepEnd)
+				let endByte = jsonEnd(data, k)
+				return (-1, calls) when endByte < 0
+				calls.push(new ToolCall("", name, string(data[k:endByte])))
+				return (skipMarker(data, endByte, format.end), calls)
+			case CallShape.Pairs:
+				let (name, afterName) = readName(data, from)
+				return (-1, calls) when name.len() == 0
+				let kinds = parameters.get(name)
+				let arguments = new map<string, any>()
+				let pos = afterName
+				let (ne, neEnd) = findMarker(data, pos, format.nameEnd + format.keyStart)
+				if ne >= 0 && ne <= pos + 2 {
+					pos = neEnd
+					for {
+						let (keyEnd, valueStart) = findMarker(data, pos, format.keyEnd)
+						break when keyEnd < 0
+						let key = string(data[pos:keyEnd]).trim()
+						let (valueEnd, afterValue) = findMarker(data, valueStart, format.valueEnd)
+						break when valueEnd < 0
+						let raw = string(data[valueStart:valueEnd])
+						// Marker matching drops a marker's edge whitespace; the
+						// newline the template writes around a value is its markup.
+						raw = raw.slice(1) when format.keyEnd.endsWith("\n") && raw.startsWith("\n")
+						raw = raw.slice(0, raw.len() - 1) when format.valueEnd.startsWith("\n") && raw.endsWith("\n")
+						arguments.set(key, typedValue(raw, kindOf(kinds is none ?? (ToolParameter[], kinds), key)))
+						pos = afterValue
+						let (more, afterSep) = findMarker(data, pos, format.keyStart)
+						if more >= 0 && more <= pos + 2 && format.keyStart.trim().len() > 0 {
+							pos = afterSep
+							continue
+						}
+						break
+					}
+				} else {
+					let (nameStop, afterStop) = findMarker(data, pos, format.nameEnd)
+					pos = afterStop when nameStop >= 0 && nameStop <= pos + 2
+				}
+				calls.push(new ToolCall("", name, toJson(arguments)))
+				return (skipMarker(data, pos, format.end), calls)
+			case CallShape.Pythonic:
+				return readPythonic(format, data, from)
+			case CallShape.Gemma4:
+				let (name, afterName) = readName(data, from)
+				return (-1, calls) when name.len() == 0
+				let (arguments, close) = gemmaValue(data, afterName)
+				return (-1, calls) unless close >= 0 && isMap(arguments)
+				calls.push(new ToolCall("", name, toJson(arguments)))
+				return (skipMarker(data, close, format.end), calls)
+			default:
+		}
+		return (-1, calls)
+	}
+
+	// Gemma 4's string quote.
+	const gemmaQuote = "<|\"|>"
+
+	// A Gemma 4 value at `from` (after whitespace), as the chat template's
+	// format_argument writes it: a string between `<|"|>` (its text as it
+	// is), an object of `key:value` pairs whose keys are bare or quoted, a
+	// list, true, false, null or a number. Returns the value and where it
+	// ends, or -1 when it does not parse.
+	def gemmaValue(data byte[], from int) (any, int) {
+		let quote = gemmaQuote.bytes()
+		let k = skipSpace(data, from)
+		return (none, -1) when k >= data.len()
+		if matchAt(data, k, quote) > 0 {
+			let (close, after) = findExact(data, k + quote.len(), quote)
+			return (none, -1) when close < 0
+			return (string(data[k + quote.len():close]), after)
+		}
+		let c = data[k]
+		if c == byte(123) {
+			let object = new map<string, any>()
+			k = skipSpace(data, k + 1)
+			return (object, k + 1) when k < data.len() && data[k] == byte(125)
+			for k < data.len() {
+				let keyStart = k
+				let quoted = matchAt(data, k, quote) > 0
+				let key = ""
+				if quoted {
+					let (close, after) = findExact(data, k + quote.len(), quote)
+					return (none, -1) when close < 0
+					key = string(data[k + quote.len():close])
+					k = after
+				} else {
+					for k < data.len() && data[k] != byte(58) && data[k] != byte(125) {
+						k++
+					}
+					key = string(data[keyStart:k]).trim()
+				}
+				k = skipSpace(data, k)
+				return (none, -1) unless k < data.len() && data[k] == byte(58) && key.len() > 0
+				let (value, after) = gemmaValue(data, k + 1)
+				return (none, -1) when after < 0
+				object.set(key, value)
+				k = skipSpace(data, after)
+				return (none, -1) when k >= data.len()
+				return (object, k + 1) when data[k] == byte(125)
+				return (none, -1) unless data[k] == byte(44)
+				k = skipSpace(data, k + 1)
+			}
+			return (none, -1)
+		}
+		if c == byte(91) {
+			let list any[] = []
+			k = skipSpace(data, k + 1)
+			return (list, k + 1) when k < data.len() && data[k] == byte(93)
+			for k < data.len() {
+				let (value, after) = gemmaValue(data, k)
+				return (none, -1) when after < 0
+				list.push(value)
+				k = skipSpace(data, after)
+				return (none, -1) when k >= data.len()
+				return (list, k + 1) when data[k] == byte(93)
+				return (none, -1) unless data[k] == byte(44)
+				k++
+			}
+			return (none, -1)
+		}
+		// A bare word: a number, true, false or null.
+		let start = k
+		for k < data.len() && !(data[k] := byte(44) || byte(125) || byte(93) || byte(60)) && !isSpace(data[k]) {
+			k++
+		}
+		let word = string(data[start:k])
+		return (none, -1) when word.len() == 0
+		match word {
+			case "true":
+				return (true, k)
+			case "false":
+				return (false, k)
+			case "null":
+				return (none, k)
+		}
+		let number = parseJson(word) onerror recover none
+		return (none, -1) when number is none
+		return (number, k)
+	}
+
+	// The first exact occurrence of `m` in `data` at or after `from`: its
+	// start and end, or (-1, -1).
+	def findExact(data byte[], from int, m byte[]) (int, int) {
+		for let k = from; k + m.len() <= data.len(); k++ {
+			return (k, k + m.len()) when matchAt(data, k, m) > 0
+		}
+		return (-1, -1)
+	}
+
+	// The call in a JSON item of a Json format.
+	def jsonCall(format CallFormat, item any) ?ToolCall {
+		return none unless isMap(item)
+		let inner = item
+		if format.nested {
+			let f = entry(item, "function")
+			inner = f when isMap(f)
+		}
+		let id = format.idKey.len() > 0 ?? (textOf(entry(item, format.idKey)), "")
+		if format.nameAsKey {
+			for let (_, name) in reflection.keysOf(inner) {
+				let args = entry(inner, name)
+				return new ToolCall(id, name, argumentsText(args))
+			}
+			return none
+		}
+		let name = textOf(entry(inner, format.nameKey))
+		return none when name.len() == 0
+		return new ToolCall(id, name, argumentsText(entry(inner, format.argsKey)))
+	}
+
+	// Arguments as JSON text: a JSON string's text as it is, anything else encoded.
+	def argumentsText(args any) string {
+		return "\{\}" when args is none
+		return textOf(args) when isText(args)
+		return toJson(args)
+	}
+
+	// The text of a string or number value; "" for anything else.
+	def textOf(value any) string {
+		return "" when value is none
+		let kind = reflection.kindOf(value)
+		return reflection.scalarText(value) when kind := FieldKind.String || FieldKind.Int || FieldKind.Uint || FieldKind.Float || FieldKind.Bool
+		return ""
+	}
+
+	// A function name at `from` (letters, digits, `_`, `-`, `.`); a
+	// `functions.` prefix is dropped.
+	def readName(data byte[], from int) (string, int) {
+		let k = skipSpace(data, from)
+		let start = k
+		for k < data.len() && isNameByte(data[k]) {
+			k++
+		}
+		let name = string(data[start:k])
+		name = name.slice("functions.".len()) when name.startsWith("functions.")
+		return (name, k)
+	}
+
+	def isNameByte(b byte) bool {
+		return (b >= byte(97) && b <= byte(122)) || (b >= byte(65) && b <= byte(90)) || (b >= byte(48) && b <= byte(57)) || b == byte(95) || b == byte(45) || b == byte(46)
+	}
+
+	def isSpace(b byte) bool {
+		return b == byte(32) || b == byte(9) || b == byte(10) || b == byte(13)
+	}
+
+	def skipSpace(data byte[], from int) int {
+		let k = from
+		for k < data.len() && isSpace(data[k]) {
+			k++
+		}
+		return k
+	}
+
+	// Past `marker` when it follows at `from` (after whitespace), else `from`.
+	def skipMarker(data byte[], from int, marker string) int {
+		return from when marker.trim().len() == 0
+		let (at, after) = findMarker(data, from, marker)
+		return (at >= 0 && at <= skipSpace(data, from)) ?? (after, from)
+	}
+
+	def kindOf(parameters ToolParameter[], key string) ParameterKind {
+		for let (_, p) in parameters {
+			return p.kind when p.name == key
+		}
+		return ParameterKind.String
+	}
+
+	// A parameter value written as text, typed by its parameter's kind.
+	def typedValue(raw string, kind ParameterKind) any {
+		match kind {
+			case ParameterKind.String:
+				return raw
+			case ParameterKind.Boolean:
+				let t = raw.trim().lower()
+				return t == "true" when t := "true" || "false"
+				return raw
+			default:
+		}
+		let parsed = parseJson(raw.trim()) onerror recover none
+		return parsed is none ?? (raw, parsed)
+	}
+
+	// gpt-oss: the recipient of the last message addressed to a function
+	// and that message's text; the answer is the final channel's text.
+	def readHarmony(reply string) (string, ToolCall[]) {
+		let calls ToolCall[]
+		let at = lastIndex(reply, "to=functions.")
+		return (reply, calls) when at < 0
+		let data = reply.bytes()
+		let byteAt = reply.slice(0, at).bytes().len() + "to=functions.".len()
+		let (name, _) = readName(data, byteAt)
+		let (msg, body) = findMarker(data, byteAt, "<|message|>")
+		return (reply, calls) when msg < 0
+		let (stop, _) = findMarker(data, body, "<|call|>")
+		let endByte = stop < 0 ?? (data.len(), stop)
+		calls.push(new ToolCall("", name, string(data[body:endByte]).trim()))
+		return ("", calls)
+	}
+
+	// LFM2: `[name(key="value", n=1), other()]`.
+	def readPythonic(format CallFormat, data byte[], from int) (int, ToolCall[]) {
+		let calls ToolCall[]
+		let (stop, afterStop) = findMarker(data, from, format.end)
+		let bodyEnd = stop < 0 ?? (data.len(), stop)
+		let body = string(data[from:bodyEnd]).trim()
+		body = body.slice(1, body.len() - 1) when body.startsWith("[") && body.endsWith("]")
+		let b = body.bytes()
+		let k = 0
+		for k < b.len() {
+			let (name, afterName) = readName(b, k)
+			break when name.len() == 0
+			let open = skipSpace(b, afterName)
+			break unless open < b.len() && b[open] == byte(40)
+			let arguments = new map<string, any>()
+			let j = open + 1
+			for j < b.len() && b[j] != byte(41) {
+				let (key, afterKey) = readName(b, j)
+				let eq = skipSpace(b, afterKey)
+				break unless eq < b.len() && b[eq] == byte(61)
+				let v = skipSpace(b, eq + 1)
+				let e = pythonValueEnd(b, v)
+				let raw = string(b[v:e]).trim()
+				arguments.set(key, pythonValue(raw))
+				j = skipSpace(b, e)
+				j++ when j < b.len() && b[j] == byte(44)
+				j = skipSpace(b, j)
+			}
+			calls.push(new ToolCall("", name, toJson(arguments)))
+			k = skipSpace(b, j + 1)
+			k++ when k < b.len() && b[k] == byte(44)
+		}
+		return (stop < 0 ?? (data.len(), afterStop), calls)
+	}
+
+	def pythonValueEnd(b byte[], from int) int {
+		let depth = 0
+		let quote = byte(0)
+		for let k = from; k < b.len(); k++ {
+			let c = b[k]
+			if quote != byte(0) {
+				if c == byte(92) {
+					k++
+				} else if c == quote {
+					quote = byte(0)
+				}
+				continue
+			}
+			if c == byte(34) || c == byte(39) {
+				quote = c
+			} else if c == byte(40) || c == byte(91) || c == byte(123) {
+				depth++
+			} else if c == byte(41) || c == byte(93) || c == byte(125) {
+				return k when depth == 0
+				depth--
+			} else if c == byte(44) && depth == 0 {
+				return k
+			}
+		}
+		return b.len()
+	}
+
+	// A Python literal as a plain value: strings in either quotes, numbers,
+	// True/False/None, and JSON-like lists and dicts.
+	def pythonValue(raw string) any {
+		return raw.slice(1, raw.len() - 1) when raw.len() >= 2 && (raw.startsWith("'") || raw.startsWith("\""))
+		match raw {
+			case "True":
+				return true
+			case "False":
+				return false
+			case "None":
+				return none
+		}
+		let json = raw.replace("'", "\"", -1).replace("True", "true", -1).replace("False", "false", -1).replace("None", "null", -1)
+		let parsed = parseJson(json) onerror recover none
+		return parsed is none ?? (raw, parsed)
+	}
+
+	// Marker matching ------------------------------------------------------
+
+	// Finds `marker` in `data` at or after `from`: its start and end, or
+	// (-1, -1). Whitespace in the marker matches any run of whitespace (or
+	// none), a digit run any digit run, a quoted attribute value any quoted
+	// value, and the probe call id any run of non-space bytes.
+	def findMarker(data byte[], from int, marker string) (int, int) {
+		let m = marker.trim().bytes()
+		return (from, from) when m.len() == 0
+		for let k = from; k < data.len(); k++ {
+			let e = matchAt(data, k, m)
+			return (k, e) when e >= 0
+		}
+		return (-1, -1)
+	}
+
+	// Where `m` ends when it matches at `k`; -1 when it does not.
+	def matchAt(data byte[], k int, m byte[]) int {
+		let i = 0
+		let j = k
+		let id = probeId.bytes()
+		for i < m.len() {
+			let c = m[i]
+			if isSpace(c) {
+				for i < m.len() && isSpace(m[i]) {
+					i++
+				}
+				for j < data.len() && isSpace(data[j]) {
+					j++
+				}
+				continue
+			}
+			if c >= byte(48) && c <= byte(57) {
+				for i < m.len() && m[i] >= byte(48) && m[i] <= byte(57) {
+					i++
+				}
+				let start = j
+				for j < data.len() && data[j] >= byte(48) && data[j] <= byte(57) {
+					j++
+				}
+				return -1 when j == start
+				continue
+			}
+			if i + id.len() <= m.len() && string(m[i:i + id.len()]) == probeId {
+				i += id.len()
+				let start = j
+				for j < data.len() && !isSpace(data[j]) && data[j] != byte(60) {
+					j++
+				}
+				return -1 when j == start
+				continue
+			}
+			if c == byte(34) && i > 0 && m[i - 1] == byte(61) {
+				// ="...": any quoted value.
+				let close = i + 1
+				for close < m.len() && m[close] != byte(34) {
+					close++
+				}
+				return -1 unless j < data.len() && data[j] == byte(34)
+				let dj = j + 1
+				for dj < data.len() && data[dj] != byte(34) {
+					dj++
+				}
+				return -1 when dj >= data.len()
+				i = close + 1
+				j = dj + 1
+				continue
+			}
+			return -1 unless j < data.len() && data[j] == c
+			i++
+			j++
+		}
+		return j
+	}
+
+	// What a model's chat template gives its sessions: the parsed template
+	// (none when the file has none, or it does not parse), the format the
+	// template was detected as, how it writes tool calls, and the start and
+	// end token texts it reads as `bos_token` and `eos_token`.
+	struct ChatSetup {
+		template   ?jinja.Template
+		detected   ChatFormat
+		callFormat CallFormat
+		bos        string
+		eos        string
+	}
+
+	def chatSetup(source string, tokenizer Tokenizer, detected ChatFormat) ChatSetup {
+		let setup = ChatSetup{detected: detected}
+		setup.bos = tokenizer.startToken() >= 0 ?? (string(tokenizer.piece(tokenizer.startToken(), true)), "")
+		setup.eos = tokenizer.endToken() >= 0 ?? (string(tokenizer.piece(tokenizer.endToken(), true)), "")
+		return setup when source.len() == 0
+		let template = jinja.parse(source, jinja.Options{trimBlocks: true, lstripBlocks: true}) onerror (err error) {
+			return setup
+		}
+		template.define("raise_exception", def (args any[]) !any {
+			fail "llm: the chat template refused the conversation: {args.len() > 0 ?? ("{args[0]}", "")}"
+		})
+		template.define("strftime_now", def (args any[]) !any {
+			return strftime(args.len() > 0 ?? ("{args[0]}", "%Y-%m-%d"), time.now())
+		})
+		setup.template = template
+		if source.contains("tool") {
+			let extra = map<string, any>{"bos_token": setup.bos, "eos_token": setup.eos}
+			setup.callFormat = learnCallFormat(template, source, extra)
+		}
+		return setup
+	}
+
+	const monthNames = string["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+	const dayNames = string["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+	// C's strftime for the fields chat templates use: %Y %y %m %d %e %B %b
+	// %A %a %H %M %S %j %%, in UTC.
+	def strftime(pattern string, t time.Time) string {
+		let out = ""
+		let chars = pattern.split("")
+		for let k = 0; k < chars.len(); k++ {
+			if chars[k] != "%" || k + 1 >= chars.len() {
+				out = out + chars[k]
+				continue
+			}
+			k++
+			let day = (int(t.unixNs() / int64(86400000000000)) + 3) % 7
+			match chars[k] {
+				case "Y":
+					out = out + "{t.year()}"
+				case "y":
+					out = out + "{t.year() % 100}".padStart(2, "0")
+				case "m":
+					out = out + "{t.month()}".padStart(2, "0")
+				case "d":
+					out = out + "{t.day()}".padStart(2, "0")
+				case "e":
+					out = out + "{t.day()}".padStart(2, " ")
+				case "B":
+					out = out + monthNames[t.month() - 1]
+				case "b":
+					out = out + monthNames[t.month() - 1].slice(0, 3)
+				case "A":
+					out = out + dayNames[day]
+				case "a":
+					out = out + dayNames[day].slice(0, 3)
+				case "H":
+					out = out + "{t.hour()}".padStart(2, "0")
+				case "M":
+					out = out + "{t.minute()}".padStart(2, "0")
+				case "S":
+					out = out + "{t.second()}".padStart(2, "0")
+				case "%":
+					out = out + "%"
+				default:
+					out = out + "%" + chars[k]
+			}
+		}
+		return out
+	}
+
+	use (
+		std.reflection
+		std.reflection::(FunctionDescriptor, AttrHit, EnumMember)
+	)
+
+	// A tool's result for a call, by the call's id.
+	struct ToolResult {
+		id   string
+		text string
+	}
+
+	// Runs `call` on `tool`: its result, or its error message.
+	def runTool(tool ?Tool, call ToolCall) string {
+		return "error: there is no tool named {call.name}" when tool is none
+		let run = tool.run
+		return "error: {call.name} has no run function" when run is none
+		let result = run(call) onerror (err error) {
+			return "error: {err}"
+		}
+		return result
+	}
+
+	async def runToolTask(tool ?Tool, call ToolCall, done channel<ToolResult>) {
+		done <- ToolResult{id: call.id, text: runTool(tool, call)}
+	}
+
+	// The tool a `@tool` method makes, run on `receiver`.
+	def toolOf(fn FunctionDescriptor, hit AttrHit, receiver any) Tool {
+		let named = hit.attr.arguments.get("name")
+		let positional = hit.attr.arguments.get("#0")
+		let name = !(named is none) ?? (string(named).trim("\""), !(positional is none) ?? (string(positional).trim("\""), fn.node.name))
+		name = fn.node.name when name.len() == 0
+		// The doc comments describe the tool and its parameters; an enum
+		// parameter is a string whose choices are the member names.
+		let parameters ToolParameter[]
+		let members EnumMember[][]
+		for let (_, p) in fn.signature.parameters {
+			let listed = reflection.members(p.paramType)
+			let choices string[]
+			for let (_, m) in listed {
+				choices.push(m.node.name)
+			}
+			members.push(listed)
+			parameters.push(ToolParameter{
+				name:        p.node.name,
+				kind:        listed.len() > 0 ?? (ParameterKind.String, parameterKindOf(p.paramType.node.name)),
+				description: p.node.doc,
+				required:    p.defaultLiteral.len() == 0,
+				choices:     choices,
+				items:       parameterKindOf(p.paramType.node.name.trimSuffix("[]")),
+			})
+		}
+		let signature = fn.signature.parameters
+		return Tool{
+			name:        name,
+			description: fn.node.doc,
+			parameters:  parameters,
+			run:         def (call ToolCall) !string {
+				let parsed = try parseJson(call.arguments)
+				let args any[] = []
+				for let (k, p) in signature {
+					let v = entry(parsed, p.node.name)
+					if members[k].len() == 0 {
+						args.push(argumentValue(v, p.paramType.node.name))
+						continue
+					}
+					let chosen = textOf(v)
+					let found = members[k].find(m => m.node.name == chosen)
+					fail "llm: {p.node.name} is one of {parameters[k].choices.join(", ")}, not \"{chosen}\"" when found is none
+					args.push(found.value)
+				}
+				let result = reflection.invoke(fn, receiver, args)
+				return result is none ?? ("", "{result}")
+			},
+		}
+	}
+
+	// The JSON kind of an ADM type name.
+	def parameterKindOf(typeName string) ParameterKind {
+		return ParameterKind.Array when typeName.endsWith("[]")
+		match typeName {
+			case "string":
+				return ParameterKind.String
+			case "bool":
+				return ParameterKind.Boolean
+			case "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "byte":
+				return ParameterKind.Integer
+			case "float", "float32", "float64":
+				return ParameterKind.Number
+		}
+		return ParameterKind.String
+	}
+
+	// A JSON argument as the ADM type a parameter declares.
+	def argumentValue(v any, typeName string) any {
+		return none when v is none
+		let text = textOf(v)
+		match parameterKindOf(typeName) {
+			case ParameterKind.Integer:
+				return parseInt<int>(text)
+			case ParameterKind.Number:
+				return parseFloat<float>(text)
+			case ParameterKind.Boolean:
+				return text == "true"
+			case ParameterKind.String:
+				return text
+			default:
+		}
+		return v
+	}
+}
