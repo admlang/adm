@@ -1,0 +1,841 @@
+partial module std.proto.auth.webauthn {
+	use (
+		std.crypto
+		std.crypto::(publicKeyOf)
+		std.crypto.hash::(Hash, digest, hmac)
+		std.data.encoding::(CBOR, CBORValue, CBORKind, CBORKeyOrder)
+		std.proto.auth.webauthn.cose::*
+		std.proto.auth.webauthn.formats::*
+		std.proto.auth.webauthn.ctap::*
+	)
+
+	// SoftDevice is a security key in software: a CTAPTransport that
+	// answers CTAPHID PING, WINK, CBOR (CTAP 2.1) and MSG (U2F) the way a
+	// USB key does, keeping its credentials in a SoftAuthenticator. It
+	// holds a PIN, issues PIN/UV auth tokens over both protocols, and
+	// supports credential management, large blobs, authenticator config
+	// and the credProtect, hmac-secret, largeBlobKey, credBlob and
+	// minPinLength extensions. Pair it with SecurityKey to exercise a
+	// platform's CTAP code without hardware.
+	//
+	//     let device = new SoftDevice(new SoftAuthenticator())
+	//     let key = new SecurityKey(device)
+	//     try key.changePIN("1234")
+	type SoftDevice {
+		authenticator SoftAuthenticator
+
+		// PIN attempts left; 8 after the PIN is set.
+		pinRetries int = 8
+
+		minPINLength int = 4
+
+		// Relying parties the minPinLength extension may report to.
+		minPINLengthRPs string[]
+
+		// Whether the PIN must be changed before it is used again.
+		forcePINChange bool
+
+		// Whether every operation requires user verification.
+		alwaysUV bool
+
+		enterpriseAttestation bool
+
+		// Answer CTAPHID_MSG (U2F) too.
+		u2f bool = true
+
+		// Answer CTAPHID_CBOR; clear for a U2F-only key.
+		ctap2 bool = true
+
+		// The PIN/UV auth protocols offered, most preferred first.
+		pinProtocols int[] = [2, 1]
+
+		// How many credentials an allow or exclude list may hold.
+		maxCredentialCount int = 8
+
+		// Simulate a touch fingerprint sensor (bio enrollment): every
+		// sample is good, and an enrollment takes three.
+		fingerprint bool
+
+		// The enrolled fingerprints.
+		templates Fingerprint[]
+
+		internal pinDigest        byte[]
+		internal kaScalar         bigint
+		internal kaPublic         CBORValue            = new CBORValue()
+		internal token            byte[]
+		internal tokenPermissions int
+		internal tokenRpId        string
+		internal pending          GetAssertionResult[]
+		internal listing          CBORValue[]
+		internal blobWrite        byte[]
+		internal blobExpected     int
+		internal enrolling        byte[]
+		internal samplesLeft      int
+
+		def new(authenticator SoftAuthenticator) {
+			self.authenticator = authenticator
+		}
+
+		// The CTAPHID capabilities: WINK, CBOR unless ctap2 is clear, and
+		// NMSG without u2f.
+		def capabilities() int {
+			let c = CTAPHIDCapability.Wink.value
+			c |= CTAPHIDCapability.CBOR.value when ctap2
+			c |= CTAPHIDCapability.NoMsg.value when !u2f
+			return c
+		}
+
+		// Answers one CTAPHID message, implementing CTAPTransport. Fails
+		// with InvalidCommand for a command it does not take.
+		def transact(command CTAPHIDCommand, data byte[]) !byte[] {
+			match command {
+				case CTAPHIDCommand.Ping:
+					return data
+				case CTAPHIDCommand.Wink:
+					return byte[]
+				case CTAPHIDCommand.CBOR:
+					fail ctapError(CTAPStatus.InvalidCommand, "this device does not speak CTAP2") when !ctap2
+					fail ctapError(CTAPStatus.InvalidLength, "empty CBOR message") when data.len() == 0
+					return handle(int(data[0]), data.slice(1, data.len() - 1))
+				case CTAPHIDCommand.Msg:
+					fail ctapError(CTAPStatus.InvalidCommand, "this device does not speak U2F") when !u2f
+					return u2fAnswer(data)
+				default:
+					fail ctapError(CTAPStatus.InvalidCommand, "unsupported CTAPHID command {command}")
+			}
+		}
+
+		// Implements CTAPTransport; there is nothing to release, so it does
+		// not fail.
+		def close() !none {
+			return none
+		}
+
+		// Answers a CTAP2 command: the status byte and the CBOR answer.
+		internal def handle(cmd int, body byte[]) byte[] {
+			let failure = CTAPStatus.Ok
+			let answer = dispatch(cmd, body) onerror (err error) {
+				failure = CTAPStatus.Other
+				failure = err.status when err is CTAPError
+				failure = CTAPStatus.InvalidCBOR when err.message.startsWith("cbor:")
+				recover new CBORValue()
+			}
+			return byte[failure.value] when failure != CTAPStatus.Ok
+			let out byte[] = [0]
+			if answer.kind == CBORKind.Map {
+				let c = new CBOR()
+				c.keyOrder = CBORKeyOrder.LengthFirst
+				out.push(...c.encode(answer))
+			}
+			return out
+		}
+
+		// Runs a CTAP2 command; null for an answer with no CBOR.
+		internal def dispatch(cmd int, body byte[]) !CBORValue {
+			let params = body.len() > 0 ?? (try new CBOR().parse(body), new CBORValue(CBORKind.Map))
+			fail ctapError(CTAPStatus.CBORUnexpectedType, "the parameters are not a map") when body.len() > 0 && params.kind != CBORKind.Map
+			match cmd {
+				case 0x01:
+					return try makeCredential(params)
+				case 0x02:
+					return try getAssertion(params)
+				case 0x04:
+					return info()
+				case 0x06:
+					return try clientPIN(params)
+				case 0x07:
+					reset()
+					return new CBORValue()
+				case 0x08:
+					fail ctapError(CTAPStatus.NotAllowed, "no assertions are pending") when pending.len() == 0
+					return assertionMap(pending.shift(), 0)
+				case 0x0A, 0x41:
+					return try manage(params)
+				case 0x0B:
+					fail ctapError(CTAPStatus.OperationDenied, "the user is not present") when !authenticator.userPresent
+					return new CBORValue()
+				case 0x0C:
+					return try largeBlobCommand(params)
+				case 0x0D:
+					try config(params)
+					return new CBORValue()
+				case 0x09:
+					fail ctapError(CTAPStatus.InvalidCommand, "no fingerprint sensor") when !fingerprint
+					return try bio(params)
+				default:
+					fail ctapError(CTAPStatus.InvalidCommand, "unsupported command {cmd}")
+			}
+		}
+
+		// The authenticatorGetInfo answer.
+		internal def info() CBORValue {
+			let m = new CBORValue(CBORKind.Map)
+			let versions = new CBORValue(CBORKind.Array)
+			versions.push(new CBORValue("U2F_V2")) when u2f
+			versions.push(new CBORValue("FIDO_2_0")).push(new CBORValue("FIDO_2_1"))
+			m.set(1, versions)
+			let ext = new CBORValue(CBORKind.Array)
+			for let (_, e) in ["credProtect", "hmac-secret", "largeBlobKey", "credBlob", "minPinLength"] {
+				ext.push(new CBORValue(e))
+			}
+			m.set(2, ext)
+			m.set(3, new CBORValue(authenticator.aaguid))
+			let options = new CBORValue(CBORKind.Map)
+			options.set("rk", new CBORValue(true))
+			options.set("up", new CBORValue(true))
+			options.set("uv", new CBORValue(authenticator.userVerified))
+			options.set("plat", new CBORValue(false))
+			options.set("clientPin", new CBORValue(pinDigest.len() > 0))
+			options.set("pinUvAuthToken", new CBORValue(true))
+			options.set("credMgmt", new CBORValue(true))
+			options.set("largeBlobs", new CBORValue(true))
+			options.set("authnrCfg", new CBORValue(true))
+			options.set("setMinPINLength", new CBORValue(true))
+			options.set("makeCredUvNotRqd", new CBORValue(true))
+			options.set("alwaysUv", new CBORValue(alwaysUV))
+			options.set("ep", new CBORValue(enterpriseAttestation))
+			if fingerprint {
+				options.set("bioEnroll", new CBORValue(templates.len() > 0))
+				options.set("uvBioEnroll", new CBORValue(true))
+			}
+			m.set(4, options)
+			m.set(5, new CBORValue(1200))
+			let protocols = new CBORValue(CBORKind.Array)
+			for let (_, v) in pinProtocols {
+				protocols.push(new CBORValue(v))
+			}
+			m.set(6, protocols)
+			m.set(7, new CBORValue(maxCredentialCount))
+			m.set(8, new CBORValue(64))
+			let transports = new CBORValue(CBORKind.Array)
+			transports.push(new CBORValue("usb"))
+			m.set(9, transports)
+			let algs = new CBORValue(CBORKind.Array)
+			for let (_, alg) in authenticator.algorithms {
+				let a = new CBORValue(CBORKind.Map)
+				a.set("alg", new CBORValue(alg.value))
+				a.set("type", new CBORValue("public-key"))
+				algs.push(a)
+			}
+			m.set(10, algs)
+			m.set(11, new CBORValue(1024))
+			m.set(12, new CBORValue(forcePINChange))
+			m.set(13, new CBORValue(minPINLength))
+			m.set(15, new CBORValue(32))
+			return m
+		}
+
+		// Checks a pinUvAuthParam over message against the current token and
+		// a permission, binding the token to the relying party on first use.
+		// Fails with PINAuthInvalid when it does not verify or the token
+		// lacks the permission or is bound to another relying party.
+		internal def checkToken(params CBORValue, paramKey int, protocolKey int, permission PinPermission, rpId string, message byte[]) !none {
+			let version = try params.get(protocolKey).asInt()
+			fail ctapError(CTAPStatus.InvalidParameter, "PIN/UV auth protocol {version} is not supported") when version != 1 && version != 2
+			let protocol = new PinProtocol(version)
+			fail ctapError(CTAPStatus.PINAuthInvalid, "no token was issued") when token.len() == 0
+			fail ctapError(CTAPStatus.PINAuthInvalid, "the pinUvAuthParam does not verify") when !protocol.verify(token, message, try params.get(paramKey).asBytes())
+			fail ctapError(CTAPStatus.PINAuthInvalid, "the token lacks the {permission} permission") when (tokenPermissions & permission.value) == 0
+			if rpId != "" {
+				fail ctapError(CTAPStatus.PINAuthInvalid, "the token is bound to another relying party") when tokenRpId != "" && tokenRpId != rpId
+				tokenRpId = rpId
+			}
+			return none
+		}
+
+		// authenticatorMakeCredential (CTAP 2.2 §6.1.2).
+		internal def makeCredential(p CBORValue) !CBORValue {
+			fail ctapError(CTAPStatus.MissingParameter, "makeCredential needs clientDataHash, rp, user and pubKeyCredParams") when !p.has(1) || !p.has(2) || !p.has(3) || !p.has(4)
+			let cdh = try p.get(1).asBytes()
+			let rpId = try p.get(2).get("id").asString()
+			let u = p.get(3)
+			let user = User{id: try u.get("id").asBytes(), name: u.get("name").asString() onerror recover "", displayName: u.get("displayName").asString() onerror recover ""}
+			let options = p.get(7)
+			let rk = options.has("rk") && (try options.get("rk").asBool())
+			let uvOption = options.has("uv") && (try options.get("uv").asBool())
+			fail ctapError(CTAPStatus.InvalidOption, "up cannot be set for makeCredential") when options.has("up") && !(try options.get("up").asBool())
+			let verified = false
+			if p.has(8) {
+				try checkToken(p, 8, 9, PinPermission.MakeCredential, rpId, cdh)
+				verified = true
+			} else if uvOption {
+				fail ctapError(CTAPStatus.InvalidOption, "the authenticator has no built-in user verification") when !authenticator.userVerified
+				verified = true
+			} else if alwaysUV || (rk && pinDigest.len() > 0) {
+				fail ctapError(CTAPStatus.PUATRequired, "user verification is required")
+			}
+
+			let alg ?COSEAlgorithm = none
+			for let (_, entry) in p.get(4).elements() {
+				let candidate = coseAlgorithm(entry.get("alg").asInt() onerror recover 0)
+				continue when candidate is none
+				alg = candidate when alg is none && authenticator.algorithms.includes(candidate)
+			}
+			fail ctapError(CTAPStatus.UnsupportedAlgorithm, "none of the requested algorithms is supported") when alg is none
+			let chosen COSEAlgorithm = alg
+
+			let rpIdHash = digest(Hash.SHA256, rpId.bytes())
+			for let (_, d) in p.get(5).elements() {
+				let id = try d.get("id").asBytes()
+				for let (_, c) in authenticator.credentials {
+					continue when !c.rpIdHash.equals(rpIdHash) || !c.id.equals(id)
+					fail ctapError(CTAPStatus.CredentialExcluded, "the authenticator holds an excluded credential") when c.credProtect < 3 || verified
+				}
+			}
+			fail ctapError(CTAPStatus.OperationDenied, "the user is not present") when !authenticator.userPresent
+
+			let key = try softGenerateKey(chosen)
+			let cred = new SoftCredential(try crypto.rand(32), rpId, user, key, chosen, rk)
+			let ext = p.get(6)
+			let outputs = new CBORValue(CBORKind.Map)
+			let largeBlobKey byte[]
+			if ext.kind == CBORKind.Map {
+				if ext.has("credProtect") {
+					let level = try ext.get("credProtect").asInt()
+					fail ctapError(CTAPStatus.InvalidOption, "credProtect {level} is not 1 to 3") when level < 1 || level > 3
+					cred.credProtect = level
+					outputs.set("credProtect", new CBORValue(level))
+				}
+				if ext.has("hmac-secret") && (try ext.get("hmac-secret").asBool()) {
+					cred.credRandom = try crypto.rand(64)
+					outputs.set("hmac-secret", new CBORValue(true))
+				}
+				if ext.has("credBlob") {
+					let blob = try ext.get("credBlob").asBytes()
+					let stored = blob.len() <= 32
+					cred.credBlob = blob when stored
+					outputs.set("credBlob", new CBORValue(stored))
+				}
+				if ext.has("largeBlobKey") && (try ext.get("largeBlobKey").asBool()) {
+					fail ctapError(CTAPStatus.InvalidOption, "largeBlobKey needs a discoverable credential") when !rk
+					largeBlobKey = try crypto.rand(32)
+					cred.largeBlobKey = largeBlobKey
+				}
+				outputs.set("minPinLength", new CBORValue(minPINLength)) when ext.has("minPinLength") && (try ext.get("minPinLength").asBool()) && minPINLengthRPs.includes(rpId)
+			}
+			if rk {
+				for let i = authenticator.credentials.len() - 1; i >= 0; i-- {
+					let old = authenticator.credentials[i]
+					authenticator.credentials.remove(i) when old.discoverable && old.rpIdHash.equals(rpIdHash) && old.user.id.equals(user.id)
+				}
+			}
+			authenticator.credentials.push(cred)
+
+			let a = new AuthenticatorData()
+			a.rpIdHash = rpIdHash
+			a.set(AuthFlag.UserPresent, true)
+			a.set(AuthFlag.UserVerified, verified)
+			a.set(AuthFlag.BackupEligible, authenticator.backupEligible)
+			a.set(AuthFlag.BackedUp, authenticator.backupEligible && authenticator.backedUp)
+			a.signCount = softCount(authenticator, cred)
+			a.aaguid = authenticator.aaguid
+			a.credentialId = cred.id
+			a.credentialKey = new COSEKey(publicKeyOf(key), chosen)
+			a.extensions = outputs when outputs.len() > 0
+			let authData = try a.encode()
+
+			let m = new CBORValue(CBORKind.Map)
+			if authenticator.noAttestation {
+				m.set(1, new CBORValue("none"))
+				m.set(3, new CBORValue(CBORKind.Map))
+			} else {
+				m.set(1, new CBORValue("packed"))
+				m.set(3, try softPacked(authenticator, chosen, key, authData, cdh))
+			}
+			m.set(2, new CBORValue(authData))
+			m.set(4, new CBORValue(true)) when p.has(10) && enterpriseAttestation && !authenticator.noAttestation
+			m.set(5, new CBORValue(largeBlobKey)) when largeBlobKey.len() > 0
+			return m
+		}
+
+		// authenticatorGetAssertion (CTAP 2.2 §6.2.2).
+		internal def getAssertion(p CBORValue) !CBORValue {
+			fail ctapError(CTAPStatus.MissingParameter, "getAssertion needs rpId and clientDataHash") when !p.has(1) || !p.has(2)
+			let rpId = try p.get(1).asString()
+			let cdh = try p.get(2).asBytes()
+			let options = p.get(5)
+			let up = !options.has("up") || (try options.get("up").asBool())
+			let uvOption = options.has("uv") && (try options.get("uv").asBool())
+			let verified = false
+			if p.has(6) {
+				try checkToken(p, 6, 7, PinPermission.GetAssertion, rpId, cdh)
+				verified = true
+			} else if uvOption {
+				fail ctapError(CTAPStatus.InvalidOption, "the authenticator has no built-in user verification") when !authenticator.userVerified
+				verified = true
+			} else if alwaysUV && up {
+				fail ctapError(CTAPStatus.PUATRequired, "user verification is required")
+			}
+
+			let rpIdHash = digest(Hash.SHA256, rpId.bytes())
+			let allow = p.get(3).elements()
+			fail ctapError(CTAPStatus.LimitExceeded, "the allow list holds more than {maxCredentialCount}") when allow.len() > maxCredentialCount
+			let found SoftCredential[] = []
+			for let i = authenticator.credentials.len() - 1; i >= 0; i-- {
+				let c = authenticator.credentials[i]
+				continue when !c.rpIdHash.equals(rpIdHash)
+				if allow.len() > 0 {
+					let listed = false
+					for let (_, d) in allow {
+						listed = true when (d.get("id").asBytes() onerror recover byte[]).equals(c.id)
+					}
+					continue when !listed
+					continue when c.credProtect == 3 && !verified
+				} else {
+					continue when !c.discoverable
+					continue when c.credProtect >= 2 && !verified
+				}
+				found.push(c)
+			}
+			fail ctapError(CTAPStatus.NoCredentials, "no credential matches") when found.len() == 0
+			fail ctapError(CTAPStatus.OperationDenied, "the user is not present") when up && !authenticator.userPresent
+
+			let ext = p.get(4)
+			let results GetAssertionResult[] = []
+			let take = allow.len() > 0 ?? (1, found.len())
+			for let k = 0; k < take; k++ {
+				let c = found[k]
+				let outputs = new CBORValue(CBORKind.Map)
+				if ext.kind == CBORKind.Map {
+					outputs.set("hmac-secret", new CBORValue(try hmacSecret(ext.get("hmac-secret"), c.credRandom, verified))) when ext.has("hmac-secret") && c.credRandom.len() == 64
+					outputs.set("credBlob", new CBORValue(c.credBlob)) when ext.has("credBlob") && (try ext.get("credBlob").asBool())
+				}
+				let a = new AuthenticatorData()
+				a.rpIdHash = rpIdHash
+				a.set(AuthFlag.UserPresent, up)
+				a.set(AuthFlag.UserVerified, verified)
+				a.set(AuthFlag.BackupEligible, authenticator.backupEligible)
+				a.set(AuthFlag.BackedUp, authenticator.backupEligible && authenticator.backedUp)
+				a.signCount = softCount(authenticator, c)
+				a.extensions = outputs when outputs.len() > 0
+				let authData = try a.encode()
+				let r = new GetAssertionResult()
+				r.credentialId = c.id
+				r.authData = authData
+				r.signature = try coseSign(c.algorithm, c.key, authData + cdh)
+				r.user = verified && found.len() > 1 ?? (c.user, User{id: c.user.id}) when c.discoverable
+				r.largeBlobKey = c.largeBlobKey when ext.kind == CBORKind.Map && ext.has("largeBlobKey")
+				results.push(r)
+			}
+			let first = results.shift()
+			pending = results
+			return assertionMap(first, take > 1 ?? (take, 0))
+		}
+
+		// The hmac-secret output (CTAP 2.2 §12.5): the salts decrypted with
+		// the shared secret, each HMAC'd under the credential's CredRandom
+		// (the one for user verification when it took place), encrypted
+		// back.
+		internal def hmacSecret(input CBORValue, credRandom byte[], verified bool) !byte[] {
+			let version = input.has(4) ?? (try input.get(4).asInt(), 1)
+			let protocol = new PinProtocol(version)
+			let shared = try protocol.sharedSecret(kaScalar, input.get(1))
+			let saltEnc = try input.get(2).asBytes()
+			fail ctapError(CTAPStatus.PINAuthInvalid, "saltAuth does not verify") when !protocol.verify(shared, saltEnc, try input.get(3).asBytes())
+			let salts = try protocol.decrypt(shared, saltEnc)
+			fail ctapError(CTAPStatus.InvalidLength, "salts are not 32 or 64 bytes") when salts.len() != 32 && salts.len() != 64
+			let cr = verified ?? (credRandom.slice(32, 32), credRandom.slice(0, 32))
+			let out = hmac(Hash.SHA256, cr, salts.slice(0, 32))
+			out.push(...hmac(Hash.SHA256, cr, salts.slice(32, 32))) when salts.len() == 64
+			return try protocol.encrypt(shared, out)
+		}
+
+		// authenticatorClientPIN (CTAP 2.2 §6.5.5).
+		internal def clientPIN(p CBORValue) !CBORValue {
+			let sub = try p.get(2).asInt()
+			let m = new CBORValue(CBORKind.Map)
+			match sub {
+				case 0x01:
+					m.set(3, new CBORValue(pinRetries))
+					return m
+				case 0x02:
+					try ensureKeyAgreement()
+					m.set(1, kaPublic)
+					return m
+				case 0x07:
+					m.set(5, new CBORValue(8))
+					return m
+				default:
+			}
+			let version = try p.get(1).asInt()
+			fail ctapError(CTAPStatus.InvalidParameter, "PIN/UV auth protocol {version} is not supported") when !pinProtocols.includes(version)
+			let protocol = new PinProtocol(version)
+			try ensureKeyAgreement()
+			let shared = try protocol.sharedSecret(kaScalar, p.get(3))
+			match sub {
+				case 0x03:
+					fail ctapError(CTAPStatus.NotAllowed, "a PIN is already set") when pinDigest.len() > 0
+					let enc = try p.get(5).asBytes()
+					fail ctapError(CTAPStatus.PINAuthInvalid, "the pinUvAuthParam does not verify") when !protocol.verify(shared, enc, try p.get(4).asBytes())
+					try storePIN(try protocol.decrypt(shared, enc))
+					return m
+				case 0x04:
+					fail ctapError(CTAPStatus.PINNotSet, "no PIN is set") when pinDigest.len() == 0
+					let newEnc = try p.get(5).asBytes()
+					let hashEnc = try p.get(6).asBytes()
+					fail ctapError(CTAPStatus.PINAuthInvalid, "the pinUvAuthParam does not verify") when !protocol.verify(shared, newEnc + hashEnc, try p.get(4).asBytes())
+					try checkPIN(protocol, shared, hashEnc)
+					try storePIN(try protocol.decrypt(shared, newEnc))
+					forcePINChange = false
+					return m
+				case 0x05, 0x09:
+					fail ctapError(CTAPStatus.PINNotSet, "no PIN is set") when pinDigest.len() == 0
+					try checkPIN(protocol, shared, try p.get(6).asBytes())
+					fail ctapError(CTAPStatus.PINPolicyViolation, "the PIN must be changed first") when forcePINChange
+					let permissions = sub == 0x05 ?? (PinPermission.MakeCredential.value | PinPermission.GetAssertion.value, try p.get(9).asInt())
+					fail ctapError(CTAPStatus.InvalidParameter, "no permissions asked for") when permissions == 0
+					return try issueToken(protocol, shared, permissions, p.get(10).asString() onerror recover "")
+				case 0x06:
+					fail ctapError(CTAPStatus.InvalidSubcommand, "no built-in user verification") when !authenticator.userVerified
+					return try issueToken(protocol, shared, try p.get(9).asInt(), p.get(10).asString() onerror recover "")
+				default:
+					fail ctapError(CTAPStatus.InvalidSubcommand, "unknown clientPIN subcommand {sub}")
+			}
+		}
+
+		// A fresh token for the permissions, encrypted to the platform.
+		internal def issueToken(protocol PinProtocol, shared byte[], permissions int, rpId string) !CBORValue {
+			token = try crypto.rand(32)
+			tokenPermissions = permissions
+			tokenRpId = rpId
+			let m = new CBORValue(CBORKind.Map)
+			m.set(2, new CBORValue(try protocol.encrypt(shared, token)))
+			return m
+		}
+
+		// Checks an encrypted PIN hash, using up a retry and changing the
+		// key agreement key on a mismatch.
+		internal def checkPIN(protocol PinProtocol, shared byte[], hashEnc byte[]) !none {
+			fail ctapError(CTAPStatus.PINBlocked, "no PIN retries are left") when pinRetries == 0
+			let got = try protocol.decrypt(shared, hashEnc)
+			if !crypto.constantTimeEqual(got, pinDigest) {
+				pinRetries -= 1
+				kaPublic = new CBORValue()
+				fail ctapError(pinRetries == 0 ?? (CTAPStatus.PINBlocked, CTAPStatus.PINInvalid), "wrong PIN")
+			}
+			pinRetries = 8
+			return none
+		}
+
+		// Stores a new PIN from its 64-byte zero-padded form.
+		internal def storePIN(padded byte[]) !none {
+			fail ctapError(CTAPStatus.PINPolicyViolation, "the padded PIN is not 64 bytes") when padded.len() != 64
+			let end = padded.indexOf(byte(0))
+			end = 64 when end < 0
+			let pin = string(padded.slice(0, end))
+			fail ctapError(CTAPStatus.PINPolicyViolation, "the PIN is shorter than {minPINLength}") when pin.len() < minPINLength
+			pinDigest = pinHash(pin)
+			pinRetries = 8
+			token = byte[]
+			return none
+		}
+
+		// Makes a key-agreement key when there is none.
+		internal def ensureKeyAgreement() !none {
+			return none when kaPublic.kind == CBORKind.Map
+			let (scalar, cose) = try new PinProtocol(2).keyPair()
+			kaScalar = scalar
+			kaPublic = cose
+			return none
+		}
+
+		// Erases credentials, PIN, large blobs and tokens (authenticatorReset).
+		internal def reset() {
+			authenticator.credentials = []
+			pinDigest = byte[]
+			pinRetries = 8
+			token = byte[]
+			kaPublic = new CBORValue()
+			authenticator.largeBlobs = emptyLargeBlobArray()
+			minPINLength = 4
+			alwaysUV = false
+			enterpriseAttestation = false
+		}
+
+		// authenticatorCredentialManagement (CTAP 2.2 §6.8).
+		internal def manage(p CBORValue) !CBORValue {
+			let sub = try p.get(1).asInt()
+			let m = new CBORValue(CBORKind.Map)
+			if sub := 0x03 || 0x05 {
+				fail ctapError(CTAPStatus.NotAllowed, "nothing is being enumerated") when listing.len() == 0
+				return listing.shift()
+			}
+			let c = new CBOR()
+			c.keyOrder = CBORKeyOrder.LengthFirst
+			let msg byte[] = [byte(sub)]
+			msg.push(...c.encode(p.get(2))) when p.has(2)
+			try checkToken(p, 4, 3, PinPermission.CredentialManagement, "", msg)
+			let resident SoftCredential[] = []
+			for let (_, cred) in authenticator.credentials {
+				resident.push(cred) when cred.discoverable
+			}
+			match sub {
+				case 0x01:
+					m.set(1, new CBORValue(resident.len()))
+					m.set(2, new CBORValue(100 - resident.len()))
+					return m
+				case 0x02:
+					let seen byte[][] = []
+					listing = []
+					for let (_, cred) in resident {
+						let dup = false
+						for let (_, h) in seen {
+							dup = true when h.equals(cred.rpIdHash)
+						}
+						continue when dup
+						seen.push(cred.rpIdHash)
+						let e = new CBORValue(CBORKind.Map)
+						let rp = new CBORValue(CBORKind.Map)
+						rp.set("id", new CBORValue(cred.rpId))
+						e.set(3, rp)
+						e.set(4, new CBORValue(cred.rpIdHash))
+						listing.push(e)
+					}
+					fail ctapError(CTAPStatus.NoCredentials, "no discoverable credentials") when listing.len() == 0
+					let first = listing.shift()
+					first.set(5, new CBORValue(seen.len()))
+					return first
+				case 0x04:
+					let hash = try p.get(2).get(1).asBytes()
+					listing = []
+					for let (_, cred) in resident {
+						continue when !cred.rpIdHash.equals(hash)
+						let e = new CBORValue(CBORKind.Map)
+						e.set(6, ctapUser(cred.user))
+						e.set(7, ctapDescriptor(cred.id))
+						e.set(8, try coseKeyMap(publicKeyOf(cred.key), cred.algorithm))
+						e.set(10, new CBORValue(cred.credProtect))
+						e.set(11, new CBORValue(cred.largeBlobKey)) when cred.largeBlobKey.len() > 0
+						listing.push(e)
+					}
+					fail ctapError(CTAPStatus.NoCredentials, "no credentials for that relying party") when listing.len() == 0
+					let total = listing.len()
+					let first = listing.shift()
+					first.set(9, new CBORValue(total))
+					return first
+				case 0x06, 0x07:
+					let id = try p.get(2).get(2).get("id").asBytes()
+					for let (i, cred) in authenticator.credentials {
+						continue when !cred.discoverable || !cred.id.equals(id)
+						if sub == 0x06 {
+							authenticator.credentials.remove(i)
+						} else {
+							let u = p.get(2).get(3)
+							let uid = try u.get("id").asBytes()
+							fail ctapError(CTAPStatus.InvalidParameter, "the user id cannot change") when !uid.equals(cred.user.id)
+							cred.user = User{id: uid, name: u.get("name").asString() onerror recover "", displayName: u.get("displayName").asString() onerror recover ""}
+						}
+						return m
+					}
+					fail ctapError(CTAPStatus.NoCredentials, "no such credential")
+				default:
+					fail ctapError(CTAPStatus.InvalidSubcommand, "unknown credential management subcommand {sub}")
+			}
+		}
+
+		// authenticatorLargeBlobs (CTAP 2.2 §6.10).
+		internal def largeBlobCommand(p CBORValue) !CBORValue {
+			let offset = try p.get(3).asInt()
+			if p.has(1) {
+				let count = try p.get(1).asInt()
+				fail ctapError(CTAPStatus.InvalidParameter, "offset {offset} is past the array") when offset > authenticator.largeBlobs.len()
+				let n = authenticator.largeBlobs.len() - offset < count ?? (authenticator.largeBlobs.len() - offset, count)
+				let m = new CBORValue(CBORKind.Map)
+				m.set(1, new CBORValue(authenticator.largeBlobs.slice(offset, n)))
+				return m
+			}
+			let fragment = try p.get(2).asBytes()
+			let msg byte[]
+			for let k = 0; k < 32; k++ {
+				msg.push(byte(0xFF))
+			}
+			msg.push(byte(0x0C), byte(0x00))
+			msg.push(byte(offset & 0xFF), byte((offset >> 8) & 0xFF), byte((offset >> 16) & 0xFF), byte((offset >> 24) & 0xFF))
+			msg.push(...digest(Hash.SHA256, fragment))
+			try checkToken(p, 5, 6, PinPermission.LargeBlobWrite, "", msg)
+			if offset == 0 {
+				blobExpected = try p.get(4).asInt()
+				fail ctapError(CTAPStatus.LargeBlobStorageFull, "the array is larger than 1024 bytes") when blobExpected > 1024
+				blobWrite = []
+			}
+			fail ctapError(CTAPStatus.InvalidSeq, "fragment at {offset}, expected {blobWrite.len()}") when offset != blobWrite.len()
+			blobWrite.push(...fragment)
+			if blobWrite.len() == blobExpected {
+				parseLargeBlobArray(blobWrite) onerror (err error) {
+					fail ctapError(CTAPStatus.IntegrityFailure, err.message)
+				}
+				authenticator.largeBlobs = blobWrite
+			}
+			return new CBORValue()
+		}
+
+		// authenticatorBioEnrollment (CTAP 2.2 §6.7) for the simulated
+		// fingerprint sensor.
+		internal def bio(p CBORValue) !CBORValue {
+			let m = new CBORValue(CBORKind.Map)
+			m.set(1, new CBORValue(1))
+			let sub = p.has(2) ?? (try p.get(2).asInt(), 0)
+			if sub == 0x07 || (!p.has(2) && p.has(6)) {
+				m.set(2, new CBORValue(1))
+				m.set(3, new CBORValue(3))
+				m.set(8, new CBORValue(32))
+				return m
+			}
+			if sub == 0x03 {
+				fail ctapError(CTAPStatus.InvalidOption, "no enrollment is in progress") when enrolling.len() == 0
+				enrolling = byte[]
+				return new CBORValue()
+			}
+			let c = new CBOR()
+			c.keyOrder = CBORKeyOrder.LengthFirst
+			let msg byte[] = [1, byte(sub)]
+			msg.push(...c.encode(p.get(3))) when p.has(3)
+			try checkToken(p, 5, 4, PinPermission.BioEnrollment, "", msg)
+			let params = p.get(3)
+			match sub {
+				case 0x01:
+					enrolling = try crypto.rand(8)
+					samplesLeft = 2
+					m.set(4, new CBORValue(enrolling))
+					m.set(5, new CBORValue(0))
+					m.set(6, new CBORValue(samplesLeft))
+					return m
+				case 0x02:
+					fail ctapError(CTAPStatus.InvalidOption, "no enrollment is in progress") when enrolling.len() == 0 || !(try params.get(1).asBytes()).equals(enrolling)
+					samplesLeft -= 1
+					m.set(5, new CBORValue(0))
+					m.set(6, new CBORValue(samplesLeft))
+					if samplesLeft == 0 {
+						templates.push(Fingerprint{id: enrolling, name: ""})
+						enrolling = byte[]
+					}
+					return m
+				case 0x04:
+					fail ctapError(CTAPStatus.InvalidOption, "no fingerprints are enrolled") when templates.len() == 0
+					let list = new CBORValue(CBORKind.Array)
+					for let (_, t) in templates {
+						let info = new CBORValue(CBORKind.Map)
+						info.set(1, new CBORValue(t.id))
+						info.set(2, new CBORValue(t.name)) when t.name != ""
+						list.push(info)
+					}
+					m.set(7, list)
+					return m
+				case 0x05, 0x06:
+					let id = try params.get(1).asBytes()
+					for let (i, t) in templates {
+						continue when !t.id.equals(id)
+						if sub == 0x05 {
+							templates[i] = Fingerprint{id: id, name: try params.get(2).asString()}
+						} else {
+							templates.remove(i)
+						}
+						return new CBORValue()
+					}
+					fail ctapError(CTAPStatus.InvalidOption, "no such template")
+				default:
+					fail ctapError(CTAPStatus.InvalidSubcommand, "unknown bio enrollment subcommand {sub}")
+			}
+		}
+
+		// authenticatorConfig (CTAP 2.2 §6.11).
+		internal def config(p CBORValue) !none {
+			let sub = try p.get(1).asInt()
+			let c = new CBOR()
+			c.keyOrder = CBORKeyOrder.LengthFirst
+			let msg byte[]
+			for let k = 0; k < 32; k++ {
+				msg.push(byte(0xFF))
+			}
+			msg.push(byte(0x0D), byte(sub))
+			msg.push(...c.encode(p.get(2))) when p.has(2)
+			try checkToken(p, 4, 3, PinPermission.AuthenticatorConfig, "", msg)
+			match sub {
+				case 0x01:
+					enterpriseAttestation = true
+				case 0x02:
+					alwaysUV = !alwaysUV
+				case 0x03:
+					let params = p.get(2)
+					if params.has(1) {
+						let length = try params.get(1).asInt()
+						fail ctapError(CTAPStatus.PINPolicyViolation, "the minimum PIN length cannot go down") when length < minPINLength
+						minPINLength = length
+					}
+					for let (_, rp) in params.get(2).elements() {
+						minPINLengthRPs.push(try rp.asString())
+					}
+					forcePINChange = true when params.has(3) && (try params.get(3).asBool())
+				default:
+					fail ctapError(CTAPStatus.InvalidSubcommand, "unknown config subcommand {sub}")
+			}
+			return none
+		}
+
+		// Answers a U2F APDU (CTAP1): VERSION, REGISTER, AUTHENTICATE; the
+		// status word last.
+		internal def u2fAnswer(apdu byte[]) !byte[] {
+			fail ctapError(CTAPStatus.InvalidLength, "short APDU") when apdu.len() < 4
+			let ins = int(apdu[1])
+			let p1 = int(apdu[2])
+			let data byte[]
+			if apdu.len() >= 7 {
+				let n = int(apdu[5]) << 8 | int(apdu[6])
+				data = apdu.slice(7, n < apdu.len() - 7 ?? (n, apdu.len() - 7))
+			}
+			match ins {
+				case 0x03:
+					return "U2F_V2".bytes() + byte[0x90, 0x00]
+				case 0x01:
+					return byte[0x6A, 0x80] when data.len() != 64
+					return byte[0x69, 0x85] when !authenticator.userPresent
+					let attKey = authenticator.attestationKey
+					return byte[0x6D, 0x00] when attKey is none || authenticator.attestationChain.len() == 0
+					let challenge = data.slice(0, 32)
+					let app = data.slice(32, 32)
+					let key = try crypto.generateECDSAKey(crypto.p256)
+					let point = crypto.marshalPoint(crypto.p256, key.point)
+					let handle = try crypto.rand(64)
+					let cred = new SoftCredential(handle, "", User{}, key, COSEAlgorithm.ES256, false)
+					cred.rpIdHash = app
+					authenticator.credentials.push(cred)
+					let signed byte[] = [0]
+					signed.push(...app)
+					signed.push(...challenge)
+					signed.push(...handle)
+					signed.push(...point)
+					let out byte[] = [5]
+					out.push(...point)
+					out.push(byte(handle.len()))
+					out.push(...handle)
+					out.push(...authenticator.attestationChain[0])
+					out.push(...(try coseSign(COSEAlgorithm.ES256, attKey, signed)))
+					return out + byte[0x90, 0x00]
+				case 0x02:
+					return byte[0x6A, 0x80] when data.len() < 65
+					let challenge = data.slice(0, 32)
+					let app = data.slice(32, 32)
+					let handle = data.slice(65, int(data[64]))
+					for let (_, c) in authenticator.credentials {
+						continue when !c.rpIdHash.equals(app) || !c.id.equals(handle)
+						return byte[0x69, 0x85] when p1 == 0x07
+						return byte[0x69, 0x85] when p1 == 0x03 && !authenticator.userPresent
+						let flags = p1 == 0x03 ?? (1, 0)
+						let count = softCount(authenticator, c)
+						let counter byte[] = [byte(count >> 24), byte((count >> 16) & 0xFF), byte((count >> 8) & 0xFF), byte(count & 0xFF)]
+						let signed = app.clone()
+						signed.push(byte(flags))
+						signed.push(...counter)
+						signed.push(...challenge)
+						let out byte[] = [byte(flags)]
+						out.push(...counter)
+						out.push(...(try coseSign(COSEAlgorithm.ES256, c.key, signed)))
+						return out + byte[0x90, 0x00]
+					}
+					return byte[0x6A, 0x80]
+				default:
+					return byte[0x6D, 0x00]
+			}
+		}
+	}
+}

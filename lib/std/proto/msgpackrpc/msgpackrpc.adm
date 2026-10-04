@@ -1,0 +1,375 @@
+// MessagePack-RPC (https://github.com/msgpack-rpc/msgpack-rpc/blob/master/spec.md):
+// requests, responses and notifications as MessagePack arrays over a byte
+// stream, in both directions (Neovim's API speaks it).
+//
+//     let peer = new msgpackrpc.Peer(conn, conn)
+//     peer.handle("add", def (req msgpackrpc.Request) !any {
+//         return (try req.arg(0).asInt()) + (try req.arg(1).asInt())
+//     })
+//     peer.start()
+//     let sum = try peer.call("remote_add", [1, 2])
+partial module std.proto.msgpackrpc {
+	use (
+		std.io
+		std.time
+		std.errors
+		std.data.encoding::(MsgPack, MsgPackValue, MsgPackKind, MsgPackReader)
+	)
+
+	// Why a call failed.
+	enum ErrorCode {
+		// The peer answered with an error object.
+		Remote,
+		// The connection ended before the response arrived.
+		Closed,
+		// No response arrived within the call's timeout.
+		Timeout,
+		// A message was not valid MessagePack-RPC.
+		Protocol
+	}
+
+	// The error a call fails with, and the error a handler fails with to
+	// answer with a specific error object.
+	//
+	//     fail msgpackrpc.errorOf(["NotFound", key])
+	struct RPCError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorCode
+		// The error object the peer sent (or that a handler answers with);
+		// nil for local failures.
+		object  MsgPackValue
+	}
+
+	// An RPCError carrying an error object for a handler to fail with. The
+	// message is the object's text form.
+	def errorOf(object any) RPCError {
+		let v = toValue(object)
+		return RPCError{message: describe(v), code: "Remote", kind: ErrorCode.Remote, object: v}
+	}
+
+	// One incoming request or notification, as a handler sees it.
+	type Request {
+		// The method name.
+		method       string
+		// The arguments.
+		params       MsgPackValue[]
+		// Whether no response is expected.
+		notification bool
+
+		// The argument at index; nil when there are fewer.
+		def arg(index int) MsgPackValue {
+			return new MsgPackValue() when index < 0 || index >= params.len()
+			return params[index]
+		}
+
+		// Fills target from the argument at index the way `MsgPack.decode`
+		// does (a map onto an object's fields). Fails with an RPCError when
+		// it does not fit, which a handler can pass on with `try`.
+		def bind(index int, target any) !none {
+			let mp = new MsgPack()
+			mp.decode(mp.encode(arg(index)), target) onerror (err error) {
+				fail errorOf("invalid argument {index}: {err.message}")
+			}
+			return none
+		}
+	}
+
+	// Answers one request: the result to send, or a failure. Failing with an
+	// RPCError sends its error object; any other failure sends the failure's
+	// message as a string. For a notification the result is dropped.
+	type Handler = def(Request) !any
+
+	// Speaks MessagePack-RPC over a byte stream, both ways: it answers the
+	// methods registered with handle and makes calls of its own, matching
+	// responses by message id. Requests are answered on tasks of their own;
+	// notifications run in arrival order before the next message is read.
+	type Peer {
+		// How long a call waits for its response; 0s waits until the stream
+		// ends.
+		timeout duration = 0s
+
+		internal names    string[]
+		internal handlers Handler[]
+		internal reader   MsgPackReader
+		internal writer   io.Writer
+		internal pending  map<string, channel<Reply>>
+		internal next     int                         = 0
+		internal running  bool
+		internal ended    bool
+		internal failure  string                      = ""
+		internal done     channel<none>
+
+		def new(reader io.Reader, writer io.Writer) {
+			self.reader = new MsgPackReader(reader)
+			self.writer = writer
+			self.pending = {}
+			self.done = new channel<none>(1)
+		}
+
+		// Registers the handler of a method, replacing an earlier one.
+		// Register before start: a request for an unknown method is
+		// answered with an error.
+		def handle(method string, handler Handler) {
+			let i = names.indexOf(method)
+			if i >= 0 {
+				handlers[i] = handler
+				return
+			}
+			names.push(method)
+			handlers.push(handler)
+		}
+
+		// Starts reading the stream on a task of its own.
+		def start() {
+			return when running
+			running = true
+			let task = async readLoop()
+			task.keepAlive()
+		}
+
+		// Blocks until the stream ends or close is called.
+		def wait() {
+			return when !running
+			// The value stays in the channel, so every later wait returns at
+			// once too.
+			select {
+				case done:
+			}
+		}
+
+		// Why the stream ended; "" while it runs or when it ended cleanly.
+		def endReason() string {
+			return failure
+		}
+
+		// Calls a method and returns its result. Fails with an RPCError:
+		// Remote with the error object the peer answered with, or Closed,
+		// Timeout or Protocol; and with the writer's error when the request
+		// cannot be sent. start must have been called.
+		def call(method string, params any[] = []) !MsgPackValue {
+			let (id, ch) = try register()
+			let key = id.str()
+			let message any[] = [0, id, method, params]
+			send(message) onerror (err error) {
+				forget(key)
+				fail err
+			}
+			let reply = try waitFor(key, ch)
+			let err = reply.error
+			fail err unless err is none
+			return reply.result
+		}
+
+		// Calls a method and fills result from what it returns, the way
+		// `MsgPack.decode` does. Fails as call does, or when the result does
+		// not fit.
+		def call(method string, params any[], result any) !none {
+			let value = try call(method, params)
+			let mp = new MsgPack()
+			try mp.decode(mp.encode(value), result)
+			return none
+		}
+
+		// Sends a notification. Fails when the writer does or the peer has
+		// ended.
+		def notify(method string, params any[] = []) !none {
+			fail closedError(failure) when ended
+			let message any[] = [2, method, params]
+			return try send(message)
+		}
+
+		// Ends the peer: pending calls fail with Closed and wait returns. The
+		// reader and writer stay open; they belong to the caller, and closing
+		// the reader is what stops the reading task.
+		def close() {
+			stop("")
+		}
+
+		internal atomic def register() !(int, channel<Reply>) {
+			fail RPCError{message: "msgpackrpc: call before start", code: "Closed", kind: ErrorCode.Closed, object: new MsgPackValue()} unless running
+			fail closedError(failure) when ended
+			let id = next
+			// Message ids are 32-bit and wrap.
+			next = next == 0xFFFFFFFF ?? (0, next + 1)
+			let ch = new channel<Reply>(1)
+			pending[id.str()] = ch
+			return (id, ch)
+		}
+
+		internal atomic def forget(key string) {
+			pending.delete(key) when pending.hasKey(key)
+		}
+
+		internal atomic def deliver(key string, reply Reply) {
+			return unless pending.hasKey(key)
+			let ch = pending[key]
+			pending.delete(key)
+			ch <- reply
+		}
+
+		// Waits for the reply on the channel register handed out; deliver
+		// may already have put it there.
+		internal def waitFor(key string, ch channel<Reply>) !Reply {
+			if timeout <= 0s {
+				select {
+					case ch:
+						return <- ch
+				}
+			}
+			let sleep = time.sleepChan(timeout)
+			select {
+				case ch:
+					return <- ch
+				case sleep:
+					forget(key)
+					fail RPCError{message: "msgpackrpc: no response within {timeout}", code: "Timeout", kind: ErrorCode.Timeout, object: new MsgPackValue()}
+			}
+		}
+
+		// Writes one message as one unit.
+		internal atomic def send(message any[]) !none {
+			try writer.write(new MsgPack().encode(message))
+			return none
+		}
+
+		internal atomic def stop(reason string) {
+			return when ended
+			ended = true
+			failure = reason
+			let err = closedError(reason)
+			for let (_, ch) in pending {
+				ch <- Reply{error: err}
+			}
+			pending = {}
+			done <- none when done.len() == 0
+		}
+
+		internal def readLoop() {
+			for !ended {
+				let more = reader.more() onerror (err error) {
+					stop(err.message)
+					return
+				}
+				if !more {
+					stop("")
+					return
+				}
+				let message = reader.next() onerror (err error) {
+					stop(err.message)
+					return
+				}
+				dispatchIncoming(message) onerror (err error) {
+					stop(err.message)
+					return
+				}
+			}
+		}
+
+		// Routes one message: a response to its call, a request to a task, a
+		// notification in order. Fails on a message that is not valid
+		// MessagePack-RPC, which ends the peer: the stream can no longer be
+		// trusted.
+		internal def dispatchIncoming(message MsgPackValue) !none {
+			expects {
+				assert message.kind == MsgPackKind.Array onerror fail "msgpackrpc: message is not an array"
+			}
+			let kind = message.at(0).asInt() onerror (err error) {
+				fail "msgpackrpc: message type is not an integer"
+			}
+			match kind {
+				case 0:
+					fail "msgpackrpc: request is not 4 elements" when message.len() != 4
+					let id = try message.at(1).asUint()
+					let req = try requestOf(message.at(2), message.at(3), false)
+					let task = async answer(id, req)
+					task.keepAlive()
+				case 1:
+					fail "msgpackrpc: response is not 4 elements" when message.len() != 4
+					let id = try message.at(1).asUint()
+					let errObject = message.at(2)
+					if errObject.kind == MsgPackKind.Nil {
+						deliver(id.str(), Reply{result: message.at(3)})
+					} else {
+						deliver(id.str(), Reply{error: RPCError{message: describe(errObject), code: "Remote", kind: ErrorCode.Remote, object: errObject}})
+					}
+				case 2:
+					fail "msgpackrpc: notification is not 3 elements" when message.len() != 3
+					let req = try requestOf(message.at(1), message.at(2), true)
+					let i = names.indexOf(req.method)
+					if i >= 0 {
+						let fn = handlers[i]
+						fn(req) onerror recover none
+					}
+				default:
+					fail "msgpackrpc: unknown message type {kind}"
+			}
+			return none
+		}
+
+		// Runs a request's handler and sends the response.
+		internal def answer(id uint64, req Request) {
+			let i = names.indexOf(req.method)
+			let errObject any = none
+			let result any = none
+			if i < 0 {
+				errObject = "method not found: {req.method}"
+			} else {
+				let fn = handlers[i]
+				result = fn(req) onerror (err error) {
+					errObject = errorObjectOf(err)
+					recover none
+				}
+			}
+			let message any[] = [1, id, errObject, result]
+			send(message) onerror (err error) {
+				stop(err.message)
+				recover none
+			}
+		}
+	}
+
+	// The outcome of one call.
+	internal struct Reply {
+		result MsgPackValue
+		error  ?RPCError
+	}
+
+	// The Request a method and params value describe; fails when they are
+	// malformed.
+	internal def requestOf(method MsgPackValue, params MsgPackValue, notification bool) !Request {
+		let req = new Request()
+		req.method = method.asString() onerror (err error) {
+			fail "msgpackrpc: method is not a string"
+		}
+		fail "msgpackrpc: params is not an array" when params.kind != MsgPackKind.Array
+		req.params = params.elements()
+		req.notification = notification
+		return req
+	}
+
+	// The error object a handler's failure answers with.
+	internal def errorObjectOf(err error) any {
+		return err.object when err is RPCError
+		return err.message
+	}
+
+	// A value as a MsgPackValue, through its encoding.
+	internal def toValue(object any) MsgPackValue {
+		let mp = new MsgPack()
+		return mp.parse(mp.encode(object)) onerror recover new MsgPackValue()
+	}
+
+	// The text of an error object: a str as it is, anything else in its
+	// text form.
+	internal def describe(v MsgPackValue) string {
+		return v.asString() onerror recover v.str()
+	}
+
+	internal def closedError(reason string) RPCError {
+		let text = reason == "" ?? ("msgpackrpc: connection closed", "msgpackrpc: connection closed: {reason}")
+		return RPCError{message: text, code: "Closed", kind: ErrorCode.Closed, object: new MsgPackValue()}
+	}
+}

@@ -1,0 +1,491 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.math
+		std.simd
+		std.math.processing
+		std.formats.ai
+		std.formats.ai::(ModelFile)
+		std.formats.audio
+		std.formats.audio::(Audio)
+		std.ai.tensor::(Weights, loadWeights, rmsNorm, softmax, silu)
+		std.ai.llm::*
+	)
+
+	// One block of the Gemma 4 audio conformer.
+	struct AudioLayer {
+		// The first half-step feed-forward.
+		ffnNorm       float32[]
+		ffnUp         ClampedLinear
+		ffnDown       ClampedLinear
+		ffnPost       float32[]
+		attentionNorm float32[]
+		query         ClampedLinear
+		key           ClampedLinear
+		value         ClampedLinear
+		output        ClampedLinear
+		// Multiplies each value of a query head, after the scale.
+		perDimension  float32[]
+		// Projects the relative position table onto the heads.
+		relative      Weights
+		attentionPost float32[]
+		// The convolution module: norm, pointwise to twice the width, GLU,
+		// causal depthwise over `kernel` steps, norm, SiLU, pointwise back.
+		convNorm      float32[]
+		pointwise1    ClampedLinear
+		depthwise     float32[]
+		kernel        int
+		convPost      float32[]
+		pointwise2    ClampedLinear
+		// The second half-step feed-forward.
+		ffn2Norm      float32[]
+		ffn2Up        ClampedLinear
+		ffn2Down      ClampedLinear
+		ffn2Post      float32[]
+		// Norm of the block's output.
+		outputNorm    float32[]
+	}
+
+	// Gemma 4's audio encoder: 16 kHz mono in 30-second chunks, a log-mel
+	// spectrogram per chunk, two stride-2 convolutions (a row per 40 ms),
+	// a conformer, and projections to the language model's width.
+	type AudioEncoder {
+		mels       int
+		// Per mel bin, its weights over the FFT bins (HTK scale, no area
+		// normalisation), and the Hann window of the frame.
+		filters    float32[]
+		window     float32[]
+		// The two subsampling convolutions (output channels × input channels
+		// × 3 × 3) and their channel norms.
+		conv0      float32[]
+		conv0Norm  float32[]
+		conv1      float32[]
+		conv1Norm  float32[]
+		channels0  int
+		channels1  int
+		input      Weights
+		layers     AudioLayer[]
+		width      int
+		heads      int
+		// Per distance 0..past, the sinusoidal position rows.
+		positions  matrix<float32>
+		output     ClampedLinear
+		outputBias float32[]
+		projection ClampedLinear
+		epsilon    float32         = float32(0.000001)
+
+		def new(input Weights, output ClampedLinear, projection ClampedLinear) {
+			self.input = input
+			self.output = output
+			self.projection = projection
+		}
+
+		// The rows `sound` becomes, `projection.weights.rows` wide.
+		// Fails when the sound is shorter than one frame.
+		def encode(sound Audio) !matrix<float32> {
+			let converter = new audio.Converter(int(sound.info.sampleRate), int(sound.info.channels), sampleRate, 1)
+			let samples = converter.convert(sound.samples)
+			samples.push(...converter.flush())
+			let chunk = 30 * sampleRate
+			let parts matrix<float32>[]
+			let total = 0
+			for let from = 0; from < samples.len(); from += chunk {
+				let mel = try melFrames(samples[from:(from + chunk).min(samples.len())])
+				let rows = encodeFrames(mel)
+				parts.push(rows)
+				total += rows.rows
+			}
+			fail "llm: the sound is shorter than one audio frame (20 ms)" when total == 0
+			let out = matrix<float32>[].size(total, projection.weights.rows)
+			let at = 0
+			for let (_, p) in parts {
+				for let r = 0; r < p.rows; r++ {
+					copyInto(p.row(r), out.row(at + r))
+				}
+				at += p.rows
+			}
+			return out
+		}
+
+		// The log-mel spectrogram of `samples`, a row of `mels` values per
+		// 10 ms, as Gemma 4's feature extractor frames it: 20 ms windows
+		// padded to 512, half a window of silence first.
+		// Fails when there is not one whole frame.
+		def melFrames(samples float32[]) !matrix<float32> {
+			let n = samples.len()
+			let frames = (n + frameLength / 2 - (frameLength + 1)) / hop + 1
+			fail "llm: the sound is shorter than one audio frame (20 ms)" when frames <= 0
+			let needed = (frames - 1) * hop + fftSize
+			let padded float32[]
+			padded.len((needed - n).max(frameLength / 2) + n)
+			copyAt(samples, padded, frameLength / 2)
+			let bins = fftSize / 2 + 1
+			let out = matrix<float32>[].size(frames, mels)
+			let tasks = (frames / 64).clamp(1, 16)
+			forall let t in 0..tasks {
+				let input complex128[]
+				input.len(fftSize)
+				let magnitude float32[]
+				magnitude.len(bins)
+				for let i = frames * t / tasks; i < frames * (t + 1) / tasks; i++ {
+					let offset = i * hop
+					for let j = 0; j < fftSize; j++ {
+						let at = offset + j
+						let v = at < padded.len() ?? (float(padded[at]) * float(window[j]), 0.0)
+						input[j] = complex(v, 0.0)
+					}
+					let spectrum = processing.fft(input) onerror recover input
+					for let k = 0; k < bins; k++ {
+						let z = spectrum[k]
+						magnitude[k] = float32(math.sqrt(float(z.real()) * float(z.real()) + float(z.imag()) * float(z.imag())))
+					}
+					let row = out.row(i)
+					for let m = 0; m < mels; m++ {
+						let sum = 0.0
+						for let k = 0; k < bins; k++ {
+							sum += float(magnitude[k]) * float(filters[m * bins + k])
+						}
+						row[m] = float32(math.ln(sum.max(0.001)))
+					}
+				}
+			}
+			return out
+		}
+
+		// The conformer over one chunk's mel frames.
+		internal def encodeFrames(mel matrix<float32>) matrix<float32> {
+			let x = subsample(mel)
+			let n = x.rows
+			for let (_, layer) in layers {
+				runLayer(layer, x)
+			}
+			let out = matrix<float32>[].size(n, output.weights.rows)
+			applyClamped(output, x, out)
+			for let i = 0; i < n; i++ {
+				let row = out.row(i)
+				addInto(row, outputBias)
+				normalize(row, epsilon)
+			}
+			let projected = matrix<float32>[].size(n, projection.weights.rows)
+			applyClamped(projection, out, projected)
+			return projected
+		}
+
+		// Two 3×3 stride-2 convolutions over (time, mel), each with a norm
+		// over its channels and ReLU, flattened to a row per time step
+		// (channel fastest, then frequency) and projected.
+		internal def subsample(mel matrix<float32>) matrix<float32> {
+			let t0 = mel.rows
+			let f0 = mels
+			let t1 = (t0 - 1) / 2 + 1
+			let f1 = (f0 - 1) / 2 + 1
+			let t2 = (t1 - 1) / 2 + 1
+			let f2 = (f1 - 1) / 2 + 1
+			// Layout (time, frequency, channel), channel fastest.
+			let first = convolve(mel.data(), t0, f0, 1, conv0, channels0, conv0Norm, t1, f1)
+			let second = convolve(first, t1, f1, channels0, conv1, channels1, conv1Norm, t2, f2)
+			let flat = matrix<float32>[].size(t2, f2 * channels1)
+			copyInto(second, flat.data())
+			let x = matrix<float32>[].size(t2, input.rows)
+			multiplyRows(input, flat, x)
+			return x
+		}
+
+		// A 3×3 convolution with stride 2 and padding 1 from (t, f, cin) to
+		// (tOut, fOut, cout), then a norm over the channels of each cell
+		// (mean and variance, times `norm`) and ReLU.
+		internal def convolve(from float32[], t int, f int, cin int, weights float32[], cout int, norm float32[], tOut int, fOut int) float32[] {
+			let out float32[]
+			out.len(tOut * fOut * cout)
+			let tasks = (tOut / 8).clamp(1, 32)
+			forall let task in 0..tasks {
+				for let y = tOut * task / tasks; y < tOut * (task + 1) / tasks; y++ {
+					for let x = 0; x < fOut; x++ {
+						let cell = (y * fOut + x) * cout
+						for let co = 0; co < cout; co++ {
+							let acc = float32(0)
+							for let ky = 0; ky < 3; ky++ {
+								let sy = y * 2 - 1 + ky
+								continue when sy < 0 || sy >= t
+								for let kx = 0; kx < 3; kx++ {
+									let sx = x * 2 - 1 + kx
+									continue when sx < 0 || sx >= f
+									let at = (sy * f + sx) * cin
+									let w = co * cin * 9 + ky * 3 + kx
+									for let ci = 0; ci < cin; ci++ {
+										acc += from[at + ci] * weights[w + ci * 9]
+									}
+								}
+							}
+							out[cell + co] = acc
+						}
+						let mean = 0.0
+						for let co = 0; co < cout; co++ {
+							mean += float(out[cell + co])
+						}
+						mean /= float(cout)
+						let spread = 0.0
+						for let co = 0; co < cout; co++ {
+							let d = float(out[cell + co]) - mean
+							spread += d * d
+						}
+						let scale = 1.0 / math.sqrt(spread / float(cout) + float(epsilon))
+						for let co = 0; co < cout; co++ {
+							let v = float32((float(out[cell + co]) - mean) * scale) * norm[co]
+							out[cell + co] = v.max(float32(0))
+						}
+					}
+				}
+			}
+			return out
+		}
+
+		// One conformer block over every row of `x`, in place.
+		internal def runLayer(layer AudioLayer, x matrix<float32>) {
+			let n = x.rows
+			feedForward(x, layer.ffnNorm, layer.ffnUp, layer.ffnDown, layer.ffnPost)
+			// Attention over the current and 11 earlier rows, with relative
+			// position terms and scores capped to ±50.
+			let normed = normedCopy(x, layer.attentionNorm)
+			let q = matrix<float32>[].size(n, width)
+			let k = matrix<float32>[].size(n, width)
+			let v = matrix<float32>[].size(n, width)
+			applyClamped(layer.query, normed, q)
+			applyClamped(layer.key, normed, k)
+			applyClamped(layer.value, normed, v)
+			let hs = width / heads
+			let qScale = float32(1.0 / math.sqrt(float(hs)) / math.ln(2.0))
+			let kScale = float32(math.ln(1.0 + math.E ** (1.0)) / math.ln(2.0))
+			for let i = 0; i < n; i++ {
+				let qr = q.row(i)
+				let kr = k.row(i)
+				for let e = 0; e < width; e++ {
+					qr[e] *= qScale * layer.perDimension[e % hs]
+					kr[e] *= kScale
+				}
+			}
+			let relative = matrix<float32>[].size(positions.rows, width)
+			multiplyRows(layer.relative, positions, relative)
+			let attended = matrix<float32>[].size(n, width)
+			let qd = q.data()
+			let kd = k.data()
+			let vd = v.data()
+			let rd = relative.data()
+			let ad = attended.data()
+			let tasks = (n / 16).clamp(1, 32)
+			forall let t in 0..tasks {
+				let scores float32[]
+				scores.len(pastRows)
+				for let i = n * t / tasks; i < n * (t + 1) / tasks; i++ {
+					for let h = 0; h < heads; h++ {
+						attendLocal(qd, kd, vd, rd, ad, scores, i, h * hs, hs, width)
+					}
+				}
+			}
+			let projected = matrix<float32>[].size(n, width)
+			applyClamped(layer.output, attended, projected)
+			for let i = 0; i < n; i++ {
+				let p = projected.row(i)
+				rmsNorm(p, layer.attentionPost, epsilon)
+				addInto(x.row(i), p)
+			}
+			// Convolution module.
+			let convIn = normedCopy(x, layer.convNorm)
+			let doubled = matrix<float32>[].size(n, 2 * width)
+			applyClamped(layer.pointwise1, convIn, doubled)
+			let gated = matrix<float32>[].size(n, width)
+			for let i = 0; i < n; i++ {
+				let d = doubled.row(i)
+				let g = gated.row(i)
+				for let e = 0; e < width; e++ {
+					g[e] = d[e] / (float32(1) + float32(math.E ** (-float(d[e + width]))))
+				}
+			}
+			let mixed = matrix<float32>[].size(n, width)
+			for let i = 0; i < n; i++ {
+				let m = mixed.row(i)
+				for let tap = 0; tap < layer.kernel; tap++ {
+					let src = i - (layer.kernel - 1) + tap
+					continue when src < 0
+					let g = gated.row(src)
+					for let e = 0; e < width; e++ {
+						m[e] += g[e] * layer.depthwise[e * layer.kernel + tap]
+					}
+				}
+				rmsNorm(m, layer.convPost, epsilon)
+				silu(m)
+			}
+			applyClamped(layer.pointwise2, mixed, projected)
+			for let i = 0; i < n; i++ {
+				addInto(x.row(i), projected.row(i))
+			}
+			feedForward(x, layer.ffn2Norm, layer.ffn2Up, layer.ffn2Down, layer.ffn2Post)
+			for let i = 0; i < n; i++ {
+				rmsNorm(x.row(i), layer.outputNorm, epsilon)
+			}
+		}
+
+		// x += ½ · post-norm(down(SiLU(up(norm(x))))).
+		internal def feedForward(x matrix<float32>, norm float32[], up ClampedLinear, down ClampedLinear, post float32[]) {
+			let n = x.rows
+			let normed = normedCopy(x, norm)
+			let hidden = matrix<float32>[].size(n, up.weights.rows)
+			applyClamped(up, normed, hidden)
+			for let i = 0; i < n; i++ {
+				silu(hidden.row(i))
+			}
+			let back = matrix<float32>[].size(n, width)
+			applyClamped(down, hidden, back)
+			for let i = 0; i < n; i++ {
+				let b = back.row(i)
+				rmsNorm(b, post, epsilon)
+				scaleBy(b, float32(0.5))
+				addInto(x.row(i), b)
+			}
+		}
+
+		internal def normedCopy(x matrix<float32>, norm float32[]) matrix<float32> {
+			let out = x.clone()
+			for let i = 0; i < out.rows; i++ {
+				rmsNorm(out.row(i), norm, epsilon)
+			}
+			return out
+		}
+	}
+
+	const sampleRate = 16000
+	const frameLength = 320
+	const hop = 160
+	const fftSize = 512
+	// Rows an audio query attends to: itself and the 11 before it.
+	const pastRows = 12
+
+	// One head of row i's local attention: scores against rows i−11..i of
+	// k plus the relative term q·rel[distance], capped to ±50, their
+	// softmax, and the weighted rows of v summed into out's row i.
+	def attendLocal(q float32[], k float32[], v float32[], rel float32[], out float32[], scores float32[], i int, o int, hs int, width int) {
+		let first = (i - pastRows + 1).max(0)
+		let count = i + 1 - first
+		let qo = i * width + o
+		for let j = 0; j < count; j++ {
+			let key = first + j
+			let ko = key * width + o
+			let ro = (i - key) * width + o
+			let acc = simd.splat8<float32>(float32(0))
+			for let e = 0; e < hs; e += 8 {
+				let qv = simd.load8<float32>(q, qo + e)
+				acc = simd.fma(qv, simd.load8<float32>(k, ko + e) + simd.load8<float32>(rel, ro + e), acc)
+			}
+			let s = simd.sum(acc)
+			scores[j] = float32(50.0 * math.tanh(float(s) / 50.0))
+		}
+		softmax(scores[:count])
+		for let j = 0; j < count; j++ {
+			let s = simd.splat8<float32>(scores[j])
+			let vo = (first + j) * width + o
+			for let e = 0; e < hs; e += 8 {
+				simd.store8<float32>(out, qo + e, simd.fma(simd.load8<float32>(v, vo + e), s, simd.load8<float32>(out, qo + e)))
+			}
+		}
+	}
+
+	// Mel filters over n/2 + 1 FFT bins: `mels` triangles evenly spaced on
+	// the HTK mel scale from 0 Hz to half the sample rate.
+	def melFilters(mels int, n int, rate int) float32[] {
+		let bins = n / 2 + 1
+		let top = 2595.0 * math.log10(1.0 + float(rate) / 2.0 / 700.0)
+		let edges float[]
+		for let i = 0; i < mels + 2; i++ {
+			let m = top * float(i) / float(mels + 1)
+			edges.push(700.0 * (10.0 ** (m / 2595.0) - 1.0))
+		}
+		let out float32[]
+		out.len(mels * bins)
+		let step = float(rate) / float(n)
+		for let m = 0; m < mels; m++ {
+			let left = edges[m]
+			let center = edges[m + 1]
+			let right = edges[m + 2]
+			for let k = 0; k < bins; k++ {
+				let f = float(k) * step
+				let w = 0.0
+				if f >= left && f <= center {
+					w = (f - left) / (center - left).max(1e-30)
+				} else if f > center && f <= right {
+					w = (right - f) / (right - center).max(1e-30)
+				}
+				out[m * bins + k] = float32(w)
+			}
+		}
+		return out
+	}
+
+	// Gemma 4's audio encoder from a projector file for a model `width` wide.
+	// Fails when a tensor is missing or cannot be read.
+	def readGemma4Audio(file ModelFile, width int) !AudioEncoder {
+		let size = try required(file, "clip.audio.embedding_length")
+		let encoder = new AudioEncoder(try loadWeights(file, "a.input_projection.weight"), try readClamped(file, "a.pre_encode.out"), try readClamped(file, "mm.a.input_projection"))
+		fail "llm: the projector's audio projects to {encoder.projection.weights.rows} values, the model reads {width}" unless encoder.projection.weights.rows == width
+		encoder.width = size
+		encoder.heads = try required(file, "clip.audio.attention.head_count")
+		encoder.mels = try required(file, "clip.audio.num_mel_bins")
+		encoder.filters = melFilters(encoder.mels, fftSize, sampleRate)
+		encoder.window.len(fftSize)
+		for let i = 0; i < frameLength; i++ {
+			encoder.window[i] = float32(0.5 - 0.5 * math.cos(math.Tau * float(i) / float(frameLength)))
+		}
+		encoder.conv0 = try file.readFloats("a.conv1d.0.weight")
+		encoder.conv0Norm = try file.readFloats("a.conv1d.0.norm.weight")
+		encoder.conv1 = try file.readFloats("a.conv1d.1.weight")
+		encoder.conv1Norm = try file.readFloats("a.conv1d.1.norm.weight")
+		encoder.channels0 = encoder.conv0Norm.len()
+		encoder.channels1 = encoder.conv1Norm.len()
+		encoder.outputBias = try optionalFloats(file, "a.pre_encode.out.bias")
+		// Sinusoidal rows for distances 0..pastRows: sines of the position
+		// over geometric timescales, then cosines.
+		let half = size / 2
+		encoder.positions = matrix<float32>[].size(pastRows + 1, size)
+		let increment = math.ln(10000.0) / float((half - 1).max(1))
+		for let d = 0; d <= pastRows; d++ {
+			let row = encoder.positions.row(d)
+			for let i = 0; i < half; i++ {
+				let angle = float(d) * math.E ** (-float(i) * increment)
+				row[i] = float32(math.sin(angle))
+				row[i + half] = float32(math.cos(angle))
+			}
+		}
+		let count = try required(file, "clip.audio.block_count")
+		for let n = 0; n < count; n++ {
+			let p = "a.blk.{n}."
+			let depthwise = file.tensor(p + "conv_dw.weight")
+			fail "llm: the projector has no {p}conv_dw.weight" when depthwise is none
+			encoder.layers.push(AudioLayer{
+				ffnNorm:       try file.readFloats(p + "ffn_norm.weight"),
+				ffnUp:         try readClamped(file, p + "ffn_up"),
+				ffnDown:       try readClamped(file, p + "ffn_down"),
+				ffnPost:       try file.readFloats(p + "ffn_post_norm.weight"),
+				attentionNorm: try file.readFloats(p + "attn_pre_norm.weight"),
+				query:         try readClamped(file, p + "attn_q"),
+				key:           try readClamped(file, p + "attn_k"),
+				value:         try readClamped(file, p + "attn_v"),
+				output:        try readClamped(file, p + "attn_out"),
+				perDimension:  try file.readFloats(p + "per_dim_scale.weight"),
+				relative:      try loadWeights(file, p + "attn_k_rel.weight"),
+				attentionPost: try file.readFloats(p + "attn_post_norm.weight"),
+				// The file swaps the two convolution norms' names (llama.cpp
+				// reads them the same way).
+				convNorm:   try file.readFloats(p + "conv_norm.weight"),
+				pointwise1: try readClamped(file, p + "conv_pw1"),
+				depthwise:  try file.readFloats(p + "conv_dw.weight"),
+				kernel:     depthwise.shape[0],
+				convPost:   try file.readFloats(p + "norm_conv.weight"),
+				pointwise2: try readClamped(file, p + "conv_pw2"),
+				ffn2Norm:   try file.readFloats(p + "ffn_norm_1.weight"),
+				ffn2Up:     try readClamped(file, p + "ffn_up_1"),
+				ffn2Down:   try readClamped(file, p + "ffn_down_1"),
+				ffn2Post:   try file.readFloats(p + "ffn_post_norm_1.weight"),
+				outputNorm: try file.readFloats(p + "ln2.weight"),
+			})
+		}
+		return encoder
+	}
+}

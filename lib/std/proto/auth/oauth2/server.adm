@@ -1,0 +1,1242 @@
+partial module std.proto.auth.oauth2 {
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Context, Handler, Method)
+		std.net.url
+		std.net.url::(Values)
+		std.crypto::(constantTimeEqual, marshalPKIXPublicKey, rand)
+		std.crypto.hash::(Hash, digest)
+		std.data.encoding::(Base64)
+		std.proto.auth.jose
+		std.proto.auth.oauth2.engine::*
+	)
+
+	// AccessTokenFormat is how an authorization server issues access
+	// tokens.
+	enum AccessTokenFormat {
+		// Random strings the server stores; resource servers introspect.
+		Opaque,
+		// Signed JWTs (RFC 9068) resource servers check with the server's
+		// keys.
+		Jwt,
+	}
+
+	// Decision is the app's answer to a pending authorization: who logged
+	// in and what they granted.
+	struct Decision {
+		subject  string
+		// The scopes granted, a subset of the requested ones; empty grants
+		// all of them.
+		scopes   string[]         = []
+		authTime ?time.Time
+		acr      ?string
+		amr      string[]         = []
+		// Claims to keep with the grant (OpenID Connect reads them).
+		claims   map<string, any>
+	}
+
+	// PendingAuthorization is an authorization request the server checked
+	// and parked while the app logs the user in: the client, the scopes
+	// asked for, and every request parameter (`prompt`, `max_age`,
+	// `login_hint`, ...). For the device flow `userCode` is set.
+	type PendingAuthorization {
+		id          string
+		client      RegisteredClient
+		scopes      string[]            = []
+		redirectUri string              = ""
+		userCode    ?string
+		params      map<string, string>
+
+		def new(id string, client RegisteredClient) {
+			self.id = id
+			self.client = client
+		}
+
+		// param returns a request parameter, none when absent.
+		def param(name string) ?string {
+			return params.get(name)
+		}
+	}
+
+	// AuthorizationServer is an OAuth authorization server. `handler()`
+	// serves its endpoints under the issuer's path; the user's login and
+	// consent stay in the app, reached through loginURL (and deviceURL for
+	// the device flow). Clients and grants live in memory unless other
+	// stores are given.
+	//
+	// ```
+	// let server = new oauth2.AuthorizationServer("https://as.example", keys)
+	// server.loginURL = "https://as.example/login"
+	// try server.clients.save(new oauth2.RegisteredClient("app", appMetadata))
+	// try mux.handle("/", server.handler())
+	// ```
+	type AuthorizationServer {
+		issuer                string
+		// Signing keys (with private parts): JWT access tokens, and ID
+		// tokens for OpenID Connect. The first key that can sign is used.
+		keys                  jose.JwkSet
+		clients               ClientStore
+		grants                GrantStore
+		// The app's login page; /authorize redirects there with
+		// `?request=<id>`.
+		loginURL              string                                                 = ""
+		// The app's device verification page (`verification_uri`).
+		deviceURL             string                                                 = ""
+		accessTokenFormat     AccessTokenFormat                                      = AccessTokenFormat.Opaque
+		accessTokenLifetime   duration                                               = 1h
+		refreshTokenLifetime  duration                                               = 720h
+		codeLifetime          duration                                               = 60s
+		pendingLifetime       duration                                               = 15m
+		deviceCodeLifetime    duration                                               = 10m
+		// The polling interval the device flow asks for (RFC 8628 §3.2).
+		deviceInterval        duration                                               = 5s
+		pushedLifetime        duration                                               = 60s
+		// Issue a new refresh token on every refresh and retire the old.
+		rotateRefreshTokens   bool                                                   = true
+		requirePushedRequests bool                                                   = false
+		scopesSupported       string[]                                               = []
+		// The resource owner password grant (RFC 6749 §4.3), off by
+		// default (RFC 9700 §2.4); needs verifyPassword.
+		allowPassword         bool                                                   = false
+		// Checks a username and password, returning the subject or none.
+		verifyPassword        ?def (string, Secret<string>) !?string
+		// Dynamic client registration (RFC 7591), off by default.
+		allowRegistration     bool                                                   = false
+		// The initial access token registration requires, when set.
+		registrationToken     ?Secret<string>
+		// Decides a token exchange (RFC 8693): the grant to issue, or an
+		// error. None turns the grant type off.
+		exchangeToken         ?def (Values, RegisteredClient) !Grant
+		// Decides a JWT bearer grant (RFC 7523 §2.1). None turns it off.
+		jwtBearer             ?def (string, RegisteredClient) !Grant
+		// Extension points for OpenID Connect: checks more authorization
+		// parameters, adds members to token responses and metadata.
+		authorizeHook         ?def (map<string, string>, RegisteredClient) !none
+		tokenHook             ?def (Grant, RegisteredClient, map<string, any>) !none
+		metadataHook          ?def (ServerMetadata)
+		// Adds members to an authorization response before it goes to the
+		// client: OpenID Connect's id_token and access_token for the
+		// implicit and hybrid flows.
+		responseHook          ?def (Grant, RegisteredClient, Values) !none
+		internal replay       ReplayCache
+
+		def new(issuer string, keys jose.JwkSet, clients ?ClientStore = none, grants ?GrantStore = none) {
+			self.issuer = issuer
+			self.keys = keys
+			self.clients = clients is none ?? (new MemoryClientStore(), clients)
+			self.grants = grants is none ?? (new MemoryGrantStore(), grants)
+			replay = new ReplayCache()
+		}
+
+		// metadata is the server's metadata (RFC 8414), the document
+		// `/.well-known/oauth-authorization-server` serves.
+		def metadata() ServerMetadata {
+			let m = new ServerMetadata(issuer)
+			let base = issuer.trimSuffix("/")
+			m.authorizationEndpoint = base + "/authorize"
+			m.tokenEndpoint = base + "/token"
+			m.jwksUri = base + "/jwks"
+			m.revocationEndpoint = base + "/revoke"
+			m.introspectionEndpoint = base + "/introspect"
+			m.pushedAuthorizationRequestEndpoint = base + "/par"
+			m.deviceAuthorizationEndpoint = base + "/device_authorization"
+			m.registrationEndpoint = base + "/register" when allowRegistration
+			m.scopesSupported = scopesSupported
+			m.responseTypesSupported = ["code"]
+			m.responseModesSupported = ["query", "fragment", "form_post"]
+			let grantTypes = ["authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:device_code"]
+			grantTypes.push("password") when allowPassword
+			grantTypes.push("urn:ietf:params:oauth:grant-type:token-exchange") unless exchangeToken is none
+			grantTypes.push("urn:ietf:params:oauth:grant-type:jwt-bearer") unless jwtBearer is none
+			m.grantTypesSupported = grantTypes
+			let methods = ["client_secret_basic", "client_secret_post", "client_secret_jwt", "private_key_jwt", "tls_client_auth", "self_signed_tls_client_auth", "none"]
+			m.tokenEndpointAuthMethodsSupported = methods
+			m.revocationEndpointAuthMethodsSupported = methods
+			m.introspectionEndpointAuthMethodsSupported = methods
+			m.tokenEndpointAuthSigningAlgValuesSupported = ["RS256", "PS256", "ES256", "ES384", "ES512", "EdDSA", "HS256", "HS384", "HS512"]
+			m.codeChallengeMethodsSupported = ["S256"]
+			m.requirePushedAuthorizationRequests = requirePushedRequests
+			m.requestObjectSigningAlgValuesSupported = ["RS256", "PS256", "ES256", "ES384", "ES512", "EdDSA"]
+			m.dpopSigningAlgValuesSupported = ["ES256", "ES384", "ES512", "PS256", "RS256", "EdDSA"]
+			m.authorizationResponseIssParameterSupported = true
+			m.tlsClientCertificateBoundAccessTokens = true
+			let hook = metadataHook
+			hook(m) unless hook is none
+			return m
+		}
+
+		// issue issues tokens for a grant the app or an extension decided
+		// itself (OpenID Connect's implicit flow, custom grants): the token
+		// response members, a refresh token too when asked and the client
+		// may refresh. Fails when the token store or signing fails.
+		def issue(g Grant, client RegisteredClient, refresh bool = false) !map<string, any> {
+			return try issueTokens(self, g, client, refresh)
+		}
+
+		// handler serves the endpoints: /authorize, /token, /par,
+		// /device_authorization, /revoke, /introspect, /register and
+		// /register/{client_id}, /jwks and
+		// /.well-known/oauth-authorization-server, under the issuer's path.
+		def handler() Handler {
+			return new ServerHandler(self)
+		}
+
+		// pending returns a parked authorization request by the id the
+		// login page received, or a device authorization by its user code
+		// (with or without the dash, any case). Fails with InvalidRequest
+		// when there is none or it expired.
+		def pending(id string) !PendingAuthorization {
+			let parked = try grants.get(GrantKind.Pending, id)
+			return try pendingFrom(self, id, parked, none) unless (parked is none)
+			let code = normalizeUserCode(id)
+			let device = try grants.get(GrantKind.UserCode, code)
+			fail OAuthError{message: "oauth2: no pending authorization {id}", code: OAuthErrorKind.InvalidRequest.value, kind: OAuthErrorKind.InvalidRequest, status: 400} when device is none
+			return try pendingFrom(self, id, device, code)
+		}
+
+		// complete finishes a pending authorization with the user's
+		// decision: for a browser flow it issues a code and redirects to the
+		// client (query, fragment or form_post); for a device flow it marks
+		// the device code approved and writes nothing, so the app shows its
+		// own page. Fails with InvalidRequest when the request is gone, or
+		// InvalidScope when the decision grants a scope that was not asked.
+		def complete(ctx Context, id string, decision Decision) !none {
+			let pendingGrant = try grants.take(GrantKind.Pending, id)
+			if pendingGrant is none {
+				let code = normalizeUserCode(id)
+				let device = try grants.get(GrantKind.UserCode, code)
+				fail OAuthError{message: "oauth2: no pending authorization {id}", code: OAuthErrorKind.InvalidRequest.value, kind: OAuthErrorKind.InvalidRequest, status: 400} when device is none
+				try grant(device, decision)
+				device.status = "approved"
+				let deviceCode = device.params.get("device_code")
+				try grants.put(GrantKind.UserCode, code, device)
+				try grants.put(GrantKind.DeviceCode, deviceCode is none ?? ("", deviceCode), device)
+				return none
+			}
+			let g = pendingGrant
+			try grant(g, decision)
+			let out = new Values()
+			if responseTypeHas(g, "code") {
+				let code = try randomToken()
+				g.expiresAt = time.now() + codeLifetime
+				try grants.put(GrantKind.Code, code, g)
+				out.set("code", code)
+			}
+			let hook = responseHook
+			if !(hook is none) {
+				let client = try clients.client(g.clientId)
+				fail oauthError(OAuthErrorKind.InvalidClient, "the client is gone") when client is none
+				try hook(g, client, out)
+			}
+			return try respond(self, ctx, g, out)
+		}
+
+		// deny ends a pending authorization with an error the client
+		// receives (access_denied by default); a device code is marked
+		// denied. Fails with InvalidRequest when the request is gone.
+		def deny(ctx Context, id string, kind OAuthErrorKind = OAuthErrorKind.AccessDenied, description string = "") !none {
+			let pendingGrant = try grants.take(GrantKind.Pending, id)
+			if pendingGrant is none {
+				let code = normalizeUserCode(id)
+				let device = try grants.get(GrantKind.UserCode, code)
+				fail OAuthError{message: "oauth2: no pending authorization {id}", code: OAuthErrorKind.InvalidRequest.value, kind: OAuthErrorKind.InvalidRequest, status: 400} when device is none
+				device.status = "denied"
+				let deviceCode = device.params.get("device_code")
+				try grants.put(GrantKind.DeviceCode, deviceCode is none ?? ("", deviceCode), device)
+				try grants.remove(GrantKind.UserCode, code)
+				return none
+			}
+			let out = new Values()
+			out.set("error", kind.value)
+			out.set("error_description", description) when description != ""
+			return try respond(self, ctx, pendingGrant, out)
+		}
+	}
+
+	// signingKey is the first key that can sign, with the algorithm it
+	// signs with.
+	internal def signingKey(server AuthorizationServer) !jose.Jwk {
+		for let k in server.keys.keys {
+			return k when k.isPrivate() && k.kty != jose.KeyType.Oct
+		}
+		fail oauthError(OAuthErrorKind.ServerError, "the server has no signing key")
+	}
+
+	internal def pendingFrom(server AuthorizationServer, id string, g Grant, userCode ?string) !PendingAuthorization {
+		let client = try server.clients.client(g.clientId)
+		fail oauthError(OAuthErrorKind.InvalidClient, "the client is gone") when client is none
+		let p = new PendingAuthorization(id, client)
+		p.scopes = g.scopes
+		p.redirectUri = g.redirectUri
+		p.params = g.params
+		p.userCode = userCode
+		return p
+	}
+
+	// grant applies a decision to a grant.
+	internal def grant(g Grant, decision Decision) !none {
+		for let s in decision.scopes {
+			fail OAuthError{message: "oauth2: scope {s} was not requested", code: OAuthErrorKind.InvalidScope.value, kind: OAuthErrorKind.InvalidScope, status: 400} unless s in g.scopes
+		}
+		g.scopes = decision.scopes when decision.scopes.len() > 0
+		g.subject = decision.subject
+		let at = decision.authTime
+		g.authTime = at is none ?? (time.now(), at)
+		g.acr = decision.acr
+		g.amr = decision.amr
+		for let (k, v) in decision.claims {
+			g.claims.set(k, v)
+		}
+		return none
+	}
+
+	// respond sends an authorization response to the client's redirect
+	// URI with `state` and `iss` (RFC 9207), in the response mode asked.
+	internal def respond(server AuthorizationServer, ctx Context, g Grant, out Values) !none {
+		let state = g.params.get("state")
+		out.set("state", state) unless state is none
+		out.set("iss", server.issuer)
+		let mode = g.params.get("response_mode")
+		return try ctx.html(200, formPostPage(g.redirectUri, out)) when !(mode is none) && mode == "form_post"
+		// Tokens in the front channel go in the fragment unless asked
+		// otherwise.
+		let responseType = g.params.get("response_type")
+		let codeOnly = responseType is none || responseType == "code"
+		let fragment = (!(mode is none) && mode == "fragment") || (mode is none && !codeOnly)
+		let sep = fragment ?? ("#", g.redirectUri.contains("?") ?? ("&", "?"))
+		return try ctx.redirect(g.redirectUri + sep + out.encode(), 303)
+	}
+
+	// issueTokens makes the token response for a grant: an access token
+	// (opaque or JWT), a refresh token when allowed, the token type the
+	// binding asks for, and what the token hook adds.
+	internal def issueTokens(server AuthorizationServer, g Grant, client RegisteredClient, refresh bool) !map<string, any> {
+		let now = time.now()
+		let access = ""
+		let atGrant = new Grant(now + server.accessTokenLifetime)
+		copyGrant(g, atGrant)
+		atGrant.expiresAt = now + server.accessTokenLifetime
+		if server.accessTokenFormat == AccessTokenFormat.Jwt {
+			access = try jwtAccessToken(server, atGrant, client)
+		} else {
+			access = try randomToken()
+			try server.grants.put(GrantKind.AccessToken, access, atGrant)
+		}
+		let out map<string, any>
+		out.set("access_token", access)
+		let bound = g.dpopJkt
+		out.set("token_type", bound is none ?? ("Bearer", "DPoP"))
+		out.set("expires_in", int(server.accessTokenLifetime / 1s))
+		out.set("scope", g.scopes.join(" ")) when g.scopes.len() > 0
+		if refresh && client.allows("refresh_token") {
+			let rt = try randomToken()
+			let rtGrant = new Grant(now + server.refreshTokenLifetime)
+			copyGrant(g, rtGrant)
+			rtGrant.expiresAt = now + server.refreshTokenLifetime
+			try server.grants.put(GrantKind.RefreshToken, rt, rtGrant)
+			out.set("refresh_token", rt)
+		}
+		let hook = server.tokenHook
+		try hook(g, client, out) unless hook is none
+		return out
+	}
+
+	// jwtAccessToken is an RFC 9068 access token.
+	internal def jwtAccessToken(server AuthorizationServer, g Grant, client RegisteredClient) !string {
+		let key = try signingKey(server)
+		let claims = new jose.Claims()
+		claims.issuer = server.issuer
+		claims.subject = g.subject == "" ?? (client.id, g.subject)
+		claims.audience = g.resource.len() > 0 ?? (g.resource, [client.id])
+		claims.issuedAt = time.now()
+		claims.expires = g.expiresAt
+		claims.id = try randomToken(16)
+		try claims.set("client_id", client.id)
+		try claims.set("scope", g.scopes.join(" ")) when g.scopes.len() > 0
+		let at = g.authTime
+		try claims.set("auth_time", int(at.unixNs() / 1000000000)) unless at is none
+		let acr = g.acr
+		try claims.set("acr", acr) unless acr is none
+		try claims.set("amr", stringsValue(g.amr)) when g.amr.len() > 0
+		let cnf = confirmation(g)
+		try claims.set("cnf", cnf) when cnf.len() > 0
+		let header = new jose.Header()
+		header.typ = "at+jwt"
+		return try claims.sign(key, none, header)
+	}
+
+	// responseTypeHas reports whether the grant's response_type includes a
+	// value ("code", "token", "id_token").
+	internal def responseTypeHas(g Grant, value string) bool {
+		let responseType = g.params.get("response_type")
+		return false when responseType is none
+		return value in spaceList(responseType)
+	}
+
+	// confirmation is the `cnf` of a bound token: `jkt` for DPoP,
+	// `x5t#S256` for a certificate.
+	internal def confirmation(g Grant) map<string, any> {
+		let cnf map<string, any>
+		let jkt = g.dpopJkt
+		cnf.set("jkt", jkt) unless jkt is none
+		let x5t = g.certThumbprint
+		cnf.set("x5t#S256", x5t) unless x5t is none
+		return cnf
+	}
+
+	internal def copyGrant(from Grant, to Grant) {
+		to.clientId = from.clientId
+		to.subject = from.subject
+		to.scopes = from.scopes.clone()
+		to.redirectUri = from.redirectUri
+		to.resource = from.resource.clone()
+		to.authTime = from.authTime
+		to.acr = from.acr
+		to.amr = from.amr.clone()
+		to.dpopJkt = from.dpopJkt
+		to.certThumbprint = from.certThumbprint
+		for let (k, v) in from.params {
+			to.params.set(k, v)
+		}
+		for let (k, v) in from.claims {
+			to.claims.set(k, v)
+		}
+	}
+
+	// normalizeUserCode upper-cases a user code and drops separators.
+	internal def normalizeUserCode(code string) string {
+		return code.upper().replace("-", "").replace(" ", "")
+	}
+
+	// formPostPage is the auto-submitting page of the form_post response
+	// mode (OAuth 2.0 Form Post Response Mode).
+	internal def formPostPage(target string, values Values) string {
+		let fields = ""
+		for let p in values.pairs() {
+			fields += "<input type=\"hidden\" name=\"{htmlEscape(p.key)}\" value=\"{htmlEscape(p.value)}\">"
+		}
+		return "<!doctype html><html><head><title>Submit</title></head><body onload=\"document.forms[0].submit()\"><form method=\"post\" action=\"{htmlEscape(target)}\">{fields}<noscript><button type=\"submit\">Continue</button></noscript></form></body></html>"
+	}
+
+	internal def htmlEscape(text string) string {
+		return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+	}
+
+	// ServerHandler routes the authorization server's endpoints.
+	internal type ServerHandler {
+		server AuthorizationServer
+
+		def new(server AuthorizationServer) {
+			self.server = server
+		}
+
+		// serve implements http.Handler.
+		def serve(ctx Context) !none {
+			let base = basePath(server.issuer)
+			let path = ctx.path()
+			let local = path.startsWith(base) ?? (path[base.len():], path)
+			local = "/" + local.trimPrefix("/")
+			match local {
+				case "/.well-known/oauth-authorization-server":
+					return try sendJson(ctx, 200, try parseObject(server.metadata().json(), "metadata"))
+				case "/jwks":
+					return try sendJsonText(ctx, 200, publicKeys(server.keys).json())
+				case "/authorize":
+					return try authorizeEndpoint(server, ctx)
+				case "/par":
+					return try guard(ctx, () => parEndpoint(server, ctx))
+				case "/token":
+					return try guard(ctx, () => tokenEndpoint(server, ctx))
+				case "/device_authorization":
+					return try guard(ctx, () => deviceEndpoint(server, ctx))
+				case "/revoke":
+					return try guard(ctx, () => revokeEndpoint(server, ctx))
+				case "/introspect":
+					return try guard(ctx, () => introspectEndpoint(server, ctx))
+				default:
+					return try guard(ctx, () => registerEndpoint(server, ctx, local)) when local == "/register" || local.startsWith("/register/")
+					return try ctx.notFound()
+			}
+		}
+	}
+
+	// basePath is the path of the issuer URL, without a trailing slash.
+	internal def basePath(issuer string) string {
+		let at = issuer.indexOf("://")
+		let rest = at < 0 ?? (issuer, issuer[at + 3:])
+		let slash = rest.indexOf("/")
+		return slash < 0 ?? ("", rest[slash:].trimSuffix("/"))
+	}
+
+	// guard runs an endpoint and turns its OAuthError into the JSON error
+	// response of RFC 6749 §5.2.
+	internal def guard(ctx Context, endpoint def () !none) !none {
+		let failure ?error = none
+		endpoint() onerror (err error) {
+			failure = err
+			recover none
+		}
+		return none when failure is none
+		let err = failure
+		return try sendError(ctx, err)
+	}
+
+	internal def sendError(ctx Context, err error) !none {
+		let kind = OAuthErrorKind.ServerError
+		let status = 500
+		let description = err.message
+		if err is OAuthError {
+			kind = err.kind
+			status = err.status
+			description = err.description == "" ?? (err.message, err.description)
+		}
+		let code = kind.value
+		code = "server_error" when kind := OAuthErrorKind.Other || OAuthErrorKind.Malformed || OAuthErrorKind.Transport || OAuthErrorKind.StateMismatch || OAuthErrorKind.IssuerMismatch
+		if status == 0 {
+			status = 400
+			status = 401 when kind == OAuthErrorKind.InvalidClient
+			status = 500 when code == "server_error"
+		}
+		let body map<string, any>
+		body.set("error", code)
+		body.set("error_description", description.trimPrefix("oauth2: "))
+		ctx.setHeader("WWW-Authenticate", "Basic realm=\"oauth\"") when status == 401
+		ctx.setHeader("DPoP-Nonce", try randomToken(16)) when kind == OAuthErrorKind.UseDpopNonce
+		return try sendJson(ctx, status, body)
+	}
+
+	internal def sendJson(ctx Context, status int, body map<string, any>) !none {
+		return try sendJsonText(ctx, status, encodeJSON(body))
+	}
+
+	internal def sendJsonText(ctx Context, status int, text string) !none {
+		ctx.setHeader("Cache-Control", "no-store")
+		ctx.setHeader("Pragma", "no-cache")
+		return try ctx.blob(status, "application/json", text.bytes())
+	}
+
+	internal def publicKeys(keys jose.JwkSet) jose.JwkSet {
+		let out = new jose.JwkSet()
+		for let k in keys.keys {
+			out.keys.push(k.publicKey()) unless k.kty == jose.KeyType.Oct
+		}
+		return out
+	}
+
+	// requestParams reads a request's parameters: the query of a GET, the
+	// form body of a POST. Fails with InvalidRequest when a parameter
+	// appears twice (RFC 6749 §3.1) other than `resource`.
+	internal def requestParams(ctx Context) !Values {
+		let text = ctx.method() == Method.POST ?? (try ctx.text(), ctx.url().rawQuery)
+		let values = url.parseQuery(text) onerror fail requestError("the parameters do not parse")
+		for let name in values.keys() {
+			fail requestError("parameter {name} appears twice") when values.all(name).len() > 1 && name != "resource" && name != "audience"
+		}
+		return values
+	}
+
+	internal def requestError(text string) error {
+		return OAuthError{message: "oauth2: " + text, code: OAuthErrorKind.InvalidRequest.value, kind: OAuthErrorKind.InvalidRequest, description: text, status: 400}
+	}
+
+	internal def kindError(kind OAuthErrorKind, text string, status int = 400) error {
+		return OAuthError{message: "oauth2: " + text, code: kind.value, kind: kind, description: text, status: status}
+	}
+
+	// Authorization -------------------------------------------------------
+
+	// authorizeEndpoint checks an authorization request, parks it and sends
+	// the user to the login page. Errors about the client or redirect URI
+	// are shown to the user; once the redirect URI is trusted, errors go
+	// back to the client.
+	internal def authorizeEndpoint(server AuthorizationServer, ctx Context) !none {
+		let raw = requestParams(ctx) onerror (err error) {
+			recover new Values()
+		}
+		let clientId = raw.get("client_id")
+		return try ctx.text(400, "missing client_id") when clientId is none
+		let client = try server.clients.client(clientId)
+		return try ctx.text(400, "unknown client") when client is none
+		let params = raw
+		let pushed = raw.get("request_uri")
+		if !(pushed is none) {
+			let stored = try server.grants.take(GrantKind.Pushed, pushed)
+			return try ctx.text(400, "invalid request_uri") when stored is none || stored.clientId != clientId
+			params = new Values()
+			for let (k, v) in stored.params {
+				params.set(k, v)
+			}
+			for let r in stored.resource {
+				params.add("resource", r)
+			}
+		} else if server.requirePushedRequests {
+			return try ctx.text(400, "this server requires pushed authorization requests")
+		}
+		if params.has("request") {
+			params = verifyRequestObject(server, client, params) onerror (err error) {
+				recover new Values()
+			}
+			return try ctx.text(400, "invalid request object") when params.len() == 0
+		}
+		let redirect = registeredRedirect(client, params.get("redirect_uri"))
+		return try ctx.text(400, "invalid redirect_uri") when redirect == ""
+		let g = new Grant(time.now() + server.pendingLifetime)
+		g.clientId = clientId
+		g.redirectUri = redirect
+		for let name in params.keys() {
+			let v = params.get(name)
+			g.params.set(name, v) unless v is none
+		}
+		g.params.delete("request")
+		let checked = checkAuthorization(server, client, params, g) onerror (err error) {
+			let kind = err is OAuthError ?? (err.kind, OAuthErrorKind.ServerError)
+			let out = new Values()
+			out.set("error", kind == OAuthErrorKind.Other ?? ("server_error", kind.value))
+			let description = err is OAuthError ?? (err.description, "")
+			out.set("error_description", description) when description != ""
+			respond(server, ctx, g, out) onerror recover none
+			recover false
+		}
+		return none unless checked
+		let id = try randomToken()
+		try server.grants.put(GrantKind.Pending, id, g)
+		fail kindError(OAuthErrorKind.ServerError, "the server has no loginURL", 500) when server.loginURL == ""
+		let sep = server.loginURL.contains("?") ?? ("&", "?")
+		return try ctx.redirect(server.loginURL + sep + "request=" + url.queryEscape(id), 303)
+	}
+
+	// registeredRedirect is the redirect URI to use: the one given when it
+	// is registered exactly (RFC 9700 §4.1.1), the only registered one when
+	// none is given, "" otherwise.
+	internal def registeredRedirect(client RegisteredClient, given ?string) string {
+		let registered = client.metadata.redirectUris
+		return registered.len() == 1 ?? (registered[0], "") when given is none
+		return given in registered ?? (given, "")
+	}
+
+	// checkAuthorization checks the parameters once the redirect URI is
+	// trusted: response type, scopes, PKCE, then the hook. Fills the grant.
+	internal def checkAuthorization(server AuthorizationServer, client RegisteredClient, params Values, g Grant) !bool {
+		let responseType = params.get("response_type")
+		fail requestError("missing response_type") when responseType is none
+		let hook = server.authorizeHook
+		fail kindError(OAuthErrorKind.UnsupportedResponseType, "response_type {responseType} is not supported") when responseType != "code" && hook is none
+		let types = spaceList(responseType)
+		fail kindError(OAuthErrorKind.UnauthorizedClient, "the client may not use the authorization code grant") when "code" in types && !client.allows("authorization_code")
+		fail kindError(OAuthErrorKind.UnauthorizedClient, "the client may not use the implicit grant") when ("token" in types || "id_token" in types) && !client.allows("implicit")
+		let scope = params.get("scope")
+		g.scopes = scope is none ?? ([], spaceList(scope))
+		try checkScopes(server, client, g.scopes)
+		g.resource = params.all("resource")
+		let challenge = params.get("code_challenge")
+		if challenge is none {
+			fail requestError("PKCE is required") when client.isPublic() && responseType.contains("code")
+		} else {
+			let method = params.get("code_challenge_method")
+			fail requestError("code_challenge_method must be S256") unless !(method is none) && method == "S256"
+			fail requestError("code_challenge must be 43 to 128 characters") unless challenge.len() >= 43 && challenge.len() <= 128
+			g.codeChallenge = challenge
+			g.challengeMethod = "S256"
+		}
+		let mode = params.get("response_mode")
+		fail requestError("unsupported response_mode") unless mode is none || mode in ["query", "fragment", "form_post"]
+		let dpop = params.get("dpop_jkt")
+		g.dpopJkt = dpop
+		let m map<string, string>
+		for let name in params.keys() {
+			let v = params.get(name)
+			m.set(name, v) unless v is none
+		}
+		try hook(m, client) unless hook is none
+		return true
+	}
+
+	internal def checkScopes(server AuthorizationServer, client RegisteredClient, scopes string[]) !none {
+		let registered = client.metadata.scope
+		let allowed = registered is none ?? (string[], spaceList(registered))
+		for let s in scopes {
+			fail kindError(OAuthErrorKind.InvalidScope, "scope {s} is not supported") when server.scopesSupported.len() > 0 && !(s in server.scopesSupported)
+			fail kindError(OAuthErrorKind.InvalidScope, "the client may not ask for {s}") when allowed.len() > 0 && !(s in allowed)
+		}
+		return none
+	}
+
+	// verifyRequestObject reads a signed request object (RFC 9101 §6):
+	// signed with the client's keys, issued by the client, for this
+	// server, not expired. Its claims replace the parameters.
+	internal def verifyRequestObject(server AuthorizationServer, client RegisteredClient, params Values) !Values {
+		let text = params.get("request")
+		let keys = try clientKeys(client)
+		let claims = jose.verifyJwt(text is none ?? ("", text), keys, jose.Validation{algorithms: [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA, jose.SignatureAlgorithm.Ed25519], audience: server.issuer, requireExpiry: false}) onerror (err error) {
+			fail kindError(OAuthErrorKind.InvalidRequestObject, "the request object does not verify: {err.message}")
+		}
+		let iss = claims.issuer
+		fail kindError(OAuthErrorKind.InvalidRequestObject, "the request object is not issued by the client") unless !(iss is none) && iss == client.id
+		let out = new Values()
+		let doc = try parseObject(claims.json(), "request object")
+		for let (name, value) in doc {
+			continue when name := "iss" || "aud" || "exp" || "iat" || "nbf" || "jti"
+			match value {
+				case string:
+					out.set(name, value)
+				case any[]:
+					for let e in value {
+						out.add(name, "{e}")
+					}
+				case map<string, any>:
+					out.set(name, encodeJSON(value))
+				default:
+					out.set(name, "{value}")
+			}
+		}
+		let inner = out.get("client_id")
+		fail kindError(OAuthErrorKind.InvalidRequestObject, "client_id differs inside the request object") unless inner is none || inner == client.id
+		out.set("client_id", client.id)
+		return out
+	}
+
+	// clientKeys are a client's registered keys: `jwks`, or `jwks_uri`.
+	internal def clientKeys(client RegisteredClient) !jose.JwkSet {
+		let set = client.metadata.jwks
+		return set unless set is none
+		let uri = client.metadata.jwksUri
+		fail kindError(OAuthErrorKind.InvalidClient, "the client has no keys", 401) when uri is none
+		return new jose.RemoteKeySet(uri).keys() onerror fail kindError(OAuthErrorKind.InvalidClient, "the client's keys cannot be fetched", 401)
+	}
+
+	// parEndpoint takes a pushed authorization request (RFC 9126).
+	internal def parEndpoint(server AuthorizationServer, ctx Context) !none {
+		fail requestError("PAR takes POST") unless ctx.method() == Method.POST
+		let form = try requestParams(ctx)
+		let client = try authenticateClient(server, ctx, form)
+		fail requestError("request_uri is not allowed in a pushed request") when form.has("request_uri")
+		let params = form
+		params = try verifyRequestObject(server, client, form) when form.has("request")
+		let redirect = registeredRedirect(client, params.get("redirect_uri"))
+		fail kindError(OAuthErrorKind.InvalidRedirectUri, "invalid redirect_uri") when redirect == ""
+		let g = new Grant(time.now() + server.pushedLifetime)
+		g.clientId = client.id
+		g.redirectUri = redirect
+		for let name in params.keys() {
+			continue when name := "client_secret" || "client_assertion" || "client_assertion_type" || "request" || "resource"
+			let v = params.get(name)
+			g.params.set(name, v) unless v is none
+		}
+		g.resource = params.all("resource")
+		try checkAuthorization(server, client, params, new Grant(time.now()))
+		let uri = "urn:ietf:params:oauth:request_uri:" + try randomToken()
+		try server.grants.put(GrantKind.Pushed, uri, g)
+		let out map<string, any>
+		out.set("request_uri", uri)
+		out.set("expires_in", int(server.pushedLifetime / 1s))
+		return try sendJson(ctx, 201, out)
+	}
+
+	// Client authentication -----------------------------------------------
+
+	// authenticateClient identifies and authenticates the client of a
+	// token, PAR, revocation, introspection or device request by its
+	// registered method (RFC 6749 §2.3, RFC 7523 §3, RFC 8705 §2). Fails
+	// with InvalidClient (401).
+	internal def authenticateClient(server AuthorizationServer, ctx Context, form Values) !RegisteredClient {
+		let invalid = (text string) => kindError(OAuthErrorKind.InvalidClient, text, 401)
+		let authorization = ctx.header("Authorization")
+		if authorization.startsWith("Basic ") {
+			let decoded = new Base64().decode(authorization[6:].trim()) onerror fail invalid("bad Basic credentials")
+			let pair = string(decoded)
+			let colon = pair.indexOf(":")
+			fail invalid("bad Basic credentials") when colon < 0
+			let id = url.queryUnescape(pair[0:colon]) onerror recover pair[0:colon]
+			let secret = url.queryUnescape(pair[colon + 1:]) onerror recover pair[colon + 1:]
+			let client = try knownClient(server, id, invalid)
+			fail invalid("the client does not use client_secret_basic") unless client.authMethod() == "client_secret_basic"
+			try checkSecret(client, secret, invalid)
+			return client
+		}
+		let assertionType = form.get("client_assertion_type")
+		if !(assertionType is none) {
+			fail invalid("unsupported client_assertion_type") unless assertionType == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+			let assertion = form.get("client_assertion")
+			fail invalid("missing client_assertion") when assertion is none
+			return try assertionClient(server, ctx, assertion, form.get("client_id"), invalid)
+		}
+		let id = form.get("client_id")
+		fail invalid("the client is not identified") when id is none
+		let client = try knownClient(server, id, invalid)
+		let method = client.authMethod()
+		let secret = form.get("client_secret")
+		if !(secret is none) {
+			fail invalid("the client does not use client_secret_post") unless method == "client_secret_post"
+			try checkSecret(client, secret, invalid)
+			return client
+		}
+		if method := "tls_client_auth" || "self_signed_tls_client_auth" {
+			try checkCertificate(client, ctx, method, invalid)
+			return client
+		}
+		fail invalid("the client must authenticate") unless method == "none"
+		return client
+	}
+
+	internal def knownClient(server AuthorizationServer, id string, invalid def (string) error) !RegisteredClient {
+		let client = try server.clients.client(id)
+		fail invalid("unknown client") when client is none
+		return client
+	}
+
+	internal def checkSecret(client RegisteredClient, given string, invalid def (string) error) !none {
+		let s = client.secret
+		fail invalid("the client has no secret") when s is none
+		fail invalid("wrong client secret") unless constantTimeEqual(s.reveal().bytes(), given.bytes())
+		return none
+	}
+
+	// assertionClient checks a client assertion (RFC 7523 §3): issuer and
+	// subject the client, audience the token endpoint or the issuer, not
+	// expired, its `jti` unseen, signed with the client's secret
+	// (client_secret_jwt) or keys (private_key_jwt).
+	internal def assertionClient(server AuthorizationServer, ctx Context, assertion string, givenId ?string, invalid def (string) error) !RegisteredClient {
+		let unverified = jose.parseJws(assertion) onerror fail invalid("the client assertion is not a JWS")
+		let claims0 = jose.parseClaims(string(unverified.payload)) onerror fail invalid("the client assertion has no claims")
+		let iss = claims0.issuer
+		fail invalid("the client assertion has no issuer") when iss is none
+		fail invalid("client_id differs from the assertion") unless givenId is none || givenId == iss
+		let client = try knownClient(server, iss, invalid)
+		let method = client.authMethod()
+		let keys = new jose.JwkSet()
+		let algs jose.SignatureAlgorithm[] = []
+		if method == "client_secret_jwt" {
+			let s = client.secret
+			fail invalid("the client has no secret") when s is none
+			keys = new jose.JwkSet([new jose.Jwk(s.reveal().bytes())])
+			algs = [jose.SignatureAlgorithm.HS256, jose.SignatureAlgorithm.HS384, jose.SignatureAlgorithm.HS512]
+		} else if method == "private_key_jwt" {
+			keys = clientKeys(client) onerror fail invalid("the client's keys are not available")
+			algs = [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.RS384, jose.SignatureAlgorithm.RS512, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.PS384, jose.SignatureAlgorithm.PS512, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA, jose.SignatureAlgorithm.Ed25519, jose.SignatureAlgorithm.Ed448]
+		} else {
+			fail invalid("the client does not authenticate with a JWT")
+		}
+		// RFC 7523 §3: the audience is the endpoint called, the token
+		// endpoint, or the issuer.
+		let endpoint = server.issuer.trimSuffix("/") + ctx.path()[basePath(server.issuer).len():]
+		let audiences = [endpoint, server.issuer.trimSuffix("/") + "/token", server.issuer]
+		let claims = new jose.Claims()
+		let verified = false
+		let last = ""
+		for let aud in audiences {
+			let ok = true
+			let got = jose.verifyJwt(assertion, keys, jose.Validation{algorithms: algs, audience: aud, requireExpiry: true, leeway: 30s}) onerror (err error) {
+				ok = false
+				last = err.message
+				recover new jose.Claims()
+			}
+			if ok {
+				claims = got
+				verified = true
+				break
+			}
+		}
+		fail invalid("the client assertion does not verify: {last}") unless verified
+		let sub = claims.subject
+		fail invalid("the assertion's subject is not the client") unless !(sub is none) && sub == client.id
+		let jti = claims.id
+		fail invalid("the assertion has no jti") when jti is none
+		let exp = claims.expires
+		fail invalid("the assertion was used before") unless server.replay.first("assertion:" + client.id + ":" + jti, exp is none ?? (time.now() + 1h, exp + 1m))
+		return client
+	}
+
+	// checkCertificate checks a TLS client certificate (RFC 8705 §2.1-2.2):
+	// subject or SAN as registered for tls_client_auth, the key among the
+	// client's keys for self_signed_tls_client_auth.
+	internal def checkCertificate(client RegisteredClient, ctx Context, method string, invalid def (string) error) !none {
+		let state = ctx.request.tlsState
+		fail invalid("no TLS client certificate") when state is none || state.peerCertificates.len() == 0
+		let cert = state.peerCertificates[0]
+		if method == "self_signed_tls_client_auth" {
+			let keys = clientKeys(client) onerror fail invalid("the client's keys are not available")
+			let certKey = cert.publicKey
+			fail invalid("the certificate has no key") when certKey is none
+			let want = marshalPKIXPublicKey(certKey).hex()
+			for let k in keys.keys {
+				let pub = k.public
+				return none when !(pub is none) && marshalPKIXPublicKey(pub).hex() == want
+			}
+			fail invalid("the certificate's key is not registered")
+		}
+		let dn = client.metadata.get("tls_client_auth_subject_dn")
+		if !(dn is none) {
+			return none when "{dn}" == cert.subject.str()
+		}
+		let dns = client.metadata.get("tls_client_auth_san_dns")
+		return none when !(dns is none) && "{dns}" in cert.dnsNames
+		let uri = client.metadata.get("tls_client_auth_san_uri")
+		if !(uri is none) {
+			for let u in cert.uris {
+				return none when u == "{uri}"
+			}
+		}
+		let email = client.metadata.get("tls_client_auth_san_email")
+		return none when !(email is none) && "{email}" in cert.emailAddresses
+		fail invalid("the certificate does not match the client's registration")
+	}
+
+	// certThumbprint is the base64url SHA-256 of the TLS client
+	// certificate, for certificate-bound tokens (RFC 8705 §3); none
+	// without one.
+	internal def certThumbprint(ctx Context) ?string {
+		let state = ctx.request.tlsState
+		return none when state is none || state.peerCertificates.len() == 0
+		return b64url(digest(Hash.SHA256, state.peerCertificates[0].raw))
+	}
+
+	// Token endpoint ------------------------------------------------------
+
+	internal def tokenEndpoint(server AuthorizationServer, ctx Context) !none {
+		fail requestError("the token endpoint takes POST") unless ctx.method() == Method.POST
+		let form = try requestParams(ctx)
+		let client = try authenticateClient(server, ctx, form)
+		let grantType = form.get("grant_type")
+		fail requestError("missing grant_type") when grantType is none
+		// DPoP binding (RFC 9449 §5) and certificate binding (RFC 8705 §3).
+		let proof = ctx.header("DPoP")
+		let jkt ?string = none
+		if proof != "" {
+			let target = server.issuer.trimSuffix("/") + ctx.path()[basePath(server.issuer).len():]
+			jkt = try verifyDpop(proof, "POST", target, none, none, server.replay)
+		}
+		let thumb = certThumbprint(ctx)
+		let out map<string, any>
+		match grantType {
+			case "authorization_code":
+				out = try codeGrant(server, client, form, jkt, thumb)
+			case "refresh_token":
+				out = try refreshGrant(server, client, form, jkt, thumb)
+			case "client_credentials":
+				fail kindError(OAuthErrorKind.UnauthorizedClient, "a public client cannot use client_credentials") when client.isPublic()
+				fail kindError(OAuthErrorKind.UnauthorizedClient, "the client may not use client_credentials") unless client.allows("client_credentials")
+				let scope = form.get("scope")
+				let g = new Grant(time.now() + server.accessTokenLifetime)
+				g.clientId = client.id
+				g.scopes = scope is none ?? ([], spaceList(scope))
+				try checkScopes(server, client, g.scopes)
+				g.resource = form.all("resource")
+				g.dpopJkt = jkt
+				g.certThumbprint = thumb
+				out = try issueTokens(server, g, client, false)
+			case "password":
+				out = try passwordGrant(server, client, form, jkt, thumb)
+			case "urn:ietf:params:oauth:grant-type:device_code":
+				out = try deviceGrant(server, client, form, jkt, thumb)
+			case "urn:ietf:params:oauth:grant-type:token-exchange":
+				let decide = server.exchangeToken
+				fail kindError(OAuthErrorKind.UnsupportedGrantType, "token exchange is not enabled") when decide is none
+				let g = try decide(form, client)
+				g.clientId = client.id
+				g.dpopJkt = jkt
+				g.certThumbprint = thumb
+				out = try issueTokens(server, g, client, false)
+				out.set("issued_token_type", TokenType.AccessToken.value)
+			case "urn:ietf:params:oauth:grant-type:jwt-bearer":
+				let decide = server.jwtBearer
+				fail kindError(OAuthErrorKind.UnsupportedGrantType, "the JWT bearer grant is not enabled") when decide is none
+				let assertion = form.get("assertion")
+				fail requestError("missing assertion") when assertion is none
+				let g = try decide(assertion, client)
+				g.clientId = client.id
+				g.dpopJkt = jkt
+				g.certThumbprint = thumb
+				out = try issueTokens(server, g, client, false)
+			default:
+				fail kindError(OAuthErrorKind.UnsupportedGrantType, "grant_type {grantType} is not supported")
+		}
+		return try sendJson(ctx, 200, out)
+	}
+
+	internal def codeGrant(server AuthorizationServer, client RegisteredClient, form Values, jkt ?string, thumb ?string) !map<string, any> {
+		let code = form.get("code")
+		fail requestError("missing code") when code is none
+		let g = try server.grants.take(GrantKind.Code, code)
+		let invalid = kindError(OAuthErrorKind.InvalidGrant, "the code is invalid, expired or used")
+		fail invalid when g is none
+		fail invalid unless g.clientId == client.id
+		let redirect = form.get("redirect_uri")
+		fail kindError(OAuthErrorKind.InvalidGrant, "redirect_uri does not match") unless (redirect is none && !g.params.hasKey("redirect_uri")) || (!(redirect is none) && redirect == g.redirectUri)
+		let verifier = form.get("code_verifier")
+		if g.codeChallenge != "" {
+			fail kindError(OAuthErrorKind.InvalidGrant, "missing code_verifier") when verifier is none
+			fail kindError(OAuthErrorKind.InvalidGrant, "code_verifier does not match") unless constantTimeEqual(pkceChallenge(verifier).bytes(), g.codeChallenge.bytes())
+		} else {
+			fail kindError(OAuthErrorKind.InvalidGrant, "code_verifier without a challenge") unless verifier is none
+		}
+		let wanted = g.dpopJkt
+		if !(wanted is none) {
+			fail kindError(OAuthErrorKind.InvalidDpopProof, "the code is bound to another DPoP key") unless !(jkt is none) && jkt == wanted
+		}
+		g.dpopJkt = jkt
+		g.certThumbprint = thumb
+		let resource = form.all("resource")
+		for let r in resource {
+			fail kindError(OAuthErrorKind.InvalidTarget, "resource {r} was not authorized") unless g.resource.len() == 0 || r in g.resource
+		}
+		g.resource = resource when resource.len() > 0
+		return try issueTokens(server, g, client, true)
+	}
+
+	internal def refreshGrant(server AuthorizationServer, client RegisteredClient, form Values, jkt ?string, thumb ?string) !map<string, any> {
+		let value = form.get("refresh_token")
+		fail requestError("missing refresh_token") when value is none
+		let g = server.rotateRefreshTokens ?? (try server.grants.take(GrantKind.RefreshToken, value), try server.grants.get(GrantKind.RefreshToken, value))
+		let invalid = kindError(OAuthErrorKind.InvalidGrant, "the refresh token is invalid or expired")
+		fail invalid when g is none
+		fail invalid unless g.clientId == client.id
+		let bound = g.dpopJkt
+		fail kindError(OAuthErrorKind.InvalidDpopProof, "the refresh token is bound to another DPoP key") unless bound is none || (!(jkt is none) && jkt == bound)
+		let scope = form.get("scope")
+		if !(scope is none) {
+			let asked = spaceList(scope)
+			for let s in asked {
+				fail kindError(OAuthErrorKind.InvalidScope, "scope {s} was not granted") unless s in g.scopes
+			}
+			g.scopes = asked
+		}
+		g.certThumbprint = thumb
+		g.dpopJkt = bound is none ?? (jkt, bound)
+		let out = try issueTokens(server, g, client, server.rotateRefreshTokens)
+		return out
+	}
+
+	internal def passwordGrant(server AuthorizationServer, client RegisteredClient, form Values, jkt ?string, thumb ?string) !map<string, any> {
+		let verify = server.verifyPassword
+		fail kindError(OAuthErrorKind.UnsupportedGrantType, "the password grant is not enabled") unless server.allowPassword && !(verify is none)
+		fail kindError(OAuthErrorKind.UnauthorizedClient, "the client may not use the password grant") unless client.allows("password")
+		let username = form.get("username")
+		let password = form.get("password")
+		fail requestError("missing username or password") when username is none || password is none
+		let subject = try verify(username, password)
+		fail kindError(OAuthErrorKind.InvalidGrant, "wrong username or password") when subject is none
+		let g = new Grant(time.now())
+		g.clientId = client.id
+		g.subject = subject
+		let scope = form.get("scope")
+		g.scopes = scope is none ?? ([], spaceList(scope))
+		try checkScopes(server, client, g.scopes)
+		g.authTime = time.now()
+		g.dpopJkt = jkt
+		g.certThumbprint = thumb
+		return try issueTokens(server, g, client, true)
+	}
+
+	// Device flow ---------------------------------------------------------
+
+	internal def deviceEndpoint(server AuthorizationServer, ctx Context) !none {
+		fail requestError("the device endpoint takes POST") unless ctx.method() == Method.POST
+		let form = try requestParams(ctx)
+		let client = try authenticateClient(server, ctx, form)
+		fail kindError(OAuthErrorKind.UnauthorizedClient, "the client may not use the device flow") unless client.allows("urn:ietf:params:oauth:grant-type:device_code")
+		let scope = form.get("scope")
+		let g = new Grant(time.now() + server.deviceCodeLifetime)
+		g.clientId = client.id
+		g.scopes = scope is none ?? ([], spaceList(scope))
+		try checkScopes(server, client, g.scopes)
+		let deviceCode = try randomToken()
+		let userCode = try newUserCode()
+		g.params.set("device_code", deviceCode)
+		g.params.set("user_code", userCode)
+		try server.grants.put(GrantKind.DeviceCode, deviceCode, g)
+		try server.grants.put(GrantKind.UserCode, userCode, g)
+		let shown = userCode[0:4] + "-" + userCode[4:8]
+		let out map<string, any>
+		out.set("device_code", deviceCode)
+		out.set("user_code", shown)
+		out.set("verification_uri", server.deviceURL)
+		out.set("verification_uri_complete", server.deviceURL + (server.deviceURL.contains("?") ?? ("&", "?")) + "user_code=" + shown)
+		out.set("expires_in", int(server.deviceCodeLifetime / 1s))
+		out.set("interval", int(server.deviceInterval / 1s).max(1))
+		return try sendJson(ctx, 200, out)
+	}
+
+	// newUserCode is eight letters from a set without vowels or look-alike
+	// characters (RFC 8628 §6.1): about 34 bits.
+	internal def newUserCode() !string {
+		let letters = "BCDFGHJKLMNPQRSTVWXZ"
+		let raw = try rand(8)
+		let out = ""
+		for let b in raw {
+			out += letters[int(b) % letters.len()]
+		}
+		return out
+	}
+
+	internal def deviceGrant(server AuthorizationServer, client RegisteredClient, form Values, jkt ?string, thumb ?string) !map<string, any> {
+		let code = form.get("device_code")
+		fail requestError("missing device_code") when code is none
+		let g = try server.grants.get(GrantKind.DeviceCode, code)
+		fail kindError(OAuthErrorKind.ExpiredToken, "the device code expired") when g is none
+		fail kindError(OAuthErrorKind.InvalidGrant, "the device code belongs to another client") unless g.clientId == client.id
+		let now = time.now()
+		let last = g.lastPoll
+		g.lastPoll = now
+		if g.status == "denied" {
+			try server.grants.remove(GrantKind.DeviceCode, code)
+			fail kindError(OAuthErrorKind.AccessDenied, "the user denied the request")
+		}
+		if g.status == "pending" {
+			fail kindError(OAuthErrorKind.SlowDown, "poll less often") when !(last is none) && now.before(last + 4s)
+			fail kindError(OAuthErrorKind.AuthorizationPending, "the user has not finished")
+		}
+		try server.grants.remove(GrantKind.DeviceCode, code)
+		g.dpopJkt = jkt
+		g.certThumbprint = thumb
+		return try issueTokens(server, g, client, true)
+	}
+
+	// Revocation and introspection ---------------------------------------
+
+	internal def revokeEndpoint(server AuthorizationServer, ctx Context) !none {
+		fail requestError("revocation takes POST") unless ctx.method() == Method.POST
+		let form = try requestParams(ctx)
+		let client = try authenticateClient(server, ctx, form)
+		let value = form.get("token")
+		fail requestError("missing token") when value is none
+		for let kind in [GrantKind.RefreshToken, GrantKind.AccessToken] {
+			let g = try server.grants.get(kind, value)
+			if !(g is none) && g.clientId == client.id {
+				try server.grants.remove(kind, value)
+			}
+		}
+		return try ctx.blob(200, "application/json", byte[])
+	}
+
+	internal def introspectEndpoint(server AuthorizationServer, ctx Context) !none {
+		fail requestError("introspection takes POST") unless ctx.method() == Method.POST
+		let form = try requestParams(ctx)
+		try authenticateClient(server, ctx, form)
+		let value = form.get("token")
+		fail requestError("missing token") when value is none
+		let out map<string, any>
+		out.set("active", false)
+		let g ?Grant = none
+		let kind = "access_token"
+		let found = try server.grants.get(GrantKind.AccessToken, value)
+		if found is none {
+			let refresh = try server.grants.get(GrantKind.RefreshToken, value)
+			g = refresh
+			kind = "refresh_token"
+		} else {
+			g = found
+		}
+		if g is none && server.accessTokenFormat == AccessTokenFormat.Jwt {
+			let verified = true
+			let claims = jose.verifyJwt(value, publicKeys(server.keys), jose.Validation{algorithms: [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA], issuer: server.issuer, typ: "at+jwt", requireExpiry: true, audience: none}) onerror (err error) {
+				verified = false
+				recover new jose.Claims()
+			}
+			if verified {
+				let doc = try parseObject(claims.json(), "claims")
+				for let (k, v) in doc {
+					out.set(k, v)
+				}
+				out.set("active", true)
+				out.set("token_type", "Bearer")
+			}
+			return try sendJson(ctx, 200, out)
+		}
+		if !(g is none) {
+			out.set("active", true)
+			out.set("client_id", g.clientId)
+			out.set("sub", g.subject) when g.subject != ""
+			out.set("scope", g.scopes.join(" ")) when g.scopes.len() > 0
+			out.set("exp", int(g.expiresAt.unixNs() / 1000000000))
+			out.set("iss", server.issuer)
+			out.set("token_type", kind == "access_token" ?? (g.dpopJkt is none ?? ("Bearer", "DPoP"), "refresh_token"))
+			out.set("aud", stringsValue(g.resource)) when g.resource.len() > 0
+			let cnf = confirmation(g)
+			out.set("cnf", cnf) when cnf.len() > 0
+		}
+		return try sendJson(ctx, 200, out)
+	}
+
+	// Registration --------------------------------------------------------
+
+	internal def registerEndpoint(server AuthorizationServer, ctx Context, local string) !none {
+		fail kindError(OAuthErrorKind.InvalidRequest, "registration is not enabled", 404) unless server.allowRegistration
+		let bearer = ctx.header("Authorization").trimPrefix("Bearer ").trim()
+		if local == "/register" {
+			fail requestError("registration takes POST") unless ctx.method() == Method.POST
+			let required = server.registrationToken
+			if !(required is none) {
+				fail kindError(OAuthErrorKind.InvalidToken, "an initial access token is required", 401) unless constantTimeEqual(required.reveal().bytes(), bearer.bytes())
+			}
+			let registered = try clientMetadataFromMembers(try parseObject(try ctx.text(), "client metadata"))
+			try checkClientMetadata(registered)
+			// RFC 7591 §2: client_secret_basic unless the client says otherwise.
+			let asked = registered.tokenEndpointAuthMethod
+			registered.tokenEndpointAuthMethod = "client_secret_basic" when asked is none
+			let client = new RegisteredClient(try randomToken(16), registered)
+			let method = client.authMethod()
+			if method := "client_secret_basic" || "client_secret_post" || "client_secret_jwt" {
+				client.secret = try randomToken()
+			}
+			client.registrationAccessToken = try randomToken()
+			try server.clients.save(client)
+			return try sendJson(ctx, 201, registrationResponse(server, client))
+		}
+		let id = local["/register/".len():]
+		let client = try server.clients.client(id)
+		let denied = kindError(OAuthErrorKind.InvalidToken, "invalid registration access token", 401)
+		fail denied when client is none
+		let token = client.registrationAccessToken
+		fail denied when token is none
+		fail denied unless constantTimeEqual(token.reveal().bytes(), bearer.bytes())
+		match ctx.method() {
+			case Method.GET:
+				return try sendJson(ctx, 200, registrationResponse(server, client))
+			case Method.PUT:
+				let registered = try clientMetadataFromMembers(try parseObject(try ctx.text(), "client metadata"))
+				registered.extra.delete("client_id")
+				registered.extra.delete("client_secret")
+				try checkClientMetadata(registered)
+				client.metadata = registered
+				try server.clients.save(client)
+				return try sendJson(ctx, 200, registrationResponse(server, client))
+			case Method.DELETE:
+				try server.clients.remove(id)
+				return try ctx.noContent()
+			default:
+				fail requestError("unsupported method")
+		}
+	}
+
+	// checkClientMetadata refuses metadata a server cannot honour (RFC 7591
+	// §2, §3.2.2): redirect URIs that are not absolute or carry a fragment,
+	// an unknown authentication method.
+	internal def checkClientMetadata(registered ClientMetadata) !none {
+		for let uri in registered.redirectUris {
+			let u = url.parse(uri) onerror fail kindError(OAuthErrorKind.InvalidRedirectUri, "{uri} is not a URL")
+			fail kindError(OAuthErrorKind.InvalidRedirectUri, "{uri} is not absolute") unless u.isAbs()
+			fail kindError(OAuthErrorKind.InvalidRedirectUri, "{uri} has a fragment") when uri.contains("#")
+		}
+		let method = registered.tokenEndpointAuthMethod
+		if !(method is none) {
+			fail kindError(OAuthErrorKind.InvalidClientMetadata, "unsupported token_endpoint_auth_method {method}") unless method in ["client_secret_basic", "client_secret_post", "client_secret_jwt", "private_key_jwt", "tls_client_auth", "self_signed_tls_client_auth", "none"]
+			fail kindError(OAuthErrorKind.InvalidClientMetadata, "{method} needs jwks or jwks_uri") when (method := "private_key_jwt" || "self_signed_tls_client_auth") && registered.jwks is none && registered.jwksUri is none
+		}
+		return none
+	}
+
+	internal def registrationResponse(server AuthorizationServer, client RegisteredClient) map<string, any> {
+		let out = clientMetadataMembers(client.metadata)
+		out.set("client_id", client.id)
+		let secret = client.secret
+		if !(secret is none) {
+			out.set("client_secret", secret.reveal())
+			out.set("client_secret_expires_at", 0)
+		}
+		let token = client.registrationAccessToken
+		out.set("registration_access_token", token.reveal()) unless token is none
+		out.set("registration_client_uri", server.issuer.trimSuffix("/") + "/register/" + client.id)
+		return out
+	}
+}

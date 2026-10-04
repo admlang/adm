@@ -1,5 +1,6 @@
 partial module std.gfx.canvas {
 	use (
+		std.gfx::Raster
 		std.gfx.color::(Color, RGBA)
 		std.gfx.colorspace
 		std.math::(Pi, Tau, atan2, sqrt)
@@ -17,6 +18,16 @@ partial module std.gfx.canvas {
 		def shade(x0 int, y int, n int, out byte[])
 	}
 
+	// Makes what the shader samples before its rows are shaded on several
+	// tasks (a pattern's halved levels).
+	internal def prepareShader(shader Shader) {
+		if shader is PatternShader {
+			shader.prepare()
+		} else if shader is TintShader {
+			prepareShader(shader.inner)
+		}
+	}
+
 	// The shader for a paint drawn through `t` (user space to device); a
 	// plain colour gets one too, though fills take its span path instead.
 	internal def shaderFor(paint Paint, t Transform2D) Shader {
@@ -28,11 +39,205 @@ partial module std.gfx.canvas {
 			case ConicGradient:
 				return new ConicShader(paint, t)
 			case Pattern:
-				return new PatternShader(paint.src, Rect{left: 0.0, top: 0.0, right: -1.0, bottom: -1.0}, paint.repeatX, paint.repeatY, t.then(paint.transform), paint.sampling)
+				let all = Rect{left: 0.0, top: 0.0, right: -1.0, bottom: -1.0}
+				let src = paint.src
+				if src is Picture {
+					let tile = paint.tile
+					let tw = tile.right - tile.left
+					let th = tile.bottom - tile.top
+					let full = t.then(paint.transform)
+					if tw > 0.0 && th > 0.0 && isFinite(full) {
+						let r = renderedTile(paint, src, maxScale(full))
+						let size = r.size()
+						// Rendered pixels back to the tile's place in pattern space.
+						let place = new Transform2D(a = tw / float(size.width), d = th / float(size.height), tx = tile.left, ty = tile.top)
+						return new PatternShader(r, all, paint.repeatX, paint.repeatY, full.then(place), paint.sampling)
+					}
+					return new SolidShader(new Color(RGBA{r: 0, g: 0, b: 0, a: 0}))
+				}
+				let raster Raster = src
+				return new PatternShader(raster, all, paint.repeatX, paint.repeatY, t.then(paint.transform), paint.sampling)
+			case Noise:
+				return new NoiseShader(paint, t)
+			case MeshGradient:
+				return new MeshShader(paint, t)
+			case ShaderPaint:
+				return new FragmentShader(paint.shader, paint.uniforms, t.then(paint.transform).inverse())
 			case Color:
 				return new SolidShader(paint)
 		}
 		return new SolidShader(new Color(RGBA{r: 0, g: 0, b: 0, a: 0}))
+	}
+
+	// The pixels of a picture pattern's tile drawn `scale` device pixels to
+	// the unit (capped so a side stays within 4096), rendered once per scale.
+	internal def renderedTile(p Pattern, pic Picture, scale float) Raster {
+		let c = p.cache
+		if c is Canvas && p.cacheScale == scale {
+			return c
+		}
+		let tile = p.tile
+		let tw = tile.right - tile.left
+		let th = tile.bottom - tile.top
+		let w = int((tw * scale).ceil()).clamp(1, 4096)
+		let h = int((th * scale).ceil()).clamp(1, 4096)
+		let cv = new Canvas(w, h)
+		cv.scale(float(w) / tw, float(h) / th)
+		cv.translate(-tile.left, -tile.top)
+		pic.replay(cv)
+		p.cache = cv
+		p.cacheScale = scale
+		return cv
+	}
+
+	// Another shader's colours multiplied by a colour, channel by channel
+	// (straight alpha, so the alpha multiplies too): drawAtlas's tint.
+	internal type TintShader {
+		internal inner Shader
+		internal tint  byte[]
+
+		def new(inner Shader, c RGBA) {
+			self.inner = inner
+			tint.len(16)
+			for let k = 0; k < 16; k += 4 {
+				tint[k] = c.r
+				tint[k + 1] = c.g
+				tint[k + 2] = c.b
+				tint[k + 3] = c.a
+			}
+		}
+
+		// Shade implements Shader.
+		def shade(x0 int, y int, n int, out byte[]) {
+			inner.shade(x0, y, n, out)
+			let t = simd.convert<byte, uint16>(simd.load16<byte>(tint, 0))
+			let round = simd.splat16<uint16>(uint16(128))
+			let end = n * 4
+			let i = 0
+			for i + 16 <= end {
+				let p = simd.convert<byte, uint16>(simd.load16<byte>(out, i)) * t + round
+				simd.store16<byte>(out, i, simd.convert<uint16, byte>((p + (p >> 8)) >> 8))
+				i += 16
+			}
+			for i < end {
+				out[i] = byte(canvasDiv255(int(out[i]) * int(tint[i % 4])))
+				i++
+			}
+		}
+	}
+
+	// Noise as a shader: the field at each pixel centre, eight a vector,
+	// through the colour table.
+	internal type NoiseShader {
+		internal table   uint16[]
+		internal perm    int32[]
+		internal octaves int
+		// Device pixels to noise units (user space over the scale).
+		internal inv     Transform2D
+		internal reaches bool
+
+		def new(n Noise, t Transform2D) {
+			table = gradientTable(n.stops, n.space, n.premultiplied)
+			perm = noisePermutation(n.seed)
+			octaves = n.octaves.clamp(1, 12)
+			let k = 1.0 / n.scale.max(1e-9)
+			inv = new Transform2D(a = k, d = k).then(t.inverse())
+			reaches = n.scale > 0.0 && isFinite(inv)
+		}
+
+		// Shade implements Shader.
+		def shade(x0 int, y int, n int, out byte[]) {
+			let (ts, idx) = rowBuffers(n)
+			if !reaches {
+				fillIndex(idx, n, -1)
+				ditherRow(table, idx, x0, y, n, out)
+				return
+			}
+			let lanes = simd.load8<float32>(laneOffsets, 0)
+			let gx = simd.load8<float32>(noiseGradX, 0)
+			let gy = simd.load8<float32>(noiseGradY, 0)
+			let one = simd.splat8<float32>(float32(1.0))
+			let six = simd.splat8<float32>(float32(6.0))
+			let fifteen = simd.splat8<float32>(float32(15.0))
+			let ten = simd.splat8<float32>(float32(10.0))
+			let mask = simd.splat8<int32>(int32(255))
+			let seven = simd.splat8<int32>(int32(7))
+			let py = float(y) + 0.5
+			// The largest sum the octaves reach, to bring it to 0..1.
+			let (amp, peak) = (1.0, 0.0)
+			for let o = 0; o < octaves; o++ {
+				peak += amp
+				amp *= 0.5
+			}
+			let norm = simd.splat8<float32>(float32(0.5 / peak))
+			let half = simd.splat8<float32>(float32(0.5))
+			for let i = 0; i < n; i += 8 {
+				let px = lanes + simd.splat8<float32>(float32(float(x0 + i) + 0.5))
+				let ux = px * simd.splat8<float32>(float32(inv.a)) + simd.splat8<float32>(float32(inv.c * py + inv.tx))
+				let uy = px * simd.splat8<float32>(float32(inv.b)) + simd.splat8<float32>(float32(inv.d * py + inv.ty))
+				let sum = simd.splat8<float32>(float32(0.0))
+				let a = simd.splat8<float32>(float32(1.0))
+				for let o = 0; o < octaves; o++ {
+					let fx = ux.floor()
+					let fy = uy.floor()
+					let tx = ux - fx
+					let ty = uy - fy
+					let xi = simd.convert<float32, int32>(fx) & mask
+					let yi = simd.convert<float32, int32>(fy) & mask
+					let x1 = (xi + simd.splat8<int32>(int32(1))) & mask
+					let y1 = (yi + simd.splat8<int32>(int32(1))) & mask
+					// Corner hashes: perm[perm[x] + y], the table doubled so
+					// the sum needs no wrap.
+					let px0 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(xi))
+					let px1 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(x1))
+					let h00 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(px0 + yi)) & seven
+					let h10 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(px1 + yi)) & seven
+					let h01 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(px0 + y1)) & seven
+					let h11 = simd.gather8<int32>(perm, 0, simd.convert<int32, int>(px1 + y1)) & seven
+					let d00 = simd.gather8<float32>(noiseGradX, 0, simd.convert<int32, int>(h00)) * tx + simd.gather8<float32>(noiseGradY, 0, simd.convert<int32, int>(h00)) * ty
+					let d10 = simd.gather8<float32>(noiseGradX, 0, simd.convert<int32, int>(h10)) * (tx - one) + simd.gather8<float32>(noiseGradY, 0, simd.convert<int32, int>(h10)) * ty
+					let d01 = simd.gather8<float32>(noiseGradX, 0, simd.convert<int32, int>(h01)) * tx + simd.gather8<float32>(noiseGradY, 0, simd.convert<int32, int>(h01)) * (ty - one)
+					let d11 = simd.gather8<float32>(noiseGradX, 0, simd.convert<int32, int>(h11)) * (tx - one) + simd.gather8<float32>(noiseGradY, 0, simd.convert<int32, int>(h11)) * (ty - one)
+					let sx = tx * tx * tx * (tx * (tx * six - fifteen) + ten)
+					let sy = ty * ty * ty * (ty * (ty * six - fifteen) + ten)
+					let top = d00 + (d10 - d00) * sx
+					let bottom = d01 + (d11 - d01) * sx
+					sum = sum + (top + (bottom - top) * sy) * a
+					a = a * half
+					ux = ux * simd.splat8<float32>(float32(2.0)) + simd.splat8<float32>(float32(17.3))
+					uy = uy * simd.splat8<float32>(float32(2.0)) + simd.splat8<float32>(float32(31.7))
+				}
+				// 2D gradient noise stays within ±1/√2 per octave.
+				simd.store8<float32>(ts, i, (sum * norm * simd.splat8<float32>(float32(1.4142135)) + half).clamp(simd.splat8<float32>(float32(0.0)), one))
+			}
+			spreadToIndex(ts, n, Spread.Pad, idx)
+			ditherRow(table, idx, x0, y, n, out)
+		}
+	}
+
+	// The eight gradient directions of 2D improved noise.
+	internal const noiseGradX = float32[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0, 0.0]
+	internal const noiseGradY = float32[1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 1.0, -1.0]
+
+	// A shuffle of 0..255 for the seed, twice over (512 entries).
+	internal def noisePermutation(seed int) int32[] {
+		let p int32[]
+		p.len(512)
+		for let i = 0; i < 256; i++ {
+			p[i] = int32(i)
+		}
+		let state = uint64(seed) * uint64(6364136223846793005) + uint64(1442695040888963407)
+		for let i = 255; i > 0; i-- {
+			state = state * uint64(6364136223846793005) + uint64(1442695040888963407)
+			let j = int((state >> 33) % uint64(i + 1))
+			let t = p[i]
+			p[i] = p[j]
+			p[j] = t
+		}
+		for let i = 0; i < 256; i++ {
+			p[256 + i] = p[i]
+		}
+		return p
 	}
 
 	// A plain colour as a shader.
@@ -58,12 +263,25 @@ partial module std.gfx.canvas {
 	// sRGB r, g, b, a in 8.8 fixed point, interpolated premultiplied in
 	// `space` (CSS Color 4), so a dither added below the point rounds each
 	// pixel to 8 bits without banding.
-	internal def gradientTable(stops ColorStop[], space ColorSpace) uint16[] {
+	internal def gradientTable(stops ColorStop[], space ColorSpace, premultiplied bool = true) uint16[] {
 		let table uint16[]
 		table.len(gradientSize * 4)
 		return table when stops.len() == 0
-		// Offsets clamped and kept in order; colours in the space,
-		// premultiplied.
+		let (offs, vals) = spaceStops(stops, space, premultiplied)
+		for let k = 0; k < gradientSize; k++ {
+			let (r, g, b, a) = stopsAt(offs, vals, float(k) / float(gradientSize - 1), space, premultiplied)
+			continue when a <= 0.0
+			table[k * 4 + 0] = fixed88(r)
+			table[k * 4 + 1] = fixed88(g)
+			table[k * 4 + 2] = fixed88(b)
+			table[k * 4 + 3] = fixed88(a)
+		}
+		return table
+	}
+
+	// The stops' offsets clamped and kept in order, and their colours in
+	// the space, premultiplied (four values a stop).
+	internal def spaceStops(stops ColorStop[], space ColorSpace, premultiplied bool = true) (float[], float[]) {
 		let offs float[]
 		let vals float[]
 		let last = 0.0
@@ -73,42 +291,53 @@ partial module std.gfx.canvas {
 			offs.push(o)
 			let (c0, c1, c2) = toSpace(s.color, space)
 			let a = float(s.color.rgba.a) / 255.0
-			vals.push(c0 * a)
-			vals.push(c1 * a)
-			vals.push(c2 * a)
+			let k = premultiplied ?? (a, 1.0)
+			vals.push(c0 * k)
+			vals.push(c1 * k)
+			vals.push(c2 * k)
 			vals.push(a)
 		}
+		return (offs, vals)
+	}
+
+	// Straight sRGB (0..1) and alpha at t (0..1) of prepared stops,
+	// interpolated in the space, premultiplied or straight as they were
+	// prepared.
+	internal def stopsAt(offs float[], vals float[], t float, space ColorSpace, premultiplied bool = true) (float, float, float, float) {
 		let n = offs.len()
+		return (0.0, 0.0, 0.0, 0.0) when n == 0
 		let seg = 0
-		for let k = 0; k < gradientSize; k++ {
-			let t = float(k) / float(gradientSize - 1)
-			for seg + 1 < n && offs[seg + 1] < t {
-				seg++
-			}
-			let (i, j, f) = (seg, seg, 0.0)
-			if t <= offs[0] {
-				i = 0
-				j = 0
-			} else if seg + 1 >= n {
-				i = n - 1
-				j = n - 1
-			} else {
-				j = seg + 1
-				let span = offs[j] - offs[i]
-				f = span > 0.0 ?? ((t - offs[i]) / span, 1.0)
-			}
-			let a = vals[i * 4 + 3] + (vals[j * 4 + 3] - vals[i * 4 + 3]) * f
-			continue when a <= 0.0
-			let c0 = (vals[i * 4] + (vals[j * 4] - vals[i * 4]) * f) / a
-			let c1 = (vals[i * 4 + 1] + (vals[j * 4 + 1] - vals[i * 4 + 1]) * f) / a
-			let c2 = (vals[i * 4 + 2] + (vals[j * 4 + 2] - vals[i * 4 + 2]) * f) / a
-			let (r, g, b) = fromSpace(c0, c1, c2, space)
-			table[k * 4 + 0] = fixed88(r)
-			table[k * 4 + 1] = fixed88(g)
-			table[k * 4 + 2] = fixed88(b)
-			table[k * 4 + 3] = fixed88(a)
+		for seg + 1 < n && offs[seg + 1] < t {
+			seg++
 		}
-		return table
+		let (i, j, f) = (seg, seg, 0.0)
+		if t <= offs[0] {
+			i = 0
+			j = 0
+		} else if seg + 1 >= n {
+			i = n - 1
+			j = n - 1
+		} else {
+			j = seg + 1
+			let span = offs[j] - offs[i]
+			f = span > 0.0 ?? ((t - offs[i]) / span, 1.0)
+		}
+		let a = vals[i * 4 + 3] + (vals[j * 4 + 3] - vals[i * 4 + 3]) * f
+		return (0.0, 0.0, 0.0, 0.0) when a <= 0.0
+		let k = premultiplied ?? (a, 1.0)
+		let c0 = (vals[i * 4] + (vals[j * 4] - vals[i * 4]) * f) / k
+		let c1 = (vals[i * 4 + 1] + (vals[j * 4 + 1] - vals[i * 4 + 1]) * f) / k
+		let c2 = (vals[i * 4 + 2] + (vals[j * 4 + 2] - vals[i * 4 + 2]) * f) / k
+		let (r, g, b) = fromSpace(c0, c1, c2, space)
+		return (r, g, b, a)
+	}
+
+	// The gradient colour at t, rounded to bytes, before dithering.
+	internal def colorOfStops(stops ColorStop[], space ColorSpace, t float, premultiplied bool = true) Color {
+		let (offs, vals) = spaceStops(stops, space, premultiplied)
+		let (r, g, b, a) = stopsAt(offs, vals, t.clamp(0.0, 1.0), space, premultiplied)
+		let byteOf = (v float) => byte(int((v.clamp(0.0, 1.0) * 255.0 + 0.5).floor()))
+		return new Color(RGBA{r: byteOf(r), g: byteOf(g), b: byteOf(b), a: byteOf(a)})
 	}
 
 	// A 0..1 value as 8.8 fixed point of 0..255.
@@ -234,7 +463,7 @@ partial module std.gfx.canvas {
 		internal reaches  bool
 
 		def new(g LinearGradient, t Transform2D) {
-			table = gradientTable(g.stops, g.space)
+			table = gradientTable(g.stops, g.space, g.premultiplied)
 			spread = g.spread
 			let dx = g.to.x - g.from.x
 			let dy = g.to.y - g.from.y
@@ -309,7 +538,7 @@ partial module std.gfx.canvas {
 		internal reaches         bool
 
 		def new(g RadialGradient, t Transform2D) {
-			table = gradientTable(g.stops, g.space)
+			table = gradientTable(g.stops, g.space, g.premultiplied)
 			spread = g.spread
 			inv = t.inverse()
 			let focus = g.center
@@ -405,7 +634,7 @@ partial module std.gfx.canvas {
 		internal reaches bool
 
 		def new(g ConicGradient, t Transform2D) {
-			table = gradientTable(g.stops, g.space)
+			table = gradientTable(g.stops, g.space, g.premultiplied)
 			inv = t.inverse()
 			cx = g.center.x
 			cy = g.center.y

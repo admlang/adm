@@ -1,0 +1,1295 @@
+partial module std.ui.renderer.opengl {
+	use (
+		std.gfx.canvas::(Composite, GpuEffectKind, OutlinePosition, GpuBackdropBlur, GpuBeginGroup, GpuBlit, GpuDraw, GpuEndGroup, GpuFragment, GpuFrame, GpuGradient, GpuImage, GpuNoise, GpuOp, GpuPixels, GpuSolid)
+		std.math.geom::Transform2D
+		std.gfx.color::(BlendMode, RGBA)
+		std.ui.renderer.opengl.gl
+	)
+
+	@embed("shaders/canvas.vert")
+	internal const canvasVertexSource byte[]
+
+	@embed("shaders/canvas.frag")
+	internal const canvasFragmentSource byte[]
+
+	@embed("shaders/effects.frag")
+	internal const effectsFragmentSource byte[]
+
+	// The passes of the effects program (shaders/effects.frag).
+	enum EffectMode {
+		Alpha,
+		Covered,
+		Copy,
+		Inverted,
+		Multiply,
+		MultiplyInverse,
+		Shifted,
+		Box,
+		Grown,
+		Ring,
+		Signed,
+		DistanceInit,
+		DistanceColumns,
+		DistanceRows,
+		Linear,
+		Store,
+		Halve,
+	}
+
+	// One level of a cached image: an RGBA8 texture and its framebuffer.
+	internal struct ImageLevel {
+		texture uint32
+		fbo     uint32 = 0
+		w       int
+		h       int
+	}
+
+	// An image's levels in the cache, and the frame it was last drawn in.
+	internal type CachedImage {
+		levels ImageLevel[]
+		used   int          = 0
+
+		def new(levels ImageLevel[]) {
+			self.levels = levels
+		}
+	}
+
+	// A float texture an effect pass writes, with its framebuffer.
+	internal struct PlaneTex {
+		texture uint32
+		fbo     uint32
+		w       int
+		h       int
+		format  uint32
+	}
+
+	// The region a group's effects work on, and its planes' width.
+	internal struct EffectRegion {
+		x  int
+		y  int
+		w  int
+		h  int
+		pw int
+	}
+
+	// A compiled canvas program and its uniform locations by name.
+	internal type CanvasProgram {
+		internal id        uint32
+		internal locations map<string, int>
+
+		def new(id uint32) {
+			self.id = id
+		}
+
+		// The location of the uniform, looked up once.
+		def at(name string) int {
+			if !locations.hasKey(name) {
+				locations = locations.set(name, gl.glGetUniformLocation(id, name))
+			}
+			return locations[name]
+		}
+	}
+
+	// A texture that grows to the largest box asked of it.
+	internal type ScratchTexture {
+		internal id     uint32 = 0
+		internal w      int    = 0
+		internal h      int    = 0
+		internal format uint32
+		// What uploads hold: the pixel format and component type.
+		internal pixel  uint32
+		internal kind   uint32
+
+		def new(format uint32) {
+			self.format = format
+			pixel = format == gl.GL_R8 ?? (gl.GL_RED, gl.GL_RGBA)
+			kind = gl.GL_UNSIGNED_BYTE
+		}
+
+		def new(format uint32, pixel uint32, kind uint32) {
+			self.format = format
+			self.pixel = pixel
+			self.kind = kind
+		}
+
+		// The texture bound, at least w x h.
+		def ensure(w int, h int) uint32 {
+			if id == 0 {
+				let ids uint32[]
+				ids.len(1)
+				gl.glGenTextures(1, ids)
+				id = ids[0]
+			}
+			gl.glBindTexture(gl.GL_TEXTURE_2D, id)
+			if w > self.w || h > self.h {
+				self.w = w.max(self.w)
+				self.h = h.max(self.h)
+				gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+				gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+				gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(format), self.w, self.h, 0, pixel, kind, byte[])
+			}
+			return id
+		}
+
+		// Uploads w x h tightly packed bytes to the texture's corner.
+		def upload(w int, h int, data byte[]) uint32 {
+			let t = ensure(w, h)
+			gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+			gl.glPixelStorei(gl.GL_UNPACK_ROW_LENGTH, w)
+			gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, w, h, pixel, kind, data)
+			gl.glPixelStorei(gl.GL_UNPACK_ROW_LENGTH, 0)
+			return t
+		}
+
+		// Frees the texture.
+		def dispose() {
+			if id != 0 {
+				gl.glDeleteTextures(1, uint32[id])
+				id = 0
+				w = 0
+				h = 0
+			}
+		}
+	}
+
+	// A frame-sized RGBA8 texture with its framebuffer.
+	internal struct Target {
+		texture uint32
+		fbo     uint32
+	}
+
+	// FrameRenderer draws GpuFrames (DrawContext.lower) with OpenGL on the
+	// current context, into a texture the size of the frame: the canvas's
+	// coverage and pixels, the paint, clip, operators, blend modes and
+	// groups in a shader that composites as the canvas does.
+	internal type FrameRenderer {
+		internal width       int                        = 0
+		internal height      int                        = 0
+		// The frame's target, then one per open group.
+		internal stack       Target[]
+		// Group targets kept for the next frame.
+		internal spare       Target[]
+		internal dst         ScratchTexture             = new ScratchTexture(gl.GL_RGBA8)
+		internal coverage    ScratchTexture             = new ScratchTexture(gl.GL_R8)
+		internal clip        ScratchTexture             = new ScratchTexture(gl.GL_R8)
+		internal pixels      ScratchTexture             = new ScratchTexture(gl.GL_RGBA8)
+		// Gradient tables (1024 x 1, 16-bit channels), the blue noise they
+		// dither with, and noise hashes.
+		internal table       ScratchTexture             = new ScratchTexture(gl.GL_RGBA16UI, gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_SHORT)
+		internal dither      ScratchTexture             = new ScratchTexture(gl.GL_R8)
+		internal perm        ScratchTexture             = new ScratchTexture(gl.GL_R32I, gl.GL_RED_INTEGER, gl.GL_INT)
+		internal ditherUp    bool                       = false
+		// Float planes effects work on, kept for the next group, and the
+		// colour tables of colour blurs.
+		internal planePool   PlaneTex[]
+		// Image textures by their content key, what they take, and the
+		// frame each was last drawn in.
+		internal images      map<string, CachedImage>
+		internal imageBytes  int                        = 0
+		internal imageBudget int                        = 256 * 1024 * 1024
+		internal frameCount  int                        = 0
+		internal linearTable uint32                     = 0
+		internal srgbTable   uint32                     = 0
+		// The base program, and one per @fragment function by name.
+		internal programs    map<string, CanvasProgram>
+
+		def new() {}
+
+		// The texture holding the last frame drawn (straight RGBA8, row 0
+		// the top of the frame), or 0 before the first.
+		def texture() uint32 {
+			return stack.len() == 0 ?? (uint32(0), stack[0].texture)
+		}
+
+		// Draws the frame from transparent black.
+		def draw(frame GpuFrame) !none {
+			try start(frame.width, frame.height)
+			frameCount++
+			for let (_, op) in frame.ops {
+				try apply(op, frame)
+			}
+			// Groups left open are dropped, as endGroup never came.
+			for stack.len() > 1 {
+				spare.push(stack.pop())
+			}
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+			trimImages()
+		}
+
+		// The last frame's pixels, straight RGBA8, row 0 the top.
+		def read() byte[] {
+			let out byte[]
+			return out when stack.len() == 0
+			out.len(width * height * 4)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, stack[0].fbo)
+			gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+			gl.glReadPixels(0, 0, width, height, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, out)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, 0)
+			return out
+		}
+
+		// Frees every texture, framebuffer and program.
+		def dispose() {
+			for stack.len() > 0 {
+				spare.push(stack.pop())
+			}
+			for let (_, t) in spare {
+				freeTarget(t)
+			}
+			spare.len(0)
+			dst.dispose()
+			coverage.dispose()
+			clip.dispose()
+			pixels.dispose()
+			table.dispose()
+			dither.dispose()
+			perm.dispose()
+			ditherUp = false
+			for let (_, t) in planePool {
+				gl.glDeleteFramebuffers(1, uint32[t.fbo])
+				gl.glDeleteTextures(1, uint32[t.texture])
+			}
+			planePool.len(0)
+			for let (_, c) in images {
+				for let (_, l) in c.levels {
+					gl.glDeleteFramebuffers(1, uint32[l.fbo])
+					gl.glDeleteTextures(1, uint32[l.texture])
+				}
+			}
+			images = map<string, CachedImage>{}
+			imageBytes = 0
+			if linearTable != 0 {
+				gl.glDeleteTextures(2, uint32[linearTable, srgbTable])
+				linearTable = 0
+				srgbTable = 0
+			}
+			for let (_, p) in programs {
+				gl.glDeleteProgram(p.id)
+			}
+			programs = map<string, CanvasProgram>{}
+			width = 0
+			height = 0
+		}
+
+		internal def start(w int, h int) !none {
+			if w != width || h != height {
+				for stack.len() > 0 {
+					freeTarget(stack.pop())
+				}
+				for let (_, t) in spare {
+					freeTarget(t)
+				}
+				spare.len(0)
+				width = w
+				height = h
+			}
+			for stack.len() > 1 {
+				spare.push(stack.pop())
+			}
+			if stack.len() == 0 {
+				let t = try newTarget()
+				stack.push(t)
+			}
+			clearTarget(stack[0])
+			gl.glDisable(gl.GL_BLEND)
+		}
+
+		internal def newTarget() !Target {
+			if spare.len() > 0 {
+				return spare.pop()
+			}
+			let ids uint32[]
+			ids.len(1)
+			gl.glGenTextures(1, ids)
+			let tex = ids[0]
+			gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+			gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(gl.GL_RGBA8), width.max(1), height.max(1), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, byte[])
+			let fbos uint32[]
+			fbos.len(1)
+			gl.glGenFramebuffers(1, fbos)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbos[0])
+			gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, tex, 0)
+			let status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+			if status != gl.GL_FRAMEBUFFER_COMPLETE {
+				gl.glDeleteFramebuffers(1, fbos)
+				gl.glDeleteTextures(1, ids)
+				fail "the GPU canvas could not make a {width}x{height} RGBA8 framebuffer (status {status})"
+			}
+			return Target{texture: tex, fbo: fbos[0]}
+		}
+
+		internal def freeTarget(t Target) {
+			gl.glDeleteFramebuffers(1, uint32[t.fbo])
+			gl.glDeleteTextures(1, uint32[t.texture])
+		}
+
+		internal def clearTarget(t Target) {
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, t.fbo)
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			gl.glViewport(0, 0, width, height)
+			gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+			gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+		}
+
+		internal def apply(op GpuOp, frame GpuFrame) !none {
+			match op {
+				case GpuDraw:
+					try drawOp(op, frame)
+				case GpuBlit:
+					try blitOp(op)
+				case GpuBeginGroup:
+					let t = try newTarget()
+					clearTarget(t)
+					stack.push(t)
+				case GpuEndGroup:
+					return none when stack.len() < 2
+					if op.effects.len() > 0 || op.margin > 0 {
+						try endGroupEffects(op, frame)
+						return none
+					}
+					let g = stack.pop()
+					let p = try program(none)
+					try composite(p, op.x, op.y, op.w, op.h, def () {
+						bindPaintPixels(p, g.texture, 0, 0)
+						bindCoverage(p, op.coverage, op.w, op.h)
+						bindClip(p, byte[], 0, 0)
+						gl.glUniform1ui(p.at("uAlpha"), uint32(op.alpha))
+						gl.glUniform1i(p.at("uComposite"), int(op.composite))
+						gl.glUniform1i(p.at("uBlend"), int(op.blend))
+						gl.glUniform1i(p.at("uPaired"), 0)
+						gl.glUniform1i(p.at("uOp"), 1)
+					})
+					spare.push(g)
+				case GpuBackdropBlur:
+					backdropOp(op)
+			}
+		}
+
+		// `plane` (not 0): coverage is that plane rounded to bytes, and pixel
+		// paints cover the box (px, py, pw, ph) rather than the draw's.
+		internal def drawOp(d GpuDraw, frame GpuFrame, plane uint32 = 0, px int = 0, py int = 0, pw int = 0, ph int = 0) !none {
+			let paint = d.paint
+			let frag ?GpuFragment = none
+			if paint is GpuFragment {
+				frag = paint
+			}
+			let p = try program(frag)
+			// An image's level is made before the draw: uploading and halving
+			// bind textures and another program.
+			let level = ImageLevel{texture: 0, w: 1, h: 1}
+			if paint is GpuImage {
+				try ensureTables(frame)
+				level = try imageLevel(paint, frame)
+			}
+			try composite(p, d.x, d.y, d.w, d.h, def () {
+				match paint {
+					case GpuSolid:
+						gl.glUniform1i(p.at("uPaintKind"), 0)
+						gl.glUniform3ui(p.at("uSolid"), uint32(paint.r), uint32(paint.g), uint32(paint.b))
+						bindNoPixels(p)
+					case GpuPixels:
+						if pw > 0 {
+							bindUploadedPixels(p, pw, ph, paint.pixels, px, py)
+						} else {
+							bindUploadedPixels(p, d.w, d.h, paint.pixels, d.x, d.y)
+						}
+					case GpuGradient:
+						gl.glUniform1i(p.at("uPaintKind"), 3)
+						bindNoPixels(p)
+						bindTable(p, paint.table, frame)
+						gl.glUniform1i(p.at("uGradKind"), int(paint.kind))
+						gl.glUniform1i(p.at("uSpread"), int(paint.spread))
+						setInverse(p, paint.inv)
+						let params float64[]
+						params.len(8)
+						for let (i, v) in paint.params {
+							params[i] = float64(v) when i < 8
+						}
+						gl.glUniform1dv(p.at("uParams"), 8, params)
+					case GpuImage:
+						gl.glUniform1i(p.at("uPaintKind"), 6)
+						bindNoPixels(p)
+						gl.glActiveTexture(gl.GL_TEXTURE8)
+						gl.glBindTexture(gl.GL_TEXTURE_2D, level.texture)
+						gl.glUniform1i(p.at("uImage"), 8)
+						gl.glActiveTexture(gl.GL_TEXTURE9)
+						gl.glBindTexture(gl.GL_TEXTURE_2D, linearTable)
+						gl.glUniform1i(p.at("uToLinear"), 9)
+						gl.glActiveTexture(gl.GL_TEXTURE10)
+						gl.glBindTexture(gl.GL_TEXTURE_2D, srgbTable)
+						gl.glUniform1i(p.at("uToSrgb"), 10)
+						gl.glActiveTexture(gl.GL_TEXTURE0)
+						gl.glUniform2i(p.at("uImageSize"), level.w, level.h)
+						gl.glUniform2i(p.at("uImageSpread"), int(paint.repeatX), int(paint.repeatY))
+						gl.glUniform1i(p.at("uSampling"), int(paint.sampling))
+						let inv = paint.inv
+						gl.glUniform1dv(p.at("uParams"), 8, float64[float64(inv.a), float64(inv.b), float64(inv.c), float64(inv.d), float64(inv.tx), float64(inv.ty), float64(0), float64(0)])
+						let tint = paint.tint
+						if tint is RGBA {
+							gl.glUniform1i(p.at("uTinted"), 1)
+							gl.glUniform4ui(p.at("uTint"), uint32(tint.r), uint32(tint.g), uint32(tint.b), uint32(tint.a))
+						} else {
+							gl.glUniform1i(p.at("uTinted"), 0)
+						}
+					case GpuNoise:
+						gl.glUniform1i(p.at("uPaintKind"), 4)
+						bindNoPixels(p)
+						bindTable(p, paint.table, frame)
+						setInverse(p, paint.inv)
+						gl.glUniform1i(p.at("uOctaves"), paint.octaves)
+						gl.glActiveTexture(gl.GL_TEXTURE6)
+						perm.upload(paint.perm.len(), 1, int32Bytes(paint.perm))
+						gl.glUniform1i(p.at("uPerm"), 6)
+						gl.glActiveTexture(gl.GL_TEXTURE0)
+					case GpuFragment:
+						gl.glUniform1i(p.at("uPaintKind"), 2)
+						bindNoPixels(p)
+						setInverse(p, paint.inv)
+						setFragmentUniforms(p, paint)
+				}
+				bindCoverage(p, d.coverage, d.w, d.h)
+				bindClip(p, d.clip, d.w, d.h)
+				gl.glUniform1ui(p.at("uAlpha"), uint32(d.alpha))
+				gl.glUniform1i(p.at("uComposite"), int(d.composite))
+				gl.glUniform1i(p.at("uBlend"), int(d.blend))
+				// fillCoverage's pair table, for large shaded fills in a
+				// per-channel mode.
+				let paired = !(paint is GpuSolid) && !d.layer && d.composite == Composite.SourceOver && perChannelMode(d.blend) && d.w * d.h >= 128 * 128
+				gl.glUniform1i(p.at("uPaired"), paired ?? (1, 0))
+				gl.glUniform1i(p.at("uOp"), d.layer ?? (1, 0))
+				if d.quad.len() == 8 {
+					gl.glUniform1i(p.at("uHasQuad"), 1)
+					gl.glUniform1i(p.at("uHardQuad"), d.antialias ?? (0, 1))
+					let q float64[]
+					for let (_, v) in d.quad {
+						q.push(float64(v))
+					}
+					gl.glUniform1dv(p.at("uQuad"), 8, q)
+				}
+				if plane != 0 {
+					bindPlane(p, plane)
+					gl.glUniform1i(p.at("uCoverageFromPlane"), 1)
+				}
+			})
+		}
+
+		internal def blitOp(b GpuBlit) !none {
+			let x0 = b.x.max(0)
+			let y0 = b.y.max(0)
+			let x1 = (b.x + b.w).min(width)
+			let y1 = (b.y + b.h).min(height)
+			return none when x0 >= x1 || y0 >= y1
+			let p = try program(none)
+			try composite(p, x0, y0, x1 - x0, y1 - y0, def () {
+				bindUploadedPixels(p, b.w, b.h, b.pixels, b.x, b.y)
+				bindCoverage(p, byte[], 0, 0)
+				bindClip(p, byte[], 0, 0)
+				gl.glUniform1i(p.at("uBlend"), int(b.blend))
+				gl.glUniform1i(p.at("uOp"), b.copy ?? (2, 3))
+			})
+		}
+
+		// Backdrop blur on the CPU: the box read back, blurred as the canvas
+		// does, and written again.
+		internal def backdropOp(b GpuBackdropBlur) {
+			return when b.w <= 0 || b.h <= 0
+			let t = stack[stack.len() - 1]
+			let box byte[]
+			box.len(b.w * b.h * 4)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, t.fbo)
+			gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+			gl.glReadPixels(b.x, b.y, b.w, b.h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, box)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, 0)
+			b.apply(box)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, t.texture)
+			gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+			gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, b.x, b.y, b.w, b.h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, box)
+		}
+
+		// Runs the program over the box of the current target: copies the
+		// box to the destination texture, lets `setup` set the paint and
+		// coverage, and draws.
+		internal def composite(p CanvasProgram, x int, y int, w int, h int, setup def()) !none {
+			return none when w <= 0 || h <= 0
+			let t = stack[stack.len() - 1]
+			gl.glUseProgram(p.id)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+			dst.ensure(w, h)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, t.fbo)
+			gl.glCopyTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, x, y, w, h)
+			gl.glUniform1i(p.at("uDst"), 0)
+			gl.glUniform4i(p.at("uBox"), x, y, w, h)
+			gl.glUniform1i(p.at("uCoverageFromPlane"), 0)
+			gl.glUniform1i(p.at("uHasQuad"), 0)
+			setup()
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, t.fbo)
+			gl.glViewport(0, 0, width, height)
+			gl.glEnable(gl.GL_SCISSOR_TEST)
+			gl.glScissor(x, y, w, h)
+			gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			let err = gl.glGetError()
+			fail "the GPU canvas draw failed (GL error {err})" when err != 0
+		}
+
+		internal def bindPaintPixels(p CanvasProgram, texture uint32, ox int, oy int) {
+			gl.glActiveTexture(gl.GL_TEXTURE3)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+			gl.glUniform1i(p.at("uPixels"), 3)
+			gl.glUniform2i(p.at("uPixelsOrigin"), ox, oy)
+			gl.glUniform1i(p.at("uPaintKind"), 1)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		// Uploads w x h pixels as the paint, texel (0, 0) at target pixel
+		// (ox, oy).
+		internal def bindUploadedPixels(p CanvasProgram, w int, h int, bytes byte[], ox int, oy int) {
+			gl.glActiveTexture(gl.GL_TEXTURE3)
+			bindPaintPixels(p, pixels.upload(w, h, bytes), ox, oy)
+		}
+
+		// Device pixels to the paint's space.
+		internal def setInverse(p CanvasProgram, inv Transform2D) {
+			gl.glUniform2f(p.at("uInvX"), float32(inv.a), float32(inv.b))
+			gl.glUniform2f(p.at("uInvY"), float32(inv.c), float32(inv.d))
+			gl.glUniform2f(p.at("uInvT"), float32(inv.tx), float32(inv.ty))
+		}
+
+		// A gradient table on unit 4, and the blue noise on unit 5.
+		internal def bindTable(p CanvasProgram, entries uint16[], frame GpuFrame) {
+			gl.glActiveTexture(gl.GL_TEXTURE4)
+			table.upload(entries.len() / 4, 1, uint16Bytes(entries))
+			gl.glUniform1i(p.at("uTable"), 4)
+			gl.glActiveTexture(gl.GL_TEXTURE5)
+			if !ditherUp {
+				dither.upload(64, 64, frame.blueNoise())
+				ditherUp = true
+			} else {
+				dither.ensure(64, 64)
+			}
+			gl.glUniform1i(p.at("uBlueNoise"), 5)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		internal def bindNoPixels(p CanvasProgram) {
+			gl.glActiveTexture(gl.GL_TEXTURE3)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, pixels.ensure(1, 1))
+			gl.glUniform1i(p.at("uPixels"), 3)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		internal def bindCoverage(p CanvasProgram, bytes byte[], w int, h int) {
+			gl.glActiveTexture(gl.GL_TEXTURE1)
+			if bytes.len() > 0 {
+				coverage.upload(w, h, bytes)
+			} else {
+				coverage.ensure(1, 1)
+			}
+			gl.glUniform1i(p.at("uCoverage"), 1)
+			gl.glUniform1i(p.at("uHasCoverage"), bytes.len() > 0 ?? (1, 0))
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		internal def bindClip(p CanvasProgram, bytes byte[], w int, h int) {
+			gl.glActiveTexture(gl.GL_TEXTURE2)
+			if bytes.len() > 0 {
+				clip.upload(w, h, bytes)
+			} else {
+				clip.ensure(1, 1)
+			}
+			gl.glUniform1i(p.at("uClip"), 2)
+			gl.glUniform1i(p.at("uHasClip"), bytes.len() > 0 ?? (1, 0))
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		// The fragment's parameters, from the packed uniforms.
+		internal def setFragmentUniforms(p CanvasProgram, f GpuFragment) {
+			let u = f.uniforms
+			for let (_, param) in f.shader.params {
+				let at = p.at("adm_u_" + param.name)
+				continue when at < 0
+				let o = param.offset
+				let v = (i int) => o + i < u.len() ?? (u[o + i], float32(0))
+				match param.kind {
+					case FragmentKind.Float32:
+						gl.glUniform1f(at, v(0))
+					case FragmentKind.Int32:
+						gl.glUniform1i(at, int(v(0)))
+					case FragmentKind.Bool:
+						gl.glUniform1i(at, v(0) != float32(0) ?? (1, 0))
+					case FragmentKind.Vec2:
+						gl.glUniform2f(at, v(0), v(1))
+					case FragmentKind.Vec3:
+						gl.glUniform3f(at, v(0), v(1), v(2))
+					case FragmentKind.Vec4:
+						gl.glUniform4f(at, v(0), v(1), v(2), v(3))
+				}
+			}
+		}
+
+		// The texture of the image's level, from the cache while its key
+		// stays the same: the window uploaded, then halved on the GPU.
+		internal def imageLevel(img GpuImage, frame GpuFrame) !ImageLevel {
+			let key = "{img.key}"
+			if !images.hasKey(key) {
+				let base = try newLevel(img.ww, img.wh)
+				gl.glBindTexture(gl.GL_TEXTURE_2D, base.texture)
+				gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+				gl.glPixelStorei(gl.GL_UNPACK_ROW_LENGTH, img.stride / 4)
+				gl.glPixelStorei(gl.GL_UNPACK_SKIP_PIXELS, img.wx)
+				gl.glPixelStorei(gl.GL_UNPACK_SKIP_ROWS, img.wy)
+				gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, img.ww, img.wh, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, img.pixels)
+				gl.glPixelStorei(gl.GL_UNPACK_ROW_LENGTH, 0)
+				gl.glPixelStorei(gl.GL_UNPACK_SKIP_PIXELS, 0)
+				gl.glPixelStorei(gl.GL_UNPACK_SKIP_ROWS, 0)
+				let levels ImageLevel[]
+				levels.push(base)
+				images = images.set(key, new CachedImage(levels))
+				imageBytes += img.ww * img.wh * 4
+			}
+			let cached = images[key]
+			cached.used = frameCount
+			for cached.levels.len() <= img.halvings {
+				let below = cached.levels[cached.levels.len() - 1]
+				let next = try newLevel((below.w + 1) / 2, (below.h + 1) / 2)
+				try halveInto(below, next)
+				cached.levels.push(next)
+				imageBytes += next.w * next.h * 4
+			}
+			return cached.levels[img.halvings]
+		}
+
+		// An RGBA8 texture with its framebuffer, for an image level.
+		internal def newLevel(w int, h int) !ImageLevel {
+			let ids uint32[]
+			ids.len(1)
+			gl.glGenTextures(1, ids)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, ids[0])
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+			gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(gl.GL_RGBA8), w.max(1), h.max(1), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, byte[])
+			let fbos uint32[]
+			fbos.len(1)
+			gl.glGenFramebuffers(1, fbos)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbos[0])
+			gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, ids[0], 0)
+			let status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+			fail "the GPU canvas could not make a {w}x{h} image texture (status {status})" when status != gl.GL_FRAMEBUFFER_COMPLETE
+			return ImageLevel{texture: ids[0], fbo: fbos[0], w: w, h: h}
+		}
+
+		// halveLevel on the GPU: `below` averaged 2x2 into `next`.
+		internal def halveInto(below ImageLevel, next ImageLevel) !none {
+			let e = try effectsProgram()
+			gl.glUseProgram(e.id)
+			gl.glUniform1i(e.at("uMode"), int(EffectMode.Halve))
+			gl.glUniform1i(e.at("uW"), below.w)
+			gl.glUniform1i(e.at("uH"), below.h)
+			bindUnit(e, "uImage", 3, below.texture)
+			bindUnit(e, "uLinear", 4, linearTable)
+			bindUnit(e, "uSrgb", 5, srgbTable)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, next.fbo)
+			gl.glViewport(0, 0, next.w, next.h)
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+			let err = gl.glGetError()
+			fail "halving an image on the GPU failed (GL error {err})" when err != 0
+		}
+
+		// Drops images no frame drew for a while, oldest first, once the
+		// cache holds more than its budget.
+		internal def trimImages() {
+			return when imageBytes <= imageBudget
+			let keys = images.keys()
+			for let (_, k) in keys {
+				let c = images[k]
+				continue when frameCount - c.used < 2
+				for let (_, l) in c.levels {
+					gl.glDeleteFramebuffers(1, uint32[l.fbo])
+					gl.glDeleteTextures(1, uint32[l.texture])
+					imageBytes -= l.w * l.h * 4
+				}
+				images = images.delete(k)
+				return when imageBytes <= imageBudget
+			}
+		}
+
+		// A group with effects closed as the canvas's closeGroup does: the
+		// exact region from the group's pixels, then the effects as passes
+		// over float planes, the planes below and the group composited onto
+		// the target below.
+		internal def endGroupEffects(op GpuEndGroup, frame GpuFrame) !none {
+			let g = stack.pop()
+			if op.w <= 0 || op.h <= 0 {
+				spare.push(g)
+				return none
+			}
+			let clears = op.composite := Composite.SourceIn || Composite.SourceOut || Composite.DestinationIn || Composite.DestinationAtop || Composite.Copy || Composite.Clear
+			let (rx0, ry0, rx1, ry1) = (op.x, op.y, op.x + op.w, op.y + op.h)
+			if !clears {
+				let (found, bx0, by0, bx1, by1) = alphaBox(g, op.x, op.y, op.w, op.h)
+				if !found {
+					spare.push(g)
+					return none
+				}
+				rx0 = (bx0 - op.margin).max(op.x)
+				ry0 = (by0 - op.margin).max(op.y)
+				rx1 = (bx1 + op.margin).min(op.x + op.w)
+				ry1 = (by1 + op.margin).min(op.y + op.h)
+			}
+			let r = EffectRegion{x: rx0, y: ry0, w: rx1 - rx0, h: ry1 - ry0, pw: (rx1 - rx0 + 7) / 8 * 8}
+			let cov = coverageWithin(op, r.x, r.y, r.w, r.h)
+			try ensureTables(frame)
+			stack.push(g)
+			let used PlaneTex[]
+			let shape = try alphaOf(r, used, g)
+			let dist = shape
+			let haveDist = false
+			let below PlaneTex[]
+			let colors RGBA[]
+			let blends BlendMode[]
+			let showContent = true
+			for let (_, fx) in op.effects {
+				match fx.kind {
+					case GpuEffectKind.DropShadow:
+						let a = shape
+						if fx.grow != 0.0 {
+							if !haveDist {
+								dist = try signedDistance(r, used, shape)
+								haveDist = true
+							}
+							a = try grown(r, used, dist, fx.grow)
+						}
+						let sh = try shifted(r, used, a, fx.dx, fx.dy, 0.0)
+						sh = try blurPlane(r, used, sh, fx.radii)
+						if fx.knockout {
+							sh = try binary(r, used, EffectMode.MultiplyInverse, sh, shape)
+							showContent = false
+						}
+						below.push(sh)
+						colors.push(fx.color)
+						blends.push(BlendMode.Normal)
+					case GpuEffectKind.OuterGlow:
+						let a = try unary(r, used, EffectMode.Copy, shape)
+						if fx.grow != 0.0 {
+							if !haveDist {
+								dist = try signedDistance(r, used, shape)
+								haveDist = true
+							}
+							a = try grown(r, used, dist, fx.grow)
+						}
+						a = try blurPlane(r, used, a, fx.radii)
+						below.push(a)
+						colors.push(fx.color)
+						blends.push(fx.blend)
+					case GpuEffectKind.InnerShadow:
+						let outside = try unary(r, used, EffectMode.Inverted, shape)
+						if fx.grow != 0.0 {
+							if !haveDist {
+								dist = try signedDistance(r, used, shape)
+								haveDist = true
+							}
+							let g2 = try grown(r, used, dist, -fx.grow)
+							outside = try unary(r, used, EffectMode.Inverted, g2)
+						}
+						let sh = try shifted(r, used, outside, fx.dx, fx.dy, 1.0)
+						sh = try blurPlane(r, used, sh, fx.radii)
+						sh = try binary(r, used, EffectMode.Multiply, sh, shape)
+						try atop(r, sh, fx.color, BlendMode.Normal)
+					case GpuEffectKind.InnerGlow:
+						let glow = try unary(r, used, EffectMode.Inverted, shape)
+						glow = try blurPlane(r, used, glow, fx.radii)
+						glow = try binary(r, used, EffectMode.Multiply, glow, shape)
+						try atop(r, glow, fx.color, fx.blend)
+					case GpuEffectKind.Outline:
+						if !haveDist {
+							dist = try signedDistance(r, used, shape)
+							haveDist = true
+						}
+						let w = fx.grow
+						let (outer, inner) = (w, 0.0)
+						if fx.position == OutlinePosition.Inside {
+							(outer, inner) = (0.0, -w)
+						} else if fx.position == OutlinePosition.Center {
+							(outer, inner) = (w / 2.0, -w / 2.0)
+						}
+						let ga = try grown(r, used, dist, outer)
+						let gb = try grown(r, used, dist, inner)
+						let ring = try binary(r, used, EffectMode.Ring, ga, gb)
+						let paint = fx.paint
+						if !(paint is none) {
+							let solidAlpha = 255
+							if paint is GpuSolid {
+								solidAlpha = int(paint.a)
+							}
+							try drawOp(GpuDraw{x: r.x, y: r.y, w: r.w, h: r.h, paint: paint, alpha: solidAlpha, composite: Composite.SourceOver, blend: BlendMode.Normal}, frame, ring.texture, op.x, op.y, op.w, op.h)
+						}
+					case GpuEffectKind.Blur:
+						try colourBlur(r, used, g, fx.radii, none)
+						shape = try alphaOf(r, used, g)
+						haveDist = false
+					case GpuEffectKind.BackdropBlur:
+						let within = try unary(r, used, EffectMode.Covered, shape)
+						try colourBlur(r, used, stack[stack.len() - 2], fx.radii, within)
+					case GpuEffectKind.ColorMatrix:
+						try colorMatrix(r, fx.matrix)
+				}
+			}
+			stack.pop()
+			let p = try program(none)
+			for let (i, l) in below {
+				let c = colors[i]
+				let mode = blends[i]
+				try composite(p, r.x, r.y, r.w, r.h, def () {
+					gl.glUniform1i(p.at("uPaintKind"), 5)
+					gl.glUniform3ui(p.at("uSolid"), uint32(c.r), uint32(c.g), uint32(c.b))
+					gl.glUniform1ui(p.at("uSolidA"), uint32(c.a))
+					bindNoPixels(p)
+					bindPlane(p, l.texture)
+					bindCoverage(p, cov, r.w, r.h)
+					bindClip(p, byte[], 0, 0)
+					gl.glUniform1ui(p.at("uAlpha"), uint32(op.alpha))
+					gl.glUniform1i(p.at("uComposite"), int(Composite.SourceOver))
+					gl.glUniform1i(p.at("uBlend"), int(mode))
+					gl.glUniform1i(p.at("uPaired"), 0)
+					gl.glUniform1i(p.at("uOp"), 1)
+				})
+			}
+			if showContent {
+				try composite(p, r.x, r.y, r.w, r.h, def () {
+					bindPaintPixels(p, g.texture, 0, 0)
+					bindCoverage(p, cov, r.w, r.h)
+					bindClip(p, byte[], 0, 0)
+					gl.glUniform1ui(p.at("uAlpha"), uint32(op.alpha))
+					gl.glUniform1i(p.at("uComposite"), int(op.composite))
+					gl.glUniform1i(p.at("uBlend"), int(op.blend))
+					gl.glUniform1i(p.at("uPaired"), 0)
+					gl.glUniform1i(p.at("uOp"), 1)
+				})
+			}
+			for let (_, t) in used {
+				planePool.push(t)
+			}
+			spare.push(g)
+			return none
+		}
+
+		// alphaPlane of the group over the region.
+		internal def alphaOf(r EffectRegion, used PlaneTex[], g Target) !PlaneTex {
+			return try pass(r, used, EffectMode.Alpha, gl.GL_R32F, def (e CanvasProgram) {
+				bindImage(e, g.texture, r)
+			})
+		}
+
+		// The box of the group's non-transparent pixels within (x, y, w, h).
+		internal def alphaBox(g Target, x int, y int, w int, h int) (bool, int, int, int, int) {
+			let px byte[]
+			px.len(w * h * 4)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, g.fbo)
+			gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+			gl.glReadPixels(x, y, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, px)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, 0)
+			let (x0, y0, x1, y1) = (w, h, 0, 0)
+			for let j = 0; j < h; j++ {
+				let row = j * w * 4 + 3
+				let first = -1
+				let last = -1
+				for let i = 0; i < w; i++ {
+					if px[row + i * 4] != 0 {
+						first = i when first < 0
+						last = i
+					}
+				}
+				continue when first < 0
+				x0 = x0.min(first)
+				x1 = x1.max(last + 1)
+				y0 = y0.min(j)
+				y1 = j + 1
+			}
+			return (x0 < x1, x + x0, y + y0, x + x1, y + y1)
+		}
+
+		// The group's coverage bytes over the region, from its box's.
+		internal def coverageWithin(op GpuEndGroup, x int, y int, w int, h int) byte[] {
+			return byte[] when op.coverage.len() == 0
+			let out byte[]
+			out.len(w * h)
+			for let j = 0; j < h; j++ {
+				let from = (y - op.y + j) * op.w + (x - op.x)
+				for let i = 0; i < w; i++ {
+					out[j * w + i] = op.coverage[from + i]
+				}
+			}
+			return out
+		}
+
+		// A pass of the effects program into a new plane of the region.
+		internal def pass(r EffectRegion, used PlaneTex[], mode EffectMode, format uint32, setup def(CanvasProgram)) !PlaneTex {
+			let out = try planeOf(r.pw, r.h, format)
+			used.push(out)
+			let e = try effectsProgram()
+			gl.glUseProgram(e.id)
+			gl.glUniform1i(e.at("uMode"), int(mode))
+			gl.glUniform1i(e.at("uW"), r.w)
+			gl.glUniform1i(e.at("uH"), r.h)
+			gl.glUniform1i(e.at("uPW"), r.pw)
+			setup(e)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, out.fbo)
+			gl.glViewport(0, 0, r.pw, r.h)
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+			let err = gl.glGetError()
+			fail "a GPU canvas effect pass failed (GL error {err})" when err != 0
+			return out
+		}
+
+		internal def unary(r EffectRegion, used PlaneTex[], mode EffectMode, a PlaneTex) !PlaneTex {
+			return try pass(r, used, mode, a.format, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, a.texture)
+			})
+		}
+
+		internal def binary(r EffectRegion, used PlaneTex[], mode EffectMode, a PlaneTex, b PlaneTex) !PlaneTex {
+			return try pass(r, used, mode, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, a.texture)
+				bindUnit(e, "uB", 1, b.texture)
+			})
+		}
+
+		// shifted: the plane moved by (dx, dy), `outside` coming in.
+		internal def shifted(r EffectRegion, used PlaneTex[], a PlaneTex, dx float, dy float, outside float) !PlaneTex {
+			if dx == 0.0 && dy == 0.0 {
+				return try unary(r, used, EffectMode.Copy, a)
+			}
+			let (fx, fy) = (dx.floor(), dy.floor())
+			return try pass(r, used, EffectMode.Shifted, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, a.texture)
+				gl.glUniform4i(e.at("uI"), int(fx), int(fy), 0, 0)
+				gl.glUniform4f(e.at("uF"), float32(dx - fx), float32(dy - fy), float32(outside), float32(0))
+			})
+		}
+
+		// grown: clamp(0.5 + by - distance, 0, 1).
+		internal def grown(r EffectRegion, used PlaneTex[], dist PlaneTex, by float) !PlaneTex {
+			return try pass(r, used, EffectMode.Grown, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, dist.texture)
+				gl.glUniform4f(e.at("uF"), float32(0.5 + by), float32(0), float32(0), float32(0))
+			})
+		}
+
+		// blurPlane: three box passes down, then three across.
+		internal def blurPlane(r EffectRegion, used PlaneTex[], a PlaneTex, radii int[]) !PlaneTex {
+			let cur = a
+			for let dir = 0; dir < 2; dir++ {
+				for let (_, br) in radii {
+					continue when br <= 0
+					let src = cur
+					cur = try pass(r, used, EffectMode.Box, a.format, def (e CanvasProgram) {
+						bindUnit(e, "uA", 0, src.texture)
+						gl.glUniform4i(e.at("uI"), br, dir, 0, 0)
+						gl.glUniform4f(e.at("uF"), float32(1.0 / float(2 * br + 1)), float32(0), float32(0), float32(0))
+					})
+				}
+			}
+			return cur
+		}
+
+		// signedDistance from exact distance transforms to the inside and
+		// the outside.
+		internal def signedDistance(r EffectRegion, used PlaneTex[], shape PlaneTex) !PlaneTex {
+			let toInside = try distanceTo(r, used, shape, true)
+			let toOutside = try distanceTo(r, used, shape, false)
+			return try pass(r, used, EffectMode.Signed, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, shape.texture)
+				bindUnit(e, "uB", 1, toInside.texture)
+				bindUnit(e, "uC", 2, toOutside.texture)
+			})
+		}
+
+		internal def distanceTo(r EffectRegion, used PlaneTex[], shape PlaneTex, inside bool) !PlaneTex {
+			let d = try pass(r, used, EffectMode.DistanceInit, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, shape.texture)
+				gl.glUniform4i(e.at("uI"), inside ?? (1, 0), 0, 0, 0)
+			})
+			let edge = inside ?? (float32(1e20), float32(0))
+			let cols = try pass(r, used, EffectMode.DistanceColumns, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, d.texture)
+				gl.glUniform4f(e.at("uF"), edge, float32(0), float32(0), float32(0))
+			})
+			return try pass(r, used, EffectMode.DistanceRows, gl.GL_R32F, def (e CanvasProgram) {
+				bindUnit(e, "uA", 0, cols.texture)
+				gl.glUniform4f(e.at("uF"), edge, float32(0), float32(0), float32(0))
+			})
+		}
+
+		// blurWhere on the target's region: premultiplied linear light,
+		// blurred, written back (as far as `within` covers, when given).
+		internal def colourBlur(r EffectRegion, used PlaneTex[], t Target, radii int[], within ?PlaneTex) !none {
+			let lin = try pass(r, used, EffectMode.Linear, gl.GL_RGBA32F, def (e CanvasProgram) {
+				bindImage(e, t.texture, r)
+				bindUnit(e, "uLinear", 4, linearTable)
+			})
+			let blurred = try blurPlane(r, used, lin, radii)
+			// The region's pixels before, then the store over them.
+			gl.glActiveTexture(gl.GL_TEXTURE6)
+			dst.ensure(r.w, r.h)
+			gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, t.fbo)
+			gl.glCopyTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, r.x, r.y, r.w, r.h)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+			let e = try effectsProgram()
+			gl.glUseProgram(e.id)
+			gl.glUniform1i(e.at("uMode"), int(EffectMode.Store))
+			gl.glUniform1i(e.at("uOld"), 6)
+			bindUnit(e, "uA", 0, blurred.texture)
+			bindUnit(e, "uSrgb", 5, srgbTable)
+			gl.glUniform2i(e.at("uOrigin"), r.x, r.y)
+			if within is PlaneTex {
+				bindUnit(e, "uB", 1, within.texture)
+				gl.glUniform4i(e.at("uI"), 1, 0, 0, 0)
+			} else {
+				gl.glUniform4i(e.at("uI"), 0, 0, 0, 0)
+			}
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, t.fbo)
+			gl.glViewport(0, 0, width, height)
+			gl.glEnable(gl.GL_SCISSOR_TEST)
+			gl.glScissor(r.x, r.y, r.w, r.h)
+			gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+			gl.glDisable(gl.GL_SCISSOR_TEST)
+			let err = gl.glGetError()
+			fail "a GPU canvas blur failed (GL error {err})" when err != 0
+		}
+
+		// paintAtop over the current target's region.
+		internal def atop(r EffectRegion, plane PlaneTex, c RGBA, mode BlendMode) !none {
+			let p = try program(none)
+			try composite(p, r.x, r.y, r.w, r.h, def () {
+				gl.glUniform1i(p.at("uPaintKind"), 0)
+				gl.glUniform3ui(p.at("uSolid"), uint32(c.r), uint32(c.g), uint32(c.b))
+				gl.glUniform1ui(p.at("uSolidA"), uint32(c.a))
+				bindNoPixels(p)
+				bindPlane(p, plane.texture)
+				gl.glUniform1i(p.at("uBlend"), int(mode))
+				gl.glUniform1i(p.at("uOp"), 4)
+			})
+		}
+
+		// applyMatrix over the current target's region.
+		internal def colorMatrix(r EffectRegion, m float[]) !none {
+			let p = try program(none)
+			try composite(p, r.x, r.y, r.w, r.h, def () {
+				bindNoPixels(p)
+				for let j = 0; j < 5; j++ {
+					gl.glUniform4f(p.at("uMatrix[{j}]"), float32(m[j]), float32(m[5 + j]), float32(m[10 + j]), float32(m[15 + j]))
+				}
+				gl.glUniform1i(p.at("uOp"), 5)
+			})
+		}
+
+		internal def bindPlane(p CanvasProgram, texture uint32) {
+			gl.glActiveTexture(gl.GL_TEXTURE7)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+			gl.glUniform1i(p.at("uPlane"), 7)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		internal def bindUnit(e CanvasProgram, name string, unit int, texture uint32) {
+			gl.glActiveTexture(gl.GL_TEXTURE0 + uint32(unit))
+			gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+			gl.glUniform1i(e.at(name), unit)
+			gl.glActiveTexture(gl.GL_TEXTURE0)
+		}
+
+		internal def bindImage(e CanvasProgram, texture uint32, r EffectRegion) {
+			bindUnit(e, "uImage", 3, texture)
+			gl.glUniform2i(e.at("uOrigin"), r.x, r.y)
+		}
+
+		// A float plane of w x h, from the pool when one fits.
+		internal def planeOf(w int, h int, format uint32) !PlaneTex {
+			for let (i, t) in planePool {
+				if t.w == w && t.h == h && t.format == format {
+					let last = planePool.len() - 1
+					planePool[i] = planePool[last]
+					planePool.len(last)
+					return t
+				}
+			}
+			let ids uint32[]
+			ids.len(1)
+			gl.glGenTextures(1, ids)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, ids[0])
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+			let pixel = format == gl.GL_R32F ?? (gl.GL_RED, gl.GL_RGBA)
+			gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(format), w, h, 0, pixel, gl.GL_FLOAT, byte[])
+			let fbos uint32[]
+			fbos.len(1)
+			gl.glGenFramebuffers(1, fbos)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbos[0])
+			gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, ids[0], 0)
+			let status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+			gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+			fail "the GPU canvas could not make a {w}x{h} float plane (status {status})" when status != gl.GL_FRAMEBUFFER_COMPLETE
+			return PlaneTex{texture: ids[0], fbo: fbos[0], w: w, h: h, format: format}
+		}
+
+		// The colour tables colour blurs read and write through.
+		internal def ensureTables(frame GpuFrame) !none {
+			return none when linearTable != 0
+			let ids uint32[]
+			ids.len(2)
+			gl.glGenTextures(2, ids)
+			gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+			gl.glPixelStorei(gl.GL_UNPACK_ROW_LENGTH, 0)
+			gl.glBindTexture(gl.GL_TEXTURE_2D, ids[0])
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+			gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(gl.GL_R32F), 256, 1, 0, gl.GL_RED, gl.GL_FLOAT, float32Bytes(frame.srgbToLinear()))
+			gl.glBindTexture(gl.GL_TEXTURE_2D, ids[1])
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, int(gl.GL_NEAREST))
+			gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, int(gl.GL_NEAREST))
+			gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, int(gl.GL_R8), 4096, 1, 0, gl.GL_RED, gl.GL_UNSIGNED_BYTE, frame.linearToSrgb())
+			linearTable = ids[0]
+			srgbTable = ids[1]
+			return none
+		}
+
+		// The effects program, built on first use.
+		internal def effectsProgram() !CanvasProgram {
+			if programs.hasKey("#effects") {
+				return programs["#effects"]
+			}
+			let header = "#version 400 core\n"
+			let id = try buildProgram(header + string(canvasVertexSource), header + string(effectsFragmentSource), "the GPU canvas effects")
+			let p = new CanvasProgram(id)
+			programs = programs.set("#effects", p)
+			return p
+		}
+
+		// The canvas program, with the fragment's paint compiled in when
+		// given; built on first use.
+		internal def program(frag ?GpuFragment) !CanvasProgram {
+			let key = ""
+			let fragSource = ""
+			if !(frag is none) {
+				key = frag.shader.name
+				fragSource = "#define ADM_FRAGMENT\n" + frag.shader.glsl + "\n#define ADM_ENTRY " + frag.shader.entry + "\n"
+			}
+			if programs.hasKey(key) {
+				return programs[key]
+			}
+			let header = "#version 400 core\n"
+			let id = try buildProgram(header + string(canvasVertexSource), header + fragSource + string(canvasFragmentSource), key == "" ?? ("the GPU canvas", "the @fragment function {key}"))
+			let p = new CanvasProgram(id)
+			programs = programs.set(key, p)
+			return p
+		}
+	}
+
+	// Whether the canvas blends the mode channel by channel.
+	internal def perChannelMode(mode BlendMode) bool {
+		return !(mode := BlendMode.Normal || BlendMode.DarkerColor || BlendMode.LighterColor || BlendMode.Hue || BlendMode.Saturation || BlendMode.Color || BlendMode.Luminosity)
+	}
+
+	// Compiles and links a vertex and fragment shader pair; `what` names it
+	// in the error.
+	internal def buildProgram(vsrc string, fsrc string, what string) !uint32 {
+		let vs = try compileShader(gl.GL_VERTEX_SHADER, vsrc, what)
+		let fs = try compileShader(gl.GL_FRAGMENT_SHADER, fsrc, what)
+		let prog = gl.glCreateProgram()
+		gl.glAttachShader(prog, vs)
+		gl.glAttachShader(prog, fs)
+		gl.glLinkProgram(prog)
+		gl.glDeleteShader(vs)
+		gl.glDeleteShader(fs)
+		let ok int32[]
+		ok.len(1)
+		gl.glGetProgramiv(prog, gl.GL_LINK_STATUS, ok)
+		if ok[0] == 0 {
+			let log = programLog(prog)
+			gl.glDeleteProgram(prog)
+			fail "{what}: shaders did not link: {log}"
+		}
+		return prog
+	}
+
+	internal def compileShader(kind uint32, src string, what string) !uint32 {
+		let s = gl.glCreateShader(kind)
+		gl.glShaderSource(s, 1, string[src], int[src.len()])
+		gl.glCompileShader(s)
+		let ok int32[]
+		ok.len(1)
+		gl.glGetShaderiv(s, gl.GL_COMPILE_STATUS, ok)
+		if ok[0] == 0 {
+			let n int32[]
+			n.len(1)
+			gl.glGetShaderiv(s, gl.GL_INFO_LOG_LENGTH, n)
+			let log byte[]
+			log.len(int(n[0]).max(1))
+			let got int32[]
+			got.len(1)
+			gl.glGetShaderInfoLog(s, log.len(), got, log)
+			gl.glDeleteShader(s)
+			let stage = kind == gl.GL_VERTEX_SHADER ?? ("vertex", "fragment")
+			fail "{what}: the {stage} shader did not compile: {string(log[0:int(got[0])])}"
+		}
+		return s
+	}
+
+	internal def programLog(prog uint32) string {
+		let n int32[]
+		n.len(1)
+		gl.glGetProgramiv(prog, gl.GL_INFO_LOG_LENGTH, n)
+		let log byte[]
+		log.len(int(n[0]).max(1))
+		let got int32[]
+		got.len(1)
+		gl.glGetProgramInfoLog(prog, log.len(), got, log)
+		return string(log[0:int(got[0])])
+	}
+
+	// The values as little-endian bytes, for an upload.
+	internal def uint16Bytes(v uint16[]) byte[] {
+		let out byte[]
+		out.len(v.len() * 2)
+		for let (i, x) in v {
+			out[i * 2] = byte(x & 255)
+			out[i * 2 + 1] = byte(x >> 8)
+		}
+		return out
+	}
+
+	// The values as little-endian bytes, for an upload.
+	internal def int32Bytes(v int32[]) byte[] {
+		let out byte[]
+		out.len(v.len() * 4)
+		for let (i, x) in v {
+			let u = uint32(x)
+			out[i * 4] = byte(u & 255)
+			out[i * 4 + 1] = byte((u >> 8) & 255)
+			out[i * 4 + 2] = byte((u >> 16) & 255)
+			out[i * 4 + 3] = byte(u >> 24)
+		}
+		return out
+	}
+
+	// The values as little-endian bytes, for an upload.
+	internal def float32Bytes(v float32[]) byte[] {
+		let out byte[]
+		out.len(v.len() * 4)
+		for let (i, x) in v {
+			let u = __bitcast_u32_from_f32(x)
+			out[i * 4] = byte(u & 255)
+			out[i * 4 + 1] = byte((u >> 8) & 255)
+			out[i * 4 + 2] = byte((u >> 16) & 255)
+			out[i * 4 + 3] = byte(u >> 24)
+		}
+		return out
+	}
+}

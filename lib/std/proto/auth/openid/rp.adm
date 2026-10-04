@@ -1,0 +1,384 @@
+partial module std.proto.auth.openid {
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Context, Method, newRequest)
+		std.net.url
+		std.crypto::(rand)
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid.engine::*
+	)
+
+	// connect discovers a provider and makes a relying party for a client
+	// registered there; secret for a confidential client. Fails as
+	// discover does.
+	def connect(issuer string, clientId string, secret ?Secret<string> = none, client ?http.Client = none) !RelyingParty {
+		let provider = try discover(issuer, client)
+		let rp = new RelyingParty(clientId, provider)
+		rp.client.secret = secret
+		rp.client.httpClient = client
+		let uri = provider.oauth.jwksUri
+		rp.keys = new jose.RemoteKeySet(uri, client) unless (uri is none)
+		return rp
+	}
+
+	// RelyingParty is an OpenID Connect client of one provider. It holds the
+	// OAuth client (`client`, for secrets, keys and DPoP) and checks every
+	// ID token it receives as Core §3.1.3.7 says.
+	type RelyingParty {
+		client               oauth2.Client
+		provider             ProviderMetadata
+		// The provider's signing keys; from its jwks_uri by connect.
+		keys                 ?jose.RemoteKeySet
+		// The algorithms an ID token may be signed with. HS* checks with
+		// the client secret.
+		idTokenAlgorithms    jose.SignatureAlgorithm[] = [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA, jose.SignatureAlgorithm.Ed25519]
+		// The client's own keys, to decrypt encrypted ID tokens and UserInfo.
+		decryptionKeys       jose.JwkSet
+		keyAlgorithms        jose.KeyAlgorithm[]       = []
+		encryptions          jose.ContentEncryption[]  = []
+		leeway               duration                  = 60s
+		// The implicit and hybrid flows (Core §3.2, §3.3), off by default
+		// (RFC 9700 §2.1.2).
+		allowImplicit        bool                      = false
+		internal seenLogouts map<string, time.Time>
+
+		def new(clientId string, provider ProviderMetadata) {
+			self.provider = provider
+			client = new oauth2.Client(clientId, provider.oauth)
+			decryptionKeys = new jose.JwkSet()
+		}
+
+		// authorize starts a sign-in: the `openid` scope is added, and a
+		// nonce unless options give one. `max_age`, `prompt`, `login_hint`,
+		// `acr_values`, `claims` go through options.extra. A response type
+		// other than "code" needs allowImplicit. Fails as
+		// oauth2.Client.authorize does, and with UnsupportedResponseType for
+		// a disallowed flow.
+		def authorize(redirectUri string, scopes string[] = [], options ?oauth2.AuthorizationOptions = none) !oauth2.AuthorizationRequest {
+			let opts = options is none ?? (oauth2.AuthorizationOptions{}, options)
+			fail openidError(oauth2.OAuthErrorKind.UnsupportedResponseType, "the implicit and hybrid flows are off") when opts.responseType != "code" && !allowImplicit
+			let all = ["openid"]
+			for let s in scopes {
+				all.push(s) unless s == "openid"
+			}
+			let nonce = opts.nonce
+			opts.nonce = nonce is none ?? (try newNonce(), nonce)
+			return try client.authorize(redirectUri, all, opts)
+		}
+
+		// exchange finishes a sign-in from the callback: the front-channel
+		// ID token of the implicit and hybrid flows is checked (with c_hash
+		// and at_hash), the code is redeemed, and the token response's ID
+		// token is checked against the request's nonce and max_age. Fails
+		// with the error in the callback, StateMismatch, IssuerMismatch,
+		// InvalidToken for an ID token that does not check out, and as the
+		// token request does.
+		def exchange(request oauth2.AuthorizationRequest, callback string) !Login {
+			let params = try callbackParams(callback)
+			let types = request.responseType.split(" ")
+			let maxAge = maxAgeOf(request)
+			let front ?IdClaims = none
+			let frontToken = params.get("id_token")
+			if "id_token" in types {
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the callback has no id_token") when frontToken is none
+				let state = params.get("state")
+				fail openidError(oauth2.OAuthErrorKind.StateMismatch, "the callback's state does not match") unless !(state is none) && state == request.state
+				let code = params.get("code")
+				let access = params.get("access_token")
+				front = try validateIdToken(frontToken, request.nonce, access, code, maxAge, true)
+			}
+			if !("code" in types) {
+				// Implicit: the tokens came in the fragment.
+				let state = params.get("state")
+				fail openidError(oauth2.OAuthErrorKind.StateMismatch, "the callback's state does not match") unless !(state is none) && state == request.state
+				let access = params.get("access_token")
+				let token = new oauth2.Token(access is none ?? ("", access))
+				let tokenType = params.get("token_type")
+				token.tokenType = tokenType is none ?? ("Bearer", tokenType)
+				let expiresIn = params.get("expires_in")
+				token.expiresAt = time.now() + 1s * float(parseInt<int>(expiresIn)) unless expiresIn is none
+				token.idToken = frontToken
+				let claims = front
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the callback has no id_token") when claims is none
+				return new Login(token, frontToken is none ?? ("", frontToken), claims)
+			}
+			let token = try client.exchange(request, callback)
+			let idToken = token.idToken
+			fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the token response has no id_token") when idToken is none
+			let claims = try validateIdToken(idToken, request.nonce, token.accessToken.reveal(), none, maxAge, false)
+			let earlier = front
+			if !(earlier is none) {
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the two ID tokens name different subjects") unless earlier.subject == claims.subject
+			}
+			return new Login(token, idToken, claims)
+		}
+
+		// validateIdToken checks an ID token (Core §3.1.3.7, §3.2.2.11,
+		// §3.3.2.12): decrypted when encrypted, signed with an allowed
+		// algorithm by the provider's keys (HS* by the client secret),
+		// issued by the provider for this client (`azp` when there are other
+		// audiences), not expired, the nonce sent, `auth_time` within
+		// max_age, and at_hash/c_hash matching the access token and code.
+		// `front` marks a front-channel token, where at_hash/c_hash are
+		// required. Fails with InvalidToken.
+		def validateIdToken(idToken string, nonce ?string, accessToken ?string = none, code ?string = none, maxAge ?duration = none, front bool = false) !IdClaims {
+			let bad = (text string) => openidError(oauth2.OAuthErrorKind.InvalidToken, "ID token " + text)
+			let signed = idToken
+			if idToken.split(".").len() == 5 {
+				let jwe = jose.parseJwe(idToken) onerror fail bad("is not a JWE")
+				signed = string(jwe.decrypt(decryptionKeys, keyAlgorithms, encryptions) onerror fail bad("cannot be decrypted"))
+			}
+			let jws = jose.parseJws(signed) onerror fail bad("is not a JWS")
+			fail bad("must have one signature") unless jws.signatures.len() == 1
+			let header = jws.signatures[0].protected
+			let algName = header.alg
+			let alg = algName is none ?? ("", algName)
+			let verifyKeys = try keysFor(alg, header.kid)
+			let payload = jws.verify(verifyKeys, idTokenAlgorithms) onerror (err error) {
+				fail bad("does not verify: {err.message}")
+			}
+			let claims = claimsFromJson(string(payload)) onerror fail bad("has malformed claims")
+			let iss = claims.issuer
+			fail bad("is from another issuer") unless !(iss is none) && iss == provider.oauth.issuer
+			fail bad("is for another client") unless client.id in claims.audience
+			let azp = claims.azp
+			if claims.audience.len() > 1 || !(azp is none) {
+				fail bad("names another authorized party") unless !(azp is none) && azp == client.id
+			}
+			let now = time.now()
+			let exp = claims.expires
+			fail bad("has no exp") when exp is none
+			fail bad("expired") unless now.before(exp + leeway)
+			let iat = claims.issuedAt
+			fail bad("has no iat") when iat is none
+			fail bad("is issued in the future") when (now + leeway).before(iat)
+			if !(nonce is none) {
+				let got = claims.nonce
+				fail bad("has another nonce") unless !(got is none) && got == nonce
+			}
+			if !(maxAge is none) {
+				let at = claims.authTime
+				fail bad("has no auth_time though max_age was asked") when at is none
+				fail bad("authentication is older than max_age") unless now.before(at + maxAge + leeway)
+			}
+			let curve = verifyKeys.keys.len() > 0 ?? (verifyKeys.keys[0].curve, none)
+			let atHash = claims.get("at_hash")
+			if !(accessToken is none) && accessToken != "" {
+				if atHash is none {
+					fail bad("has no at_hash") when front
+				} else {
+					fail bad("at_hash does not match the access token") unless "{atHash}" == tokenHash(accessToken, alg, curve)
+				}
+			}
+			let cHash = claims.get("c_hash")
+			if !(code is none) {
+				if cHash is none {
+					fail bad("has no c_hash") when front
+				} else {
+					fail bad("c_hash does not match the code") unless "{cHash}" == tokenHash(code, alg, curve)
+				}
+			}
+			return claims
+		}
+
+		// refresh refreshes the tokens; a new ID token is checked like the
+		// first and must name the same subject (Core §12.2). Fails as
+		// oauth2.Client.refresh does, and with InvalidToken.
+		def refresh(login Login) !Login {
+			let token = try client.refresh(login.token)
+			let idToken = token.idToken
+			return new Login(token, login.idToken, login.claims) when idToken is none
+			let claims = try validateIdToken(idToken, none, token.accessToken.reveal())
+			fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the refreshed ID token names another subject") unless claims.subject == login.claims.subject
+			return new Login(token, idToken, claims)
+		}
+
+		// userInfo fetches the user's claims (Core §5.3): JSON, or a signed
+		// or encrypted JWT. The subject must be the ID token's. Fails with
+		// Malformed when the provider has no UserInfo endpoint, InvalidToken
+		// when the response does not check out, and with the provider's
+		// error.
+		def userInfo(login Login) !IdClaims {
+			let endpoint = provider.userinfoEndpoint
+			fail openidError(oauth2.OAuthErrorKind.Malformed, "the provider has no UserInfo endpoint") when endpoint is none
+			let req = try newRequest(Method.GET, endpoint)
+			let res = try client.send(req, login.token)
+			let text = try res.text()
+			fail openidError(oauth2.OAuthErrorKind.InvalidToken, "UserInfo answered {res.status}") unless res.status == 200
+			let contentType = res.header("Content-Type").lower()
+			let claims = new IdClaims()
+			if contentType.startsWith("application/jwt") {
+				let jwt = text.trim()
+				let signed = jwt
+				if jwt.split(".").len() == 5 {
+					let jwe = try jose.parseJwe(jwt)
+					signed = string(try jwe.decrypt(decryptionKeys, keyAlgorithms, encryptions))
+				}
+				let jws = try jose.parseJws(signed)
+				let header = jws.signatures[0].protected
+				let algName = header.alg
+				let payload = try jws.verify(try keysFor(algName is none ?? ("", algName), header.kid), idTokenAlgorithms)
+				claims = try claimsFromJson(string(payload))
+				let iss = claims.issuer
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "UserInfo JWT is from another issuer") unless iss is none || iss == provider.oauth.issuer
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "UserInfo JWT is for another client") unless claims.audience.len() == 0 || client.id in claims.audience
+			} else {
+				claims = try claimsFromJson(text)
+			}
+			fail openidError(oauth2.OAuthErrorKind.InvalidToken, "UserInfo names another subject") unless claims.subject == login.claims.subject
+			return claims
+		}
+
+		// logoutURL is where to send the browser to sign out at the provider
+		// (RP-Initiated Logout §2). Fails with Malformed when the provider
+		// has no end_session_endpoint.
+		def logoutURL(idTokenHint ?string = none, postLogoutRedirectUri ?string = none, state ?string = none) !string {
+			let endpoint = provider.endSessionEndpoint
+			fail openidError(oauth2.OAuthErrorKind.Malformed, "the provider has no end_session_endpoint") when endpoint is none
+			let params = new url.Values()
+			params.set("id_token_hint", idTokenHint) unless idTokenHint is none
+			params.set("client_id", client.id)
+			params.set("post_logout_redirect_uri", postLogoutRedirectUri) unless postLogoutRedirectUri is none
+			params.set("state", state) unless state is none
+			return endpoint + (endpoint.contains("?") ?? ("&", "?")) + params.encode()
+		}
+
+		// backChannelLogout reads and checks a logout token POSTed to the
+		// RP's backchannel_logout_uri (Back-Channel Logout §2.6): signed by
+		// the provider, for this client, recent, carrying the logout event,
+		// `sub` or `sid`, no nonce, a `jti` not seen before. The app ends
+		// the session and answers 200. Fails with InvalidRequest.
+		def backChannelLogout(ctx Context) !LogoutEvent {
+			let form = url.parseQuery(try ctx.text()) onerror fail logoutError("the body is not a form")
+			let tokenText = form.get("logout_token")
+			fail logoutError("missing logout_token") when tokenText is none
+			let jws = jose.parseJws(tokenText) onerror fail logoutError("logout_token is not a JWS")
+			let header = jws.signatures[0].protected
+			let typ = header.typ
+			fail logoutError("logout_token has the wrong typ") unless typ is none || typ.lower() == "logout+jwt"
+			let algName = header.alg
+			let payload = jws.verify(try keysFor(algName is none ?? ("", algName), header.kid), idTokenAlgorithms) onerror fail logoutError("logout_token does not verify")
+			let claims = claimsFromJsonLoose(string(payload))
+			let iss = claims.get("iss")
+			fail logoutError("logout_token is from another issuer") unless !(iss is none) && "{iss}" == provider.oauth.issuer
+			let aud = claims.get("aud")
+			let audiences = audienceList(aud)
+			fail logoutError("logout_token is for another client") unless client.id in audiences
+			let iat = claims.get("iat")
+			fail logoutError("logout_token has no iat") when iat is none
+			fail logoutError("logout_token carries a nonce") unless claims.get("nonce") is none
+			let events = claims.get("events")
+			let hasEvent = false
+			match events {
+				case map<string, any>:
+					hasEvent = events.hasKey(backChannelLogoutEvent)
+				default:
+			}
+			fail logoutError("logout_token lacks the logout event") unless hasEvent
+			let sub = claims.get("sub")
+			let sid = claims.get("sid")
+			fail logoutError("logout_token names neither sub nor sid") when sub is none && sid is none
+			let jti = claims.get("jti")
+			fail logoutError("logout_token has no jti") when jti is none
+			fail logoutError("logout_token was used before") unless firstLogout("{jti}")
+			return LogoutEvent{subject: sub is none ?? (none, "{sub}"), sessionId: sid is none ?? (none, "{sid}")}
+		}
+
+		// frontChannelLogout reads a front-channel logout request (Front-
+		// Channel Logout §2): `iss` must be the provider's when present. The
+		// app ends the session and answers with a page that may be framed.
+		// Fails with InvalidRequest for another issuer.
+		def frontChannelLogout(ctx Context) !LogoutEvent {
+			let iss = ctx.query("iss")
+			fail logoutError("the request is from another issuer") unless iss is none || iss == provider.oauth.issuer
+			return LogoutEvent{subject: none, sessionId: ctx.query("sid")}
+		}
+
+		// register registers the client at the provider (Dynamic
+		// Registration): OpenID members go through ClientMetadata.set
+		// (`application_type`, `post_logout_redirect_uris`,
+		// `backchannel_logout_uri`, `id_token_signed_response_alg`, ...).
+		// Fails as oauth2.Client.register does.
+		def register(metadata oauth2.ClientMetadata, initialAccessToken ?Secret<string> = none) !oauth2.ClientRegistration {
+			return try client.register(metadata, initialAccessToken)
+		}
+
+		// keysFor picks what verifies an ID token: the client secret for
+		// HS*, else the provider's keys (fetched again for an unknown kid).
+		internal def keysFor(alg string, kid ?string) !jose.JwkSet {
+			if alg.startsWith("HS") {
+				let secret = client.secret
+				fail openidError(oauth2.OAuthErrorKind.InvalidToken, "an HMAC-signed ID token needs the client secret") when secret is none
+				return new jose.JwkSet([new jose.Jwk(secret.reveal().bytes())])
+			}
+			let remote = keys
+			fail openidError(oauth2.OAuthErrorKind.InvalidToken, "the provider's keys are unknown") when remote is none
+			return try remote.keysFor(kid is none ?? ([], [kid]))
+		}
+
+		internal atomic def firstLogout(jti string) bool {
+			let now = time.now()
+			let seen = seenLogouts.get(jti)
+			return false when !(seen is none) && now.before(seen)
+			seenLogouts.set(jti, now + 10m)
+			return true
+		}
+	}
+
+	internal def logoutError(text string) error {
+		return oauth2.OAuthError{message: "openid: " + text, code: oauth2.OAuthErrorKind.InvalidRequest.value, kind: oauth2.OAuthErrorKind.InvalidRequest, description: text, status: 400}
+	}
+
+	internal def newNonce() !string {
+		return b64url(try rand(24))
+	}
+
+	// maxAgeOf is the max_age a request asked for.
+	internal def maxAgeOf(request oauth2.AuthorizationRequest) ?duration {
+		let at = request.url.indexOf("max_age=")
+		return none when at < 0
+		let rest = request.url[at + "max_age=".len():]
+		let end = rest.indexOf("&")
+		let digits = end < 0 ?? (rest, rest[0:end])
+		return none unless /^[0-9]+$/.test(digits)
+		return 1s * float(parseInt<int>(digits))
+	}
+
+	// callbackParams reads an authorization response from its query or
+	// fragment.
+	internal def callbackParams(callback string) !url.Values {
+		let text = callback
+		let hash = text.indexOf("#")
+		if hash >= 0 {
+			text = text[hash + 1:]
+		} else if text.contains("?") {
+			text = text[text.indexOf("?") + 1:]
+		}
+		return url.parseQuery(text) onerror fail openidError(oauth2.OAuthErrorKind.Malformed, "the callback does not parse")
+	}
+
+	internal def audienceList(aud ?any) string[] {
+		match aud {
+			case string:
+				return [aud]
+			case string[]:
+				return aud
+			case any[]:
+				let out string[] = []
+				for let a in aud {
+					out.push("{a}")
+				}
+				return out
+			default:
+				return []
+		}
+	}
+
+	// claimsFromJsonLoose reads a JSON object of claims without requiring
+	// `sub`, for logout tokens.
+	internal def claimsFromJsonLoose(text string) map<string, any> {
+		return parseObject(text, "claims") onerror recover new map<string, any>()
+	}
+}

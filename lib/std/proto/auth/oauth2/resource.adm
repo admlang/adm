@@ -1,0 +1,246 @@
+partial module std.proto.auth.oauth2 {
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Context, Handler, Middleware, MiddlewareFunc)
+		std.proto.auth.jose
+		std.proto.auth.oauth2.engine::*
+	)
+
+	// AccessToken is an access token a resource server accepted.
+	type AccessToken {
+		value           Secret<string>   = ""
+		subject         ?string
+		clientId        ?string
+		scopes          string[]         = []
+		audience        string[]         = []
+		issuer          ?string
+		expires         ?time.Time
+		// The DPoP key thumbprint or certificate thumbprint the token is
+		// bound to.
+		jkt             ?string
+		certThumbprint  ?string
+		internal claims map<string, any>
+
+		def new() {}
+
+		// has reports whether the token carries a scope.
+		def has(scope string) bool {
+			return scope in scopes
+		}
+
+		// get returns a claim or introspection member; none when absent.
+		def get(name string) ?any {
+			return claims.get(name)
+		}
+	}
+
+	// ResourceServer accepts access tokens issued by one authorization
+	// server: JWT access tokens (RFC 9068) checked with the server's keys,
+	// opaque ones through introspection (RFC 7662), with DPoP (RFC 9449)
+	// and certificate (RFC 8705) binding enforced.
+	//
+	// ```
+	// let rs = new oauth2.ResourceServer(meta, "https://api.example")
+	// try mux.use(rs.middleware(["read"]))
+	// ```
+	type ResourceServer {
+		issuer          string
+		// The audience tokens must name; none accepts any.
+		audience        ?string
+		// The authorization server's keys, from its jwks_uri.
+		keys            ?jose.RemoteKeySet
+		// A client of the authorization server allowed to introspect; none
+		// accepts JWT access tokens only.
+		introspection   ?Client
+		algorithms      jose.SignatureAlgorithm[]   = [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA, jose.SignatureAlgorithm.Ed25519]
+		// Refuse tokens that are not DPoP-bound.
+		requireDpop     bool                        = false
+		leeway          duration                    = 60s
+		// Shown in WWW-Authenticate challenges.
+		realm           string                      = ""
+		// Looks a token up directly (an authorization server checking its
+		// own tokens); none, or a none answer, goes on to JWT checking and
+		// introspection.
+		lookup          ?def (string) !?AccessToken
+		internal replay ReplayCache
+
+		def new(metadata ServerMetadata, audience ?string = none, introspection ?Client = none) {
+			issuer = metadata.issuer
+			self.audience = audience
+			self.introspection = introspection
+			let uri = metadata.jwksUri
+			keys = uri is none ?? (none, new jose.RemoteKeySet(uri))
+			replay = new ReplayCache()
+		}
+
+		// authenticate checks the request's access token (RFC 6750 §2.1, or
+		// the DPoP scheme) and returns it when it is valid, bound as it
+		// claims, and carries every scope asked for. Fails with
+		// InvalidRequest or InvalidToken (401), InsufficientScope (403), or
+		// InvalidDpopProof / UseDpopNonce (401).
+		def authenticate(ctx Context, scopes string[] = []) !AccessToken {
+			let header = ctx.header("Authorization")
+			let space = header.indexOf(" ")
+			fail challengeError(OAuthErrorKind.InvalidToken, "no access token", 401, false) when space < 0
+			let scheme = header[0:space].lower()
+			let value = header[space + 1:].trim()
+			fail challengeError(OAuthErrorKind.InvalidRequest, "unsupported authorization scheme", 401, false) unless scheme := "bearer" || "dpop"
+			fail challengeError(OAuthErrorKind.InvalidRequest, "empty access token", 401, false) when value == ""
+			let token = try validate(value)
+			let bound = token.jkt
+			if scheme == "dpop" || !(bound is none) {
+				fail challengeError(OAuthErrorKind.InvalidToken, "the token is DPoP-bound; use the DPoP scheme", 401, true) unless scheme == "dpop"
+				fail challengeError(OAuthErrorKind.InvalidToken, "the token is not DPoP-bound", 401, true) when bound is none
+				let proof = ctx.header("DPoP")
+				fail challengeError(OAuthErrorKind.InvalidDpopProof, "missing DPoP proof", 401, true) when proof == ""
+				let target = ctx.request.url.str()
+				let jkt = try verifyDpop(proof, ctx.method().value, absoluteTarget(ctx, target), value, none, replay)
+				fail challengeError(OAuthErrorKind.InvalidToken, "the DPoP key does not match the token", 401, true) unless jkt == bound
+			} else if requireDpop {
+				fail challengeError(OAuthErrorKind.InvalidToken, "a DPoP-bound token is required", 401, true)
+			}
+			let cert = token.certThumbprint
+			if !(cert is none) {
+				let presented = certThumbprint(ctx)
+				fail challengeError(OAuthErrorKind.InvalidToken, "the token is bound to another certificate", 401, false) unless !(presented is none) && presented == cert
+			}
+			for let s in scopes {
+				fail challengeError(OAuthErrorKind.InsufficientScope, "scope {s} is required", 403, scheme == "dpop") unless token.has(s)
+			}
+			return token
+		}
+
+		// middleware authenticates every request, puts the token in the
+		// context's values under "oauth2.token" (subject in `user`), and
+		// answers 401/403 with a WWW-Authenticate challenge otherwise.
+		def middleware(scopes string[] = []) Middleware {
+			let rs = self
+			return new MiddlewareFunc(def (ctx Context, next Handler) !none {
+				let failure ?error = none
+				let token = rs.authenticate(ctx, scopes) onerror (err error) {
+					failure = err
+					recover new AccessToken()
+				}
+				return try writeChallenge(ctx, failure, rs.realm) unless (failure is none)
+				ctx.set("oauth2.token", token)
+				ctx.authenticated = true
+				let sub = token.subject
+				ctx.user = sub unless sub is none
+				return try next.serve(ctx)
+			})
+		}
+
+		// validate checks a token value: a JWT access token with the keys
+		// when it is one, else through introspection.
+		internal def validate(value string) !AccessToken {
+			let direct = lookup
+			if !(direct is none) {
+				let found = try direct(value)
+				return found unless found is none
+			}
+			let jwtKeys = keys
+			if value.split(".").len() == 3 && !(jwtKeys is none) {
+				let ok = true
+				let claims = jose.verifyJwt(value, jwtKeys, jose.Validation{algorithms: algorithms, issuer: issuer, audience: audience, typ: "at+jwt", leeway: leeway}) onerror (err error) {
+					ok = false
+					recover new jose.Claims()
+				}
+				return try tokenFromClaims(value, claims) when ok
+				fail challengeError(OAuthErrorKind.InvalidToken, "the token is invalid or expired", 401, false) when introspection is none
+			}
+			let client = introspection
+			fail challengeError(OAuthErrorKind.InvalidToken, "the token is invalid", 401, false) when client is none
+			let r = client.introspect(value, "access_token") onerror fail challengeError(OAuthErrorKind.InvalidToken, "the token cannot be checked", 401, false)
+			fail challengeError(OAuthErrorKind.InvalidToken, "the token is invalid or expired", 401, false) unless r.active
+			let exp = r.expires
+			fail challengeError(OAuthErrorKind.InvalidToken, "the token expired", 401, false) when !(exp is none) && !time.now().before(exp + leeway)
+			let want = audience
+			fail challengeError(OAuthErrorKind.InvalidToken, "the token is for another audience", 401, false) when !(want is none) && r.audience.len() > 0 && !(want in r.audience)
+			let t = new AccessToken()
+			t.value = value
+			t.subject = r.subject
+			t.clientId = r.clientId
+			t.scopes = r.scope
+			t.audience = r.audience
+			t.issuer = r.issuer
+			t.expires = r.expires
+			let cnf = r.get("cnf")
+			match cnf {
+				case map<string, any>:
+					let jkt = cnf.get("jkt")
+					t.jkt = "{jkt}" unless jkt is none
+					let x5t = cnf.get("x5t#S256")
+					t.certThumbprint = "{x5t}" unless x5t is none
+				default:
+			}
+			return t
+		}
+	}
+
+	internal def tokenFromClaims(value string, claims jose.Claims) !AccessToken {
+		let t = new AccessToken()
+		t.value = value
+		t.subject = claims.subject
+		t.audience = claims.audience
+		t.issuer = claims.issuer
+		t.expires = claims.expires
+		let doc = try parseObject(claims.json(), "claims")
+		for let (k, v) in doc {
+			t.claims.set(k, v)
+		}
+		let clientId = claims.get("client_id")
+		t.clientId = "{clientId}" unless clientId is none
+		let scope = claims.get("scope")
+		t.scopes = spaceList("{scope}") unless scope is none
+		let cnf = claims.get("cnf")
+		match cnf {
+			case map<string, any>:
+				let jkt = cnf.get("jkt")
+				t.jkt = "{jkt}" unless jkt is none
+				let x5t = cnf.get("x5t#S256")
+				t.certThumbprint = "{x5t}" unless x5t is none
+			default:
+		}
+		return t
+	}
+
+	// absoluteTarget is the request's URL as the client addressed it, for
+	// comparing with a DPoP proof's `htu`.
+	internal def absoluteTarget(ctx Context, target string) string {
+		return target when target.contains("://")
+		let scheme = ctx.request.isSecure() ?? ("https", "http")
+		return scheme + "://" + ctx.request.host + target
+	}
+
+	// challengeError is a resource server failure; `dpop` picks the scheme
+	// the challenge names.
+	internal def challengeError(kind OAuthErrorKind, text string, status int, dpop bool) error {
+		return OAuthError{message: "oauth2: " + text, code: kind.value, kind: kind, error: dpop ?? ("dpop", ""), description: text, status: status}
+	}
+
+	// writeChallenge answers a refused request with its status and an RFC
+	// 6750 §3 challenge (DPoP's when the token was DPoP).
+	internal def writeChallenge(ctx Context, err error, realm string) !none {
+		let status = 401
+		let kind = OAuthErrorKind.InvalidToken
+		let dpop = false
+		let description = err.message
+		if err is OAuthError {
+			status = err.status == 0 ?? (401, err.status)
+			kind = err.kind
+			dpop = err.error == "dpop" || (kind := OAuthErrorKind.InvalidDpopProof || OAuthErrorKind.UseDpopNonce)
+			description = err.description
+		}
+		let scheme = dpop ?? ("DPoP", "Bearer")
+		let parts string[] = []
+		parts.push("realm=\"{realm}\"") when realm != ""
+		if description != "no access token" {
+			parts.push("error=\"{kind.value}\"")
+			parts.push("error_description=\"{description.replace("\"", "'")}\"")
+		}
+		parts.push("algs=\"ES256 PS256 EdDSA\"") when dpop
+		ctx.setHeader("WWW-Authenticate", scheme + (parts.len() > 0 ?? (" " + parts.join(", "), "")))
+		return try ctx.text(status, description)
+	}
+}

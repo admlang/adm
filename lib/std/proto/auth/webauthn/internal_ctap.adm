@@ -1,0 +1,407 @@
+internal partial module std.proto.auth.webauthn.ctap {
+	use (
+		std.crypto
+		std.crypto.cipher
+		std.data.compress.flate
+		std.net.url
+		std.time
+		std.bytes::(Buffer)
+		std.crypto::(ECDSAPublicKey, Ed25519PublicKey, Ed448PublicKey, Point, PrivateKey, publicKeyOf)
+		std.crypto.hash::(Hash, digest)
+		std.data.encoding::(CBOR, CBORKeyOrder, CBORKind, CBORValue, json)
+		std.proto.auth.webauthn::*
+		std.proto.auth.webauthn.cose::*
+		std.proto.auth.webauthn.json::*
+		std.proto.auth.webauthn.formats::*
+	)
+
+	// The CTAPStatus of a status byte; Other for one not listed.
+	def ctapStatus(code int) CTAPStatus {
+		for let (_, v) in CTAPStatus.values() {
+			return CTAPStatus(code) when v == code
+		}
+		return CTAPStatus.Other
+	}
+
+	// A CTAPError for a status.
+	def ctapError(status CTAPStatus, message string) CTAPError {
+		return CTAPError{message: "ctap: {status}: {message}", code: status.name, status: status}
+	}
+
+	// The COSE_Key of a key-agreement point.
+	def pinCOSEKey(p Point) CBORValue {
+		let m = new CBORValue(CBORKind.Map)
+		m.set(1, new CBORValue(2))
+		m.set(3, new CBORValue(-25))
+		m.set(-1, new CBORValue(1))
+		m.set(-2, new CBORValue(p.x.bytes(32) onerror recover byte[]))
+		m.set(-3, new CBORValue(p.y.bytes(32) onerror recover byte[]))
+		return m
+	}
+
+	// A PIN padded to 64 bytes with zeros, the form changePIN
+	// encrypt. Fails when the PIN is under 4 code points or over 63 bytes.
+	def paddedPIN(pin string) !byte[] {
+		let b = pin.bytes()
+		fail "ctap: a PIN needs at least 4 characters" when pin.len() < 4
+		fail "ctap: a PIN can be at most 63 bytes" when b.len() > 63
+		let out = b.clone()
+		for out.len() < 64 {
+			out.push(byte(0))
+		}
+		return out
+	}
+
+	// LEFT(SHA-256(pin), 16), what proves the PIN to the authenticator.
+	def pinHash(pin string) byte[] {
+		return digest(Hash.SHA256, pin.bytes()).slice(0, 16)
+	}
+
+	// Splits a message into 64-byte CTAPHID packets: an initialization
+	// packet (channel, command | 0x80, 16-bit length, 57 bytes of data) and
+	// continuation packets (channel, sequence 0 to 127, 59 bytes), the last
+	// one zero-padded.
+	def ctaphidPackets(cid uint32, command int, data byte[]) byte[][] {
+		let out byte[][] = []
+		let head byte[] = [byte(cid >> 24), byte((cid >> 16) & uint32(0xFF)), byte((cid >> 8) & uint32(0xFF)), byte(cid & uint32(0xFF))]
+		let first = head.clone()
+		first.push(byte(0x80 | command), byte(data.len() >> 8), byte(data.len() & 0xFF))
+		let at = data.len() < 57 ?? (data.len(), 57)
+		first.push(...data.slice(0, at))
+		for first.len() < 64 {
+			first.push(byte(0))
+		}
+		out.push(first)
+		let seq = 0
+		for at < data.len() {
+			let next = head.clone()
+			next.push(byte(seq))
+			let n = data.len() - at < 59 ?? (data.len() - at, 59)
+			next.push(...data.slice(at, n))
+			for next.len() < 64 {
+				next.push(byte(0))
+			}
+			out.push(next)
+			at += n
+			seq++
+		}
+		return out
+	}
+
+	// CTAPHIDAssembler puts a message back together from the packets of one
+	// channel; packets of other channels are skipped.
+	type CTAPHIDAssembler {
+		cid uint32
+
+		// The message's command, without the 0x80 bit; -1 until the
+		// initialization packet arrives.
+		command int = -1
+
+		// The payload gathered so far.
+		data byte[]
+
+		internal total int
+		internal seq   int
+
+		def new(cid uint32) {
+			self.cid = cid
+		}
+
+		// Adds a packet and reports whether the message is complete. Fails
+		// when a continuation packet arrives first or out of sequence.
+		def add(packet byte[]) !bool {
+			return false when packet.len() < 5
+			let pcid = uint32(packet[0]) << 24 | uint32(packet[1]) << 16 | uint32(packet[2]) << 8 | uint32(packet[3])
+			return false when pcid != cid
+			let b = int(packet[4])
+			if (b & 0x80) != 0 {
+				return false when packet.len() < 7
+				command = b & 0x7F
+				total = int(packet[5]) << 8 | int(packet[6])
+				seq = 0
+				let n = total < packet.len() - 7 ?? (total, packet.len() - 7)
+				data = packet.slice(7, n).clone()
+				return data.len() >= total
+			}
+			fail ctapError(CTAPStatus.InvalidSeq, "a continuation packet came before the message started") when command < 0
+			fail ctapError(CTAPStatus.InvalidSeq, "continuation packet {b} out of sequence, expected {seq}") when b != seq
+			seq++
+			let n = total - data.len() < packet.len() - 5 ?? (total - data.len(), packet.len() - 5)
+			data.push(...packet.slice(5, n))
+			return data.len() >= total
+		}
+	}
+
+	// A CTAP map holding only subCommand (key 1).
+	def ctapSub(sub int) CBORValue {
+		let p = new CBORValue(CBORKind.Map)
+		p.set(1, new CBORValue(sub))
+		return p
+	}
+
+	// A public key credential descriptor map.
+	def ctapDescriptor(id byte[]) CBORValue {
+		let m = new CBORValue(CBORKind.Map)
+		m.set("id", new CBORValue(id))
+		m.set("type", new CBORValue("public-key"))
+		return m
+	}
+
+	// The bio enrollment command an authenticator answers to: the CTAP 2.1
+	// one, or the preview one of FIDO_2_1_PRE authenticators.
+	def bioCommand(i AuthenticatorInfo) CTAPCommand {
+		return i.options.hasKey("bioEnroll") ?? (CTAPCommand.BioEnrollment, CTAPCommand.BioEnrollmentPreview)
+	}
+
+	// The CTAP user entity: id, and name and displayName when set.
+	def ctapUser(user User) CBORValue {
+		let u = new CBORValue(CBORKind.Map)
+		u.set("id", new CBORValue(user.id))
+		u.set("name", new CBORValue(user.name)) when user.name != ""
+		u.set("displayName", new CBORValue(user.displayName)) when user.displayName != ""
+		return u
+	}
+
+	// A CTAP list of public key credential descriptors.
+	def ctapDescriptors(list CredentialDescriptor[]) CBORValue {
+		let a = new CBORValue(CBORKind.Array)
+		for let (_, d) in list {
+			let m = new CBORValue(CBORKind.Map)
+			m.set("id", new CBORValue(d.id))
+			m.set("type", new CBORValue("public-key"))
+			a.push(m)
+		}
+		return a
+	}
+
+	// One assertion from a getAssertion or getNextAssertion answer. The
+	// credential is omitted when the allow list held exactly one. Fails
+	// when the answer lacks authenticator data or a signature.
+	def ctapAssertion(m CBORValue, allow CredentialDescriptor[]) !GetAssertionResult {
+		let r = new GetAssertionResult()
+		if m.has(1) {
+			r.credentialId = try m.get(1).get("id").asBytes()
+		} else {
+			fail ctapError(CTAPStatus.MissingParameter, "the assertion names no credential") when allow.len() != 1
+			r.credentialId = allow[0].id
+		}
+		r.authData = try m.get(2).asBytes()
+		r.signature = try m.get(3).asBytes()
+		if m.has(4) {
+			let u = m.get(4)
+			r.user = User{id: try u.get("id").asBytes(), name: u.get("name").asString() onerror recover "", displayName: u.get("displayName").asString() onerror recover ""}
+		}
+		r.userSelected = m.has(6) && (try m.get(6).asBool())
+		r.largeBlobKey = m.get(7).asBytes() onerror recover byte[]
+		return r
+	}
+
+	// The serialized large-blob array of an empty authenticator: an empty
+	// CBOR array and LEFT(SHA-256, 16) of it (CTAP 2.2 §6.10.2).
+	def emptyLargeBlobArray() byte[] {
+		let out byte[] = [0x80]
+		out.push(...digest(Hash.SHA256, byte[0x80]).slice(0, 16))
+		return out
+	}
+
+	// Reads a serialized large-blob array: the CBOR array, checked against
+	// its trailing LEFT(SHA-256, 16). Fails when the check value does not
+	// match or the array does not parse.
+	def parseLargeBlobArray(serialized byte[]) !CBORValue {
+		expects {
+			assert serialized.len() >= 17 onerror fail "ctap: large-blob array is shorter than its check value"
+		}
+		let body = serialized.slice(0, serialized.len() - 16)
+		let checkValue = serialized.slice(serialized.len() - 16, 16)
+		fail "ctap: large-blob array check value does not match" when !digest(Hash.SHA256, body).slice(0, 16).equals(checkValue)
+		let a = try new CBOR().parse(body)
+		fail "ctap: large-blob array is not an array" when a.kind != CBORKind.Array
+		return a
+	}
+
+	// The serialized form of a large-blob array: its CBOR and the check
+	// value.
+	def serializeLargeBlobArray(array CBORValue) byte[] {
+		let c = new CBOR()
+		c.keyOrder = CBORKeyOrder.LengthFirst
+		let body = c.encode(array)
+		return body + digest(Hash.SHA256, body).slice(0, 16)
+	}
+
+	// Encrypts a credential's large blob into an array entry (WebAuthn
+	// §10.1.5): DEFLATE-compressed, AES-256-GCM under the large-blob key
+	// with a random nonce, the associated data "blob" and the original
+	// size. Fails when the key is not 32 bytes or the random source is
+	// unavailable.
+	def sealLargeBlob(key byte[], data byte[]) !CBORValue {
+		let packed = new Buffer()
+		let w = new flate.Writer(packed, 6)
+		try w.write(data)
+		try w.close()
+		let nonce = try crypto.rand(12)
+		let gcm = try cipher.newGCM(try cipher.newAES(key))
+		let entry = new CBORValue(CBORKind.Map)
+		entry.set(1, new CBORValue(gcm.seal(nonce, packed.bytes(), largeBlobAD(data.len()))))
+		entry.set(2, new CBORValue(nonce))
+		entry.set(3, new CBORValue(data.len()))
+		return entry
+	}
+
+	// Decrypts an array entry under a large-blob key; none when the entry
+	// is not that credential's or the key is not 32 bytes. Fails when the
+	// entry decrypts but does not inflate to its stated size.
+	def openLargeBlob(key byte[], entry CBORValue) !?byte[] {
+		let ct = entry.get(1).asBytes() onerror recover byte[]
+		let nonce = entry.get(2).asBytes() onerror recover byte[]
+		let size = entry.get(3).asInt() onerror recover -1
+		return none when ct.len() < 16 || nonce.len() != 12 || size < 0
+		return none when key.len() != 32
+		let gcm = try cipher.newGCM(try cipher.newAES(key))
+		let other = false
+		let packed = gcm.open(nonce, ct, largeBlobAD(size)) onerror (err error) {
+			// Another credential's entry: its tag does not verify under this key.
+			other = true
+			recover byte[]
+		}
+		return none when other
+		let r = new flate.Reader(new Buffer(packed))
+		let out byte[]
+		let chunk byte[]
+		chunk.len(4096)
+		for {
+			let n = try r.read(chunk)
+			break when n <= 0
+			out.push(...chunk.slice(0, n))
+		}
+		fail "ctap: large blob inflates to {out.len()} bytes, not {size}" when out.len() != size
+		return out
+	}
+
+	// The associated data of a large-blob entry: "blob" and the original
+	// size as a little-endian uint64.
+	def largeBlobAD(size int) byte[] {
+		let ad = "blob".bytes()
+		for let i = 0; i < 8; i++ {
+			ad.push(byte((size >> (8 * i)) & 0xFF))
+		}
+		return ad
+	}
+
+	// CTAP1/U2F status words (ISO 7816-4) a U2F authenticator answers with.
+	enum U2FStatus {
+		Ok = 0x9000,
+		// The user has not touched the key yet.
+		ConditionsNotSatisfied = 0x6985,
+		// The key handle is not this authenticator's, or not for this AppID.
+		WrongData = 0x6A80,
+		WrongLength = 0x6700,
+		ClaNotSupported = 0x6E00,
+		InsNotSupported = 0x6D00
+	}
+
+	// The total length of the DER element at the start of data (header and
+	// content); 0 when the header is malformed.
+	def derLength(data byte[]) int {
+		return 0 when data.len() < 2
+		let first = int(data[1])
+		return 2 + first when first < 0x80
+		let n = first & 0x7F
+		return 0 when n == 0 || n > 4 || data.len() < 2 + n
+		let len = 0
+		for let i = 0; i < n; i++ {
+			len = len << 8 | int(data[2 + i])
+		}
+		return 2 + n + len
+	}
+
+	// A packed attestation statement over authenticator data and the client
+	// data hash: signed by the authenticator's attestation key with its
+	// chain, or by the credential key itself (self attestation) when it has
+	// none. Fails when signing does.
+	def softPacked(auth SoftAuthenticator, alg COSEAlgorithm, key PrivateKey, authData byte[], clientDataHash byte[]) !CBORValue {
+		let st = new CBORValue(CBORKind.Map)
+		let signed = authData + clientDataHash
+		let attKey = auth.attestationKey
+		if attKey is none {
+			st.set("alg", new CBORValue(alg.value))
+			st.set("sig", new CBORValue(try coseSign(alg, key, signed)))
+			return st
+		}
+		let attAlg = softAlgorithmOf(attKey)
+		st.set("alg", new CBORValue(attAlg.value))
+		st.set("sig", new CBORValue(try coseSign(attAlg, attKey, signed)))
+		let x5c = new CBORValue(CBORKind.Array)
+		for let (_, der) in auth.attestationChain {
+			x5c.push(new CBORValue(der))
+		}
+		st.set("x5c", x5c)
+		return st
+	}
+
+	// A fresh key for an algorithm. Fails when the random source is
+	// unavailable.
+	def softGenerateKey(alg COSEAlgorithm) !PrivateKey {
+		match alg {
+			case COSEAlgorithm.EdDSA, COSEAlgorithm.Ed25519:
+				return try crypto.generateEd25519Key()
+			case COSEAlgorithm.Ed448:
+				return try crypto.generateEd448Key()
+			case COSEAlgorithm.ES384:
+				return try crypto.generateECDSAKey(crypto.p384)
+			case COSEAlgorithm.ES512:
+				return try crypto.generateECDSAKey(crypto.p521)
+			case COSEAlgorithm.RS256, COSEAlgorithm.RS384, COSEAlgorithm.RS512, COSEAlgorithm.PS256, COSEAlgorithm.PS384, COSEAlgorithm.PS512, COSEAlgorithm.RS1:
+				return try crypto.generateRSAKey(2048, 65537)
+			default:
+				return try crypto.generateECDSAKey(crypto.p256)
+		}
+	}
+
+	// The algorithm an attestation key signs with: ES256/384/512 by curve,
+	// EdDSA, or RS256.
+	def softAlgorithmOf(key PrivateKey) COSEAlgorithm {
+		let pub = publicKeyOf(key)
+		if pub is ECDSAPublicKey {
+			let ec ECDSAPublicKey = pub
+			return ec.curve.name == "P-384" ?? (COSEAlgorithm.ES384, ec.curve.name == "P-521" ?? (COSEAlgorithm.ES512, COSEAlgorithm.ES256))
+		}
+		return COSEAlgorithm.EdDSA when pub is Ed25519PublicKey || pub is Ed448PublicKey
+		return COSEAlgorithm.RS256
+	}
+
+	// A getAssertion answer map; numberOfCredentials only when above 0.
+	def assertionMap(r GetAssertionResult, total int) CBORValue {
+		let m = new CBORValue(CBORKind.Map)
+		m.set(1, ctapDescriptor(r.credentialId))
+		m.set(2, new CBORValue(r.authData))
+		m.set(3, new CBORValue(r.signature))
+		m.set(4, ctapUser(r.user)) when r.user.id.len() > 0
+		m.set(5, new CBORValue(total)) when total > 0
+		m.set(7, new CBORValue(r.largeBlobKey)) when r.largeBlobKey.len() > 0
+		return m
+	}
+
+	// Advances and returns a credential's counter, or 0 when the
+	// authenticator keeps none.
+	def softCount(auth SoftAuthenticator, c SoftCredential) uint32 {
+		return uint32(0) when !auth.counters
+		c.signCount += uint32(1)
+		return c.signCount
+	}
+
+	// The hmac-secret salt of a prf input: SHA-256("WebAuthn PRF" || 0x00 ||
+	// input) (WebAuthn §10.1.4).
+	def prfSalt(input byte[]) byte[] {
+		let msg = "WebAuthn PRF".bytes()
+		msg.push(byte(0))
+		msg.push(...input)
+		return digest(Hash.SHA256, msg)
+	}
+
+	// Whether to ask an authenticator to verify the user: always when
+	// required, and when preferred if it has built-in verification or a PIN
+	// set.
+	def wantsUV(preference UserVerification, info AuthenticatorInfo) bool {
+		return preference == UserVerification.Required || (preference == UserVerification.Preferred && (info.option("uv") || info.option("clientPin")))
+	}
+}

@@ -1,0 +1,722 @@
+partial module std.proto.auth.openid {
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Context, Handler, Method, newRequest)
+		std.net.url
+		std.crypto::(rand)
+		std.crypto.hash::(Hash, digest)
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid.engine::*
+	)
+
+	// UserStore holds the claims of the provider's users (Core §5.1
+	// names), by subject.
+	interface UserStore {
+		// claims returns the user's claims, none for an unknown subject.
+		def claims(subject string) !?map<string, any>
+	}
+
+	// MemoryUserStore keeps users' claims in memory; the default UserStore.
+	type MemoryUserStore {
+		internal users map<string, map<string, any>>
+
+		def new() {}
+
+		// add sets a user's claims.
+		atomic def add(subject string, claims map<string, any>) {
+			users.set(subject, claims)
+		}
+
+		// claims implements UserStore. Never fails.
+		atomic def claims(subject string) !?map<string, any> {
+			return users.get(subject)
+		}
+	}
+
+	// SubjectType is how the provider names a user to clients (Core §8).
+	enum SubjectType {
+		// The same `sub` for every client.
+		Public = "public",
+		// A different `sub` per client sector (Core §8.1).
+		Pairwise = "pairwise",
+	}
+
+	// The claims each scope asks for (Core §5.4).
+	internal const scopeClaims = map<string, string[]>{
+		"profile": ["name", "family_name", "given_name", "middle_name", "nickname", "preferred_username", "profile", "picture", "website", "gender", "birthdate", "zoneinfo", "locale", "updated_at"],
+		"email":   ["email", "email_verified"],
+		"address": ["address"],
+		"phone":   ["phone_number", "phone_number_verified"],
+	}
+
+	// Provider is an OpenID provider built on an OAuth authorization
+	// server: it adds ID tokens to the server's responses, the UserInfo,
+	// discovery, end-session and check-session endpoints, and logout
+	// notifications. The app still logs users in through the server's
+	// pending/complete hand-off; a Decision may carry `sid` in its claims
+	// to tie the login to the app's session.
+	//
+	// ```
+	// let op = new openid.Provider(server, users)
+	// try mux.handle("/", op.handler())
+	// ```
+	type Provider {
+		server            oauth2.AuthorizationServer
+		users             UserStore
+		idTokenLifetime   duration                   = 1h
+		subjectType       SubjectType                = SubjectType.Public
+		// The salt of pairwise subjects; keep it stable, or every pairwise
+		// `sub` changes.
+		pairwiseSalt      Secret<string>             = ""
+		// The implicit and hybrid flows, off by default (RFC 9700 §2.1.2).
+		allowImplicit     bool                       = false
+		// Called when a session ends at the end_session endpoint, so the
+		// app clears its own login: the session id and subject.
+		onLogout          ?def (string, string)
+		// The client logout tokens go through; a default client when none.
+		httpClient        ?http.Client
+		internal sessions map<string, SessionRecord>
+		internal resource oauth2.ResourceServer
+
+		def new(server oauth2.AuthorizationServer, users ?UserStore = none) {
+			self.server = server
+			self.users = users is none ?? (new MemoryUserStore(), users)
+			pairwiseSalt = b64url(rand(32) onerror recover byte[])
+			resource = new oauth2.ResourceServer(server.metadata())
+			let p = self
+			server.tokenHook = def (g oauth2.Grant, client oauth2.RegisteredClient, out map<string, any>) !none {
+				return try addIdToken(p, g, client, out)
+			}
+			server.responseHook = def (g oauth2.Grant, client oauth2.RegisteredClient, out url.Values) !none {
+				return try addFrontChannel(p, g, client, out)
+			}
+			server.authorizeHook = def (params map<string, string>, client oauth2.RegisteredClient) !none {
+				return try checkOpenIdRequest(p, params, client)
+			}
+			server.metadataHook = def (m oauth2.ServerMetadata) {
+				addProviderMetadata(p, m)
+			}
+			resource.lookup = def (value string) !?oauth2.AccessToken {
+				return try ownToken(p, value)
+			}
+		}
+
+		// handler serves the OpenID endpoints (/userinfo,
+		// /.well-known/openid-configuration, /end_session, /check_session)
+		// and the authorization server's under the issuer's path.
+		def handler() Handler {
+			return new ProviderHandler(self)
+		}
+
+		// sessionState is the `session_state` of Session Management §3.2 for
+		// a client and redirect URI, given the browser state the app keeps
+		// in the `op_browser_state` cookie.
+		def sessionState(clientId string, redirectUri string, browserState string) string {
+			let salt = b64url(rand(16) onerror recover byte[])
+			return hexDigest(clientId + " " + originOf(redirectUri) + " " + browserState + " " + salt) + "." + salt
+		}
+
+		// endSession ends a session: back-channel logout tokens go to its
+		// clients now, onLogout runs, and the front-channel logout URIs to
+		// load are returned. Fails only when a logout token cannot be
+		// signed.
+		def endSession(sid string) !string[] {
+			let record = takeSession(self, sid)
+			return [] when record is none
+			let frames string[] = []
+			for let id in record.clients {
+				let client = server.clients.client(id) onerror recover none
+				continue when client is none
+				let back = client.metadata.get("backchannel_logout_uri")
+				if !(back is none) {
+					let token = try logoutToken(self, client, record.subject, sid)
+					postLogoutToken(self, "{back}", token)
+				}
+				let front = client.metadata.get("frontchannel_logout_uri")
+				if !(front is none) {
+					let target = "{front}"
+					let withSession = client.metadata.get("frontchannel_logout_session_required")
+					if !(withSession is none) && "{withSession}" == "true" {
+						let params = new url.Values()
+						params.set("iss", server.issuer)
+						params.set("sid", sid)
+						target += (target.contains("?") ?? ("&", "?")) + params.encode()
+					}
+					frames.push(target)
+				}
+			}
+			let hook = onLogout
+			hook(sid, record.subject) unless hook is none
+			return frames
+		}
+	}
+
+	// SessionRecord is a login session the provider tracks for logout: the
+	// subject and the clients that received ID tokens in it.
+	internal type SessionRecord {
+		subject string
+		clients string[] = []
+
+		def new(subject string) {
+			self.subject = subject
+		}
+	}
+
+	internal atomic def noteSession(p Provider, sid string, subject string, clientId string) {
+		let record = p.sessions.get(sid)
+		let r = record is none ?? (new SessionRecord(subject), record)
+		r.clients.push(clientId) unless clientId in r.clients
+		p.sessions.set(sid, r)
+	}
+
+	internal atomic def takeSession(p Provider, sid string) ?SessionRecord {
+		let record = p.sessions.get(sid)
+		p.sessions.delete(sid)
+		return record
+	}
+
+	// checkOpenIdRequest checks the OpenID parameters of an authorization
+	// request: the response types allowed, a nonce with an ID token in the
+	// front channel, `prompt=none` alone, a `claims` value that is JSON.
+	internal def checkOpenIdRequest(p Provider, params map<string, string>, _ oauth2.RegisteredClient) !none {
+		let responseType = params.get("response_type")
+		let types = responseType is none ?? (string[], responseType.split(" ").filter(t => t != ""))
+		let allowed = ["code"]
+		allowed.push("id_token", "id_token token", "code id_token", "code token", "code id_token token", "token") when p.allowImplicit
+		let canonical = canonicalResponseType(types)
+		fail openidRequestError(oauth2.OAuthErrorKind.UnsupportedResponseType, "response_type {responseType is none ?? ("", responseType)} is not supported") unless canonical in allowed
+		let scope = params.get("scope")
+		let openid = !(scope is none) && "openid" in scope.split(" ")
+		if "id_token" in types {
+			fail openidRequestError(oauth2.OAuthErrorKind.InvalidRequest, "an id_token response needs the openid scope") unless openid
+			fail openidRequestError(oauth2.OAuthErrorKind.InvalidRequest, "an id_token in the front channel needs a nonce") when params.get("nonce") is none
+		}
+		let prompt = params.get("prompt")
+		if !(prompt is none) {
+			let prompts = prompt.split(" ")
+			fail openidRequestError(oauth2.OAuthErrorKind.InvalidRequest, "prompt=none cannot be combined") when "none" in prompts && prompts.len() > 1
+		}
+		let claims = params.get("claims")
+		if !(claims is none) {
+			parseObject(claims, "claims") onerror fail openidRequestError(oauth2.OAuthErrorKind.InvalidRequest, "claims is not a JSON object")
+		}
+		let maxAge = params.get("max_age")
+		fail openidRequestError(oauth2.OAuthErrorKind.InvalidRequest, "max_age must be a number of seconds") unless maxAge is none || /^[0-9]+$/.test(maxAge)
+		return none
+	}
+
+	// canonicalResponseType orders a response type the way Multiple
+	// Response Types lists them ("code id_token token").
+	internal def canonicalResponseType(types string[]) string {
+		let out string[] = []
+		for let t in ["code", "id_token", "token"] {
+			out.push(t) when t in types
+		}
+		return out.len() == types.len() ?? (out.join(" "), "")
+	}
+
+	internal def openidRequestError(kind oauth2.OAuthErrorKind, text string) error {
+		return oauth2.OAuthError{message: "openid: " + text, code: kind.value, kind: kind, description: text, status: 400}
+	}
+
+	// addIdToken adds an ID token to a token response when the grant has
+	// the openid scope (Core §3.1.3.3).
+	internal def addIdToken(p Provider, g oauth2.Grant, client oauth2.RegisteredClient, out map<string, any>) !none {
+		return none unless "openid" in g.scopes
+		let access = out.get("access_token")
+		let idToken = try idTokenFor(p, g, client, access is none ?? (none, "{access}"), none, false)
+		out.set("id_token", idToken)
+		return none
+	}
+
+	// addFrontChannel adds the implicit and hybrid flows' tokens to an
+	// authorization response (Core §3.2.2.5, §3.3.2.5) and, with a session,
+	// `session_state`.
+	internal def addFrontChannel(p Provider, g oauth2.Grant, client oauth2.RegisteredClient, out url.Values) !none {
+		let responseType = g.params.get("response_type")
+		let types = responseType is none ?? (string[], responseType.split(" "))
+		let access ?string = none
+		if "token" in types {
+			let issued = try p.server.issue(g, client)
+			let value = issued.get("access_token")
+			access = value is none ?? (none, "{value}")
+			out.set("access_token", access is none ?? ("", access))
+			let tokenType = issued.get("token_type")
+			out.set("token_type", tokenType is none ?? ("Bearer", "{tokenType}"))
+			let expiresIn = issued.get("expires_in")
+			out.set("expires_in", "{expiresIn}") unless expiresIn is none
+		}
+		if "id_token" in types {
+			let code = out.get("code")
+			out.set("id_token", try idTokenFor(p, g, client, access, code, !("token" in types) && !("code" in types)))
+		}
+		let sid = g.claims.get("sid")
+		out.set("session_state", p.sessionState(client.id, g.redirectUri, "{sid}")) unless sid is none
+		return none
+	}
+
+	// idTokenFor makes an ID token (Core §2, §3.1.3.6): the subject as the
+	// client sees it, the authentication facts, the nonce, at_hash and
+	// c_hash, the claims the `claims` parameter asks for in the ID token,
+	// and, when no access token is issued, the scope claims. Signed with
+	// the server's key (or the client secret when the client registered an
+	// HS* `id_token_signed_response_alg`), encrypted when the client
+	// registered an encryption algorithm.
+	internal def idTokenFor(p Provider, g oauth2.Grant, client oauth2.RegisteredClient, accessToken ?string, code ?string, withScopeClaims bool) !string {
+		let signer = try idTokenSigner(p, client)
+		let alg = signer.alg
+		let algName = alg is none ?? (defaultAlgorithmName(signer), alg)
+		let claims = new jose.Claims()
+		claims.issuer = p.server.issuer
+		claims.subject = subjectFor(p, g.subject, client)
+		claims.audience = [client.id]
+		claims.issuedAt = time.now()
+		claims.expires = time.now() + p.idTokenLifetime
+		let authTime = g.authTime
+		try claims.set("auth_time", int(authTime.unixNs() / 1000000000)) unless authTime is none
+		let nonce = g.params.get("nonce")
+		try claims.set("nonce", nonce) unless nonce is none
+		let acr = g.acr
+		try claims.set("acr", acr) unless acr is none
+		try claims.set("amr", stringsArray(g.amr)) when g.amr.len() > 0
+		try claims.set("azp", client.id)
+		let sid = g.claims.get("sid")
+		if !(sid is none) {
+			try claims.set("sid", "{sid}")
+			noteSession(p, "{sid}", g.subject, client.id)
+		}
+		try claims.set("at_hash", tokenHash(accessToken, algName, signer.curve)) unless accessToken is none
+		try claims.set("c_hash", tokenHash(code, algName, signer.curve)) unless code is none
+		let requested = requestedClaims(g, "id_token")
+		if withScopeClaims {
+			for let name in scopeClaimNames(g.scopes) {
+				requested.push(name) unless name in requested
+			}
+		}
+		if requested.len() > 0 {
+			let all = try p.users.claims(g.subject)
+			if !(all is none) {
+				for let name in requested {
+					let v = all.get(name)
+					try claims.set(name, v) unless v is none
+				}
+			}
+		}
+		let header = new jose.Header()
+		let token = try claims.sign(signer, none, header)
+		return try encryptForClient(client, token, "id_token")
+	}
+
+	// idTokenSigner is the key ID tokens for a client are signed with.
+	internal def idTokenSigner(p Provider, client oauth2.RegisteredClient) !jose.Jwk {
+		let asked = client.metadata.get("id_token_signed_response_alg")
+		let name = asked is none ?? ("", "{asked}")
+		if name.startsWith("HS") {
+			let secret = client.secret
+			fail openidError(oauth2.OAuthErrorKind.ServerError, "HS-signed ID tokens need a client secret") when secret is none
+			let k = new jose.Jwk(secret.reveal().bytes())
+			k.alg = name
+			return k
+		}
+		for let k in p.server.keys.keys {
+			continue unless k.isPrivate() && k.kty != jose.KeyType.Oct
+			let own = k.alg
+			return k when name == "" || own is none || own == name
+		}
+		fail openidError(oauth2.OAuthErrorKind.ServerError, "no signing key for ID tokens")
+	}
+
+	internal def defaultAlgorithmName(key jose.Jwk) string {
+		match key.kty {
+			case jose.KeyType.Rsa:
+				return "RS256"
+			case jose.KeyType.Ec:
+				let c = key.curve
+				return "ES384" when !(c is none) && c == jose.Curve.P384
+				return "ES512" when !(c is none) && c == jose.Curve.P521
+				return "ES256K" when !(c is none) && c == jose.Curve.Secp256k1
+				return "ES256"
+			case jose.KeyType.Oct:
+				return "HS256"
+			default:
+				return "EdDSA"
+		}
+	}
+
+	// encryptForClient encrypts a signed token to the client's keys when it
+	// registered `<what>_encrypted_response_alg` (and `_enc`), as a nested
+	// JWT.
+	internal def encryptForClient(client oauth2.RegisteredClient, token string, what string) !string {
+		let algValue = client.metadata.get(what + "_encrypted_response_alg")
+		return token when algValue is none
+		let encValue = client.metadata.get(what + "_encrypted_response_enc")
+		let alg = keyAlgorithmNamed("{algValue}")
+		fail openidError(oauth2.OAuthErrorKind.ServerError, "unsupported {what}_encrypted_response_alg") when alg is none
+		let encName = encValue is none ?? ("A128CBC-HS256", "{encValue}")
+		let enc = contentEncryptionNamed(encName)
+		fail openidError(oauth2.OAuthErrorKind.ServerError, "unsupported {what}_encrypted_response_enc") when enc is none
+		let keys = client.metadata.jwks
+		fail openidError(oauth2.OAuthErrorKind.ServerError, "the client has no keys to encrypt to") when keys is none
+		let header = new jose.Header()
+		header.cty = "JWT"
+		for let k in keys.keys {
+			let sealed = jose.encrypt(token.bytes(), k, alg, enc, header) onerror recover ""
+			return sealed when sealed != ""
+		}
+		fail openidError(oauth2.OAuthErrorKind.ServerError, "no client key fits {algValue}")
+	}
+
+	internal def keyAlgorithmNamed(name string) ?jose.KeyAlgorithm {
+		for let (i, v) in jose.KeyAlgorithm.values() {
+			return jose.KeyAlgorithm(i) when v == name
+		}
+		return none
+	}
+
+	internal def contentEncryptionNamed(name string) ?jose.ContentEncryption {
+		for let (i, v) in jose.ContentEncryption.values() {
+			return jose.ContentEncryption(i) when v == name
+		}
+		return none
+	}
+
+	// subjectFor is the `sub` a client sees: the user's subject, or the
+	// pairwise value of Core §8.1 for the client's sector.
+	internal def subjectFor(p Provider, subject string, client oauth2.RegisteredClient) string {
+		let asked = client.metadata.get("subject_type")
+		let pairwise = p.subjectType == SubjectType.Pairwise || (!(asked is none) && "{asked}" == "pairwise")
+		return subject unless pairwise
+		let sectorUri = client.metadata.get("sector_identifier_uri")
+		let source = sectorUri is none ?? (client.metadata.redirectUris.len() > 0 ?? (client.metadata.redirectUris[0], client.id), "{sectorUri}")
+		let sector = hostOf(source)
+		return b64url(digest(Hash.SHA256, (sector + subject + p.pairwiseSalt.reveal()).bytes()))
+	}
+
+	internal def hostOf(target string) string {
+		let at = target.indexOf("://")
+		let rest = at < 0 ?? (target, target[at + 3:])
+		let slash = rest.indexOf("/")
+		return slash < 0 ?? (rest, rest[0:slash])
+	}
+
+	internal def originOf(target string) string {
+		let at = target.indexOf("://")
+		return target when at < 0
+		return target[0:at + 3] + hostOf(target)
+	}
+
+	internal def hexDigest(text string) string {
+		return digest(Hash.SHA256, text.bytes()).hex().lower()
+	}
+
+	internal def scopeClaimNames(scopes string[]) string[] {
+		let out string[] = []
+		for let s in scopes {
+			let names = scopeClaims.get(s)
+			continue when names is none
+			for let n in names {
+				out.push(n) unless n in out
+			}
+		}
+		return out
+	}
+
+	// requestedClaims are the claim names the `claims` parameter asks for
+	// in "id_token" or "userinfo" (Core §5.5).
+	internal def requestedClaims(g oauth2.Grant, part string) string[] {
+		let text = g.params.get("claims")
+		return [] when text is none
+		let doc = parseObject(text, "claims") onerror recover new map<string, any>()
+		let section = doc.get(part)
+		let out string[] = []
+		match section {
+			case map<string, any>:
+				for let k in section.keys() {
+					out.push(k)
+				}
+			default:
+		}
+		return out
+	}
+
+	internal def stringsArray(list string[]) any[] {
+		let out any[] = []
+		for let s in list {
+			out.push(s)
+		}
+		return out
+	}
+
+	// addProviderMetadata adds the OpenID members to the server's metadata
+	// (Discovery §3).
+	internal def addProviderMetadata(p Provider, m oauth2.ServerMetadata) {
+		let base = m.issuer.trimSuffix("/")
+		m.set("userinfo_endpoint", base + "/userinfo")
+		m.set("end_session_endpoint", base + "/end_session")
+		m.set("check_session_iframe", base + "/check_session")
+		m.set("frontchannel_logout_supported", true)
+		m.set("frontchannel_logout_session_supported", true)
+		m.set("backchannel_logout_supported", true)
+		m.set("backchannel_logout_session_supported", true)
+		m.set("subject_types_supported", stringsArray(["public", "pairwise"]))
+		m.set("id_token_signing_alg_values_supported", stringsArray(["RS256", "PS256", "ES256", "ES384", "ES512", "EdDSA", "HS256"]))
+		m.set("id_token_encryption_alg_values_supported", stringsArray(["RSA-OAEP", "RSA-OAEP-256", "ECDH-ES", "ECDH-ES+A128KW", "ECDH-ES+A256KW", "A128KW", "A256KW"]))
+		m.set("id_token_encryption_enc_values_supported", stringsArray(["A128CBC-HS256", "A256CBC-HS512", "A128GCM", "A256GCM"]))
+		m.set("userinfo_signing_alg_values_supported", stringsArray(["RS256", "PS256", "ES256", "EdDSA"]))
+		m.set("claims_parameter_supported", true)
+		m.set("request_parameter_supported", true)
+		m.set("request_uri_parameter_supported", true)
+		let claims = ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid"]
+		for let n in scopeClaimNames(["profile", "email", "address", "phone"]) {
+			claims.push(n)
+		}
+		m.set("claims_supported", stringsArray(claims))
+		let scopes = m.scopesSupported.clone()
+		for let s in ["openid", "profile", "email", "address", "phone", "offline_access"] {
+			scopes.push(s) unless s in scopes
+		}
+		m.scopesSupported = scopes
+		let types = ["code"]
+		types.push("id_token", "id_token token", "code id_token", "code token", "code id_token token") when p.allowImplicit
+		m.responseTypesSupported = types
+	}
+
+	// ownToken checks an access token the provider's server issued, for
+	// UserInfo: an opaque one from the grant store, a JWT one with the
+	// server's keys. None for a token it does not know.
+	internal def ownToken(p Provider, value string) !?oauth2.AccessToken {
+		let g = try p.server.grants.get(oauth2.GrantKind.AccessToken, value)
+		if g is none {
+			return none unless value.split(".").len() == 3
+			let pub = new jose.JwkSet()
+			for let k in p.server.keys.keys {
+				pub.keys.push(k.publicKey()) unless k.kty == jose.KeyType.Oct
+			}
+			let claims = jose.verifyJwt(value, pub, jose.Validation{algorithms: [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA], issuer: p.server.issuer, typ: "at+jwt", audience: none}) onerror recover new jose.Claims()
+			let sub = claims.subject
+			return none when sub is none
+			let t = new oauth2.AccessToken()
+			t.value = value
+			t.subject = sub
+			let scope = claims.get("scope")
+			t.scopes = scope is none ?? ([], "{scope}".split(" "))
+			let clientId = claims.get("client_id")
+			t.clientId = clientId is none ?? (none, "{clientId}")
+			let cnf = claims.get("cnf")
+			match cnf {
+				case map<string, any>:
+					let jkt = cnf.get("jkt")
+					t.jkt = jkt is none ?? (none, "{jkt}")
+				default:
+			}
+			return t
+		}
+		let t = new oauth2.AccessToken()
+		t.value = value
+		t.subject = g.subject
+		t.scopes = g.scopes
+		t.clientId = g.clientId
+		t.expires = g.expiresAt
+		t.jkt = g.dpopJkt
+		t.certThumbprint = g.certThumbprint
+		return t
+	}
+
+	// ProviderHandler routes the OpenID endpoints and passes the rest to
+	// the authorization server.
+	internal type ProviderHandler {
+		provider Provider
+		inner    Handler
+
+		def new(provider Provider) {
+			self.provider = provider
+			inner = provider.server.handler()
+		}
+
+		// serve implements http.Handler.
+		def serve(ctx Context) !none {
+			let base = hostlessPath(provider.server.issuer)
+			let path = ctx.path()
+			let local = path.startsWith(base) ?? (path[base.len():], path)
+			local = "/" + local.trimPrefix("/")
+			match local {
+				case "/.well-known/openid-configuration":
+					ctx.setHeader("Cache-Control", "no-store")
+					return try ctx.blob(200, "application/json", provider.server.metadata().json().bytes())
+				case "/userinfo":
+					return try userInfoEndpoint(provider, ctx)
+				case "/end_session":
+					return try endSessionEndpoint(provider, ctx)
+				case "/check_session":
+					return try ctx.html(200, checkSessionPage())
+				default:
+					return try inner.serve(ctx)
+			}
+		}
+	}
+
+	internal def hostlessPath(issuer string) string {
+		let at = issuer.indexOf("://")
+		let rest = at < 0 ?? (issuer, issuer[at + 3:])
+		let slash = rest.indexOf("/")
+		return slash < 0 ?? ("", rest[slash:].trimSuffix("/"))
+	}
+
+	// userInfoEndpoint answers UserInfo (Core §5.3): the token checked with
+	// its binding, the openid scope required, the scope claims and the
+	// `claims` parameter's userinfo claims; JSON, or a signed (and maybe
+	// encrypted) JWT when the client registered
+	// `userinfo_signed_response_alg`.
+	internal def userInfoEndpoint(p Provider, ctx Context) !none {
+		let token = p.resource.authenticate(ctx, ["openid"]) onerror (err error) {
+			let status = err is oauth2.OAuthError ?? (err.status == 0 ?? (401, err.status), 401)
+			let kind = err is oauth2.OAuthError ?? (err.kind.value, "invalid_token")
+			ctx.setHeader("WWW-Authenticate", "Bearer error=\"{kind}\"")
+			ctx.text(status, err.message) onerror recover none
+			recover new oauth2.AccessToken()
+		}
+		let sub = token.subject
+		return none when sub is none
+		let user = try p.users.claims(sub)
+		let clientId = token.clientId
+		let client = clientId is none ?? (none, try p.server.clients.client(clientId))
+		let out map<string, any>
+		out.set("sub", client is none ?? (sub, subjectFor(p, sub, client)))
+		if !(user is none) {
+			let names = scopeClaimNames(token.scopes)
+			for let n in names {
+				let v = user.get(n)
+				out.set(n, v) unless v is none
+			}
+		}
+		let alg = client is none ?? (none, client.metadata.get("userinfo_signed_response_alg"))
+		if !(alg is none) && !(client is none) {
+			let claims = try jose.parseClaims(encodeJSON(out))
+			claims.issuer = p.server.issuer
+			claims.audience = [client.id]
+			let signer = try idTokenSigner(p, client)
+			let signed = try claims.sign(signer)
+			let sealed = try encryptForClient(client, signed, "userinfo")
+			return try ctx.blob(200, "application/jwt", sealed.bytes())
+		}
+		ctx.setHeader("Cache-Control", "no-store")
+		return try ctx.blob(200, "application/json", encodeJSON(out).bytes())
+	}
+
+	// endSessionEndpoint is RP-Initiated Logout §2-3: the id_token_hint
+	// (signature checked, expiry ignored) names the session and client, the
+	// post_logout_redirect_uri must be registered, then the session ends
+	// (back-channel tokens sent, front-channel URIs loaded in frames) and
+	// the browser goes to the redirect URI with `state`.
+	internal def endSessionEndpoint(p Provider, ctx Context) !none {
+		let text = ctx.method() == Method.POST ?? (try ctx.text(), ctx.url().rawQuery)
+		let params = url.parseQuery(text) onerror recover new url.Values()
+		let hint = params.get("id_token_hint")
+		let sid = ""
+		let clientId = params.get("client_id")
+		if !(hint is none) {
+			let pub = new jose.JwkSet()
+			for let k in p.server.keys.keys {
+				pub.keys.push(k.publicKey()) unless k.kty == jose.KeyType.Oct
+			}
+			let jws = jose.parseJws(hint) onerror recover new jose.Jws()
+			let payload = jws.verify(pub, [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.PS256, jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.ES512, jose.SignatureAlgorithm.EdDSA]) onerror recover byte[]
+			if payload.len() > 0 {
+				let doc = parseObject(string(payload), "id_token_hint") onerror recover new map<string, any>()
+				let s = doc.get("sid")
+				sid = s is none ?? ("", "{s}")
+				let aud = doc.get("aud")
+				if clientId is none {
+					let list = audienceList(aud)
+					clientId = list.len() > 0 ?? (list[0], none)
+				}
+			}
+		}
+		let redirect = params.get("post_logout_redirect_uri")
+		let target = ""
+		if !(redirect is none) && !(clientId is none) {
+			let client = try p.server.clients.client(clientId)
+			let registered = client is none ?? (none, client.metadata.get("post_logout_redirect_uris"))
+			let allowed = audienceList(registered)
+			if redirect in allowed {
+				target = redirect
+				let state = params.get("state")
+				if !(state is none) {
+					let q = new url.Values()
+					q.set("state", state)
+					target += (target.contains("?") ?? ("&", "?")) + q.encode()
+				}
+			}
+		}
+		let frames = sid == "" ?? (string[], try p.endSession(sid))
+		if frames.len() == 0 {
+			return try ctx.redirect(target, 303) when target != ""
+			return try ctx.html(200, "<!doctype html><html><head><title>Signed out</title></head><body><p>You are signed out.</p></body></html>")
+		}
+		let iframes = ""
+		for let f in frames {
+			iframes += "<iframe src=\"{htmlEscapeText(f)}\" style=\"display:none\"></iframe>"
+		}
+		let next = target == "" ?? ("", "<script>window.onload=function()\{setTimeout(function()\{location.href=" + jsString(target) + "\},1000)\}</script>")
+		return try ctx.html(200, "<!doctype html><html><head><title>Signing out</title></head><body><p>Signing out...</p>" + iframes + next + "</body></html>")
+	}
+
+	internal def htmlEscapeText(text string) string {
+		return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+	}
+
+	internal def jsString(text string) string {
+		return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"").replace("<", "\\u003c") + "\""
+	}
+
+	// logoutToken is a back-channel logout token (Back-Channel Logout §2.4).
+	internal def logoutToken(p Provider, client oauth2.RegisteredClient, subject string, sid string) !string {
+		let claims = new jose.Claims()
+		claims.issuer = p.server.issuer
+		claims.subject = subjectFor(p, subject, client)
+		claims.audience = [client.id]
+		claims.issuedAt = time.now()
+		claims.expires = time.now() + 2m
+		claims.id = b64url(try rand(16))
+		try claims.set("sid", sid)
+		let events map<string, any>
+		events.set(backChannelLogoutEvent, new map<string, any>())
+		try claims.set("events", events)
+		let header = new jose.Header()
+		header.typ = "logout+jwt"
+		return try claims.sign(try idTokenSigner(p, client), none, header)
+	}
+
+	// postLogoutToken delivers a logout token; failures are dropped, as an
+	// RP that cannot be reached cannot be made to log out.
+	internal def postLogoutToken(p Provider, target string, token string) {
+		let form = new url.Values()
+		form.set("logout_token", token)
+		let built = true
+		let req = newRequest(Method.POST, target, form.encode()) onerror (err error) {
+			built = false
+			recover new http.Request()
+		}
+		return unless built
+		req.headers.set("Content-Type", "application/x-www-form-urlencoded")
+		let c = p.httpClient
+		let client = c is none ?? (new http.Client(), c)
+		client.do(req) onerror (err error) {
+			recover new http.Response()
+		}
+	}
+
+	// checkSessionPage is the OP iframe of Session Management §3.3: it
+	// answers "changed" or "unchanged" to an RP's "client_id session_state"
+	// message by recomputing the state from the `op_browser_state` cookie.
+	internal def checkSessionPage() string {
+		return "<!doctype html><html><head><title>check_session</title></head><body><script>" +
+			"function cookie(n)\{var m=document.cookie.match(new RegExp('(?:^|; )'+n+'=([^;]*)'));return m?decodeURIComponent(m[1]):''\}" +
+			"async function hex(s)\{var d=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(d)).map(function(b)\{return b.toString(16).padStart(2,'0')\}).join('')\}" +
+			"window.addEventListener('message',async function(e)\{try\{var parts=String(e.data).split(' ');var cid=parts[0],ss=parts[1]||'';var salt=ss.split('.')[1]||'';" +
+			"var calc=(await hex(cid+' '+e.origin+' '+cookie('op_browser_state')+' '+salt))+'.'+salt;e.source.postMessage(calc===ss?'unchanged':'changed',e.origin)\}catch(x)\{e.source.postMessage('error',e.origin)\}\},false);" +
+			"</script></body></html>"
+	}
+}

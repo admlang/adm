@@ -1,0 +1,377 @@
+partial module std.net.grpc {
+	use (
+		std.time
+		std.net
+		std.net.url
+		std.net.url::(URL)
+		std.net.http.http2
+		std.net.http.http2::(HeaderField)
+		std.net.tls
+		std.data.encoding::(Protobuf)
+		std.net.grpc.wire::*
+	)
+
+	// Per-call settings.
+	struct CallOptions {
+		// Metadata sent with the request headers.
+		metadata    ?Metadata   = none
+		// How long the call may take; 0s for no deadline. Sent as
+		// `grpc-timeout`, and the call fails with DeadlineExceeded when it
+		// passes.
+		timeout     duration    = 0s
+		// How request messages are compressed.
+		compression Compression = Compression.Identity
+	}
+
+	// A connection to one gRPC server, shared by every call made through
+	// it. Calls run concurrently as HTTP/2 streams.
+	type Client {
+		// `http://host:port` (HTTP/2 without TLS, by prior knowledge) or
+		// `https://host:port` (TLS with ALPN h2).
+		target         string
+		// TLS settings for an https target; the server name defaults to the
+		// target's host.
+		tlsConfig      ?tls.Config = none
+		// Encodes requests and decodes responses.
+		codec          Codec       = new Protobuf()
+		// The content subtype after `application/grpc+`; "" sends plain
+		// `application/grpc`.
+		subtype        string      = "proto"
+		// The largest message received; a larger one fails the call with
+		// ResourceExhausted.
+		maxReceiveSize int         = 4 << 20
+		// How long connecting may take.
+		dialTimeout    duration    = 30s
+		userAgent      string      = "grpc-adm/0.1"
+
+		internal conn     ?http2.Conn = none
+		internal endpoint URL
+
+		// A client for the target. A target that is not an http or https
+		// URL with a host makes every call fail with Unavailable.
+		def new(target string) {
+			self.target = target
+		}
+
+		// Makes a unary call: sends request, fills response. method is the
+		// full name, `/package.Service/Method`. Fails with a Status: the one
+		// the server ended the call with, or one this side derived.
+		def call(method string, request any, response any, options CallOptions = CallOptions{}) !none {
+			let s = try stream(method, options)
+			try s.send(request)
+			try s.closeSend()
+			let got = try s.receive(response)
+			fail errorOf(Code.Unimplemented, "grpc: unary call ended without a response") unless got
+			let extra = s.receive(new Discard()) onerror (err error) {
+				recover false
+			}
+			fail errorOf(Code.Unimplemented, "grpc: unary call answered with more than one response") when extra
+			return none
+		}
+
+		// Opens a call for streaming in either or both directions. Fails with
+		// Unavailable when the connection cannot be made.
+		def stream(method string, options CallOptions = CallOptions{}) !ClientStream {
+			let c = try connection()
+			let deadline ?time.Time = none
+			deadline = time.now() + options.timeout when options.timeout > 0s
+			let s = c.newStream(deadline) onerror (err error) {
+				drop(c)
+				fail transportError(err)
+			}
+			s.deadline = deadline
+			let fields HeaderField[] = []
+			fields.push(HeaderField{name: ":method", value: "POST"})
+			fields.push(HeaderField{name: ":scheme", value: endpoint.scheme.lower()})
+			fields.push(HeaderField{name: ":path", value: method})
+			fields.push(HeaderField{name: ":authority", value: endpoint.host})
+			fields.push(HeaderField{name: "content-type", value: subtype == "" ?? ("application/grpc", "application/grpc+" + subtype)})
+			fields.push(HeaderField{name: "te", value: "trailers"})
+			fields.push(HeaderField{name: "user-agent", value: userAgent})
+			fields.push(HeaderField{name: "grpc-accept-encoding", value: "identity, deflate, gzip"})
+			fields.push(HeaderField{name: "grpc-encoding", value: encodingName(options.compression)}) when options.compression != Compression.Identity
+			fields.push(HeaderField{name: "grpc-timeout", value: timeoutText(options.timeout)}) when options.timeout > 0s
+			let md = options.metadata
+			fields += fieldsOf(md) unless md is none
+			s.writeHeaders(fields, false) onerror (err error) {
+				fail transportError(err)
+			}
+			return new ClientStream(self, s, options.compression)
+		}
+
+		// Closes the connection; calls in flight fail with Unavailable.
+		// Fails when closing the socket does.
+		def close() !none {
+			let c = takeConn()
+			try c.close() unless c is none
+			return none
+		}
+
+		// The connection, made on first use and again after it fails.
+		internal atomic def connection() !http2.Conn {
+			let have = conn
+			return have when !(have is none) && have.isUsable()
+			endpoint = parseTarget(target) onerror (err error) {
+				fail errorOf(Code.Unavailable, "grpc: bad target {target}: {err.message}")
+			}
+			let secure = endpoint.scheme.lower() == "https"
+			let addr = joinHostPort(endpoint.hostname(), endpoint.effectivePort())
+			let raw = net.dialStream(addr, dialTimeout) onerror (err error) {
+				fail transportError(err)
+			}
+			let stream net.Stream = raw
+			if secure {
+				let given = tls.Config{}
+				let cfg0 = tlsConfig
+				given = cfg0 unless cfg0 is none
+				let cfg = tls.withServerName(given, given.serverName == "" ?? (endpoint.hostname(), given.serverName))
+				cfg.alpn = ["h2"]
+				let secured = tls.client(raw, cfg)
+				secured.handshake(dialTimeout) onerror (err error) {
+					raw.close() onerror recover none
+					fail transportError(err)
+				}
+				stream = secured
+			}
+			let wire = new Wire(stream)
+			let c = new http2.Conn(wire, wire, true, stream)
+			c.handshake() onerror (err error) {
+				stream.close() onerror recover none
+				fail transportError(err)
+			}
+			conn = c
+			return c
+		}
+
+		internal atomic def takeConn() ?http2.Conn {
+			let c = conn
+			conn = none
+			return c
+		}
+
+		internal atomic def drop(c http2.Conn) {
+			let have = conn
+			conn = none when !(have is none) && have == c
+		}
+	}
+
+	// One call in progress, on the client side.
+	type ClientStream {
+		internal client      Client
+		internal s           http2.Stream
+		internal compression Compression
+		internal headerRead  bool         = false
+		internal encoding    Compression  = Compression.Identity
+		internal finished    bool         = false
+		internal result      ?Status      = none
+		internal head        Metadata
+		internal tail        Metadata
+
+		def new(client Client, s http2.Stream, compression Compression) {
+			self.client = client
+			self.s = s
+			self.compression = compression
+			self.head = new Metadata()
+			self.tail = new Metadata()
+		}
+
+		// Sends one request message. Fails with a Status when the stream
+		// fails (the call's status, when the server already ended it).
+		def send(message any) !none {
+			writeMessage(s, client.codec.encode(message), compression) onerror (err error) {
+				fail try statusAfterFailure(err)
+			}
+			return none
+		}
+
+		// Ends the request side: no more messages follow. Fails with a
+		// Status when the stream already failed.
+		def closeSend() !none {
+			s.end() onerror (err error) {
+				fail try statusAfterFailure(err)
+			}
+			return none
+		}
+
+		// Reads the next response message into target. Returns false when
+		// the server ended the call with OK and no message is left. Fails
+		// with the Status the call ended with otherwise, or when a message
+		// does not decode (Internal).
+		def receive(target any) !bool {
+			try readHead()
+			return try conclude() when finished
+			let data = readMessage(s, encoding, client.maxReceiveSize) onerror (err error) {
+				if err is Status {
+					s.reset(http2.ErrorCode.Cancel) onerror recover none
+					fail err
+				}
+				fail try statusAfterFailure(err)
+			}
+			if data is none {
+				finished = true
+				return try conclude()
+			}
+			client.codec.decode(data, target) onerror (err error) {
+				s.reset(http2.ErrorCode.Cancel) onerror recover none
+				fail errorOf(Code.Internal, "grpc: cannot decode response: {err.message}")
+			}
+			return true
+		}
+
+		// The response header metadata, waiting for it. Fails with the
+		// call's Status when it ended without headers.
+		def header() !Metadata {
+			try readHead()
+			return head
+		}
+
+		// The trailing metadata; empty until the call has ended.
+		def trailer() Metadata {
+			return tail
+		}
+
+		// Cancels the call: the server sees RST_STREAM CANCEL.
+		def cancel() {
+			s.reset(http2.ErrorCode.Cancel) onerror recover none
+		}
+
+		// Reads the response headers once.
+		internal def readHead() !none {
+			return none when headerRead
+			let fields = s.readHeaders() onerror (err error) {
+				fail try statusAfterFailure(err)
+			}
+			headerRead = true
+			let status = fieldValue(fields, ":status")
+			if status != "200" {
+				let n = parseInt<int>(status)
+				finished = true
+				result = errorOf(codeOfHTTP(n), "grpc: HTTP status {status}")
+				return none
+			}
+			if fieldValue(fields, "grpc-status") != "" {
+				// Trailers-only: the headers end the call.
+				finished = true
+				tail = metadataOf(fields)
+				result = statusOf(fields, tail)
+				return none
+			}
+			let ct = fieldValue(fields, "content-type").lower()
+			if !ct.startsWith("application/grpc") {
+				finished = true
+				result = errorOf(Code.Unknown, "grpc: response content type {ct}")
+				return none
+			}
+			let enc = compressionOf(fieldValue(fields, "grpc-encoding"))
+			if enc is none {
+				finished = true
+				result = errorOf(Code.Internal, "grpc: unsupported response encoding {fieldValue(fields, "grpc-encoding")}")
+				return none
+			}
+			encoding = enc
+			head = metadataOf(fields)
+			return none
+		}
+
+		// The end of the call: false for OK, else fails with its Status.
+		internal def conclude() !bool {
+			if result is none {
+				let trailers = s.trailers
+				if !s.haveTrailers {
+					result = errorOf(Code.Internal, "grpc: call ended without trailers")
+				} else {
+					tail = metadataOf(trailers)
+					result = statusOf(trailers, tail)
+				}
+			}
+			let r = result
+			fail r unless r is none || r.kind == Code.OK
+			return false
+		}
+
+		// The Status for a stream failure: DeadlineExceeded past the
+		// deadline, Cancelled after a cancel, Unavailable otherwise.
+		internal def statusAfterFailure(err error) !Status {
+			let until = s.deadline
+			if !(until is none) {
+				return errorOf(Code.DeadlineExceeded, "grpc: deadline exceeded") unless time.now().before(until)
+			}
+			if err is http2.Http2Error {
+				return errorOf(Code.Cancelled, "grpc: call cancelled") when err.errorCode == http2.ErrorCode.Cancel
+				return errorOf(Code.ResourceExhausted, "grpc: {err.message}") when err.errorCode == http2.ErrorCode.EnhanceYourCalm
+				return errorOf(Code.PermissionDenied, "grpc: {err.message}") when err.errorCode == http2.ErrorCode.InadequateSecurity
+				return errorOf(Code.Unavailable, "grpc: {err.message}") when err.errorCode == http2.ErrorCode.RefusedStream
+			}
+			return transportError(err)
+		}
+	}
+
+	// A stream socket as an io.Reader and io.Writer without timeouts: an
+	// HTTP/2 connection waits on its own deadlines.
+	internal type Wire {
+		internal conn net.Stream
+
+		def new(conn net.Stream) {
+			self.conn = conn
+		}
+
+		def read(buf byte[]) !int {
+			return try conn.read(buf, 87600h)
+		}
+
+		def write(buf byte[]) !int {
+			return try conn.write(buf, 87600h)
+		}
+	}
+
+	// A decode target that keeps nothing, for counting extra responses.
+	internal type Discard {}
+
+	// Unavailable for a connection that could not be made or failed.
+	internal def transportError(err error) Status {
+		let s = errorOf(Code.Unavailable, "grpc: {err.message}")
+		s.cause = err
+		return s
+	}
+
+	// The Status that `grpc-status`, `grpc-message` and
+	// `grpc-status-details-bin` describe.
+	internal def statusOf(fields HeaderField[], trailer Metadata) Status {
+		let text = fieldValue(fields, "grpc-status")
+		let code = Code.Unknown
+		code = codeOf(parseInt<int>(text)) when text != "" && text.len() <= 2 && isNumber(text)
+		let s = errorOf(code, decodeMessage(fieldValue(fields, "grpc-message")))
+		let details = fieldValue(fields, "grpc-status-details-bin")
+		if details != "" {
+			s.details = decodeBase64(details) onerror recover byte[]
+		}
+		s.trailer = trailer
+		return s
+	}
+
+	internal def fieldValue(fields HeaderField[], name string) string {
+		for let f in fields {
+			return f.value when f.name.lower() == name
+		}
+		return ""
+	}
+
+	internal def isNumber(text string) bool {
+		for let c in text {
+			return false when c < '0' || c > '9'
+		}
+		return true
+	}
+
+	internal def parseTarget(target string) !URL {
+		let u = try url.parse(target)
+		fail "scheme must be http or https" unless u.scheme.lower() := "http" || "https"
+		fail "no host" when u.hostname() == ""
+		return u
+	}
+
+	internal def joinHostPort(host string, port int) string {
+		return "[{host}]:{port}" when host.contains(":")
+		return "{host}:{port}"
+	}
+}

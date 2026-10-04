@@ -1,0 +1,188 @@
+partial module std.proto.auth.webauthn {
+	use (
+		std.crypto
+		std.devices
+		std.devices::(HidDevice)
+		std.services.devices::(Device)
+		std.time
+		std.time::(Time)
+		std.proto.auth.webauthn.ctap::*
+	)
+
+	// CTAPHID commands (CTAP 2.2 §11.2.9).
+	enum CTAPHIDCommand {
+		Ping = 0x01,
+		// A CTAP1/U2F APDU.
+		Msg = 0x03,
+		Lock = 0x04,
+		Init = 0x06,
+		Wink = 0x08,
+		// A CTAP2 CBOR command.
+		CBOR = 0x10,
+		Cancel = 0x11,
+		Keepalive = 0x3B,
+		Error = 0x3F
+	}
+
+	// CTAPHID capability bits an authenticator reports at INIT.
+	enum CTAPHIDCapability {
+		Wink = 0x01,
+		CBOR = 0x04,
+		// The authenticator does not speak CTAP1/U2F (no CTAPHID_MSG).
+		NoMsg = 0x08
+	}
+
+	// CTAPTransport carries CTAP messages to an authenticator: USB HID, or
+	// an authenticator in the same process.
+	interface CTAPTransport {
+		// Sends a command's payload and returns the response payload, after
+		// any keepalives. Fails with a CTAPError when the transport reports
+		// one, or when no answer comes before the transport's timeout.
+		def transact(command CTAPHIDCommand, data byte[]) !byte[]
+
+		// The CTAPHIDCapability bits.
+		def capabilities() int
+
+		// Releases the transport. Fails when the device cannot be closed.
+		def close() !none
+	}
+
+	// The FIDO security keys connected over USB: raw HID devices whose usage
+	// page is 0xF1D0. Fails when the policy denies listing devices.
+	def securityKeys() !Device[] {
+		return try devices.hidDevices(0xF1D0)
+	}
+
+	// HIDTransport speaks CTAPHID (CTAP 2.2 §11.2) to a security key over a
+	// std.devices HidDevice: 64-byte reports, a channel of its own from INIT, and
+	// messages split into an initialization packet and continuation
+	// packets.
+	type HIDTransport {
+		device Device = Device{}
+
+		// How long to wait for an answer, including the time the user takes
+		// to touch the key.
+		timeout duration = 30s
+
+		// Called with each keepalive status: 1 while processing, 2 while
+		// waiting for the user to touch the key.
+		onKeepalive ?def (int) = none
+
+		// The CTAPHID protocol version and the device's version from INIT.
+		protocolVersion int
+		deviceVersion   (int, int, int) = (0, 0, 0)
+
+		internal hid  ?HidDevice = none
+		internal cid  uint32     = uint32(0xFFFFFFFF)
+		internal caps int
+
+		def new() {}
+
+		// The capability bits from INIT.
+		def capabilities() int {
+			return caps
+		}
+
+		// Sends one message and returns the answer; see CTAPTransport.
+		// Fails with a CTAPError for a CTAPHID error, Timeout when no
+		// answer arrives in time (the request is then cancelled), or when the
+		// device cannot be written or read.
+		def transact(command CTAPHIDCommand, data byte[]) !byte[] {
+			let deadline = time.now() + timeout
+			for {
+				try writeMessage(command.value, data)
+				let busy = false
+				let answer = readMessage(command.value, deadline) onerror (err error) {
+					if err is CTAPError && err.status == CTAPStatus.ChannelBusy && time.now().before(deadline) {
+						busy = true
+						recover byte[]
+					}
+					cancel() when err is CTAPError && err.status == CTAPStatus.Timeout
+					fail err
+				}
+				if busy {
+					// Another channel holds the key; ask again shortly.
+					time.sleep(50ms)
+					continue
+				}
+				return answer
+			}
+		}
+
+		// Abandons the request in progress on this channel (CTAPHID_CANCEL).
+		def cancel() {
+			writeMessage(CTAPHIDCommand.Cancel.value, byte[]) onerror recover none
+		}
+
+		// Closes the device. Fails when it was not open.
+		def close() !none {
+			let h = hid
+			fail "ctap: the key is not open" when h is none
+			h.close()
+			hid = none
+			return none
+		}
+
+		// Opens a security key's hidraw node and allocates a channel
+		// (CTAPHID_INIT on the broadcast channel). Fails when the device
+		// cannot be opened or does not answer INIT within five seconds.
+		def open(d Device) !none {
+			device = d
+			hid = try devices.openHid(d.id)
+			let nonce = try crypto.rand(8)
+			cid = uint32(0xFFFFFFFF)
+			try writeMessage(CTAPHIDCommand.Init.value, nonce)
+			let deadline = time.now() + 5s
+			for {
+				let answer = try readMessage(CTAPHIDCommand.Init.value, deadline)
+				continue when answer.len() < 17 || !answer.slice(0, 8).equals(nonce)
+				cid = uint32(answer[8]) << 24 | uint32(answer[9]) << 16 | uint32(answer[10]) << 8 | uint32(answer[11])
+				protocolVersion = int(answer[12])
+				deviceVersion = (int(answer[13]), int(answer[14]), int(answer[15]))
+				caps = int(answer[16])
+				return none
+			}
+		}
+
+		// Writes a message as CTAPHID packets, unnumbered output reports.
+		internal def writeMessage(command int, data byte[]) !none {
+			let h = hid
+			fail "ctap: the key is not open" when h is none
+			for let (_, packet) in ctaphidPackets(cid, command, data) {
+				try h.write(packet)
+			}
+			return none
+		}
+
+		// Reads the answer to a command on this channel, passing keepalives
+		// to onKeepalive. Fails on a CTAPHID error, a broken sequence, or the
+		// deadline.
+		internal def readMessage(command int, deadline Time) !byte[] {
+			let assembler = new CTAPHIDAssembler(cid)
+			for {
+				let left = deadline.since(time.now())
+				fail ctapError(CTAPStatus.Timeout, "no answer from the key") when left <= 0s
+				let h = hid
+				fail "ctap: the key is not open" when h is none
+				let packet = try h.read(left)
+				continue when packet is none || packet.len() < 7
+				let done = try assembler.add(packet)
+				continue when !done
+				let cmd = assembler.command
+				if cmd == CTAPHIDCommand.Keepalive.value {
+					let status = assembler.data.len() > 0 ?? (int(assembler.data[0]), 0)
+					let hook = onKeepalive
+					hook(status) unless hook is none
+					assembler = new CTAPHIDAssembler(cid)
+					continue
+				}
+				if cmd == CTAPHIDCommand.Error.value {
+					let code = assembler.data.len() > 0 ?? (int(assembler.data[0]), 0x7F)
+					fail ctapError(ctapStatus(code), "the key reported a CTAPHID error")
+				}
+				fail ctapError(CTAPStatus.InvalidCommand, "answer to command {cmd} instead of {command}") when cmd != command
+				return assembler.data
+			}
+		}
+	}
+}

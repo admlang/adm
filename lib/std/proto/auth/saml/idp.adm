@@ -1,0 +1,946 @@
+partial module std.proto.auth.saml {
+	use (
+		std.time
+		std.crypto::(PrivateKey, publicKeyOf)
+		std.crypto.hash::(Hash, hmac)
+		std.data.encoding::(XMLNode, Base64, SignatureMethod, DataEncryption, KeyTransport, XMLEncryption, XMLRecipient, encryptXML)
+		std.net.http
+		std.net.http::(Context, Handler)
+		std.net.url
+		std.proto.auth.saml.engine::*
+	)
+
+	// Decision is the app's answer to a pending login: who logged in, what
+	// to assert about them, and their login session at the identity
+	// provider.
+	struct Decision {
+		// The user's identifier: the NameID value for the email,
+		// unspecified and other plain formats, the input of a persistent
+		// identifier.
+		nameId          string
+		// Overrides the format the request or the service provider's
+		// metadata asks for.
+		nameIdFormat    ?NameIdFormat
+		attributes      map<string, string[]>
+		authnContext    string                = passwordProtectedTransport
+		// When the user authenticated; now when none.
+		authnInstant    ?time.Time
+		// The app's login session at the identity provider; Single Logout
+		// ends the service providers' sessions of the same one. Empty gives
+		// each login a session of its own.
+		session         string                = ""
+		// Sent as SessionNotOnOrAfter when set.
+		sessionLifetime ?duration
+	}
+
+	// PendingLogin is an AuthnRequest the identity provider checked and
+	// parked while the app logs the user in: the service provider, where
+	// the response goes, and what the request asked for.
+	type PendingLogin {
+		id            string
+		sp            EntityDescriptor
+		// The AuthnRequest's ID.
+		requestId     string
+		acs           Endpoint
+		relayState    string           = ""
+		forceAuthn    bool             = false
+		isPassive     bool             = false
+		// The NameIDPolicy Format, "" when the request has none.
+		nameIdFormat  string           = ""
+		allowCreate   bool             = true
+		// RequestedAuthnContext class references and how to compare them.
+		authnContexts string[]         = []
+		comparison    AuthnComparison  = AuthnComparison.Exact
+		expiresAt     time.Time
+
+		def new(id string, sp EntityDescriptor, requestId string, acs Endpoint, expiresAt time.Time) {
+			self.id = id
+			self.sp = sp
+			self.requestId = requestId
+			self.acs = acs
+			self.expiresAt = expiresAt
+		}
+	}
+
+	// ServiceProviderStore holds the metadata of the service providers an
+	// identity provider serves, by entity ID.
+	interface ServiceProviderStore {
+		// serviceProvider returns the metadata of a service provider, none
+		// when unknown.
+		def serviceProvider(entityId string) !?EntityDescriptor
+		// save adds or replaces a service provider.
+		def save(metadata EntityDescriptor) !none
+		def remove(entityId string) !none
+	}
+
+	// MemoryServiceProviderStore keeps service providers in memory; the
+	// default ServiceProviderStore.
+	type MemoryServiceProviderStore {
+		internal entities map<string, EntityDescriptor>
+
+		def new() {}
+
+		// serviceProvider implements ServiceProviderStore. Never fails.
+		atomic def serviceProvider(entityId string) !?EntityDescriptor {
+			return entities.get(entityId)
+		}
+
+		// save implements ServiceProviderStore. Never fails.
+		atomic def save(metadata EntityDescriptor) !none {
+			entities.set(metadata.entityId, metadata)
+			return none
+		}
+
+		// remove implements ServiceProviderStore. Never fails.
+		atomic def remove(entityId string) !none {
+			entities.delete(entityId)
+			return none
+		}
+	}
+
+	// IdentityProvider is a SAML identity provider. `handler()` serves its
+	// endpoints under baseURL: `/sso` (Redirect and Post), `/slo`
+	// (Redirect, Post and Soap), `/artifact` (artifact resolution over
+	// SOAP) and `/metadata`. The user's login stays in the app, reached
+	// through loginURL with `?request=<id>`; the app finishes it with
+	// complete or deny.
+	//
+	// ```
+	// let provider = new saml.IdentityProvider("https://idp.example/saml", key, cert)
+	// provider.loginURL = "https://idp.example/login"
+	// try provider.serviceProviders.save(try saml.parseMetadata(spMetadata))
+	// try mux.handle("/saml/", provider.handler())
+	// ```
+	type IdentityProvider {
+		entityId              string
+		key                   PrivateKey
+		// The DER certificate of the key, published in the metadata.
+		certificate           ?byte[]
+		serviceProviders      ServiceProviderStore
+		// Where the endpoints live; the entity ID by default.
+		baseURL               string
+		// The app's login page.
+		loginURL              string                       = ""
+		// The signature method; none picks the key's usual one.
+		signatureMethod       ?SignatureMethod
+		// Sign assertions. Responses are signed when this is off, or with
+		// signResponses.
+		signAssertions        bool                         = true
+		signResponses         bool                         = false
+		// Encrypt assertions to service providers that publish an
+		// encryption key. The algorithms come from the key's
+		// EncryptionMethods when it lists ones this module implements,
+		// else from `encryption`.
+		encryptAssertions     bool                         = true
+		encryption            XMLEncryption                = XMLEncryption{}
+		// Refuse AuthnRequests that are not signed (service providers whose
+		// metadata says AuthnRequestsSigned are always held to it).
+		requireSignedRequests bool                         = false
+		nameIdFormats         NameIdFormat[]               = [NameIdFormat.Persistent, NameIdFormat.Transient, NameIdFormat.EmailAddress, NameIdFormat.Unspecified]
+		// The HMAC key persistent NameIDs are derived from, so a user gets
+		// the same opaque identifier at a service provider every time and a
+		// different one at each. Required for the persistent format.
+		persistentSecret      byte[]                       = []
+		assertionLifetime     duration                     = 5m
+		pendingLifetime       duration                     = 15m
+		artifactLifetime      duration                     = 60s
+		leeway                duration                     = 60s
+		allowSha1             bool                         = false
+		// Ends the app's login session when a service provider starts
+		// Single Logout (the session of the Decision that logged in).
+		endSession            ?def (Context, string) !none
+		// The client back-channel (SOAP) logout uses.
+		httpClient            ?http.Client
+		internal state        IdpState
+
+		def new(entityId string, key PrivateKey, certificate ?byte[] = none, serviceProviders ?ServiceProviderStore = none) {
+			self.entityId = entityId
+			self.key = key
+			self.certificate = certificate
+			self.serviceProviders = serviceProviders is none ?? (new MemoryServiceProviderStore(), serviceProviders)
+			baseURL = entityId
+			state = new IdpState()
+		}
+
+		// metadata is this identity provider's metadata: the signing key,
+		// single sign-on for Redirect and Post, Single Logout for Redirect,
+		// Post and Soap, artifact resolution, and the NameID formats.
+		def metadata() EntityDescriptor {
+			let e = new EntityDescriptor(entityId)
+			let d = new IdpDescriptor()
+			d.keys.push(new KeyDescriptor(publicKeyOf(key), certificate, KeyUse.Signing))
+			let base = baseURL.trimSuffix("/")
+			d.singleSignOn = [Endpoint{binding:Binding.Redirect, location:base + "/sso"}, Endpoint{binding:Binding.Post, location:base + "/sso"}]
+			d.singleLogout = [Endpoint{binding:Binding.Redirect, location:base + "/slo"}, Endpoint{binding:Binding.Post, location:base + "/slo"}, Endpoint{binding:Binding.Soap, location:base + "/slo"}]
+			d.artifactResolution = [Endpoint{binding:Binding.Soap, location:base + "/artifact", index:0, isDefault:true}]
+			d.wantAuthnRequestsSigned = requireSignedRequests
+			d.nameIdFormats = nameIdFormats.mapElem<string>(f => f.value)
+			e.idp = d
+			return e
+		}
+
+		// handler serves the endpoints under baseURL's path.
+		def handler() Handler {
+			return new IdpHandler(self)
+		}
+
+		// pending returns a parked login by the id the login page received.
+		// Fails with Expired when there is none or it expired.
+		def pending(id string) !PendingLogin {
+			let p = state.getPending(id)
+			fail samlError(SamlErrorKind.Expired, "no pending login {id}") when p is none
+			return p
+		}
+
+		// complete finishes a pending login with the user's decision: the
+		// Response and Assertion are built (NameID in the format asked for,
+		// AuthnStatement with the session's index, the attributes), signed,
+		// encrypted to the service provider when it has an encryption key,
+		// and delivered to its ACS by POST form or artifact. A request with
+		// an exact RequestedAuthnContext the decision's context is not in
+		// gets NoAuthnContext instead. Fails with Expired when the login is
+		// gone, Unsupported for a persistent
+		// NameID without persistentSecret, and when signing or encryption
+		// fails.
+		def complete(ctx Context, id string, decision Decision) !none {
+			let p = state.takePending(id)
+			fail samlError(SamlErrorKind.Expired, "no pending login {id}") when p is none
+			let format = try chooseFormat(self, p.sp, p.nameIdFormat, decision.nameIdFormat)
+			return try sendStatus(self, ctx, p.sp, p.acs, p.requestId, p.relayState, [StatusCode.Requester.value, StatusCode.InvalidNameIdPolicy.value], "no NameID format both sides support") when format == ""
+			// An exact RequestedAuthnContext must be met (saml-core
+			// §3.3.2.2.1); the other comparisons order contexts as the app
+			// decides, so they are its to check.
+			let unmet = p.authnContexts.len() > 0 && p.comparison == AuthnComparison.Exact && !(decision.authnContext in p.authnContexts)
+			return try sendStatus(self, ctx, p.sp, p.acs, p.requestId, p.relayState, [StatusCode.Responder.value, StatusCode.NoAuthnContext.value], "the login used {decision.authnContext}") when unmet
+			let message = try deliver(self, p.sp, p.acs, p.requestId, p.relayState, decision, format)
+			return try message.send(ctx)
+		}
+
+		// deny ends a pending login with an error status the service
+		// provider receives (AuthnFailed by default; NoPassive answers a
+		// passive request the app cannot satisfy silently). Fails with
+		// Expired when the login is gone.
+		def deny(ctx Context, id string, status StatusCode = StatusCode.AuthnFailed, message string = "") !none {
+			let p = state.takePending(id)
+			fail samlError(SamlErrorKind.Expired, "no pending login {id}") when p is none
+			return try sendStatus(self, ctx, p.sp, p.acs, p.requestId, p.relayState, [StatusCode.Responder.value, status.value], message)
+		}
+
+		// unsolicited logs a user in to a service provider no request came
+		// from (IdP-initiated single sign-on), at its default ACS. Fails
+		// with UnknownEntity for an unknown service provider, Unsupported
+		// when it has no Post or Artifact ACS, and as complete does.
+		def unsolicited(ctx Context, spEntityId string, decision Decision, relayState string = "") !none {
+			let sp = try serviceProviders.serviceProvider(spEntityId)
+			fail samlError(SamlErrorKind.UnknownEntity, "unknown service provider {spEntityId}") when sp is none
+			let role = sp.sp
+			fail samlError(SamlErrorKind.UnknownEntity, "{spEntityId} has no service provider role") when role is none
+			let acs = defaultEndpoint(role.assertionConsumers.filter(e => e.binding := Binding.Post || Binding.Artifact))
+			fail samlError(SamlErrorKind.Unsupported, "{spEntityId} has no Post or Artifact ACS") when acs is none
+			let format = try chooseFormat(self, sp, "", decision.nameIdFormat)
+			fail samlError(SamlErrorKind.Unsupported, "no NameID format both sides support") when format == ""
+			let message = try deliver(self, sp, acs, "", relayState, decision, format)
+			return try message.send(ctx)
+		}
+
+		// logout ends a login session at every service provider it reached
+		// (IdP-initiated Single Logout): each gets a signed LogoutRequest,
+		// over SOAP or through the browser one after the other, and the
+		// browser lands on returnURL at the end. Fails when the response
+		// cannot be written.
+		def logout(ctx Context, session string, returnURL string = "") !none {
+			let chain = new LogoutChain(try newId())
+			chain.returnURL = returnURL
+			let s = state.takeSession(session)
+			chain.remaining = s is none ?? ([], s.participants)
+			return try continueLogout(self, ctx, chain)
+		}
+	}
+
+	internal struct Participant {
+		sp           string
+		nameId       NameId
+		sessionIndex string
+	}
+
+	internal type IdpSession {
+		index        string
+		participants Participant[] = []
+
+		def new(index string) {
+			self.index = index
+		}
+	}
+
+	// LogoutChain is a Single Logout the identity provider is propagating:
+	// who started it, who is left, and whether everyone logged out.
+	internal type LogoutChain {
+		id               string
+		// The service provider that sent the LogoutRequest, "" when the
+		// identity provider started it.
+		initiator        string        = ""
+		initiatorRequest string        = ""
+		initiatorBinding Binding       = Binding.Redirect
+		relayState       string        = ""
+		returnURL        string        = ""
+		remaining        Participant[] = []
+		// The service provider whose LogoutResponse is awaited.
+		current          string        = ""
+		incomplete       bool          = false
+
+		def new(id string) {
+			self.id = id
+		}
+	}
+
+	internal struct StoredArtifact {
+		response  XMLNode
+		sp        string
+		expiresAt time.Time
+	}
+
+	// IdpState is what an identity provider keeps between requests: parked
+	// logins, artifacts, login sessions and logouts in progress.
+	internal type IdpState {
+		pending   map<string, PendingLogin>
+		artifacts map<string, StoredArtifact>
+		sessions  map<string, IdpSession>
+		logouts   map<string, LogoutChain>
+		seen      map<string, time.Time>
+		writes    int                         = 0
+
+		def new() {}
+
+		// putFirst records a request ID until it expires and reports
+		// whether it was new.
+		atomic def putFirst(id string, until time.Time) bool {
+			let known = seen.get(id)
+			return false when !(known is none) && time.now().before(known)
+			seen.set(id, until)
+			sweep()
+			return true
+		}
+
+		atomic def putPending(p PendingLogin) {
+			pending.set(p.id, p)
+			sweep()
+		}
+
+		atomic def getPending(id string) ?PendingLogin {
+			let p = pending.get(id)
+			return none when p is none
+			return none unless time.now().before(p.expiresAt)
+			return p
+		}
+
+		atomic def takePending(id string) ?PendingLogin {
+			let p = pending.get(id)
+			return none when p is none
+			pending.delete(id)
+			return none unless time.now().before(p.expiresAt)
+			return p
+		}
+
+		atomic def putArtifact(artifact string, stored StoredArtifact) {
+			artifacts.set(artifact, stored)
+			sweep()
+		}
+
+		atomic def takeArtifact(artifact string) ?StoredArtifact {
+			let a = artifacts.get(artifact)
+			return none when a is none
+			artifacts.delete(artifact)
+			return none unless time.now().before(a.expiresAt)
+			return a
+		}
+
+		// join records a service provider in a login session and returns
+		// the session's index.
+		atomic def join(session string, index string, p Participant) string {
+			let s = sessions.get(session)
+			if s is none {
+				let fresh = new IdpSession(index)
+				fresh.participants.push(Participant{...p, sessionIndex: index})
+				sessions.set(session, fresh)
+				return index
+			}
+			let kept Participant[] = []
+			for let q in s.participants {
+				kept.push(q) unless q.sp == p.sp
+			}
+			kept.push(Participant{...p, sessionIndex: s.index})
+			s.participants = kept
+			return s.index
+		}
+
+		// sessionIndexOf returns a session's index, none for a new session.
+		atomic def sessionIndexOf(session string) ?string {
+			let s = sessions.get(session)
+			return none when s is none
+			return s.index
+		}
+
+		// findSession returns the session a service provider's LogoutRequest
+		// names: its NameID there and, when given, a session index.
+		atomic def findSession(sp string, nameId string, indexes string[]) ?string {
+			for let (key, s) in sessions {
+				for let p in s.participants {
+					return key when p.sp == sp && p.nameId.value == nameId && (indexes.len() == 0 || p.sessionIndex in indexes)
+				}
+			}
+			return none
+		}
+
+		atomic def takeSession(session string) ?IdpSession {
+			let s = sessions.get(session)
+			sessions.delete(session) unless s is none
+			return s
+		}
+
+		atomic def putLogout(requestId string, chain LogoutChain) {
+			logouts.set(requestId, chain)
+		}
+
+		atomic def takeLogout(requestId string) ?LogoutChain {
+			let c = logouts.get(requestId)
+			logouts.delete(requestId) unless c is none
+			return c
+		}
+
+		// sweep drops expired logins and artifacts every so often.
+		internal def sweep() {
+			writes++
+			return unless writes % 256 == 0
+			let now = time.now()
+			for let k in pending.keys() {
+				let p = pending.get(k)
+				pending.delete(k) when !(p is none) && !now.before(p.expiresAt)
+			}
+			for let k in artifacts.keys() {
+				let a = artifacts.get(k)
+				artifacts.delete(k) when !(a is none) && !now.before(a.expiresAt)
+			}
+			for let k in seen.keys() {
+				let t = seen.get(k)
+				seen.delete(k) when !(t is none) && !now.before(t)
+			}
+		}
+	}
+
+	internal type IdpHandler {
+		provider IdentityProvider
+
+		def new(provider IdentityProvider) {
+			self.provider = provider
+		}
+
+		// serve implements http.Handler.
+		def serve(ctx Context) !none {
+			let base = basePath(provider.baseURL)
+			let path = ctx.path()
+			let local = path.startsWith(base) ?? (path[base.len():], path)
+			local = "/" + local.trimPrefix("/")
+			match local {
+				case "/metadata":
+					let text = try provider.metadata().xml(provider.key, provider.certificate, provider.signatureMethod)
+					return try ctx.blob(200, "application/samlmetadata+xml", text.bytes())
+				case "/sso":
+					return try showErrors(ctx, () => ssoEndpoint(provider, ctx))
+				case "/slo":
+					return try showErrors(ctx, () => sloEndpoint(provider, ctx))
+				case "/artifact":
+					return try artifactEndpoint(provider, ctx)
+				default:
+					return try ctx.notFound()
+			}
+		}
+	}
+
+	// showErrors runs a browser endpoint and shows a failure to the user:
+	// a message that cannot be trusted is answered to no one.
+	internal def showErrors(ctx Context, endpoint def () !none) !none {
+		let failure ?error = none
+		endpoint() onerror (err error) {
+			failure = err
+			recover none
+		}
+		return none when failure is none
+		let err = failure
+		return try ctx.text(400, err.message)
+	}
+
+	internal def idpSign(provider IdentityProvider, e XMLNode) !none {
+		return try signElement(e, provider.key, provider.signatureMethod, provider.certificate, "Issuer")
+	}
+
+	internal def spRoleOf(sp EntityDescriptor) !SpDescriptor {
+		let role = sp.sp
+		fail samlError(SamlErrorKind.UnknownEntity, "{sp.entityId} has no service provider role") when role is none
+		return role
+	}
+
+	// requester looks up the service provider a request's Issuer names.
+	internal def requester(provider IdentityProvider, message XMLNode) !EntityDescriptor {
+		let issuer = try issuerOf(message)
+		fail samlError(SamlErrorKind.UnknownEntity, "the {message.localName} has no Issuer") when issuer == ""
+		let sp = try provider.serviceProviders.serviceProvider(issuer)
+		fail samlError(SamlErrorKind.UnknownEntity, "unknown service provider {issuer}") when sp is none
+		return sp
+	}
+
+	// ssoEndpoint checks an AuthnRequest (saml-profiles §4.1.4.1) and parks
+	// it for the app's login page. Until the ACS is known to belong to the
+	// service provider, failures are shown to the user; after, they go back
+	// as SAML error responses.
+	internal def ssoEndpoint(provider IdentityProvider, ctx Context) !none {
+		let inbound = try readInbound(ctx)
+		fail samlError(SamlErrorKind.Malformed, "the single sign-on endpoint takes requests") unless inbound.request
+		fail samlError(SamlErrorKind.Unsupported, "single sign-on takes Redirect or Post") unless inbound.binding := Binding.Redirect || Binding.Post
+		let document = try parseDocument(inbound.xml)
+		try checkProtocol(document, "AuthnRequest", provider.leeway)
+		let sp = try requester(provider, document)
+		let role = try spRoleOf(sp)
+		let keys = role.signingKeys()
+		let signed = inbound.binding == Binding.Redirect ?? (try verifyRedirect(inbound, keys, provider.allowSha1), try verifyEnveloped(document, document, keys, provider.allowSha1))
+		fail samlError(SamlErrorKind.Unsigned, "the AuthnRequest must be signed") when !signed && (role.authnRequestsSigned || provider.requireSignedRequests)
+		let ssoURL = provider.baseURL.trimSuffix("/") + "/sso"
+		let destination = document.attribute("Destination")
+		if destination is none {
+			fail samlError(SamlErrorKind.DestinationMismatch, "a signed request must carry a Destination") when signed && inbound.binding == Binding.Post
+		} else {
+			fail samlError(SamlErrorKind.DestinationMismatch, "the request is for {destination}") unless destination == ssoURL
+		}
+		let acs = try requestedAcs(role, document)
+		let requestId = attr(document, "ID")
+		fail samlError(SamlErrorKind.Replayed, "AuthnRequest {requestId} was seen before") unless provider.state.putFirst(sp.entityId + " " + requestId, time.now() + provider.pendingLifetime)
+		let p = new PendingLogin(try newId(), sp, requestId, acs, time.now() + provider.pendingLifetime)
+		p.relayState = inbound.relayState
+		p.forceAuthn = isTrue(attr(document, "ForceAuthn"))
+		p.isPassive = isTrue(attr(document, "IsPassive"))
+		let policy = document.child("NameIDPolicy", samlpNS)
+		if !(policy is none) {
+			p.nameIdFormat = attr(policy, "Format")
+			let allow = policy.attribute("AllowCreate")
+			p.allowCreate = allow is none || isTrue(allow)
+		}
+		let requested = document.child("RequestedAuthnContext", samlpNS)
+		if !(requested is none) {
+			p.authnContexts = requested.elements("AuthnContextClassRef", samlNS).mapElem<string>(e => e.text().trim())
+			let comparison = attr(requested, "Comparison")
+			for let (i, v) in AuthnComparison.values() {
+				p.comparison = AuthnComparison(i) when v == comparison
+			}
+		}
+		let format = try chooseFormat(provider, sp, p.nameIdFormat, none)
+		return try sendStatus(provider, ctx, sp, acs, requestId, p.relayState, [StatusCode.Requester.value, StatusCode.InvalidNameIdPolicy.value], "unsupported NameID format {p.nameIdFormat}") when format == ""
+		return try sendStatus(provider, ctx, sp, acs, requestId, p.relayState, [StatusCode.Responder.value, StatusCode.AuthnFailed.value], "the identity provider has no login page") when provider.loginURL == ""
+		provider.state.putPending(p)
+		let target = provider.loginURL + (provider.loginURL.contains("?") ?? ("&", "?")) + "request=" + url.queryEscape(p.id)
+		return try ctx.redirect(target, 303)
+	}
+
+	// requestedAcs finds the ACS a request asks for in the service
+	// provider's metadata only (saml-profiles §4.1.4.1): by URL (and
+	// ProtocolBinding when given), by index, or the default.
+	internal def requestedAcs(role SpDescriptor, request XMLNode) !Endpoint {
+		let usable = role.assertionConsumers.filter(e => e.binding := Binding.Post || Binding.Artifact)
+		let wanted = request.attribute("AssertionConsumerServiceURL")
+		let index = request.attribute("AssertionConsumerServiceIndex")
+		let protocol = attr(request, "ProtocolBinding")
+		fail samlError(SamlErrorKind.Malformed, "the request has both an ACS URL and an ACS index") unless wanted is none || index is none
+		if !(wanted is none) {
+			for let e in usable {
+				return e when e.location == wanted && (protocol == "" || e.binding.value == protocol)
+			}
+			fail samlError(SamlErrorKind.DestinationMismatch, "{wanted} is not an ACS of the service provider")
+		}
+		if !(index is none) {
+			for let e in usable {
+				return e when "{e.index}" == index.trim()
+			}
+			fail samlError(SamlErrorKind.DestinationMismatch, "the service provider has no ACS {index}")
+		}
+		let byBinding = protocol == "" ?? (usable, usable.filter(e => e.binding.value == protocol))
+		let chosen = defaultEndpoint(byBinding)
+		fail samlError(SamlErrorKind.Unsupported, "the service provider has no Post or Artifact ACS") when chosen is none
+		return chosen
+	}
+
+	// chooseFormat picks the NameID format: the decision's, the request's,
+	// or the first of the service provider's metadata formats this identity
+	// provider supports, else its own first. "" when the request asks for
+	// one it does not support.
+	internal def chooseFormat(provider IdentityProvider, sp EntityDescriptor, requested string, decided ?NameIdFormat) !string {
+		return decided.value unless decided is none
+		let supported = provider.nameIdFormats.mapElem<string>(f => f.value)
+		return requested in supported ?? (requested, "") when requested != "" && requested != NameIdFormat.Unspecified.value
+		let role = try spRoleOf(sp)
+		for let f in role.nameIdFormats {
+			return f when f in supported
+		}
+		return supported.len() == 0 ?? (NameIdFormat.Unspecified.value, supported[0])
+	}
+
+	// nameIdFor makes the NameID: an HMAC of the service provider and the
+	// user for persistent, random for transient, the decision's value for
+	// the rest.
+	internal def nameIdFor(provider IdentityProvider, sp EntityDescriptor, format string, decision Decision) !NameId {
+		let id = new NameId(decision.nameId, format)
+		if format == NameIdFormat.Persistent.value {
+			fail samlError(SamlErrorKind.Unsupported, "persistent NameIDs need persistentSecret") when provider.persistentSecret.len() == 0
+			id.value = new Base64().encode(hmac(Hash.SHA256, provider.persistentSecret, (sp.entityId + "\u0000" + decision.nameId).bytes()))
+		} else if format == NameIdFormat.Transient.value {
+			id.value = try newId()
+		}
+		if format := NameIdFormat.Persistent.value || NameIdFormat.Transient.value {
+			id.nameQualifier = provider.entityId
+			id.spNameQualifier = sp.entityId
+		}
+		return id
+	}
+
+	// deliver builds, signs, encrypts and encodes the Response of a login.
+	internal def deliver(provider IdentityProvider, sp EntityDescriptor, acs Endpoint, requestId string, relayState string, decision Decision, format string) !Message {
+		let role = try spRoleOf(sp)
+		try checkRelayState(relayState)
+		let nameId = try nameIdFor(provider, sp, format, decision)
+		let session = decision.session == "" ?? (try newId(), decision.session)
+		let known = provider.state.sessionIndexOf(session)
+		let index = provider.state.join(session, known is none ?? (try newId(), known), Participant{sp: sp.entityId, nameId: nameId, sessionIndex: ""})
+		let now = time.now()
+		let response = protocolRoot("Response", try newId(), provider.entityId, acs.location)
+		response.set("InResponseTo", requestId) when requestId != ""
+		statusElement(response, [StatusCode.Success.value])
+		let assertion = response.add(try assertionElement(provider, sp, acs, requestId, nameId, decision, index, now))
+		let assertionSigned = provider.signAssertions || role.wantAssertionsSigned
+		try idpSign(provider, assertion) when assertionSigned
+		let recipient = role.encryptionKey()
+		if provider.encryptAssertions && !(recipient is none) {
+			let method = encryptionFor(provider.encryption, recipient)
+			let encrypted = encryptXML(assertion, [XMLRecipient{key:recipient.key, certificate:recipient.certificate}], method, response) onerror (err error) {
+				fail samlError(SamlErrorKind.Unsupported, "cannot encrypt to {sp.entityId}: {err.message}")
+			}
+			let wrapper = new XMLNode("saml:EncryptedAssertion", samlNS)
+			wrapper.add(encrypted)
+			let children XMLNode[] = []
+			for let c in response.children {
+				children.push(c == encrypted ?? (wrapper, c))
+			}
+			response.children = children
+		}
+		try idpSign(provider, response) when provider.signResponses || !assertionSigned
+		return try encodeResponse(provider, sp, acs, response, relayState)
+	}
+
+	// encryptionFor takes the first data encryption and key transport the
+	// service provider's EncryptionMethods name that this module
+	// implements, else the configured ones.
+	internal def encryptionFor(base XMLEncryption, recipient KeyDescriptor) XMLEncryption {
+		let method = XMLEncryption{...base}
+		let dataSet = false
+		let transportSet = false
+		for let uri in recipient.encryptionMethods {
+			for let (i, v) in DataEncryption.values() {
+				if !dataSet && v == uri {
+					method.data = DataEncryption(i)
+					dataSet = true
+				}
+			}
+			for let (i, v) in KeyTransport.values() {
+				if !transportSet && v == uri && KeyTransport(i) != KeyTransport.Rsa15 {
+					method.transport = KeyTransport(i)
+					transportSet = true
+				}
+			}
+		}
+		return method
+	}
+
+	internal def assertionElement(provider IdentityProvider, sp EntityDescriptor, acs Endpoint, requestId string, nameId NameId, decision Decision, sessionIndex string, now time.Time) !XMLNode {
+		let a = new XMLNode("saml:Assertion", samlNS)
+		a.set("xmlns:saml", samlNS)
+		a.set("ID", try newId())
+		a.set("Version", "2.0")
+		a.set("IssueInstant", instant(now))
+		textElement(a, "saml:Issuer", samlNS, provider.entityId)
+		let subject = element(a, "saml:Subject", samlNS)
+		nameIdElement(subject, nameId)
+		let confirmation = element(subject, "saml:SubjectConfirmation", samlNS)
+		confirmation.set("Method", bearerMethod)
+		let data = element(confirmation, "saml:SubjectConfirmationData", samlNS)
+		data.set("NotOnOrAfter", instant(now + provider.assertionLifetime))
+		data.set("Recipient", acs.location)
+		data.set("InResponseTo", requestId) when requestId != ""
+		let conditions = element(a, "saml:Conditions", samlNS)
+		conditions.set("NotBefore", instant(now - provider.leeway))
+		conditions.set("NotOnOrAfter", instant(now + provider.assertionLifetime))
+		textElement(element(conditions, "saml:AudienceRestriction", samlNS), "saml:Audience", samlNS, sp.entityId)
+		let authn = element(a, "saml:AuthnStatement", samlNS)
+		let authnInstant = decision.authnInstant
+		authn.set("AuthnInstant", instant(authnInstant is none ?? (now, authnInstant)))
+		authn.set("SessionIndex", sessionIndex)
+		let lifetime = decision.sessionLifetime
+		authn.set("SessionNotOnOrAfter", instant(now + lifetime)) unless lifetime is none
+		textElement(element(authn, "saml:AuthnContext", samlNS), "saml:AuthnContextClassRef", samlNS, decision.authnContext)
+		if decision.attributes.len() > 0 {
+			let statement = element(a, "saml:AttributeStatement", samlNS)
+			let names = decision.attributes.keys()
+			names.sort((x, y) => x < y)
+			for let name in names {
+				let attribute = element(statement, "saml:Attribute", samlNS)
+				attribute.set("Name", name)
+				attribute.set("NameFormat", "urn:oasis:names:tc:SAML:2.0:attrname-format:basic")
+				let values = decision.attributes.get(name)
+				for let v in values is none ?? ([], values) {
+					textElement(attribute, "saml:AttributeValue", samlNS, v)
+				}
+			}
+		}
+		return a
+	}
+
+	// encodeResponse sends a signed Response to the ACS: as a POST form,
+	// or as an artifact the service provider resolves.
+	internal def encodeResponse(provider IdentityProvider, sp EntityDescriptor, acs Endpoint, response XMLNode, relayState string) !Message {
+		let id = attr(response, "ID")
+		if acs.binding == Binding.Artifact {
+			let artifact = try newArtifact(provider.entityId, 0)
+			provider.state.putArtifact(artifact, StoredArtifact{response: response, sp: sp.entityId, expiresAt: time.now() + provider.artifactLifetime})
+			let message = new Message(id, Binding.Artifact, acs.location)
+			message.relayState = relayState
+			let query = "SAMLart=" + url.queryEscape(artifact)
+			query += "&RelayState=" + url.queryEscape(relayState) when relayState != ""
+			message.url = acs.location + (acs.location.contains("?") ?? ("&", "?")) + query
+			return message
+		}
+		return try outgoing(id, acs, false, response, relayState, none, none)
+	}
+
+	// sendStatus answers a request with an error status, signed.
+	internal def sendStatus(provider IdentityProvider, ctx Context, sp EntityDescriptor, acs Endpoint, requestId string, relayState string, codes string[], text string) !none {
+		let response = protocolRoot("Response", try newId(), provider.entityId, acs.location)
+		response.set("InResponseTo", requestId) when requestId != ""
+		statusElement(response, codes, text)
+		try idpSign(provider, response)
+		let message = try encodeResponse(provider, sp, acs, response, relayState)
+		return try message.send(ctx)
+	}
+
+	// artifactEndpoint answers an ArtifactResolve over SOAP: signed by the
+	// service provider the artifact was issued to, which gets the Response
+	// once, in a signed ArtifactResponse (saml-bindings §3.6.5).
+	internal def artifactEndpoint(provider IdentityProvider, ctx Context) !none {
+		let body = ctx.bytes() onerror fail samlError(SamlErrorKind.Malformed, "cannot read the request")
+		let envelope = parseDocument(body) onerror (err error) {
+			return try sendSoapFault(ctx, err.message)
+		}
+		let resolve = soapMessage(envelope) onerror (err error) {
+			return try sendSoapFault(ctx, err.message)
+		}
+		checkProtocol(resolve, "ArtifactResolve", provider.leeway) onerror (err error) {
+			return try sendSoapFault(ctx, err.message)
+		}
+		let answer = protocolRoot("ArtifactResponse", try newId(), provider.entityId, "")
+		answer.set("InResponseTo", attr(resolve, "ID"))
+		let artifact = childText(resolve, "Artifact", samlpNS)
+		let stored = artifact is none ?? (none, provider.state.takeArtifact(artifact))
+		let denied = ""
+		let sp = authorizedResolver(provider, resolve, envelope) onerror (err error) {
+			denied = err.message
+			recover new EntityDescriptor("")
+		}
+		if denied != "" {
+			statusElement(answer, [StatusCode.Requester.value, StatusCode.RequestDenied.value], denied)
+		} else if stored is none || stored.sp != sp.entityId {
+			// An unknown, expired or someone else's artifact: Success with
+			// no message (saml-bindings §3.6.5).
+			statusElement(answer, [StatusCode.Success.value])
+		} else {
+			statusElement(answer, [StatusCode.Success.value])
+			answer.add(stored.response)
+		}
+		try idpSign(provider, answer)
+		return try sendSoap(ctx, answer)
+	}
+
+	// authorizedResolver is the service provider an ArtifactResolve comes
+	// from, which must have signed it.
+	internal def authorizedResolver(provider IdentityProvider, resolve XMLNode, envelope XMLNode) !EntityDescriptor {
+		let sp = try requester(provider, resolve)
+		let role = try spRoleOf(sp)
+		fail samlError(SamlErrorKind.Unsigned, "the ArtifactResolve is not signed") unless try verifyEnveloped(resolve, envelope, role.signingKeys(), provider.allowSha1)
+		return sp
+	}
+
+	// sloEndpoint serves Single Logout: LogoutRequests from service
+	// providers (front channel or SOAP) and LogoutResponses to the requests
+	// this identity provider propagated.
+	internal def sloEndpoint(provider IdentityProvider, ctx Context) !none {
+		let inbound = try readInbound(ctx)
+		if inbound.binding == Binding.Soap {
+			let envelope = try parseDocument(inbound.xml)
+			let message = try soapMessage(envelope)
+			let sp = try requester(provider, message)
+			let signed = try verifyEnveloped(message, envelope, (try spRoleOf(sp)).signingKeys(), provider.allowSha1)
+			fail samlError(SamlErrorKind.Unsigned, "the LogoutRequest is not signed") unless signed
+			let request = try readSpLogoutRequest(provider, message, sp)
+			let chain = try startChain(provider, ctx, sp, request, Binding.Soap)
+			// Over SOAP nothing can go through the browser: the others are
+			// reached over SOAP or counted as partial.
+			let ok = try propagateBackChannel(provider, chain)
+			let answer = try idpLogoutResponse(provider, request.id, "", ok)
+			try idpSign(provider, answer)
+			return try sendSoap(ctx, answer)
+		}
+		fail samlError(SamlErrorKind.Unsupported, "Single Logout takes Redirect, Post or Soap") unless inbound.binding := Binding.Redirect || Binding.Post
+		let document = try parseDocument(inbound.xml)
+		let sp = try requester(provider, document)
+		let role = try spRoleOf(sp)
+		let keys = role.signingKeys()
+		let signed = inbound.binding == Binding.Redirect ?? (try verifyRedirect(inbound, keys, provider.allowSha1), try verifyEnveloped(document, document, keys, provider.allowSha1))
+		fail samlError(SamlErrorKind.Unsigned, "front-channel logout messages must be signed") unless signed
+		let sloURL = provider.baseURL.trimSuffix("/") + "/slo"
+		let destination = document.attribute("Destination")
+		fail samlError(SamlErrorKind.DestinationMismatch, "the message is for {destination}") unless destination is none || destination == sloURL
+		if inbound.request {
+			let request = try readSpLogoutRequest(provider, document, sp)
+			let chain = try startChain(provider, ctx, sp, request, inbound.binding)
+			chain.relayState = inbound.relayState
+			return try continueLogout(provider, ctx, chain)
+		}
+		try checkProtocol(document, "LogoutResponse", provider.leeway)
+		let chain = provider.state.takeLogout(attr(document, "InResponseTo"))
+		fail samlError(SamlErrorKind.InResponseToMismatch, "the LogoutResponse answers no logout in progress") when chain is none
+		fail samlError(SamlErrorKind.IssuerMismatch, "the LogoutResponse comes from {sp.entityId}, not {chain.current}") unless sp.entityId == chain.current
+		let (codes, _) = try statusOf(document)
+		chain.incomplete = true unless codes[0] == StatusCode.Success.value && !(StatusCode.PartialLogout.value in codes)
+		return try continueLogout(provider, ctx, chain)
+	}
+
+	internal def readSpLogoutRequest(provider IdentityProvider, message XMLNode, sp EntityDescriptor) !Logout {
+		try checkProtocol(message, "LogoutRequest", provider.leeway)
+		let until = try optionalInstant(message, "NotOnOrAfter")
+		let now = time.now()
+		if !(until is none) {
+			fail samlError(SamlErrorKind.Expired, "the LogoutRequest expired") unless now.before(until + provider.leeway)
+		}
+		let id = attr(message, "ID")
+		fail samlError(SamlErrorKind.Replayed, "LogoutRequest {id} was seen before") unless provider.state.putFirst(sp.entityId + " logout " + id, now + 10m)
+		let logout = new Logout(true, id, sp.entityId)
+		let nameId = try nameIdOf(message, [provider.key], message)
+		fail samlError(SamlErrorKind.Malformed, "the LogoutRequest has no NameID") when nameId is none
+		logout.nameId = nameId
+		logout.sessionIndexes = message.elements("SessionIndex", samlpNS).mapElem<string>(e => e.text().trim())
+		return logout
+	}
+
+	// startChain ends the session a service provider's LogoutRequest names
+	// (the app's too, through endSession) and lists the other service
+	// providers to log out.
+	internal def startChain(provider IdentityProvider, ctx Context, sp EntityDescriptor, request Logout, binding Binding) !LogoutChain {
+		let chain = new LogoutChain(try newId())
+		chain.initiator = sp.entityId
+		chain.initiatorRequest = request.id
+		chain.initiatorBinding = binding
+		let nameId = request.nameId
+		let session = provider.state.findSession(sp.entityId, nameId is none ?? ("", nameId.value), request.sessionIndexes)
+		if !(session is none) {
+			let s = provider.state.takeSession(session)
+			chain.remaining = s.participants.filter(p => p.sp != sp.entityId) unless (s is none)
+			let end = provider.endSession
+			try end(ctx, session) unless end is none
+		}
+		return chain
+	}
+
+	// continueLogout sends the next service provider its LogoutRequest:
+	// over SOAP in place, or through the browser, coming back here with its
+	// LogoutResponse. With none left it answers the initiator or goes to
+	// the return URL.
+	internal def continueLogout(provider IdentityProvider, ctx Context, chain LogoutChain) !none {
+		for chain.remaining.len() > 0 {
+			let p = chain.remaining.shift()
+			let sp = try provider.serviceProviders.serviceProvider(p.sp)
+			if sp is none {
+				chain.incomplete = true
+				continue
+			}
+			let role = try spRoleOf(sp)
+			let endpoint = pick(role.singleLogout, [Binding.Redirect, Binding.Post, Binding.Soap])
+			if endpoint is none {
+				chain.incomplete = true
+				continue
+			}
+			if endpoint.binding == Binding.Soap {
+				chain.incomplete = true unless try logoutOverSoap(provider, sp, endpoint, p)
+				continue
+			}
+			let id = try newId()
+			let request = logoutRequestElement(id, provider.entityId, endpoint.location, p.nameId, [p.sessionIndex])
+			try idpSign(provider, request) when endpoint.binding == Binding.Post
+			chain.current = sp.entityId
+			provider.state.putLogout(id, chain)
+			let message = try outgoing(id, endpoint, true, request, "", endpoint.binding == Binding.Redirect ?? (provider.key, none), provider.signatureMethod)
+			return try message.send(ctx)
+		}
+		if chain.initiator == "" {
+			return try ctx.redirect(chain.returnURL, 303) when chain.returnURL != ""
+			return try ctx.text(200, "Logged out")
+		}
+		let sp = try provider.serviceProviders.serviceProvider(chain.initiator)
+		fail samlError(SamlErrorKind.UnknownEntity, "unknown service provider {chain.initiator}") when sp is none
+		let role = try spRoleOf(sp)
+		let endpoint = pick(role.singleLogout, [chain.initiatorBinding, Binding.Redirect, Binding.Post])
+		return try ctx.text(200, "Logged out") when endpoint is none || endpoint.binding == Binding.Soap
+		let target = endpoint.responseLocation == "" ?? (endpoint.location, endpoint.responseLocation)
+		let answer = try idpLogoutResponse(provider, chain.initiatorRequest, target, !chain.incomplete)
+		try idpSign(provider, answer) when endpoint.binding == Binding.Post
+		let message = try outgoing(attr(answer, "ID"), endpoint, false, answer, chain.relayState, endpoint.binding == Binding.Redirect ?? (provider.key, none), provider.signatureMethod)
+		return try message.send(ctx)
+	}
+
+	// propagateBackChannel logs the chain's service providers out over
+	// SOAP and reports whether every one of them did.
+	internal def propagateBackChannel(provider IdentityProvider, chain LogoutChain) !bool {
+		let ok = true
+		for let p in chain.remaining {
+			let sp = try provider.serviceProviders.serviceProvider(p.sp)
+			if sp is none {
+				ok = false
+				continue
+			}
+			let role = try spRoleOf(sp)
+			let endpoint = pick(role.singleLogout, [Binding.Soap])
+			ok = false when endpoint is none || !(try logoutOverSoap(provider, sp, endpoint, p))
+		}
+		chain.remaining = []
+		return ok
+	}
+
+	// logoutOverSoap sends one signed LogoutRequest over SOAP and reports
+	// whether the service provider logged the user out. A failed exchange
+	// counts as not logged out.
+	internal def logoutOverSoap(provider IdentityProvider, sp EntityDescriptor, endpoint Endpoint, p Participant) !bool {
+		let id = try newId()
+		let request = logoutRequestElement(id, provider.entityId, endpoint.location, p.nameId, [p.sessionIndex])
+		try idpSign(provider, request)
+		let result = soapCall(provider.httpClient, endpoint.location, request) onerror (err error) {
+			return false
+		}
+		let (envelope, answer) = result
+		let role = try spRoleOf(sp)
+		let signed = verifyEnveloped(answer, envelope, role.signingKeys(), provider.allowSha1) onerror recover false
+		return false unless signed && answer.localName == "LogoutResponse" && attr(answer, "InResponseTo") == id
+		let (codes, _) = statusOf(answer) onerror (err error) {
+			return false
+		}
+		return codes[0] == StatusCode.Success.value && !(StatusCode.PartialLogout.value in codes)
+	}
+
+	internal def idpLogoutResponse(provider IdentityProvider, inResponseTo string, destination string, complete bool) !XMLNode {
+		let root = protocolRoot("LogoutResponse", try newId(), provider.entityId, destination)
+		root.set("InResponseTo", inResponseTo)
+		statusElement(root, complete ?? ([StatusCode.Success.value], [StatusCode.Success.value, StatusCode.PartialLogout.value]))
+		return root
+	}
+}

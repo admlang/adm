@@ -1,0 +1,131 @@
+partial module std.proto.auth.webauthn {
+	use (
+		std.crypto
+		std.crypto::(ECDSAPublicKey)
+		std.crypto.hash::(Hash, digest)
+		std.data.encoding::(CBORValue, CBORKind)
+		std.time
+		std.proto.auth.webauthn.ctap::*
+	)
+
+	// The CTAP1/U2F fallback of a SecurityKey (CTAP 2.2 §10), for keys that
+	// speak no CBOR.
+	partial type SecurityKey {
+		// Registers over U2F (CTAP 2.2 §10.2): a P-256 key, attested in the
+		// fido-u2f format. An excluded key handle the authenticator knows
+		// yields CredentialExcluded after a touch on a throwaway
+		// registration, so the answer does not reveal the handle without
+		// the user's consent.
+		internal def u2fRegister(request MakeCredentialRequest) !MakeCredentialResult {
+			fail ctapError(CTAPStatus.UnsupportedAlgorithm, "U2F authenticators make ES256 keys only") when !request.algorithms.includes(COSEAlgorithm.ES256)
+			fail ctapError(CTAPStatus.UnsupportedOption, "U2F authenticators cannot store discoverable credentials") when request.residentKey
+			fail ctapError(CTAPStatus.UnsupportedOption, "U2F authenticators cannot verify the user") when request.userVerification
+			let appParam = digest(Hash.SHA256, request.rp.id.bytes())
+			for let (_, d) in request.exclude {
+				continue when d.id.len() > 255
+				let sw = try u2fCheck(appParam, d.id)
+				if sw == U2FStatus.ConditionsNotSatisfied.value {
+					let bogus byte[]
+					bogus.len(32)
+					try u2fPresence(0x01, 0x00, bogus + bogus)
+					fail ctapError(CTAPStatus.CredentialExcluded, "the authenticator holds an excluded credential")
+				}
+			}
+			let data = try u2fPresence(0x01, 0x00, request.clientDataHash + appParam)
+			fail ctapError(CTAPStatus.Other, "malformed U2F registration") when data.len() < 67 || data[0] != byte(0x05)
+			let point = data.slice(1, 65)
+			let handleLen = int(data[66])
+			fail ctapError(CTAPStatus.Other, "malformed U2F registration") when data.len() < 67 + handleLen
+			let handle = data.slice(67, handleLen)
+			let rest = data.slice(67 + handleLen, data.len() - 67 - handleLen)
+			let certLen = derLength(rest)
+			fail ctapError(CTAPStatus.Other, "malformed U2F attestation certificate") when certLen <= 0 || certLen > rest.len()
+			let cert = rest.slice(0, certLen)
+			let sig = rest.slice(certLen, rest.len() - certLen)
+
+			let a = new AuthenticatorData()
+			a.rpIdHash = appParam
+			a.set(AuthFlag.UserPresent, true)
+			a.aaguid.len(16)
+			a.credentialId = handle.clone()
+			let ec = try crypto.unmarshalPoint(crypto.p256, point)
+			a.credentialKey = new COSEKey(new ECDSAPublicKey(crypto.p256, ec), COSEAlgorithm.ES256)
+			let r = new MakeCredentialResult()
+			r.authData = try a.encode()
+			r.format = "fido-u2f"
+			let st = new CBORValue(CBORKind.Map)
+			st.set("sig", new CBORValue(sig.clone()))
+			let x5c = new CBORValue(CBORKind.Array)
+			x5c.push(new CBORValue(cert.clone()))
+			st.set("x5c", x5c)
+			r.statement = st
+			return r
+		}
+
+		// Signs over U2F (CTAP 2.2 §10.3) with the first allowed key handle
+		// the authenticator knows. Fails with NoCredentials when it knows
+		// none, or when the allow list is empty (U2F has no discoverable
+		// credentials).
+		internal def u2fAuthenticate(request GetAssertionRequest) !GetAssertionResult[] {
+			fail ctapError(CTAPStatus.UnsupportedOption, "U2F authenticators cannot verify the user") when request.userVerification
+			let appParam = digest(Hash.SHA256, request.rpId.bytes())
+			for let (_, d) in request.allow {
+				continue when d.id.len() > 255
+				continue when (try u2fCheck(appParam, d.id)) != U2FStatus.ConditionsNotSatisfied.value
+				let body = request.clientDataHash + appParam
+				body.push(byte(d.id.len()))
+				body.push(...d.id)
+				let data = try u2fPresence(0x02, request.userPresence ?? (0x03, 0x08), body)
+				fail ctapError(CTAPStatus.Other, "malformed U2F authentication") when data.len() < 5
+				let authData = appParam.clone()
+				authData.push(data[0])
+				authData.push(...data.slice(1, 4))
+				let r = new GetAssertionResult()
+				r.credentialId = d.id
+				r.authData = authData
+				r.signature = data.slice(5, data.len() - 5)
+				return [r]
+			}
+			fail ctapError(CTAPStatus.NoCredentials, "the authenticator knows none of the allowed key handles")
+		}
+
+		// Asks whether a key handle is this authenticator's for the AppID
+		// (P1 = check-only); ConditionsNotSatisfied means it is.
+		internal def u2fCheck(appParam byte[], handle byte[]) !int {
+			let msg byte[]
+			msg.len(32)
+			msg.push(...appParam)
+			msg.push(byte(handle.len()))
+			msg.push(...handle)
+			let (sw, _) = try u2fSend(0x02, 0x07, msg)
+			return sw
+		}
+
+		// Sends an APDU that needs the user's touch, repeating it while the
+		// authenticator answers ConditionsNotSatisfied, until the transport's
+		// timeout. Fails with OperationDenied for any other status word, or
+		// UserActionTimeout when the user does not touch the key.
+		internal def u2fPresence(ins int, p1 int, data byte[]) !byte[] {
+			let deadline = time.now() + 30s
+			for {
+				let (sw, body) = try u2fSend(ins, p1, data)
+				return body when sw == U2FStatus.Ok.value
+				fail ctapError(CTAPStatus.OperationDenied, "U2F status {sw}") when sw != U2FStatus.ConditionsNotSatisfied.value
+				fail ctapError(CTAPStatus.UserActionTimeout, "the key was not touched") when time.now().after(deadline)
+				time.sleep(100ms)
+			}
+		}
+
+		// Sends one extended-length APDU (CLA 0, INS, P1, P2 0) and returns
+		// the status word and the response data.
+		internal def u2fSend(ins int, p1 int, data byte[]) !(int, byte[]) {
+			let apdu byte[] = [0, byte(ins), byte(p1), 0, 0, byte(data.len() >> 8), byte(data.len() & 0xFF)]
+			apdu.push(...data)
+			apdu.push(0, 0)
+			let resp = try transport.transact(CTAPHIDCommand.Msg, apdu)
+			fail ctapError(CTAPStatus.InvalidLength, "U2F answer without a status word") when resp.len() < 2
+			let sw = int(resp[resp.len() - 2]) << 8 | int(resp[resp.len() - 1])
+			return (sw, resp.slice(0, resp.len() - 2))
+		}
+	}
+}

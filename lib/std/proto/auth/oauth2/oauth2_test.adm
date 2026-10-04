@@ -1,0 +1,321 @@
+partial module std.proto.auth.oauth2 {
+	use (
+		std.testing
+		std.time
+		std.net.http
+		std.net.http::(Context, ServeMux, Request, Method, newRequest)
+		std.net.http.httptest
+		std.net.url
+		std.proto.auth.jose
+		std.proto.auth.oauth2.engine::*
+	)
+
+	internal def orEmpty(v ?string) string {
+		return v is none ?? ("", v)
+	}
+
+	// Stops at the first redirect so a test can read its Location.
+	internal type NoRedirects {
+		def new() {}
+
+		def follow(next Request, via Request[]) !bool {
+			return false
+		}
+	}
+
+	// A running authorization server with an app login route that logs in
+	// "alice" and grants what was asked.
+	internal type TestAuthority {
+		site   httptest.Server
+		server AuthorizationServer
+		api    http.Client
+
+		def new(site httptest.Server, server AuthorizationServer) {
+			self.site = site
+			self.server = server
+			api = site.client()
+			api.redirects = new NoRedirects()
+		}
+
+		// login follows an authorization URL through the login page and
+		// returns the callback URL the browser would land on.
+		def login(authorizationURL string) !string {
+			let first = try api.get(authorizationURL)
+			assert first.status == 303
+			let second = try api.get(first.header("Location"))
+			assert second.status == 303
+			return second.header("Location")
+		}
+	}
+
+	internal def startAuthority(format AccessTokenFormat = AccessTokenFormat.Opaque) !TestAuthority {
+		let signing = try jose.generateKey(jose.SignatureAlgorithm.ES256)
+		signing.kid = "as-1"
+		let server = new AuthorizationServer("http://placeholder", new jose.JwkSet([signing]))
+		server.accessTokenFormat = format
+		server.allowRegistration = true
+		server.allowPassword = true
+		server.deviceInterval = 1s
+		server.verifyPassword = def (user string, password Secret<string>) !?string {
+			return user when user == "bob" && password.reveal() == "hunter2"
+			return none
+		}
+		let mux = new ServeMux()
+		try mux.handle("/login", def (ctx Context) !none {
+			let id = ctx.query("request", "")
+			let pending = try server.pending(id)
+			return try server.deny(ctx, id) when "forbidden" in pending.scopes
+			return try server.complete(ctx, id, Decision{subject: "alice"})
+		})
+		try mux.handle("/", server.handler())
+		let site = new httptest.Server(mux)
+		try site.start()
+		server.issuer = site.url
+		server.loginURL = site.url + "/login"
+		server.deviceURL = site.url + "/device"
+		return new TestAuthority(site, server)
+	}
+
+	internal def publicClientMetadata(redirect string) ClientMetadata {
+		let m = new ClientMetadata()
+		m.redirectUris = [redirect]
+		m.tokenEndpointAuthMethod = "none"
+		m.grantTypes = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"]
+		return m
+	}
+
+	check "OAuth 2" {
+		@test()
+		def TestHelpers() !none {
+			// RFC 7636 Appendix B.
+			assert pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+			// RFC 8414 §3.1: the well-known path goes before the issuer's path.
+			assert wellKnown("https://as.example/tenant1", "oauth-authorization-server") == "https://as.example/.well-known/oauth-authorization-server/tenant1"
+			assert wellKnown("https://as.example", "oauth-authorization-server") == "https://as.example/.well-known/oauth-authorization-server"
+			let err = serverError(400, "\{\"error\":\"invalid_grant\",\"error_description\":\"code used\"\}")
+			assert err is OAuthError && err.kind == OAuthErrorKind.InvalidGrant && err.description == "code used"
+			let odd = serverError(400, "\{\"error\":\"custom_thing\"\}")
+			assert odd is OAuthError && odd.kind == OAuthErrorKind.Other && odd.error == "custom_thing"
+			let bearer = serverError(401, "", "Bearer realm=\"x\", error=\"invalid_token\", error_description=\"expired\"")
+			assert bearer is OAuthError && bearer.kind == OAuthErrorKind.InvalidToken && bearer.description == "expired"
+			let serverMeta = try parseMetadata("\{\"issuer\":\"https://as.example\",\"token_endpoint\":\"https://as.example/t\",\"grant_types_supported\":[\"x\"],\"require_pushed_authorization_requests\":true,\"userinfo_endpoint\":\"https://as.example/u\"\}")
+			assert serverMeta.requirePushedAuthorizationRequests && serverMeta.grantTypesSupported.len() == 1
+			let userinfo = serverMeta.get("userinfo_endpoint")
+			assert !(userinfo is none)
+			assert parseMetadata("\{\"token_endpoint\":\"x\"\}") is error
+		}
+
+		@test()
+		def TestCodeFlowEndToEnd() !none {
+			let a = try startAuthority()
+			let redirect = a.site.url + "/cb"
+			try a.server.clients.save(new RegisteredClient("spa", publicClientMetadata(redirect)))
+			let serverMeta = try discover(a.site.url, a.site.client())
+			assert serverMeta.issuer == a.site.url && serverMeta.authorizationResponseIssParameterSupported
+			let client = new Client("spa", serverMeta)
+			client.httpClient = a.site.client()
+			let req = try client.authorize(redirect, ["read", "write"])
+			let callback = try a.login(req.url)
+			assert callback.startsWith(redirect + "?")
+			let token = try client.exchange(req, callback)
+			assert token.tokenType == "Bearer" && !token.expired() && !(token.refreshToken is none)
+			assert token.scope.join(" ") == "read write"
+			// The code is single-use, and state is checked first.
+			assert client.exchange(req, callback) is error
+			let forged = new AuthorizationRequest()
+			forged.state = "other"
+			assert client.exchange(forged, callback) is error
+			// Introspection needs an authenticated client: register a confidential one.
+			let rsMeta = new ClientMetadata()
+			rsMeta.tokenEndpointAuthMethod = "client_secret_basic"
+			let rsClient = new RegisteredClient("api", rsMeta)
+			rsClient.secret = "s3cret"
+			try a.server.clients.save(rsClient)
+			let api = new Client("api", serverMeta)
+			api.secret = "s3cret"
+			api.httpClient = a.site.client()
+			let info = try api.introspect(token.accessToken)
+			assert info.active && orEmpty(info.clientId) == "spa" && orEmpty(info.subject) == "alice" && info.scope.len() == 2
+			// Refresh rotates; the old refresh token stops working.
+			let refreshed = try client.refresh(token, ["read"])
+			assert refreshed.scope.join(" ") == "read"
+			assert client.refresh(token) is error
+			// Revocation.
+			try client.revoke(refreshed)
+			assert client.refresh(refreshed) is error
+			try client.revoke(refreshed.accessToken, "access_token")
+			assert !(try api.introspect(refreshed.accessToken)).active
+			// A denied request comes back as access_denied.
+			let denied = try client.authorize(redirect, ["forbidden"])
+			let deniedCallback = try a.login(denied.url)
+			let refusal = client.exchange(denied, deniedCallback)
+			assert refusal is error
+			assert (try a.server.clients.client("missing")) is none
+			try a.site.close()
+		}
+
+		@test()
+		def TestConfidentialClients() !none {
+			let a = try startAuthority(AccessTokenFormat.Jwt)
+			let serverMeta = a.server.metadata()
+			// client_secret_post with client credentials.
+			let postMeta = new ClientMetadata()
+			postMeta.tokenEndpointAuthMethod = "client_secret_post"
+			postMeta.grantTypes = ["client_credentials", "password", "refresh_token"]
+			let poster = new RegisteredClient("poster", postMeta)
+			poster.secret = "pw"
+			try a.server.clients.save(poster)
+			let c1 = new Client("poster", serverMeta)
+			c1.secret = "pw"
+			c1.authentication = ClientAuthentication.SecretPost
+			c1.httpClient = a.site.client()
+			let svc = try c1.clientCredentials(["jobs"])
+			assert svc.refreshToken is none
+			// JWT access tokens check out at a resource server with the AS keys.
+			let rs = new ResourceServer(serverMeta, "poster")
+			let keyClient = new jose.RemoteKeySet(a.site.url + "/jwks", a.site.client())
+			rs.keys = keyClient
+			let probe = new ServeMux()
+			probe.apply(rs.middleware(["jobs"]))
+			try probe.handle("/data", def (ctx Context) !none {
+				return try ctx.text("ok")
+			})
+			let resource = new httptest.Server(probe)
+			try resource.start()
+			let req = try newRequest(Method.GET, resource.url + "/data")
+			let res = try c1.send(req, svc)
+			assert res.status == 200
+			let plain = try resource.client().get(resource.url + "/data")
+			assert plain.status == 401 && plain.header("WWW-Authenticate").startsWith("Bearer")
+			// Password grant, then a wrong secret is refused.
+			let pw = try c1.password("bob", "hunter2")
+			assert !(pw.refreshToken is none)
+			assert c1.password("bob", "nope") is error
+			c1.secret = "wrong"
+			assert c1.clientCredentials() is error
+			// private_key_jwt.
+			let key = try jose.generateKey(jose.SignatureAlgorithm.ES256)
+			let keyed = new ClientMetadata()
+			keyed.tokenEndpointAuthMethod = "private_key_jwt"
+			keyed.grantTypes = ["client_credentials"]
+			keyed.jwks = new jose.JwkSet([key.publicKey()])
+			try a.server.clients.save(new RegisteredClient("keyed", keyed))
+			let c2 = new Client("keyed", serverMeta)
+			c2.key = key
+			c2.httpClient = a.site.client()
+			assert !(try c2.clientCredentials()).accessToken.reveal().isEmpty()
+			// The same assertion cannot be replayed: a fresh one per request works.
+			assert !(try c2.clientCredentials()).accessToken.reveal().isEmpty()
+			try resource.close()
+			try a.site.close()
+		}
+
+		@test()
+		def TestDeviceParDpopRegistration() !none {
+			let a = try startAuthority()
+			let redirect = a.site.url + "/cb"
+			try a.server.clients.save(new RegisteredClient("tv", publicClientMetadata(redirect)))
+			let serverMeta = a.server.metadata()
+			let tv = new Client("tv", serverMeta)
+			tv.httpClient = a.site.client()
+			// Device flow: the user approves through pending/complete.
+			let device = try tv.deviceAuthorization(["watch"])
+			assert device.userCode.len() == 9 && device.userCode[4] == '-'
+			let pending = try a.server.pending(device.userCode.lower())
+			assert pending.scopes.join(" ") == "watch"
+			let page = try newRequest(Method.GET, a.site.url + "/device")
+			try a.server.complete(new Context(page, new http.ResponseWriter(page)), device.userCode, Decision{subject: "carol"})
+			let token = try tv.poll(device)
+			assert !(token.refreshToken is none)
+			// PAR and DPoP together.
+			tv.pushRequests = true
+			tv.dpopKey = try jose.generateKey(jose.SignatureAlgorithm.ES256)
+			let req = try tv.authorize(redirect, ["read"])
+			assert req.url.contains("request_uri=")
+			let bound = try tv.exchange(req, try a.login(req.url))
+			assert bound.tokenType == "DPoP"
+			// Dynamic registration lifecycle.
+			let reg = new ClientMetadata()
+			reg.redirectUris = ["https://app.example/cb"]
+			reg.clientName = "App"
+			let created = try tv.register(reg)
+			assert created.clientId != "" && !(created.clientSecret is none) && !(created.registrationAccessToken is none)
+			let read = try tv.readRegistration(created)
+			assert read.clientId == created.clientId
+			reg.clientName = "Renamed"
+			let updated = try tv.updateRegistration(created, reg)
+			assert orEmpty(updated.metadata.clientName) == "Renamed"
+			try tv.deleteRegistration(created)
+			assert tv.readRegistration(created) is error
+			let badUri = new ClientMetadata()
+			badUri.redirectUris = ["not a url#frag"]
+			assert tv.register(badUri) is error
+			try a.site.close()
+		}
+
+		@test()
+		def TestExtensionGrantsAndStores() !none {
+			let a = try startAuthority()
+			a.server.exchangeToken = def (form url.Values, _ RegisteredClient) !Grant {
+				let g = new Grant(time.now())
+				let subject = form.get("subject_token")
+				g.subject = subject is none ?? ("", "exchanged-" + subject)
+				g.scopes = ["delegated"]
+				return g
+			}
+			a.server.jwtBearer = def (assertion string, _ RegisteredClient) !Grant {
+				fail OAuthError{message: "bad assertion", code: "invalid_grant", kind: OAuthErrorKind.InvalidGrant, status: 400} unless assertion == "trusted"
+				let g = new Grant(time.now())
+				g.subject = "asserted"
+				return g
+			}
+			let m = new ClientMetadata()
+			m.tokenEndpointAuthMethod = "client_secret_basic"
+			m.grantTypes = ["urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"]
+			m.set("tls_client_auth_san_dns", "svc.example")
+			assert m.json().contains("tls_client_auth_san_dns")
+			let svc = new RegisteredClient("svc", m)
+			svc.secret = "k"
+			assert svc.authMethod() == "client_secret_basic" && !svc.isPublic() && svc.allows("urn:ietf:params:oauth:grant-type:jwt-bearer") && !svc.allows("password")
+			try a.server.clients.save(svc)
+			let serverMeta = a.server.metadata()
+			assert serverMeta.json().contains("urn:ietf:params:oauth:grant-type:token-exchange")
+			let client = new Client("svc", serverMeta)
+			client.secret = "k"
+			client.httpClient = a.site.client()
+			let swapped = try client.exchangeToken("abc", TokenType.AccessToken, TokenExchange{audience: ["api"]})
+			assert orEmpty(swapped.issuedTokenType) == TokenType.AccessToken.value
+			let info = try client.introspect(swapped.accessToken)
+			assert orEmpty(info.subject) == "exchanged-abc"
+			assert (try client.jwtBearer("trusted")).tokenType == "Bearer"
+			assert client.jwtBearer("forged") is error
+			// The resource server checks scopes on an opaque token through introspection.
+			let rs = new ResourceServer(serverMeta, none, client)
+			let page = try newRequest(Method.GET, a.site.url + "/data")
+			page.headers.set("Authorization", "Bearer " + swapped.accessToken.reveal())
+			let ctx = new Context(page, new http.ResponseWriter(page))
+			let accepted = try rs.authenticate(ctx, ["delegated"])
+			assert accepted.has("delegated") && !accepted.has("admin")
+			assert rs.authenticate(ctx, ["admin"]) is error
+			// Pending parameters and the in-memory stores.
+			let pendingGrant = new Grant(time.now() + 1m)
+			pendingGrant.clientId = "svc"
+			pendingGrant.params.set("login_hint", "dave")
+			try a.server.grants.put(GrantKind.Pending, "p1", pendingGrant)
+			let pending = try a.server.pending("p1")
+			assert orEmpty(pending.param("login_hint")) == "dave"
+			let store = new MemoryGrantStore()
+			try store.put(GrantKind.Code, "c", new Grant(time.now() + 1m))
+			assert !((try store.take(GrantKind.Code, "c")) is none)
+			assert (try store.take(GrantKind.Code, "c")) is none
+			try store.put(GrantKind.Code, "old", new Grant(time.now() - 1s))
+			assert (try store.get(GrantKind.Code, "old")) is none
+			try store.remove(GrantKind.Code, "old")
+			let clients = new MemoryClientStore()
+			try clients.save(svc)
+			try clients.remove("svc")
+			assert (try clients.client("svc")) is none
+			try a.site.close()
+		}
+	}
+}

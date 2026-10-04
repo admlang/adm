@@ -1,0 +1,867 @@
+partial module std.gfx.canvas {
+	use (
+		std.gfx.color::(BlendMode, Color, RGBA)
+		std.math.geom::(FillRule, Path, Transform2D)
+		std.mem
+		std.simd
+		std.gfx::(Mask)
+	)
+
+	// GpuFrame is a recording lowered for a GPU renderer (`DrawContext.lower`).
+	// The canvas's own rasterizer has worked out the coverage of every shape,
+	// so edges match the CPU canvas exactly; what is left for shaders is
+	// painting, the clip of operators that reach outside the shape, the
+	// Porter-Duff operators, blend modes, groups and backdrop blur.
+	//
+	// Pixels are straight (not premultiplied) sRGB RGBA8, as on the canvas,
+	// and every operation means what the canvas does with it: `render()`
+	// draws a frame on the CPU, and a GPU renderer matches it within one
+	// level a channel where it computes in floating point.
+	type GpuFrame {
+		width  int
+		height int
+		ops    GpuOp[]
+
+		def new(width int, height int) {
+			self.width = width
+			self.height = height
+		}
+
+		// The 64 x 64 blue-noise bytes gradients dither with, row by row,
+		// repeated across the frame from its corner.
+		def blueNoise() byte[] {
+			return canvasBlueNoise()
+		}
+
+		// Linear light of each sRGB byte, as colour blurs read pixels.
+		def srgbToLinear() float32[] {
+			return srgbToLinearTable.clone()
+		}
+
+		// The sRGB byte of linear light i / 4095, as colour blurs write
+		// pixels back.
+		def linearToSrgb() byte[] {
+			return linearToSrgbTable.clone()
+		}
+
+		// The frame drawn on the CPU: the pixels a GPU renderer produces.
+		def render() Canvas {
+			let c = new Canvas(width, height)
+			for let (_, op) in ops {
+				renderOp(c, op)
+			}
+			return c
+		}
+	}
+
+	// GpuOp is one step of a GpuFrame, applied to the current target: the
+	// frame, or the innermost open group.
+	type GpuOp = GpuDraw | GpuBlit | GpuBeginGroup | GpuEndGroup | GpuBackdropBlur
+
+	// GpuDraw paints a box of the target, the second half of every canvas
+	// fill: each pixel's paint colour weighted by its coverage and the
+	// opacity, put down with the operator and blend mode.
+	struct GpuDraw {
+		x         int
+		y         int
+		w         int
+		h         int
+		// Coverage of each pixel of the box, row by row; empty: all full.
+		coverage  byte[]
+		// The clip's coverage over the box for the operators that change
+		// what lies outside the shape too (SourceIn, SourceOut,
+		// DestinationIn, DestinationAtop, Copy); empty: none. The other
+		// operators have it folded into `coverage`.
+		clip      byte[]
+		paint     GpuPaint
+		// The opacity, 0 to 255, rounded as the canvas rounds it.
+		alpha     int
+		composite Composite
+		blend     BlendMode
+		// With four corners (x and y in turn, device pixels): the coverage
+		// of each pixel is the exact area of the pixel square inside that
+		// convex quadrilateral, rounded to a byte (or to 0 and 255 below and
+		// from half without antialias), instead of `coverage`.
+		quad      float[]   = []
+		antialias bool      = true
+		// Composited as a group's content or effect layer is (the canvas's
+		// compositeRowWith), rather than as a fill: source-over pixel by
+		// pixel in the blend mode, transparent source pixels left out; with
+		// another operator, every covered pixel through it, the coverage
+		// weighting the result against the backdrop.
+		layer     bool      = false
+	}
+
+	// GpuPaint is where a GpuDraw's colours come from.
+	type GpuPaint = GpuSolid | GpuPixels | GpuFragment | GpuGradient | GpuNoise | GpuImage
+
+	// GpuGradientKind is the shape a GpuGradient's parameter follows.
+	enum GpuGradientKind {
+		Linear,
+		Radial,
+		Conic,
+	}
+
+	// GpuGradient colours each pixel from a table by a parameter t worked out
+	// at the pixel's centre p: index round(clamp(t', 0, 1) · 1023) after the
+	// spread (Repeat keeps the fraction, Reflect folds every other repeat),
+	// and the entry plus the GpuFrame.blueNoise byte at the pixel, shifted
+	// right by 8.
+	//
+	// With u = inv(p), and `params` per kind:
+	// - Linear: [t0, dtx, dty], t = t0 + dtx · p.x + dty · p.y (device space).
+	// - Radial: [fx, fy, r0, cdx, cdy, dr, a, simple]: the focus, its radius,
+	//   centre minus focus, radius minus r0, a = cdx² + cdy² − dr². With
+	//   simple (1), t = |u − f| / (r0 + dr); else the larger root t of
+	//   a t² − 2 b t + c = 0 with r0 + t · dr ≥ 0, where d = u − f,
+	//   b = d · (cdx, cdy) + r0 · dr, c = |d|² − r0² (one root c / 2b when
+	//   |a| < 1e-12); no such root paints nothing.
+	// - Conic: [cx, cy, angle], t = (atan2(u.y − cy, u.x − cx) − angle) / τ,
+	//   always repeated.
+	struct GpuGradient {
+		kind            GpuGradientKind
+		// 1024 straight RGBA colours, each channel 8.8 fixed point.
+		table           uint16[]
+		spread          Spread
+		inv             Transform2D
+		params          float[]
+		// The canvas's own shader, for GpuFrame.render.
+		internal source ?Shader         = none
+	}
+
+	// GpuImage samples a window of a raster, as the canvas's patterns and
+	// drawImage do. The window (`ww` x `wh` texels of `pixels`, `stride`
+	// bytes a row, from (wx, wy)) is first halved `halvings` times when it
+	// is shown shrunk: each level the 2x2 box average of the one before in
+	// premultiplied linear light, a side of n becoming (n + 1) / 2, the last
+	// texel repeated past an odd edge, written back as straight sRGB bytes.
+	// A pixel centre p maps through `inv` to u = inv(p) in texels of that
+	// level; texel indices go past the edges as `repeatX` and `repeatY`
+	// say (Pad repeats the edge texel). Nearest takes the texel at
+	// floor(u); Bilinear weighs the four around u − ½ by their fractions
+	// in premultiplied linear light; Bicubic does the same over sixteen
+	// with Catmull-Rom weights, clamping colour to alpha. Linear colours go
+	// back through GpuFrame.linearToSrgb (4096 steps). `tint` then
+	// multiplies the colour channel by channel, alpha too, rounding as
+	// (p · t + 128 + ((p · t + 128) >> 8)) >> 8.
+	//
+	// `key` names the window's contents (its size and a hash of its bytes),
+	// so a renderer can keep the texture while the key stays the same.
+	struct GpuImage {
+		pixels          byte[]
+		stride          int
+		wx              int
+		wy              int
+		ww              int
+		wh              int
+		halvings        int
+		inv             Transform2D
+		repeatX         Spread
+		repeatY         Spread
+		sampling        Sampling
+		tint            ?RGBA       = none
+		key             uint64
+		internal source ?Shader     = none
+	}
+
+	// GpuNoise colours each pixel with fractal gradient noise (Perlin's
+	// improved noise, `octaves` layers) through a table, as GpuGradient
+	// does with Pad: u = inv(p) in noise units; per octave the hashes
+	// perm[perm[x] + y] & 7 of the cell's corners pick gradients (±1, ±1),
+	// (±1, 0), (0, ±1), blended by 6t⁵ − 15t⁴ + 10t³; the sum of the
+	// octaves (each half the last, u doubled and moved by (17.3, 31.7)),
+	// over twice their total weight, times √2, plus a half, is t.
+	struct GpuNoise {
+		table           uint16[]
+		// 512 entries: a shuffle of 0..255, twice.
+		perm            int32[]
+		octaves         int
+		inv             Transform2D
+		internal source ?Shader     = none
+	}
+
+	// GpuSolid is one colour. A fill's opacity is the draw's alpha; `a`
+	// counts where the colour is shaded as a paint (an outline effect's).
+	struct GpuSolid {
+		r byte
+		g byte
+		b byte
+		a byte = 255
+	}
+
+	// GpuPixels is a colour per pixel of the box, straight RGBA8 row by
+	// row, worked out on the CPU (paints with no shader yet).
+	struct GpuPixels {
+		pixels byte[]
+	}
+
+	// GpuFragment colours each pixel with a `@fragment` function at the
+	// pixel's centre mapped through `inv` (device pixels to the paint's
+	// space), rounded to 8 bits.
+	struct GpuFragment {
+		shader   Fragment
+		uniforms float32[]
+		inv      Transform2D
+	}
+
+	// GpuBlit puts pixels (straight RGBA8, `w` a row) at (x, y), as the
+	// canvas's blit does: replacing what is there when `copy`, else over it
+	// in the blend mode.
+	struct GpuBlit {
+		x      int
+		y      int
+		w      int
+		h      int
+		pixels byte[]
+		copy   bool
+		blend  BlendMode
+	}
+
+	// GpuBeginGroup opens a group: a new transparent target the size of
+	// the frame.
+	struct GpuBeginGroup {}
+
+	// GpuEndGroup closes the innermost group and composites it onto the
+	// target below, inside the box, weighted by `coverage` (its mask and
+	// clip; empty: full) and the opacity, in the blend mode and with the
+	// operator (as a `layer` GpuDraw does).
+	//
+	// With `effects`, the box is the region they work on, as the canvas's
+	// closeGroup does: planes of `pw = ceil(w / 8) · 8` by h floats, zero
+	// outside, starting from the group's alpha (a / 255). In order:
+	// DropShadow and OuterGlow make a plane below the group (grown by
+	// `grow` through the signed distance, shifted by (dx, dy) bilinearly
+	// with zero coming in, blurred; a knockout shadow keeps only where the
+	// group is not, and hides the group); InnerShadow (the outside grown in
+	// by `grow`, shifted with one coming in, blurred, times the alpha) and
+	// InnerGlow (the outside blurred, times the alpha) paint their colour
+	// atop the group's pixels; Outline paints `paint` source-over through
+	// the ring between two distances; Blur blurs the group's pixels (then
+	// the alpha is taken again), BackdropBlur the target below wherever the
+	// group paints; ColorMatrix maps its pixels. Then the planes below are
+	// composited in their colours and blend modes, and the group last, each
+	// as a layer.
+	//
+	// Blurs are three box passes of `radii` each way (columns, then rows),
+	// zero past the plane's h rows and pw columns, colour ones on
+	// premultiplied linear light (GpuFrame.srgbToLinear in,
+	// GpuFrame.linearToSrgb out over 4096 steps). Distances are exact
+	// Euclidean distance transforms: squared distance to the nearest pixel
+	// inside (alpha at least 0.5) or outside, one pixel of outside past
+	// every edge; the signed distance is 0.5 − a on partly covered pixels,
+	// else 0.5 − √(to outside) inside and √(to inside) − 0.5 outside; a
+	// plane grown by g is clamp(0.5 + g − distance, 0, 1).
+	struct GpuEndGroup {
+		x                  int
+		y                  int
+		w                  int
+		h                  int
+		coverage           byte[]
+		alpha              int
+		blend              BlendMode
+		composite          Composite   = Composite.SourceOver
+		effects            GpuEffect[] = []
+		// With effects: how far they reach past the group's pixels. The
+		// region is the group's non-transparent pixels' box grown by it,
+		// within the box (or the whole box for an operator that changes
+		// what lies outside the source: SourceIn, SourceOut,
+		// DestinationIn, DestinationAtop, Copy, Clear).
+		margin             int         = 0
+		// The group as the canvas closes it, for GpuFrame.render.
+		internal group     ?GroupFrame = none
+		internal clipAtEnd ?ClipRegion = none
+	}
+
+	// GpuEffectKind is what a GpuEffect does (see GpuEndGroup).
+	enum GpuEffectKind {
+		DropShadow,
+		OuterGlow,
+		InnerShadow,
+		InnerGlow,
+		Outline,
+		Blur,
+		BackdropBlur,
+		ColorMatrix,
+	}
+
+	// GpuEffect is one of a group's effects in device pixels.
+	struct GpuEffect {
+		kind     GpuEffectKind
+		// The shift of a shadow.
+		dx       float           = 0.0
+		dy       float           = 0.0
+		// The box radii of its blur, three passes (empty: no blur).
+		radii    int[]           = []
+		// Spread (shadows, glows), choke (inner shadow) or outline width.
+		grow     float           = 0.0
+		color    RGBA            = RGBA{r: 0, g: 0, b: 0, a: 255}
+		blend    BlendMode       = BlendMode.Normal
+		knockout bool            = false
+		position OutlinePosition = OutlinePosition.Outside
+		// An outline's paint over the box.
+		paint    ?GpuPaint       = none
+		// A 4x5 colour matrix, row by row, on straight colours 0 to 1.
+		matrix   float[]         = []
+	}
+
+	// GpuBackdropBlur blurs what is under the box on the target (a group's
+	// Blur effect with `backdrop`): premultiplied linear light, three box
+	// passes a direction approximating a Gaussian of deviation sigma, zero
+	// outside the box; the result replaces the pixels as far as `within`
+	// covers them (empty: fully).
+	type GpuBackdropBlur {
+		x      int
+		y      int
+		w      int
+		h      int
+		sigma  float
+		within byte[]
+
+		// Blurs `box`, the target's pixels under the box (straight RGBA8,
+		// `w` a row), as the canvas does: for renderers that read the box
+		// back rather than blur it in a shader.
+		def apply(box byte[]) {
+			let r = Region{x0: 0, y0: 0, w: w, h: h, pw: (w + 7) / 8 * 8}
+			let within float32[]
+			if self.within.len() > 0 {
+				within = plane(r)
+				for let y = 0; y < h; y++ {
+					for let x = 0; x < w; x++ {
+						within[y * r.pw + x] = float32(self.within[y * w + x]) / float32(255.0)
+					}
+				}
+			}
+			blurWhere(box, w, r, sigma, within)
+		}
+	}
+
+	// The recording lowered: every call drawn by a canvas the size of the
+	// viewport that records what to do instead of doing it.
+	internal def lowerContext(ctx DrawContext) GpuFrame {
+		let size = ctx.size()
+		let frame = new GpuFrame(int(size.width), int(size.height))
+		let c = new Canvas(0, 0)
+		c.width = frame.width
+		c.height = frame.height
+		c.lowering = frame
+		ctx.replay(c)
+		return frame
+	}
+
+	// The frame a canvas records into, when it records rather than draws:
+	// lowering, and not inside a group its effects keep on the CPU.
+	internal def recording(c Canvas) ?GpuFrame {
+		return none when c.cpuGroups > 0
+		return c.lowering
+	}
+
+	// The fill fillCoverage would composite, recorded: its box, coverage
+	// rows, clip and paint.
+	// `full`: the shape covers its whole box (a rectangle on whole pixels),
+	// so a bounded fill without a mask clip needs no coverage at all.
+	internal def lowerFill(f GpuFrame, c Canvas, paint Paint, shader Shader, shaded bool, st DrawState, a byte, unbounded bool, bx0 int, by0 int, bx1 int, by1 int, cover def(int, int, int, int, bool, def(int, byte[], int, int)), full bool = false, quad float[] = []) {
+		let w = bx1 - bx0
+		let h = by1 - by0
+		let coverage byte[]
+		let clipBytes byte[]
+		let clip = st.clip
+		let aa = st.antialias
+		// Rows with every pixel covered; rows never reported cover nothing.
+		let fullRows int[]
+		fullRows.len(h)
+		let clipMasks = clip is ClipRegion && !(clip.mask is none)
+		let skip = (full || quad.len() == 8) && !unbounded && !clipMasks
+		let analytic = !full && quad.len() == 8 && skip
+		if !skip {
+			coverage.len(w * h)
+			cover(bx0, by0, bx1, by1, unbounded, def (y int, cov byte[], lo int, end int) {
+				if !aa {
+					hardenCoverage(cov, lo, end)
+				}
+				if clip is ClipRegion && !unbounded {
+					clipCoverage(cov, lo, end, clip, bx0, y)
+				}
+				return when end <= lo
+				copyBytes(coverage, (y - by0) * w + lo, cov, lo, end - lo)
+				fullRows[y - by0] = 1 when lo == 0 && end == w && allFull(cov[0:w])
+			})
+			if unbounded && clip is ClipRegion && !(clip.mask is none) {
+				clipBytes.len(w * h)
+				for let y = by0; y < by1; y++ {
+					for let x = bx0; x < bx1; x++ {
+						clipBytes[(y - by0) * w + x - bx0] = byte(clipByte(clip, x, y))
+					}
+				}
+			}
+		}
+		let everyRow = true
+		for let (_, f) in fullRows {
+			everyRow = false when f == 0
+		}
+		everyRow = true when skip
+		if everyRow {
+			coverage = byte[]
+		}
+		let corners = analytic ?? (quad.clone(), float[])
+		let gpaint GpuPaint = GpuSolid{r: 0, g: 0, b: 0}
+		if !shaded {
+			let rgba = RGBA{r: 0, g: 0, b: 0, a: 255}
+			if paint is Color {
+				rgba = paint.rgba
+			}
+			gpaint = GpuSolid{r: rgba.r, g: rgba.g, b: rgba.b}
+		} else {
+			gpaint = gpuPaintOf(shader, bx0, by0, w, h)
+		}
+		f.ops.push(GpuDraw{x: bx0, y: by0, w: w, h: h, coverage: coverage, clip: clipBytes, paint: gpaint, alpha: int(a), composite: st.composite, blend: st.blend, quad: corners, antialias: aa})
+	}
+
+	// Whether every byte is 255, sixteen a vector.
+	internal def allFull(b byte[]) bool {
+		let n = b.len()
+		let full = simd.splat16<byte>(byte(255))
+		let i = 0
+		for i + 16 <= n {
+			return false when simd.load16<byte>(b, i).ne(full).any()
+			i += 16
+		}
+		for i < n {
+			return false when b[i] != 255
+			i++
+		}
+		return true
+	}
+
+	// The clip's and mask's coverage over the box, row by row; empty when
+	// both cover all of it.
+	internal def coverageBox(mask ?Mask, clip ?ClipRegion, x0 int, y0 int, w int, h int) byte[] {
+		let plainClip = clip is none || clip.mask is none
+		return byte[] when mask is none && plainClip
+		let out byte[]
+		out.len(w * h)
+		let row byte[]
+		row.len(w)
+		for let y = 0; y < h; y++ {
+			coverageBytes(mask, clip, x0, y0 + y, row)
+			for let x = 0; x < w; x++ {
+				out[y * w + x] = row[x]
+			}
+		}
+		return out
+	}
+
+	// The box a group composites into: the clip's, or the whole frame.
+	internal def clipBox(c Canvas, clip ?ClipRegion) (int, int, int, int) {
+		if clip is ClipRegion {
+			return (clip.left.max(0), clip.top.max(0), clip.right.min(c.width), clip.bottom.min(c.height))
+		}
+		return (0, 0, c.width, c.height)
+	}
+
+	// Coverage rows a GpuDraw recorded, replayed for fillCoverage.
+	internal def recordedCover(d GpuDraw) def(int, int, int, int, bool, def(int, byte[], int, int)) {
+		return def (bx0 int, by0 int, bx1 int, by1 int, everyRow bool, row def(int, byte[], int, int)) {
+			let w = d.w
+			let cov byte[]
+			cov.len(w + 16)
+			for let y = by0; y < by1; y++ {
+				let o = (y - d.y) * w
+				for let x = 0; x < w; x++ {
+					cov[x] = d.coverage.len() == 0 ?? (byte(255), d.coverage[o + x])
+				}
+				row(y, cov, 0, w)
+			}
+		}
+	}
+
+	// A GpuPixels paint as a shader over its box.
+	internal type PixelsShader {
+		internal pixels byte[]
+		internal x0     int
+		internal y0     int
+		internal w      int
+
+		def new(pixels byte[], x0 int, y0 int, w int) {
+			self.pixels = pixels
+			self.x0 = x0
+			self.y0 = y0
+			self.w = w
+		}
+
+		// Shade implements Shader.
+		def shade(x0 int, y int, n int, out byte[]) {
+			let o = ((y - y0) * w + (x0 - self.x0)) * 4
+			for let i = 0; i < n * 4; i++ {
+				out[i] = pixels[o + i]
+			}
+		}
+	}
+
+	// Applies one frame operation to the canvas.
+	internal def renderOp(c Canvas, op GpuOp) {
+		match op {
+			case GpuDraw:
+				renderDraw(c, op)
+			case GpuBlit:
+				if op.copy {
+					c.blitCopy(op.pixels, op.w, op.h, op.x, op.y)
+				} else {
+					c.blit(op.pixels, op.w, op.h, op.x, op.y, op.blend)
+				}
+			case GpuBeginGroup:
+				c.groups.push(new GroupFrame(c.pixels, 1.0, BlendMode.Normal, Effect[], none, new Transform2D()))
+				let fresh byte[]
+				fresh.len(c.pixels.len())
+				c.pixels = fresh
+			case GpuEndGroup:
+				return when c.groups.len() == 0
+				let f = c.groups.pop()
+				let g = c.pixels
+				c.pixels = f.parent
+				let closing = op.group
+				if closing is GroupFrame {
+					closeGroup(c, closing, g, op.clipAtEnd, op.composite)
+					return
+				}
+				let cov byte[]
+				cov.len(op.w + 16)
+				for let y = op.y; y < op.y + op.h; y++ {
+					for let x = 0; x < op.w; x++ {
+						cov[x] = op.coverage.len() == 0 ?? (byte(255), op.coverage[(y - op.y) * op.w + x])
+					}
+					let o = (y * c.width + op.x) * 4
+					let src byte[]
+					src.len((op.w + 4) * 4)
+					for let i = 0; i < op.w * 4; i++ {
+						src[i] = g[o + i]
+					}
+					compositeRowWith(c.pixels, o, src, cov, op.w, op.alpha, op.blend, op.composite)
+				}
+			case GpuBackdropBlur:
+				let box byte[]
+				box.len(op.w * op.h * 4)
+				for let y = 0; y < op.h; y++ {
+					for let i = 0; i < op.w * 4; i++ {
+						box[y * op.w * 4 + i] = c.pixels[((op.y + y) * c.width + op.x) * 4 + i]
+					}
+				}
+				op.apply(box)
+				for let y = 0; y < op.h; y++ {
+					for let i = 0; i < op.w * 4; i++ {
+						c.pixels[((op.y + y) * c.width + op.x) * 4 + i] = box[y * op.w * 4 + i]
+					}
+				}
+		}
+	}
+
+	// A GpuDraw through the canvas's own fill, so the two cannot disagree.
+	internal def renderDraw(c Canvas, d GpuDraw) {
+		let p0 = d.paint
+		if d.layer && p0 is GpuPixels {
+			let cov byte[]
+			cov.len(d.w + 16)
+			let src byte[]
+			src.len((d.w + 4) * 4)
+			for let y = 0; y < d.h; y++ {
+				for let x = 0; x < d.w; x++ {
+					cov[x] = d.coverage.len() == 0 ?? (byte(255), d.coverage[y * d.w + x])
+				}
+				for let i = 0; i < d.w * 4; i++ {
+					src[i] = p0.pixels[y * d.w * 4 + i]
+				}
+				compositeRowWith(c.pixels, ((d.y + y) * c.width + d.x) * 4, src, cov, d.w, d.alpha, d.blend, d.composite)
+			}
+			return
+		}
+		let st = DrawState{}
+		if d.clip.len() > 0 {
+			st.clip = new ClipRegion(d.x, d.y, d.x + d.w, d.y + d.h, d.clip)
+		} else if d.composite := Composite.SourceIn || Composite.SourceOut || Composite.DestinationIn || Composite.DestinationAtop || Composite.Copy {
+			st.clip = new ClipRegion(d.x, d.y, d.x + d.w, d.y + d.h)
+		}
+		st.composite = d.composite
+		st.blend = d.blend
+		let cover = recordedCover(d)
+		if d.quad.len() == 8 {
+			let q = d.quad
+			let edges = pathEdges(new Path().moveTo(q[0], q[1]).lineTo(q[2], q[3]).lineTo(q[4], q[5]).lineTo(q[6], q[7]).close().flattened(0.05))
+			cover = def (bx0 int, by0 int, bx1 int, by1 int, everyRow bool, row def(int, byte[], int, int)) {
+				rasterize(edges, bx0, by0, bx1, by1, FillRule.NonZero, everyRow, row)
+			}
+		}
+		st.antialias = d.antialias
+		let (minX, minY, maxX, maxY) = (float(d.x), float(d.y), float(d.x + d.w), float(d.y + d.h))
+		let p = d.paint
+		match p {
+			case GpuSolid:
+				let color = new Color(RGBA{r: p.r, g: p.g, b: p.b, a: byte(d.alpha)})
+				fillCoverage(c, color, new SolidShader(color), false, st, false, minX, minY, maxX, maxY, cover)
+			case GpuPixels:
+				st.alpha = float(d.alpha) / 255.0
+				fillCoverage(c, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}), new PixelsShader(p.pixels, d.x, d.y, d.w), true, st, false, minX, minY, maxX, maxY, cover)
+			case GpuFragment:
+				st.alpha = float(d.alpha) / 255.0
+				fillCoverage(c, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}), new FragmentShader(p.shader, p.uniforms, p.inv), true, st, false, minX, minY, maxX, maxY, cover)
+			case GpuGradient:
+				st.alpha = float(d.alpha) / 255.0
+				let src = p.source
+				if src is Shader {
+					fillCoverage(c, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}), src, true, st, false, minX, minY, maxX, maxY, cover)
+				}
+			case GpuImage:
+				st.alpha = float(d.alpha) / 255.0
+				let src = p.source
+				if src is Shader {
+					fillCoverage(c, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}), src, true, st, false, minX, minY, maxX, maxY, cover)
+				}
+			case GpuNoise:
+				st.alpha = float(d.alpha) / 255.0
+				let src = p.source
+				if src is Shader {
+					fillCoverage(c, new Color(RGBA{r: 0, g: 0, b: 0, a: 255}), src, true, st, false, minX, minY, maxX, maxY, cover)
+				}
+		}
+	}
+
+	// The mask's and clip's coverage over the region, as maskRow gives it,
+	// row by row: what an effect layer or group content is weighted by.
+	internal def fullBox(mask ?Mask, clip ?ClipRegion, r Region) byte[] {
+		// Nothing to weigh by: no mask, and a clip that is only a box.
+		return byte[] when mask is none && (clip is none || clip.mask is none)
+		let out byte[]
+		out.len(r.w * r.h)
+		let row byte[]
+		row.len(r.w)
+		for let y = 0; y < r.h; y++ {
+			coverageBytes(mask, clip, r.x0, r.y0 + y, row)
+			for let x = 0; x < r.w; x++ {
+				out[y * r.w + x] = row[x]
+			}
+		}
+		return byte[] when allFull(out)
+		return out
+	}
+
+	// A plane's 0..1 values as bytes, rounded as blurWhere rounds them.
+	internal def planeBytes(p float32[], r Region) byte[] {
+		let out byte[]
+		out.len(r.w * r.h)
+		for let y = 0; y < r.h; y++ {
+			for let x = 0; x < r.w; x++ {
+				out[y * r.w + x] = byte(int((float(p[y * r.pw + x]).clamp(0.0, 1.0) * 255.0 + 0.5).floor()))
+			}
+		}
+		return out
+	}
+
+	// The blue-noise table the canvas dithers with.
+	internal def canvasBlueNoise() byte[] {
+		return blueNoise.clone()
+	}
+
+	// The shader's colours as a GPU paint over the box: in a shader when
+	// there is one for it, else shaded here.
+	internal def gpuPaintOf(shader Shader, bx0 int, by0 int, w int, h int) GpuPaint {
+		let gpaint GpuPaint = GpuSolid{r: 0, g: 0, b: 0}
+		if shader is SolidShader {
+			let c = shader.rgba
+			gpaint = GpuSolid{r: c.r, g: c.g, b: c.b, a: c.a}
+		} else if shader is FragmentShader {
+			gpaint = GpuFragment{shader: shader.fragment, uniforms: shader.uniforms.clone(), inv: copyTransform(shader.inv)}
+		} else if shader is LinearShader && shader.reaches {
+			gpaint = GpuGradient{kind: GpuGradientKind.Linear, table: shader.table, spread: shader.spread, inv: new Transform2D(), params: [shader.t0, shader.dtx, shader.dty], source: shader}
+		} else if shader is RadialShader && shader.reaches {
+			gpaint = GpuGradient{kind: GpuGradientKind.Radial, table: shader.table, spread: shader.spread, inv: copyTransform(shader.inv), params: [shader.fx, shader.fy, shader.r0, shader.cdx, shader.cdy, shader.dr, shader.a, shader.simple ?? (1.0, 0.0)], source: shader}
+		} else if shader is ConicShader && shader.reaches {
+			gpaint = GpuGradient{kind: GpuGradientKind.Conic, table: shader.table, spread: Spread.Repeat, inv: copyTransform(shader.inv), params: [shader.cx, shader.cy, shader.angle], source: shader}
+		} else if shader is PatternShader && shader.reaches {
+			gpaint = gpuImageOf(shader, none, shader)
+		} else if shader is TintShader && patternReaches(shader.inner) {
+			let inner = shader.inner
+			if inner is PatternShader {
+				gpaint = gpuImageOf(inner, tintOf(shader), shader)
+			}
+		} else if shader is NoiseShader && shader.reaches {
+			gpaint = GpuNoise{table: shader.table, perm: shader.perm, octaves: shader.octaves, inv: copyTransform(shader.inv), source: shader}
+		} else {
+			let px byte[]
+			px.len(w * h * 4 + 16)
+			let row byte[]
+			row.len(w * 4 + 16)
+			for let y = by0; y < by0 + h; y++ {
+				shader.shade(bx0, y, w, row)
+				copyBytes(px, (y - by0) * w * 4, row, 0, w * 4)
+			}
+			px.len(w * h * 4)
+			gpaint = GpuPixels{pixels: px}
+		}
+		return gpaint
+	}
+
+	// The GpuEndGroup closing `f`: for a plain group the clip's box; with
+	// effects the most their region can be (what the group drew, grown by
+	// their margin, within the clip), the margin to find the exact one by,
+	// and the effects in device pixels.
+	internal def lowerEndGroup(c Canvas, rec GpuFrame, f GroupFrame, clip ?ClipRegion, op Composite) GpuEndGroup {
+		let (cx0, cy0, cx1, cy1) = clipBox(c, clip)
+		let alpha = int((f.opacity.clamp(0.0, 1.0) * 255.0 + 0.5).floor())
+		if f.effects.len() == 0 {
+			let (w, h) = ((cx1 - cx0).max(0), (cy1 - cy0).max(0))
+			return GpuEndGroup{x: cx0, y: cy0, w: w, h: h, coverage: coverageBox(f.mask, clip, cx0, cy0, w, h), alpha: alpha, blend: f.blend, composite: op}
+		}
+		let clears = op := Composite.SourceIn || Composite.SourceOut || Composite.DestinationIn || Composite.DestinationAtop || Composite.Copy || Composite.Clear
+		let (found, bx0, by0, bx1, by1) = opsBox(rec, f.opStart)
+		if clears {
+			(found, bx0, by0, bx1, by1) = (true, 0, 0, c.width, c.height)
+		}
+		let m = effectMargin(f)
+		let rx0 = (bx0 - m).max(0).max(cx0)
+		let ry0 = (by0 - m).max(0).max(cy0)
+		let rx1 = (bx1 + m).min(c.width).min(cx1)
+		let ry1 = (by1 + m).min(c.height).min(cy1)
+		if !found || rx0 >= rx1 || ry0 >= ry1 {
+			return GpuEndGroup{x: 0, y: 0, w: 0, h: 0, alpha: alpha, blend: f.blend, composite: op}
+		}
+		let r = Region{x0: rx0, y0: ry0, w: rx1 - rx0, h: ry1 - ry0, pw: (rx1 - rx0 + 7) / 8 * 8}
+		return GpuEndGroup{x: r.x0, y: r.y0, w: r.w, h: r.h, coverage: fullBox(f.mask, clip, r), alpha: alpha, blend: f.blend, composite: op, effects: gpuEffects(f, r), margin: m, group: f, clipAtEnd: clip}
+	}
+
+	// The box the frame's operations from `start` on drew into.
+	internal def opsBox(rec GpuFrame, start int) (bool, int, int, int, int) {
+		let (x0, y0, x1, y1) = (0, 0, 0, 0)
+		let found = false
+		let add = def (ax int, ay int, aw int, ah int) {
+			return when aw <= 0 || ah <= 0
+			if !found {
+				(x0, y0, x1, y1) = (ax, ay, ax + aw, ay + ah)
+				found = true
+				return
+			}
+			x0 = x0.min(ax)
+			y0 = y0.min(ay)
+			x1 = x1.max(ax + aw)
+			y1 = y1.max(ay + ah)
+		}
+		for let i = start; i < rec.ops.len(); i++ {
+			let op = rec.ops[i]
+			match op {
+				case GpuDraw:
+					add(op.x, op.y, op.w, op.h)
+				case GpuBlit:
+					add(op.x.max(0), op.y.max(0), (op.x + op.w).min(rec.width) - op.x.max(0), (op.y + op.h).min(rec.height) - op.y.max(0))
+				case GpuEndGroup:
+					add(op.x, op.y, op.w, op.h)
+				default:
+			}
+		}
+		return (found, x0, y0, x1, y1)
+	}
+
+	// The group's effects in device pixels, as closeGroup applies them.
+	internal def gpuEffects(f GroupFrame, r Region) GpuEffect[] {
+		let out GpuEffect[]
+		let s = f.scale
+		let t = f.transform
+		let radiiOf = (sigma float) => sigma < 0.3 ?? (int[], boxRadii(sigma))
+		for let (_, e) in f.effects {
+			match e {
+				case DropShadow:
+					let ox = t.a * e.offset.x + t.c * e.offset.y
+					let oy = t.b * e.offset.x + t.d * e.offset.y
+					out.push(GpuEffect{kind: GpuEffectKind.DropShadow, dx: ox, dy: oy, radii: radiiOf(float(e.blur) * s / 2.0), grow: float(e.spread) * s, color: e.color.rgba, knockout: e.knockout})
+				case OuterGlow:
+					out.push(GpuEffect{kind: GpuEffectKind.OuterGlow, radii: radiiOf(float(e.blur) * s / 2.0), grow: float(e.spread) * s, color: e.color.rgba, blend: e.blend})
+				case InnerShadow:
+					let ox = t.a * e.offset.x + t.c * e.offset.y
+					let oy = t.b * e.offset.x + t.d * e.offset.y
+					out.push(GpuEffect{kind: GpuEffectKind.InnerShadow, dx: ox, dy: oy, radii: radiiOf(float(e.blur) * s / 2.0), grow: float(e.choke) * s, color: e.color.rgba})
+				case InnerGlow:
+					out.push(GpuEffect{kind: GpuEffectKind.InnerGlow, radii: radiiOf(float(e.blur) * s / 2.0), color: e.color.rgba, blend: e.blend})
+				case Outline:
+					out.push(GpuEffect{kind: GpuEffectKind.Outline, grow: float(e.width) * s, position: e.position, paint: gpuPaintOf(shaderFor(e.paint, t), r.x0, r.y0, r.w, r.h)})
+				case Blur:
+					let kind = e.backdrop ?? (GpuEffectKind.BackdropBlur, GpuEffectKind.Blur)
+					out.push(GpuEffect{kind: kind, radii: radiiOf(float(e.radius) * s)})
+				case ColorAdjust:
+					out.push(GpuEffect{kind: GpuEffectKind.ColorMatrix, matrix: adjustMatrix(e)})
+				case ColorMatrix:
+					out.push(GpuEffect{kind: GpuEffectKind.ColorMatrix, matrix: e.values.clone()}) when e.values.len() >= 20
+			}
+		}
+		return out
+	}
+
+	// The pattern shader's window as a GPU image, before its halvings;
+	// `original` is the shader the canvas draws it with (a tint around it).
+	internal def gpuImageOf(ps PatternShader, tint ?RGBA, original Shader) GpuImage {
+		let b = ps.base
+		if !ps.keyed {
+			let sh = ps.shared
+			if sh is PatternLevels && sh.keyed {
+				ps.key = sh.key
+			} else {
+				ps.key = windowKey(b.px, b.stride, b.wx, b.wy, b.ww, b.wh)
+				if sh is PatternLevels {
+					sh.key = ps.key
+					sh.keyed = true
+				}
+			}
+			ps.keyed = true
+		}
+		return GpuImage{pixels: b.px, stride: b.stride, wx: b.wx, wy: b.wy, ww: b.ww, wh: b.wh, halvings: ps.halvings, inv: copyTransform(ps.inv), repeatX: ps.repeatX, repeatY: ps.repeatY, sampling: ps.sampling, tint: tint, key: ps.key, source: original}
+	}
+
+	internal def patternReaches(p Shader) bool {
+		return p is PatternShader && p.reaches
+	}
+
+	// A tint shader's colour.
+	internal def tintOf(t TintShader) ?RGBA {
+		return RGBA{r: t.tint[0], g: t.tint[1], b: t.tint[2], a: t.tint[3]}
+	}
+
+	// A key for the window's bytes: its size and a 64-bit hash of every
+	// row, sixteen bytes a step (multiply, rotate, fold), so a renderer can
+	// tell when an image it keeps has changed.
+	internal def windowKey(px byte[], stride int, wx int, wy int, ww int, wh int) uint64 {
+		let k1 = simd.splat16<uint32>(uint32(0x9E3779B1))
+		let k2 = simd.splat16<uint32>(uint32(0x85EBCA77))
+		let acc = simd.splat16<uint32>(uint32(0x165667B1))
+		let n = ww * 4
+		let tail uint64 = 0
+		for let y = 0; y < wh; y++ {
+			let o = (wy + y) * stride + wx * 4
+			let i = 0
+			for i + 16 <= n {
+				let v = simd.convert<byte, uint32>(simd.load16<byte>(px, o + i))
+				acc = (acc ^ (v * k1)).rotl(13) * k2
+				i += 16
+			}
+			for i < n {
+				tail = (tail ^ uint64(px[o + i])) * uint64(0x100000001B3)
+				i++
+			}
+			acc = acc + simd.splat16<uint32>(uint32(y + 1))
+		}
+		let h uint64 = uint64(0xCBF29CE484222325)
+		for let l = 0; l < 16; l++ {
+			h = (h ^ uint64(acc.lane(l))) * uint64(0x100000001B3)
+		}
+		h = (h ^ tail) * uint64(0x100000001B3)
+		return h ^ (uint64(ww) << 40) ^ (uint64(wh) << 20)
+	}
+
+	// n bytes of src from `from` into dst at `at`, sixteen a step; no
+	// slices, so nothing is allocated.
+	internal def copyBytes(dst byte[], at int, src byte[], from int, n int) {
+		let i = 0
+		for i + 16 <= n {
+			simd.store16<byte>(dst, at + i, simd.load16<byte>(src, from + i))
+			i += 16
+		}
+		for i < n {
+			dst[at + i] = src[from + i]
+			i++
+		}
+	}
+}

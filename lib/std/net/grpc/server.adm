@@ -1,0 +1,273 @@
+partial module std.net.grpc {
+	use (
+		std.time
+		std.net.http
+		std.data.encoding::(Protobuf, Base64)
+		std.net.grpc.wire::*
+	)
+
+	// Answers a unary call: read the request with `call.receive`, return the
+	// response. Failing with a Status ends the call with it; any other
+	// failure ends it with Unknown and the failure's message.
+	type UnaryHandler = def(ServerCall) !any
+
+	// Runs a streaming call (client, server or both directions): receive
+	// until it returns false, send any number of responses. Fails as a
+	// UnaryHandler does.
+	type StreamHandler = def(ServerCall) !none
+
+	// Serves gRPC methods as an `http.Handler`, so a `std.net.http` server
+	// carries them: over TLS with ALPN h2, or HTTP/2 by prior knowledge on a
+	// plain port.
+	//
+	//     let rpc = new grpc.Server()
+	//     rpc.unary("/echo.Echo/Unary", def (call grpc.ServerCall) !any { … })
+	//     let srv = new http.Server(rpc)
+	//     try srv.listenAndServe(":50051")
+	type Server {
+		// Decodes requests and encodes responses.
+		codec          Codec       = new Protobuf()
+		// The largest request message; a larger one ends the call with
+		// ResourceExhausted.
+		maxReceiveSize int         = 4 << 20
+		// How responses are compressed when the client accepts it.
+		compression    Compression = Compression.Identity
+
+		internal unaryNames  string[]
+		internal unaryFns    UnaryHandler[]
+		internal streamNames string[]
+		internal streamFns   StreamHandler[]
+
+		// Registers a unary method, `/package.Service/Method`, replacing an
+		// earlier registration of the name.
+		def unary(method string, handler UnaryHandler) {
+			forget(method)
+			unaryNames.push(method)
+			unaryFns.push(handler)
+		}
+
+		// Registers a streaming method, replacing an earlier registration of
+		// the name.
+		def stream(method string, handler StreamHandler) {
+			forget(method)
+			streamNames.push(method)
+			streamFns.push(handler)
+		}
+
+		// Serves one call. Fails when the response write does.
+		def serve(ctx http.Context) !none {
+			return try serveCall(self, ctx)
+		}
+
+		internal def forget(method string) {
+			let i = unaryNames.indexOf(method)
+			if i >= 0 {
+				unaryNames.remove(i)
+				unaryFns.remove(i)
+			}
+			let j = streamNames.indexOf(method)
+			if j >= 0 {
+				streamNames.remove(j)
+				streamFns.remove(j)
+			}
+		}
+	}
+
+	// Serves one call for a server.
+	internal def serveCall(server Server, ctx http.Context) !none {
+		let req = ctx.request
+		if ctx.method() != http.Method.POST {
+			ctx.setHeader("Allow", "POST")
+			return try ctx.error(405)
+		}
+		let ct = ctx.header("Content-Type").lower()
+		return try ctx.error(415) unless ct.startsWith("application/grpc")
+		let call = new ServerCall(server, ctx)
+		return try closeCall(call, errorOf(Code.Internal, "grpc: requires HTTP/2")) when req.proto != "HTTP/2.0"
+		let enc = compressionOf(ctx.header("grpc-encoding"))
+		if enc is none {
+			ctx.setHeader("grpc-accept-encoding", "identity, deflate, gzip")
+			return try closeCall(call, errorOf(Code.Unimplemented, "grpc: unsupported message encoding {ctx.header("grpc-encoding")}"))
+		}
+		call.encoding = enc
+		let timeout = ctx.header("grpc-timeout")
+		if timeout != "" {
+			let d = timeoutOf(timeout)
+			return try closeCall(call, errorOf(Code.Internal, "grpc: malformed grpc-timeout {timeout}")) when d is none
+			call.deadline = time.now() + d
+			req.deadline = call.deadline
+		}
+		let ui = server.unaryNames.indexOf(call.method)
+		let si = server.streamNames.indexOf(call.method)
+		return try closeCall(call, errorOf(Code.Unimplemented, "grpc: unknown method {call.method}")) when ui < 0 && si < 0
+		let failed ?error = none
+		if si >= 0 {
+			let fn = server.streamFns[si]
+			fn(call) onerror (err error) {
+				failed = err
+				recover none
+			}
+		} else {
+			let unaryFn = server.unaryFns[ui]
+			let response = unaryFn(call) onerror (err error) {
+				failed = err
+				recover none
+			}
+			if failed is none {
+				call.send(response) onerror (err error) {
+					failed = err
+					recover none
+				}
+			}
+		}
+		let err = failed
+		return try closeCall(call, errorOf(Code.DeadlineExceeded, "grpc: deadline exceeded")) when call.expired()
+		return try closeCall(call, errorOf(Code.OK, "")) when err is none
+		return try closeCall(call, err) when err is Status
+		return try closeCall(call, errorOf(Code.Unknown, err.message))
+	}
+
+	// One call on the server side, as a handler sees it.
+	type ServerCall {
+		// The full method name, `/package.Service/Method`.
+		method   string
+		// The metadata the client sent.
+		metadata Metadata
+		// When the client gives up; none when it set no timeout. Requests
+		// read after it fail with DeadlineExceeded.
+		deadline ?time.Time = none
+		// The client's address.
+		peer     string
+		// Metadata sent with the response headers, before the first message
+		// (or at the end when there is none).
+		header   Metadata
+		// Metadata sent after the last message, with the status.
+		trailer  Metadata
+
+		internal server     Server
+		internal ctx        http.Context
+		internal encoding   Compression  = Compression.Identity
+		internal outgoing   Compression  = Compression.Identity
+		internal headerSent bool         = false
+		internal closed     bool         = false
+
+		def new(server Server, ctx http.Context) {
+			self.server = server
+			self.ctx = ctx
+			self.method = ctx.path()
+			self.metadata = metadataFromHeader(ctx.request.headers)
+			self.peer = ctx.clientAddr()
+			self.header = new Metadata()
+			self.trailer = new Metadata()
+			self.outgoing = server.compression when server.compression != Compression.Identity && acceptsEncoding(ctx.header("grpc-accept-encoding"), encodingName(server.compression))
+		}
+
+		// Reads the next request message into target. Returns false when
+		// the client has ended its side. Fails with a Status: Internal for a
+		// message that does not decode, ResourceExhausted past the size
+		// limit, DeadlineExceeded past the deadline, Cancelled when the
+		// client reset the call.
+		def receive(target any) !bool {
+			let body = ctx.request.body
+			return false when body is none
+			let data = readMessage(body, encoding, server.maxReceiveSize) onerror (err error) {
+				fail err when err is Status
+				fail readFailure(err)
+			}
+			return false when data is none
+			server.codec.decode(data, target) onerror (err error) {
+				fail errorOf(Code.Internal, "grpc: cannot decode request: {err.message}")
+			}
+			return true
+		}
+
+		// Sends one response message, with the response headers first.
+		// Fails when the client is gone.
+		def send(message any) !none {
+			try sendHeader()
+			try writeMessage(ctx.response, server.codec.encode(message), outgoing)
+			try ctx.response.flush()
+			return none
+		}
+
+		// Sends the response headers now, with the header metadata. Fails
+		// when the client is gone.
+		def sendHeader() !none {
+			return none when headerSent
+			headerSent = true
+			let w = ctx.response
+			w.headers.set("Content-Type", ctx.header("Content-Type"))
+			w.headers.set("grpc-encoding", encodingName(outgoing)) when outgoing != Compression.Identity
+			w.headers.set("grpc-accept-encoding", "identity, deflate, gzip")
+			addMetadata(w.headers, header)
+			// flush commits as a streamed body: no Content-Length and no
+			// END_STREAM on the headers, so the trailers can follow.
+			w.status = 200
+			try w.flush()
+			return none
+		}
+
+		// Reports whether the deadline has passed.
+		def expired() bool {
+			let until = deadline
+			return false when until is none
+			return !time.now().before(until)
+		}
+
+		// The Status for a failed request read.
+		internal def readFailure(err error) Status {
+			return errorOf(Code.DeadlineExceeded, "grpc: deadline exceeded") when expired()
+			let s = errorOf(Code.Cancelled, "grpc: {err.message}")
+			s.cause = err
+			return s
+		}
+	}
+
+	// Ends the call with a status: the headers when not yet sent, then
+	// the trailers.
+	internal def closeCall(call ServerCall, status Status) !none {
+		return none when call.closed
+		call.closed = true
+		try call.sendHeader()
+		let w = call.ctx.response
+		w.trailer.set("grpc-status", status.kind.value.str())
+		w.trailer.set("grpc-message", encodeMessage(status.message)) when status.message != ""
+		if status.details.len() > 0 {
+			let b = new Base64()
+			b.padded = false
+			w.trailer.set("grpc-status-details-bin", b.encode(status.details))
+		}
+		addMetadata(w.trailer, call.trailer)
+		addMetadata(w.trailer, status.trailer)
+		return try w.end()
+	}
+
+	// The metadata among request headers.
+	internal def metadataFromHeader(h http.Header) Metadata {
+		let md = new Metadata()
+		for let name in h.keys() {
+			let k = name.lower()
+			continue when k.startsWith(":") || k.startsWith("grpc-") || reservedHeader(k)
+			for let v in h.values(name) {
+				md.keys.push(k)
+				md.values.push(v)
+			}
+		}
+		return md
+	}
+
+	// Adds metadata to HTTP header fields.
+	internal def addMetadata(h http.Header, md Metadata) {
+		for let (i, k) in md.keys {
+			h.add(k, md.values[i])
+		}
+	}
+
+	// Reports whether a `grpc-accept-encoding` list names the encoding.
+	internal def acceptsEncoding(list string, name string) bool {
+		for let part in list.split(",") {
+			return true when part.trim().lower() == name
+		}
+		return false
+	}
+}

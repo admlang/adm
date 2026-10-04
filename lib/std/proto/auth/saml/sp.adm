@@ -1,0 +1,544 @@
+partial module std.proto.auth.saml {
+	use (
+		std.time
+		std.crypto::(PrivateKey, Ed25519PrivateKey, Ed448PrivateKey, publicKeyOf)
+		std.data.encoding::(XMLNode, SignatureMethod, hexencode)
+		std.net.http
+		std.net.http::(Context, Handler)
+		std.proto.auth.saml.engine::*
+	)
+
+	// ServiceProvider is a SAML service provider of one identity provider:
+	// it sends AuthnRequests, accepts the assertions that come back at its
+	// assertion consumer service (ACS), and takes part in Single Logout.
+	// `key` and `certificate` sign its requests and decrypt what the
+	// identity provider encrypts for it.
+	type ServiceProvider {
+		entityId             string
+		// The ACS URL, where the identity provider posts responses or sends
+		// artifacts.
+		acsURL               string
+		idp                  EntityDescriptor
+		key                  ?PrivateKey
+		// The DER certificate of the key, published in the metadata.
+		certificate          ?byte[]
+		// The Single Logout endpoint; "" leaves Single Logout out of the
+		// metadata.
+		sloURL               string           = ""
+		// The signature method; none picks the key's usual one.
+		signatureMethod      ?SignatureMethod
+		// Sign AuthnRequests (when there is a key).
+		signRequests         bool             = true
+		// Require the assertion itself to be signed, not only the
+		// response around it.
+		wantAssertionsSigned bool             = false
+		// Accept responses that answer no request (IdP-initiated login).
+		allowUnsolicited     bool             = false
+		// Accept SHA-1 signatures.
+		allowSha1            bool             = false
+		// The clock difference tolerated in every time check.
+		leeway               duration         = 60s
+		// The NameID formats the metadata lists.
+		nameIdFormats        NameIdFormat[]   = []
+		// The client artifact resolution and back-channel logout use.
+		httpClient           ?http.Client
+		internal replay      ReplayCache
+
+		def new(entityId string, acsURL string, idp EntityDescriptor) {
+			self.entityId = entityId
+			self.acsURL = acsURL
+			self.idp = idp
+			replay = new ReplayCache()
+		}
+
+		// login makes an AuthnRequest for the identity provider's single
+		// sign-on endpoint with the binding: Redirect (query signature) or
+		// Post (enveloped signature). Keep the message's id to pass to
+		// consume. Fails with Unsupported when the identity provider has no
+		// endpoint for the binding, Malformed for a RelayState over 80
+		// bytes.
+		def login(binding Binding = Binding.Redirect, relayState string = "", options ?LoginOptions = none) !Message {
+			let role = try idpRole(self)
+			let endpoint = pick(role.singleSignOn, [binding])
+			fail samlError(SamlErrorKind.Unsupported, "the identity provider has no {binding.value} single sign-on endpoint") when endpoint is none
+			let opts = options is none ?? (LoginOptions{}, options)
+			fail samlError(SamlErrorKind.Unsupported, "responses come back by Post or Artifact") unless opts.responseBinding := Binding.Post || Binding.Artifact
+			let id = try newId()
+			let root = protocolRoot("AuthnRequest", id, entityId, endpoint.location)
+			root.set("AssertionConsumerServiceURL", acsURL)
+			root.set("ProtocolBinding", opts.responseBinding.value)
+			root.set("ForceAuthn", "true") when opts.forceAuthn
+			root.set("IsPassive", "true") when opts.isPassive
+			let policy = element(root, "samlp:NameIDPolicy", samlpNS)
+			let format = opts.nameIdFormat
+			policy.set("Format", format.value) unless format is none
+			policy.set("AllowCreate", opts.allowCreate ?? ("true", "false"))
+			if opts.authnContexts.len() > 0 {
+				let requested = element(root, "samlp:RequestedAuthnContext", samlpNS)
+				requested.set("Comparison", opts.comparison.value)
+				for let c in opts.authnContexts {
+					textElement(requested, "saml:AuthnContextClassRef", samlNS, c)
+				}
+			}
+			let signer = signRequests ?? (key, none)
+			return try sendRequest(self, id, endpoint, root, relayState, signer)
+		}
+
+		// consume accepts the response at the ACS: an HTTP-POST
+		// SAMLResponse, or an artifact (GET or POST SAMLart) resolved over
+		// SOAP with a signed ArtifactResolve. requestId is the id of the
+		// login message this browser was sent with; none accepts only an
+		// unsolicited response, and only with allowUnsolicited. Checked, in
+		// order, failing closed: no DOCTYPE; Version 2.0; the response's
+		// signature (if any) by an identity provider signing key over the
+		// response itself; Destination (required when signed), Issuer and
+		// InResponseTo; status Success; exactly one assertion in the whole
+		// message, a child of the response (EncryptedAssertion decrypted
+		// with `key`); the assertion's signature over itself; at least one
+		// of the two signatures (or a signed or TLS artifact channel), the
+		// assertion's own with wantAssertionsSigned; its Issuer;
+		// Conditions (times with leeway, an AudienceRestriction naming this
+		// provider, no unknown condition); a bearer SubjectConfirmation
+		// with Recipient the ACS, NotOnOrAfter ahead, no NotBefore and the
+		// request's InResponseTo; an AuthnStatement whose session has not
+		// ended; and the assertion ID not seen before. Only the verified
+		// assertion is read. Fails with the SamlErrorKind of the first
+		// check that does not pass.
+		def consume(ctx Context, requestId ?string) !Assertion {
+			let inbound = try readInbound(ctx)
+			fail samlError(SamlErrorKind.Malformed, "the ACS received a request, not a response") when inbound.request
+			let assertion ?Assertion = none
+			match inbound.binding {
+				case Binding.Post:
+					let document = try parseDocument(inbound.xml)
+					assertion = try accept(self, document, document, requestId, viaArtifact = false, trustedChannel = false)
+				case Binding.Artifact:
+					let (envelope, response, trusted) = try resolveArtifact(self, inbound.artifact)
+					assertion = try accept(self, envelope, response, requestId, true, trusted)
+				default:
+					fail samlError(SamlErrorKind.Unsupported, "Web Browser SSO responses come by Post or Artifact, not {inbound.binding.value}")
+			}
+			let accepted = assertion
+			fail samlError(SamlErrorKind.Malformed, "no assertion") when accepted is none
+			accepted.relayState = inbound.relayState
+			return accepted
+		}
+
+		// consume accepts the base64 SAMLResponse of an HTTP-POST, checked
+		// as the Context overload does. Fails as that overload does, and with
+		// Malformed when the text is not base64.
+		def consume(samlResponse string, requestId ?string, relayState string = "") !Assertion {
+			let document = try parseDocument(try decodeB64(samlResponse, "SAMLResponse"))
+			let assertion = try accept(self, document, document, requestId, viaArtifact = false, trustedChannel = false)
+			assertion.relayState = relayState
+			return assertion
+		}
+
+		// logout makes a LogoutRequest for the session an assertion
+		// started (SP-initiated Single Logout), signed with `key`. The
+		// binding defaults to the identity provider's first of Redirect,
+		// Post and Soap. With Soap the exchange completes here (the
+		// identity provider's LogoutResponse checked; send writes nothing);
+		// otherwise send it, and check the answer with handleLogout. Fails
+		// with Unsupported when there is no key or no endpoint, and as
+		// handleLogout for a SOAP answer.
+		def logout(assertion Assertion, binding ?Binding = none, relayState string = "") !Message {
+			let indexes string[] = []
+			let index = assertion.sessionIndex
+			indexes.push(index) unless index is none
+			return try logout(assertion.nameId, indexes, binding, relayState)
+		}
+
+		// logout makes a LogoutRequest for a name identifier and session
+		// indexes kept from an assertion. Fails as the Assertion overload.
+		def logout(nameId NameId, sessionIndexes string[], binding ?Binding = none, relayState string = "") !Message {
+			let role = try idpRole(self)
+			let preference = binding is none ?? ([Binding.Redirect, Binding.Post, Binding.Soap], [binding])
+			let endpoint = pick(role.singleLogout, preference)
+			fail samlError(SamlErrorKind.Unsupported, "the identity provider has no single logout endpoint for the binding") when endpoint is none
+			fail samlError(SamlErrorKind.Unsupported, "Single Logout needs a signing key") when key is none
+			let id = try newId()
+			let root = logoutRequestElement(id, entityId, endpoint.location, nameId, sessionIndexes)
+			if endpoint.binding == Binding.Soap {
+				try signElement(root, key, signatureMethod, none, "Issuer")
+				let (envelope, answer) = try soapCall(httpClient, endpoint.location, root)
+				try readLogoutResponse(self, answer, envelope, id, Binding.Soap, none)
+				return new Message(id, Binding.Soap, endpoint.location)
+			}
+			return try sendRequest(self, id, endpoint, root, relayState, key)
+		}
+
+		// handleLogout serves the Single Logout endpoint. A LogoutRequest
+		// from the identity provider (Redirect, Post or SOAP) must be signed
+		// by it, addressed here and current; endSession then ends the
+		// user's local session and reports whether it did, and the signed
+		// LogoutResponse goes back (Success, or Responder when endSession
+		// says false). A LogoutResponse must answer requestId (the logout
+		// message's id), be signed, and is returned for the app to finish;
+		// endSession is not called. Fails with Malformed, Unsigned,
+		// BadSignature, IssuerMismatch, DestinationMismatch, Expired,
+		// Replayed or InResponseToMismatch, and as endSession does.
+		def handleLogout(ctx Context, endSession def (Logout) !bool, requestId ?string = none) !Logout {
+			let inbound = try readInbound(ctx)
+			let role = try idpRole(self)
+			let keys = role.signingKeys()
+			if inbound.binding == Binding.Soap {
+				let envelope = try parseDocument(inbound.xml)
+				let message = try soapMessage(envelope)
+				let signed = try verifyEnveloped(message, envelope, keys, allowSha1)
+				fail samlError(SamlErrorKind.Unsigned, "the LogoutRequest is not signed") unless signed
+				let request = try readLogoutRequest(self, message)
+				let ended = try endSession(request)
+				let answer = try logoutResponseElement(self, request.id, sloURL, ended)
+				try signElement(answer, key, signatureMethod, none, "Issuer") unless key is none
+				try sendSoap(ctx, answer)
+				return request
+			}
+			fail samlError(SamlErrorKind.Unsupported, "Single Logout does not use artifacts here") when inbound.binding == Binding.Artifact
+			let document = try parseDocument(inbound.xml)
+			let signed = inbound.binding == Binding.Redirect ?? (try verifyRedirect(inbound, keys, allowSha1), try verifyEnveloped(document, document, keys, allowSha1))
+			if !inbound.request {
+				let response = try readLogoutResponse(self, document, document, requestId is none ?? ("", requestId), inbound.binding, signed)
+				response.relayState = inbound.relayState
+				return response
+			}
+			fail samlError(SamlErrorKind.Unsigned, "the LogoutRequest is not signed") unless signed
+			let request = try readLogoutRequest(self, document)
+			request.relayState = inbound.relayState
+			let ended = try endSession(request)
+			let endpoint = pick(role.singleLogout, [inbound.binding, Binding.Redirect, Binding.Post])
+			fail samlError(SamlErrorKind.Unsupported, "the identity provider has no front-channel single logout endpoint") when endpoint is none
+			let target = endpoint.responseLocation == "" ?? (endpoint.location, endpoint.responseLocation)
+			let answer = try logoutResponseElement(self, request.id, target, ended)
+			let signer = key
+			try signElement(answer, signer, signatureMethod, none, "Issuer") when !(signer is none) && endpoint.binding == Binding.Post
+			let reply = try outgoing(attr(answer, "ID"), endpoint, false, answer, inbound.relayState, endpoint.binding == Binding.Redirect ?? (signer, none), signatureMethod)
+			try reply.send(ctx)
+			return request
+		}
+
+		// metadata is this provider's metadata: its keys (signing, and
+		// encryption for a key that can decrypt), the ACS for Post (the
+		// default, index 0) and Artifact (index 1), Single Logout for
+		// Redirect, Post and Soap when sloURL is set, and the NameID
+		// formats.
+		def metadata() EntityDescriptor {
+			let e = new EntityDescriptor(entityId)
+			let d = new SpDescriptor()
+			let k = key
+			if !(k is none) {
+				let pub = publicKeyOf(k)
+				d.keys.push(new KeyDescriptor(pub, certificate, KeyUse.Signing))
+				d.keys.push(new KeyDescriptor(pub, certificate, KeyUse.Encryption)) unless k is Ed25519PrivateKey || k is Ed448PrivateKey
+			}
+			d.assertionConsumers = [Endpoint{binding:Binding.Post, location:acsURL, index:0, isDefault:true}, Endpoint{binding:Binding.Artifact, location:acsURL, index:1}]
+			d.singleLogout = [Endpoint{binding:Binding.Redirect, location:sloURL}, Endpoint{binding:Binding.Post, location:sloURL}, Endpoint{binding:Binding.Soap, location:sloURL}] when sloURL != ""
+			d.authnRequestsSigned = signRequests && !(k is none)
+			d.wantAssertionsSigned = wantAssertionsSigned
+			d.nameIdFormats = nameIdFormats.mapElem<string>(f => f.value)
+			e.sp = d
+			return e
+		}
+
+		// metadataHandler serves the metadata, signed when there is a key.
+		def metadataHandler() Handler {
+			return new SpMetadataHandler(self)
+		}
+	}
+
+	internal type SpMetadataHandler {
+		sp ServiceProvider
+
+		def new(sp ServiceProvider) {
+			self.sp = sp
+		}
+
+		// serve implements http.Handler.
+		def serve(ctx Context) !none {
+			let entity = sp.metadata()
+			let k = sp.key
+			let text = k is none ?? (entity.xml(), try entity.xml(k, sp.certificate, sp.signatureMethod))
+			return try ctx.blob(200, "application/samlmetadata+xml", text.bytes())
+		}
+	}
+
+	internal def idpRole(sp ServiceProvider) !IdpDescriptor {
+		let role = sp.idp.idp
+		fail samlError(SamlErrorKind.Malformed, "the metadata of {sp.idp.entityId} has no identity provider role") when role is none
+		return role
+	}
+
+	internal def decryptionKeys(sp ServiceProvider) PrivateKey[] {
+		let k = sp.key
+		return k is none ?? ([], [k])
+	}
+
+	// sendRequest signs a request for its binding (enveloped for Post, in
+	// the query for Redirect) and encodes it.
+	internal def sendRequest(sp ServiceProvider, id string, endpoint Endpoint, root XMLNode, relayState string, signer ?PrivateKey) !Message {
+		if !(signer is none) && endpoint.binding == Binding.Post {
+			try signElement(root, signer, sp.signatureMethod, none, "Issuer")
+		}
+		return try outgoing(id, endpoint, true, root, relayState, endpoint.binding == Binding.Redirect ?? (signer, none), sp.signatureMethod)
+	}
+
+	internal def checkInResponseTo(sp ServiceProvider, value string, requestId ?string) !none {
+		if requestId is none {
+			fail samlError(SamlErrorKind.InResponseToMismatch, "unsolicited responses are not allowed") unless sp.allowUnsolicited
+			fail samlError(SamlErrorKind.InResponseToMismatch, "the response answers request {value}, which this login did not send") when value != ""
+			return none
+		}
+		fail samlError(SamlErrorKind.InResponseToMismatch, "the response answers \"{value}\", not {requestId}") unless value == requestId
+		return none
+	}
+
+	// accept runs consume's checks on a response inside its document (the
+	// response itself, or a SOAP envelope for an artifact).
+	internal def accept(sp ServiceProvider, document XMLNode, response XMLNode, requestId ?string, viaArtifact bool, trustedChannel bool) !Assertion {
+		try checkProtocol(response, "Response", sp.leeway)
+		let role = try idpRole(sp)
+		let keys = role.signingKeys()
+		let responseSigned = try verifyEnveloped(response, document, keys, sp.allowSha1)
+		let destination = response.attribute("Destination")
+		if destination is none {
+			fail samlError(SamlErrorKind.DestinationMismatch, "a signed response must carry a Destination") when responseSigned && !viaArtifact
+		} else {
+			fail samlError(SamlErrorKind.DestinationMismatch, "the response is for {destination}, not {sp.acsURL}") unless destination == sp.acsURL
+		}
+		let issuer = try issuerOf(response)
+		fail samlError(SamlErrorKind.IssuerMismatch, "the response comes from {issuer}, not {sp.idp.entityId}") unless issuer == "" || issuer == sp.idp.entityId
+		try checkInResponseTo(sp, attr(response, "InResponseTo"), requestId)
+		let (codes, message) = try statusOf(response)
+		fail statusError(codes, message) unless codes[0] == StatusCode.Success.value
+		// One assertion in the whole message, as a child of the response:
+		// a wrapped copy anywhere else is refused, not skipped.
+		let total = document.descendants("Assertion", samlNS).len() + document.descendants("EncryptedAssertion", samlNS).len()
+		fail samlError(SamlErrorKind.Malformed, "the message holds {total} assertions, not one") unless total == 1
+		let direct = response.elements("Assertion", samlNS)
+		let encrypted = response.elements("EncryptedAssertion", samlNS)
+		fail samlError(SamlErrorKind.Malformed, "the assertion is not a child of the response") unless direct.len() + encrypted.len() == 1
+		let assertion = direct.len() == 1 ?? (direct[0], try decryptWrapped(encrypted[0], decryptionKeys(sp), document))
+		fail samlError(SamlErrorKind.Malformed, "the EncryptedAssertion does not hold an assertion") unless assertion.localName == "Assertion" && assertion.namespace == samlNS
+		fail samlError(SamlErrorKind.Malformed, "the assertion holds another assertion") unless assertion.descendants("Assertion", samlNS).len() == 0 && assertion.descendants("EncryptedAssertion", samlNS).len() == 0
+		let assertionSigned = try verifyEnveloped(assertion, document, keys, sp.allowSha1)
+		fail samlError(SamlErrorKind.Unsigned, "neither the response nor the assertion is signed") unless responseSigned || assertionSigned || trustedChannel
+		fail samlError(SamlErrorKind.Unsigned, "the assertion is not signed") when sp.wantAssertionsSigned && !assertionSigned
+		return try readAssertion(sp, assertion, document, requestId)
+	}
+
+	// readAssertion checks a verified assertion's content and reads it.
+	internal def readAssertion(sp ServiceProvider, a XMLNode, document XMLNode, requestId ?string) !Assertion {
+		let version = attr(a, "Version")
+		fail samlError(SamlErrorKind.Unsupported, "assertion version {version} is not 2.0") unless version == "2.0"
+		let id = try requiredAttr(a, "ID")
+		let issued = try parseInstant(try requiredAttr(a, "IssueInstant"), "IssueInstant")
+		let now = time.now()
+		fail samlError(SamlErrorKind.NotYetValid, "the assertion was issued in the future") when issued.after(now + sp.leeway)
+		let issuer = try issuerOf(a)
+		fail samlError(SamlErrorKind.IssuerMismatch, "the assertion comes from \"{issuer}\", not {sp.idp.entityId}") unless issuer == sp.idp.entityId
+		let subject = a.child("Subject", samlNS)
+		fail samlError(SamlErrorKind.Malformed, "the assertion has no Subject") when subject is none
+		let keys = decryptionKeys(sp)
+		let nameId = try nameIdOf(subject, keys, document)
+		fail samlError(SamlErrorKind.Malformed, "the Subject has no NameID") when nameId is none
+		let confirmedUntil = try bearerConfirmation(sp, subject, requestId, now)
+		let result = new Assertion(id, issuer, issued, nameId, a)
+		let replayUntil = confirmedUntil
+		let conditions = a.child("Conditions", samlNS)
+		fail samlError(SamlErrorKind.AudienceMismatch, "the assertion has no Conditions to restrict its audience") when conditions is none
+		let notBefore = try optionalInstant(conditions, "NotBefore")
+		if !(notBefore is none) {
+			fail samlError(SamlErrorKind.NotYetValid, "the assertion is valid from {instant(notBefore)}") when (now + sp.leeway).before(notBefore)
+		}
+		let notOnOrAfter = try optionalInstant(conditions, "NotOnOrAfter")
+		if !(notOnOrAfter is none) {
+			fail samlError(SamlErrorKind.Expired, "the assertion expired at {instant(notOnOrAfter)}") unless now.before(notOnOrAfter + sp.leeway)
+			replayUntil = notOnOrAfter when notOnOrAfter.after(replayUntil)
+		}
+		result.notBefore = notBefore
+		result.notOnOrAfter = notOnOrAfter
+		let restricted = false
+		for let c in conditions.elements() {
+			fail samlError(SamlErrorKind.Unsupported, "unknown condition {c.name}") unless c.namespace == samlNS
+			match c.localName {
+				case "AudienceRestriction":
+					let audiences = c.elements("Audience", samlNS).mapElem<string>(e => e.text().trim())
+					fail samlError(SamlErrorKind.AudienceMismatch, "the assertion is for {audiences.join(", ")}, not {sp.entityId}") unless sp.entityId in audiences
+					for let aud in audiences {
+						result.audiences.push(aud)
+					}
+					restricted = true
+				case "OneTimeUse", "ProxyRestriction":
+				// The replay cache makes every assertion one-time; a
+				// service provider never issues assertions to proxy.
+				default:
+					fail samlError(SamlErrorKind.Unsupported, "unknown condition {c.name}")
+			}
+		}
+		fail samlError(SamlErrorKind.AudienceMismatch, "the assertion has no AudienceRestriction") unless restricted
+		let statements = a.elements("AuthnStatement", samlNS)
+		fail samlError(SamlErrorKind.Malformed, "the assertion has no AuthnStatement") when statements.len() == 0
+		let authn = statements[0]
+		result.authnInstant = try parseInstant(try requiredAttr(authn, "AuthnInstant"), "AuthnInstant")
+		let index = authn.attribute("SessionIndex")
+		result.sessionIndex = index unless index is none
+		let sessionEnd = try optionalInstant(authn, "SessionNotOnOrAfter")
+		if !(sessionEnd is none) {
+			fail samlError(SamlErrorKind.Expired, "the session ended at {instant(sessionEnd)}") unless now.before(sessionEnd + sp.leeway)
+		}
+		result.sessionNotOnOrAfter = sessionEnd
+		let context = authn.child("AuthnContext", samlNS)
+		if !(context is none) {
+			let classRef = childText(context, "AuthnContextClassRef", samlNS)
+			result.authnContext = classRef unless classRef is none
+		}
+		result.attributes = try attributesOf(a, keys, document)
+		let irt = requestId
+		result.inResponseTo = irt unless irt is none
+		fail samlError(SamlErrorKind.Replayed, "assertion {id} was seen before") unless sp.replay.first(id, replayUntil + sp.leeway)
+		return result
+	}
+
+	// bearerConfirmation finds a bearer SubjectConfirmation that holds
+	// (saml-profiles §4.1.4.2, §4.1.4.3) and returns its NotOnOrAfter.
+	internal def bearerConfirmation(sp ServiceProvider, subject XMLNode, requestId ?string, now time.Time) !time.Time {
+		let kind = SamlErrorKind.Malformed
+		let why = "the Subject has no bearer SubjectConfirmation"
+		for let sc in subject.elements("SubjectConfirmation", samlNS) {
+			continue unless attr(sc, "Method") == bearerMethod
+			let data = sc.child("SubjectConfirmationData", samlNS)
+			if data is none {
+				why = "the bearer SubjectConfirmation has no data"
+				continue
+			}
+			if !(data.attribute("NotBefore") is none) {
+				why = "a bearer SubjectConfirmationData may not have NotBefore"
+				continue
+			}
+			let recipient = attr(data, "Recipient")
+			if recipient != sp.acsURL {
+				kind = SamlErrorKind.DestinationMismatch
+				why = "the bearer confirmation is for {recipient}, not {sp.acsURL}"
+				continue
+			}
+			let until = try optionalInstant(data, "NotOnOrAfter")
+			if until is none {
+				kind = SamlErrorKind.Malformed
+				why = "the bearer confirmation has no NotOnOrAfter"
+				continue
+			}
+			if !now.before(until + sp.leeway) {
+				kind = SamlErrorKind.Expired
+				why = "the bearer confirmation expired at {instant(until)}"
+				continue
+			}
+			let irt = attr(data, "InResponseTo")
+			let expected = requestId is none ?? ("", requestId)
+			if irt != expected {
+				kind = SamlErrorKind.InResponseToMismatch
+				why = "the bearer confirmation answers \"{irt}\", not \"{expected}\""
+				continue
+			}
+			return until
+		}
+		fail samlError(kind, why)
+	}
+
+	// resolveArtifact sends a signed ArtifactResolve to the identity
+	// provider's artifact resolution service the artifact names and
+	// returns the SOAP envelope of the answer, the Response in it, and
+	// whether the channel vouches for it (a signed ArtifactResponse, or
+	// TLS).
+	internal def resolveArtifact(sp ServiceProvider, artifact string) !(XMLNode, XMLNode, bool) {
+		let (index, source) = try parseArtifact(artifact)
+		fail samlError(SamlErrorKind.UnknownEntity, "the artifact comes from another identity provider") unless hexencode(source) == hexencode(sourceId(sp.idp.entityId))
+		let role = try idpRole(sp)
+		let endpoint ?Endpoint = none
+		for let e in role.artifactResolution {
+			if e.binding == Binding.Soap && e.index == index {
+				endpoint = e
+				break
+			}
+		}
+		fail samlError(SamlErrorKind.Unsupported, "the identity provider has no artifact resolution service {index}") when endpoint is none
+		let signer = sp.key
+		fail samlError(SamlErrorKind.Unsupported, "artifact resolution needs a signing key") when signer is none
+		let id = try newId()
+		let root = protocolRoot("ArtifactResolve", id, sp.entityId, endpoint.location)
+		textElement(root, "samlp:Artifact", samlpNS, artifact)
+		try signElement(root, signer, sp.signatureMethod, none, "Issuer")
+		let (envelope, answer) = try soapCall(sp.httpClient, endpoint.location, root)
+		try checkProtocol(answer, "ArtifactResponse", sp.leeway)
+		let signed = try verifyEnveloped(answer, envelope, role.signingKeys(), sp.allowSha1)
+		let issuer = try issuerOf(answer)
+		fail samlError(SamlErrorKind.IssuerMismatch, "the ArtifactResponse comes from {issuer}") unless issuer == "" || issuer == sp.idp.entityId
+		fail samlError(SamlErrorKind.InResponseToMismatch, "the ArtifactResponse answers another request") unless attr(answer, "InResponseTo") == id
+		let (codes, message) = try statusOf(answer)
+		fail statusError(codes, message) unless codes[0] == StatusCode.Success.value
+		let response = answer.child("Response", samlpNS)
+		fail samlError(SamlErrorKind.StatusNotSuccess, "the identity provider no longer holds the artifact's message") when response is none
+		fail samlError(SamlErrorKind.Malformed, "the ArtifactResponse holds more than the Response") unless answer.elements().filter(e => !(e.localName := "Issuer" || "Signature" || "Extensions" || "Status")).len() == 1
+		return (envelope, response, signed || endpoint.location.startsWith("https://"))
+	}
+
+	internal def logoutRequestElement(id string, issuer string, destination string, nameId NameId, sessionIndexes string[]) XMLNode {
+		let root = protocolRoot("LogoutRequest", id, issuer, destination)
+		root.set("NotOnOrAfter", instant(time.now() + 5m))
+		nameIdElement(root, nameId)
+		for let index in sessionIndexes {
+			textElement(root, "samlp:SessionIndex", samlpNS, index)
+		}
+		return root
+	}
+
+	internal def logoutResponseElement(sp ServiceProvider, inResponseTo string, destination string, ended bool) !XMLNode {
+		let root = protocolRoot("LogoutResponse", try newId(), sp.entityId, destination)
+		root.set("InResponseTo", inResponseTo)
+		statusElement(root, ended ?? ([StatusCode.Success.value], [StatusCode.Responder.value]))
+		return root
+	}
+
+	// readLogoutRequest checks a signed LogoutRequest from the identity
+	// provider and reads it.
+	internal def readLogoutRequest(sp ServiceProvider, message XMLNode) !Logout {
+		try checkProtocol(message, "LogoutRequest", sp.leeway)
+		let issuer = try issuerOf(message)
+		fail samlError(SamlErrorKind.IssuerMismatch, "the LogoutRequest comes from \"{issuer}\"") unless issuer == sp.idp.entityId
+		let destination = message.attribute("Destination")
+		fail samlError(SamlErrorKind.DestinationMismatch, "the LogoutRequest is for {destination}") unless destination is none || destination == sp.sloURL
+		let until = try optionalInstant(message, "NotOnOrAfter")
+		let now = time.now()
+		if !(until is none) {
+			fail samlError(SamlErrorKind.Expired, "the LogoutRequest expired") unless now.before(until + sp.leeway)
+		}
+		let id = attr(message, "ID")
+		fail samlError(SamlErrorKind.Replayed, "LogoutRequest {id} was seen before") unless sp.replay.first("logout:" + id, now + 10m)
+		let logout = new Logout(true, id, issuer)
+		let nameId = try nameIdOf(message, decryptionKeys(sp), message)
+		fail samlError(SamlErrorKind.Malformed, "the LogoutRequest has no NameID") when nameId is none
+		logout.nameId = nameId
+		logout.sessionIndexes = message.elements("SessionIndex", samlpNS).mapElem<string>(e => e.text().trim())
+		return logout
+	}
+
+	// readLogoutResponse checks the identity provider's answer to a
+	// LogoutRequest. Front-channel answers must be signed.
+	internal def readLogoutResponse(sp ServiceProvider, message XMLNode, document XMLNode, requestId string, binding Binding, signed ?bool) !Logout {
+		try checkProtocol(message, "LogoutResponse", sp.leeway)
+		let role = try idpRole(sp)
+		let isSigned = signed is none ?? (try verifyEnveloped(message, document, role.signingKeys(), sp.allowSha1), signed)
+		fail samlError(SamlErrorKind.Unsigned, "the LogoutResponse is not signed") unless isSigned || binding == Binding.Soap
+		let issuer = try issuerOf(message)
+		fail samlError(SamlErrorKind.IssuerMismatch, "the LogoutResponse comes from \"{issuer}\"") unless issuer == sp.idp.entityId
+		let destination = message.attribute("Destination")
+		fail samlError(SamlErrorKind.DestinationMismatch, "the LogoutResponse is for {destination}") unless destination is none || destination == sp.sloURL || binding == Binding.Soap
+		let irt = attr(message, "InResponseTo")
+		fail samlError(SamlErrorKind.InResponseToMismatch, "the LogoutResponse answers \"{irt}\", not \"{requestId}\"") unless requestId != "" && irt == requestId
+		let (codes, _) = try statusOf(message)
+		let logout = new Logout(false, attr(message, "ID"), issuer)
+		logout.inResponseTo = irt
+		logout.status = codes
+		logout.success = codes[0] == StatusCode.Success.value && !(StatusCode.PartialLogout.value in codes)
+		return logout
+	}
+}

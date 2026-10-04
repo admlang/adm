@@ -1,0 +1,339 @@
+// The text cache the canvas draws through: shaped runs, glyph metrics and
+// glyph coverage masks, kept between frames so text that does not change
+// is neither shaped nor rasterized again. One instance serves the whole
+// program; every method is atomic, so tasks share it safely.
+
+internal std partial module std.gfx.text {
+	use (
+		std.formats.fonts
+		std.math.geom::(Path, Transform2D)
+	)
+
+	// Horizontal positions a glyph is rasterized at within a pixel: its
+	// pen position snaps to the nearest quarter.
+	const subpixelSteps = 4
+
+	// Largest pixel size glyphs are cached as masks at; bigger text is
+	// cheaper to fill as paths than to keep.
+	const maxMaskSize = 256.0
+
+	// What the cache may hold by default: 64 MiB.
+	const defaultBudget = 64 * 1024 * 1024
+
+	// A glyph rasterized at one size and subpixel position: coverage bytes,
+	// `width` per row, placed `left` pixels right of and `top` pixels below
+	// the pen position (y down). An empty glyph has no rows.
+	struct GlyphMask {
+		width    int
+		height   int
+		left     int
+		top      int
+		coverage byte[]
+	}
+
+	internal struct RunEntry {
+		run  fonts.ShapedRun
+		used int
+		size int
+	}
+
+	internal struct MaskEntry {
+		mask GlyphMask
+		used int
+	}
+
+	internal struct ImageEntry {
+		image GlyphMask
+		used  int
+		size  int
+	}
+
+	internal struct MetricsEntry {
+		metrics fonts.GlyphMetrics
+		used    int
+	}
+
+	// TextCache keeps shaped runs, glyph metrics and glyph masks under a
+	// byte budget, dropping the least recently used when it is over.
+	type TextCache {
+		// How many bytes the cache may hold; setting it drops entries over
+		// it, least recently used first.
+		budget int {
+			value int
+
+			def get() int {
+				return value
+			}
+
+			atomic def set(bytes int) {
+				value = bytes.max(0)
+				atlas.limit(pageLimit())
+				trim()
+			}
+		}
+
+		internal held    int
+		// Glyph masks packed into texture pages for GPU renderers, up to a
+		// quarter of the budget.
+		internal atlas   Atlas
+		// Faces seen, by identity: a face's index is its part of every key.
+		internal faces   fonts.Face[]
+		internal runs    map<string, RunEntry>
+		internal masks   map<int, MaskEntry>
+		internal metrics map<int, MetricsEntry>
+		// Whole runs already rasterized, keyed by the caller's description.
+		internal images  map<string, ImageEntry>
+		internal clock   int
+
+		def new() {
+			runs = map<string, RunEntry>{}
+			masks = map<int, MaskEntry>{}
+			metrics = map<int, MetricsEntry>{}
+			images = map<string, ImageEntry>{}
+			atlas = new Atlas()
+			budget = defaultBudget
+		}
+
+		// Drops everything, faces included.
+		atomic def clear() {
+			faces = fonts.Face[]
+			runs = map<string, RunEntry>{}
+			masks = map<int, MaskEntry>{}
+			metrics = map<int, MetricsEntry>{}
+			images = map<string, ImageEntry>{}
+			atlas.clear()
+			held = 0
+		}
+
+		// Bytes held now.
+		atomic def size() int {
+			return held
+		}
+
+		// `text` shaped with `face` and `opts`, from the cache when it was
+		// shaped the same way before. `fonts.shape` failing gives an empty
+		// run, as the canvas draws nothing then.
+		atomic def shaped(face fonts.Face, text string, opts fonts.ShapeOptions) fonts.ShapedRun {
+			clock++
+			let key = runKey(faceIndex(face), text, opts)
+			let hit = runs.get(key)
+			if hit is RunEntry {
+				hit.used = clock
+				return hit.run
+			}
+			let run = fonts.shape(face, text, opts) onerror recover fonts.ShapedRun{glyphs: fonts.ShapedGlyph[], direction: opts.direction}
+			let bytes = key.len() + run.glyphs.len() * 32 + 64
+			runs[key] = RunEntry{run: run, used: clock, size: bytes}
+			held += bytes
+			trim()
+			return run
+		}
+
+		// The coverage image of a whole run drawn before, which `key`
+		// describes for `face` (text, style, scale, subpixel origin: the
+		// caller's choice), or none.
+		atomic def image(face fonts.Face, key string) ?GlyphMask {
+			clock++
+			let hit = images.get("{faceIndex(face)}\u001F{key}")
+			return none when hit is none
+			hit.used = clock
+			return hit.image
+		}
+
+		// Keeps the coverage image of a run under `key` for `face`.
+		atomic def keepImage(face fonts.Face, key string, image GlyphMask) {
+			clock++
+			let k = "{faceIndex(face)}\u001F{key}"
+			let bytes = k.len() + image.coverage.len() + 64
+			images[k] = ImageEntry{image: image, used: clock, size: bytes}
+			held += bytes
+			trim()
+		}
+
+		// A glyph's metrics in font units, from the cache.
+		atomic def glyphMetrics(face fonts.Face, glyph fonts.GlyphID) fonts.GlyphMetrics {
+			clock++
+			let key = faceIndex(face) << 16 | int(glyph)
+			let hit = metrics.get(key)
+			if hit is MetricsEntry {
+				hit.used = clock
+				return hit.metrics
+			}
+			let m = face.metrics(glyph) onerror recover fonts.GlyphMetrics{}
+			metrics[key] = MetricsEntry{metrics: m, used: clock}
+			held += 64
+			trim()
+			return m
+		}
+
+		// The glyph's coverage at `size` pixels per em with its pen position
+		// `fraction` of a pixel right of a whole pixel (snapped to quarters;
+		// hinted glyphs ignore it and sit on whole pixels), hinted when
+		// `hinting` and the face can hint it; rasterized once by `raster`,
+		// the canvas's rasterizer: a path (device pixels, y down, inside
+		// width x height) to coverage bytes, `width` per row. None when
+		// `size` is too large to keep as a mask.
+		atomic def mask(face fonts.Face, glyph fonts.GlyphID, size float, hinting bool, fraction float, raster def(Path, int, int) byte[]) ?GlyphMask {
+			let (_, m) = maskEntry(face, glyph, size, hinting, fraction, raster)
+			return m
+		}
+
+		// Where the glyph's mask (as `mask` gives it) sits in the atlas
+		// pages, packing it when new: for renderers that draw glyphs from
+		// textures. None when the mask is too large to keep or for a page.
+		atomic def atlasGlyph(face fonts.Face, glyph fonts.GlyphID, size float, hinting bool, fraction float, raster def(Path, int, int) byte[]) ?AtlasGlyph {
+			let (key, m) = maskEntry(face, glyph, size, hinting, fraction, raster)
+			return none when m is none
+			return atlas.place(key, m, clock)
+		}
+
+		// How many atlas pages exist; pages are numbered from 0.
+		atomic def atlasPages() int {
+			return atlas.pages.len()
+		}
+
+		// What changed on an atlas page since the last call, for the
+		// renderer to copy into its texture; none when nothing did.
+		atomic def atlasUpload(page int) ?AtlasUpload {
+			return atlas.upload(page)
+		}
+
+		// The mask and its key; `mask` without the lock.
+		internal def maskEntry(face fonts.Face, glyph fonts.GlyphID, size float, hinting bool, fraction float, raster def(Path, int, int) byte[]) (int, ?GlyphMask) {
+			return (0, none) when size <= 0.0 || size > maxMaskSize
+			clock++
+			// Hinted glyphs are grid-fitted: their origin stays on whole pixels.
+			let step = hinting ?? (0, int((fraction - fraction.floor()) * float(subpixelSteps) + 0.5) % subpixelSteps)
+			let key = maskKey(faceIndex(face), int(glyph), size, hinting, step)
+			let hit = masks.get(key)
+			if hit is MaskEntry {
+				hit.used = clock
+				return (key, hit.mask)
+			}
+			let m = rasterize(face, glyph, size, hinting, float(step) / float(subpixelSteps), raster)
+			masks[key] = MaskEntry{mask: m, used: clock}
+			held += m.coverage.len() + 64
+			trim()
+			return (key, m)
+		}
+
+		// Atlas pages the budget allows: a quarter of it, at least one.
+		internal def pageLimit() int {
+			return (budget / 4 / (atlasPageSize * atlasPageSize)).max(1)
+		}
+
+		// The index of a face among those seen, adding it when new.
+		internal def faceIndex(face fonts.Face) int {
+			for let (i, f) in faces {
+				return i when f == face
+			}
+			faces.push(face)
+			return faces.len() - 1
+		}
+
+		internal def runKey(face int, text string, opts fonts.ShapeOptions) string {
+			let features = ""
+			for let (tag, on) in opts.features {
+				features += "{tag}{on ?? ('+', '-')}"
+			}
+			return "{face}\u001F{opts.script}\u001F{opts.language}\u001F{int(opts.direction)}\u001F{opts.pointSize}\u001F{features}\u001F{text}"
+		}
+
+		// Face (16 bits), glyph (16), size in 1/64 px (15), hinting (1),
+		// subpixel step (2).
+		internal def maskKey(face int, glyph int, size float, hinting bool, step int) int {
+			let size64 = int(size * 64.0 + 0.5)
+			return face << 34 | glyph << 18 | size64 << 3 | (hinting ?? (1, 0)) << 2 | step
+		}
+
+		// Rasterizes a glyph into a tight mask: the outline (hinted or
+		// scaled) moved right by `dx` pixels, its box grown to whole pixels.
+		internal def rasterize(face fonts.Face, glyph fonts.GlyphID, size float, hinting bool, dx float, raster def(Path, int, int) byte[]) GlyphMask {
+			let path = new Path()
+			let hinted = hinting ?? (face.outline(glyph, size, fonts.Hinting.Full), face.outline(glyph))
+			if hinted is fonts.Outline {
+				let scale = 1.0
+				if !hinting {
+					let upm = float(face.info().unitsPerEm).max(1.0)
+					scale = size / upm
+				}
+				path = hinted.path(scale)
+			} else if hinting {
+				// The face cannot hint this glyph: its plain outline.
+				let plain = face.outline(glyph)
+				path = plain.path(size / float(face.info().unitsPerEm).max(1.0)) when plain is fonts.Outline
+			}
+			return GlyphMask{width: 0, height: 0, left: 0, top: 0, coverage: byte[]} when path.isEmpty()
+			let b = path.bounds()
+			let left = (b.left + dx).floor()
+			let top = b.top.floor()
+			let width = int((b.right + dx).ceil() - left)
+			let height = int(b.bottom.ceil() - top)
+			return GlyphMask{width: 0, height: 0, left: 0, top: 0, coverage: byte[]} when width <= 0 || height <= 0
+			let placed = path.transformed(new Transform2D(tx = dx - left, ty = -top))
+			let coverage = raster(placed, width, height)
+			return GlyphMask{width: width, height: height, left: int(left), top: int(top), coverage: coverage}
+		}
+
+		// Drops the least recently used entries until three quarters of the
+		// budget is held.
+		internal def trim() {
+			return when held <= budget
+			// Every entry's last use and size, oldest dropped first.
+			let ages int[]
+			let sizes int[]
+			for let (_, e) in runs {
+				ages.push(e.used)
+				sizes.push(e.size)
+			}
+			for let (_, e) in masks {
+				ages.push(e.used)
+				sizes.push(e.mask.coverage.len() + 64)
+			}
+			for let (_, e) in metrics {
+				ages.push(e.used)
+				sizes.push(64)
+			}
+			for let (_, e) in images {
+				ages.push(e.used)
+				sizes.push(e.size)
+			}
+			let order int[]
+			for let i = 0; i < ages.len(); i++ {
+				order.push(i)
+			}
+			order.sort((a int, b int) => ages[a] < ages[b])
+			let excess = held - budget / 4 * 3
+			let cut = -1
+			let freed = 0
+			for let (_, i) in order {
+				cut = ages[i]
+				freed += sizes[i]
+				break when freed >= excess
+			}
+			runs = runs.omitValues((k string, e RunEntry) => e.used <= cut)
+			masks = masks.omitValues((k int, e MaskEntry) => e.used <= cut)
+			metrics = metrics.omitValues((k int, e MetricsEntry) => e.used <= cut)
+			images = images.omitValues((k string, e ImageEntry) => e.used <= cut)
+			held = 0
+			for let (_, e) in runs {
+				held += e.size
+			}
+			for let (_, e) in masks {
+				held += e.mask.coverage.len() + 64
+			}
+			held += metrics.len() * 64
+			for let (_, e) in images {
+				held += e.size
+			}
+		}
+	}
+
+	// The cache every canvas shares.
+	let shared = new TextCache()
+
+	// The program-wide text cache.
+	def cache() TextCache {
+		return shared
+	}
+}

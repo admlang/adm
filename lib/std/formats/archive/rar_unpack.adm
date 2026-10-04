@@ -1,0 +1,925 @@
+internal partial module std.formats.archive.rar {
+	use (
+		std.io
+		std.formats.archive.stream::(le32)
+	)
+
+	const (
+		inBufSize        = 0x8000
+		maxQuickBits     = 9
+		maxLzMatch       = 0x1001
+		maxIncLzMatch    = 0x1001 + 3
+		max3IncLzMatch   = 0x101 + 3
+		maxFilterBlock   = 0x400000
+		maxUnpackFilters = 8192
+		unpackMaxWrite   = 0x400000
+		// Decoded bytes a decoder lets pile up before it hands control back.
+		outputChunk      = 256 * 1024
+		// Stands in for unrar's (size_t)-1 distance: larger than any window,
+		// and all ones in its low 32 bits.
+		noDistance       = (1 << 48) - 1
+		// Alphabet sizes of the Huffman tables.
+		nc               = 306
+		dcb              = 64
+		dcx              = 80
+		ldc              = 16
+		rc               = 44
+		bc               = 20
+		nc30             = 299
+		dc30             = 60
+		ldc30            = 17
+		rc30             = 28
+		nc20             = 298
+		dc20             = 48
+		rc20             = 28
+		bc20             = 19
+		mc20             = 257
+	)
+
+	// A canonical Huffman decoding table with a quick lookup for short codes.
+	type DecodeTable {
+		maxNum    int
+		decodeLen int[]
+		decodePos int[]
+		quickBits int
+		quickLen  int[]
+		quickNum  int[]
+		decodeNum int[]
+
+		def new() {
+			decodeLen = []
+			decodeLen.len(16)
+			decodePos = []
+			decodePos.len(16)
+			quickLen = []
+			quickLen.len(1 << maxQuickBits)
+			quickNum = []
+			quickNum.len(1 << maxQuickBits)
+			decodeNum = []
+			decodeNum.len(nc)
+		}
+
+		// Builds the table from the bit lengths `lengths[at:at + size]`.
+		def build(lengths int[], at int, size int) {
+			maxNum = size
+			let count int[] = []
+			count.len(16)
+			for let i = 0; i < size; i++ {
+				count[lengths[at + i] & 15] += 1
+			}
+			count[0] = 0
+			for let i = 0; i < size; i++ {
+				decodeNum[i] = 0
+			}
+			decodePos[0] = 0
+			decodeLen[0] = 0
+			let upper = 0
+			for let i = 1; i < 16; i++ {
+				upper += count[i]
+				decodeLen[i] = upper << (16 - i)
+				upper *= 2
+				decodePos[i] = decodePos[i - 1] + count[i - 1]
+			}
+			let pos = decodePos.clone()
+			for let i = 0; i < size; i++ {
+				let len = lengths[at + i] & 15
+				if len != 0 {
+					decodeNum[pos[len]] = i
+					pos[len] += 1
+				}
+			}
+			quickBits = (size := nc || nc20 || nc30) ?? (maxQuickBits, maxQuickBits - 3)
+			let quick = 1 << quickBits
+			let len = 1
+			for let code = 0; code < quick; code++ {
+				let field = code << (16 - quickBits)
+				for len < 16 && field >= decodeLen[len] {
+					len++
+				}
+				quickLen[code] = len
+				let dist = (field - decodeLen[len - 1]) >> (16 - len)
+				let p = (len < 16) ?? (decodePos[len] + dist, size)
+				quickNum[code] = (p < size) ?? (decodeNum[p], 0)
+			}
+		}
+
+		// An empty table: every code decodes to 0.
+		def clear() {
+			for let i = 0; i < 16; i++ {
+				decodeLen[i] = 0
+				decodePos[i] = 0
+			}
+			for let i = 0; i < quickLen.len(); i++ {
+				quickLen[i] = 0
+				quickNum[i] = 0
+			}
+			quickBits = 0
+			maxNum = 0
+		}
+	}
+
+	// Huffman bit lengths as RAR 3 and 5 store them: 4-bit lengths, 15
+	// followed by a zero run count.
+	def lengthsTable() int[] {
+		let t int[] = []
+		t.len(nc + dcx + rc + ldc)
+		return t
+	}
+
+	// The state every RAR decoder shares: the packed-input bit reader, the
+	// sliding window, the output queue and the repeat distances.
+	type UnpackCore {
+		source          io.Reader
+		sourceError     string
+		inBuf           byte[]
+		inAddr          int
+		inBit           int
+		readTop         int
+		readBorder      int
+		// The RAR 5 block being decoded; the RAR 5 input refill keeps it in
+		// step with the buffer.
+		blockSize       int
+		blockBitSize    int
+		blockStart      int
+		lastBlockInFile bool
+		tablePresent    bool
+		window          byte[]
+		maxWinSize      int
+		maxWinMask      int
+		unpPtr          int
+		wrPtr           int
+		prevPtr         int
+		firstWinDone    bool
+		writeBorder     int
+		out             byte[]
+		outLen          int
+		outHead         int
+		destUnpSize     int
+		writtenFileSize int
+		oldDist         int[]
+		oldDistPtr      int
+		lastDist        int
+		lastLength      int
+
+		def new() {
+			source = new EmptyReader()
+			sourceError = ""
+			inBuf = []
+			inBuf.len(inBufSize + 16)
+			window = []
+			out = []
+			oldDist = int[noDistance, noDistance, noDistance, noDistance]
+			lastDist = 0xFFFFFFFF
+		}
+
+		// Sets up the window for the next file: `size` bytes, kept when a
+		// solid file continues the window already there.
+		def initWindow(size int, solid bool) {
+			let want = (size < 0x40000) ?? (0x40000, size)
+			if !solid || window.len() == 0 {
+				maxWinSize = want
+				maxWinMask = want - 1
+			}
+			return when want <= window.len()
+			window = []
+			window.len(want)
+		}
+
+		// Starts a file: the packed input and how many bytes it unpacks to.
+		def startFile(src io.Reader, size int) {
+			source = src
+			sourceError = ""
+			destUnpSize = size
+			outLen = 0
+			outHead = 0
+		}
+
+		// UnpInitData: the part of a decoder reset every algorithm shares.
+		def initData(solid bool) {
+			if !solid {
+				for let i = 0; i < 4; i++ {
+					oldDist[i] = noDistance
+				}
+				oldDistPtr = 0
+				lastDist = 0xFFFFFFFF
+				lastLength = 0
+				unpPtr = 0
+				wrPtr = 0
+				prevPtr = 0
+				firstWinDone = false
+				writeBorder = (maxWinSize < unpackMaxWrite) ?? (maxWinSize, unpackMaxWrite)
+			}
+			inAddr = 0
+			inBit = 0
+			writtenFileSize = 0
+			readTop = 0
+			readBorder = 0
+			blockSize = -1
+			blockBitSize = 0
+			blockStart = 0
+			lastBlockInFile = false
+			tablePresent = false
+		}
+
+		// --- input ---
+
+		// Reads packed bytes into inBuf[at:at + n]; -1 when the source fails.
+		def unpRead(at int, n int) int {
+			let got = 0
+			for got < n {
+				let r = source.read(inBuf[at + got:at + n]) onerror (e error) {
+					sourceError = e.message
+					recover -1
+				}
+				return -1 when r < 0
+				break when r == 0
+				got += r
+			}
+			return got
+		}
+
+		// UnpReadBuf, the RAR 5 refill that also keeps the block bounds.
+		def unpReadBuf() bool {
+			let dataSize = readTop - inAddr
+			return false when dataSize < 0
+			blockSize -= inAddr - blockStart
+			if inAddr > inBufSize / 2 {
+				if dataSize > 0 {
+					for let i = 0; i < dataSize; i++ {
+						inBuf[i] = inBuf[inAddr + i]
+					}
+				}
+				inAddr = 0
+				readTop = dataSize
+			} else {
+				dataSize = readTop
+			}
+			let code = 0
+			code = unpRead(dataSize, inBufSize - dataSize) when inBufSize != dataSize
+			readTop += code when code > 0
+			clearTail()
+			readBorder = readTop - 30
+			blockStart = inAddr
+			if blockSize != -1 {
+				let limit = blockStart + blockSize - 1
+				readBorder = limit when limit < readBorder
+			}
+			return code != -1
+		}
+
+		// UnpReadBuf30, the RAR 3 refill.
+		def unpReadBuf30() bool {
+			let dataSize = readTop - inAddr
+			return false when dataSize < 0
+			if inAddr > inBufSize / 2 {
+				if dataSize > 0 {
+					for let i = 0; i < dataSize; i++ {
+						inBuf[i] = inBuf[inAddr + i]
+					}
+				}
+				inAddr = 0
+				readTop = dataSize
+			} else {
+				dataSize = readTop
+			}
+			let code = unpRead(dataSize, inBufSize - dataSize)
+			readTop += code when code > 0
+			clearTail()
+			readBorder = readTop - 30
+			return code != -1
+		}
+
+		// Zeroes the bytes past the data, which the bit reader may peek at.
+		def clearTail() {
+			for let i = readTop; i < readTop + 16 && i < inBuf.len(); i++ {
+				inBuf[i] = 0
+			}
+		}
+
+		def addbits(bits int) {
+			let b = bits + inBit
+			inAddr += b >> 3
+			inBit = b & 7
+		}
+
+		// The 16 bits at the read position, the first one highest.
+		def getbits() int {
+			let a = inAddr
+			let field = (int(inBuf[a]) << 16) | (int(inBuf[a + 1]) << 8) | int(inBuf[a + 2])
+			return (field >> (8 - inBit)) & 0xFFFF
+		}
+
+		def getbits32() int {
+			let a = inAddr
+			let field = (int(inBuf[a]) << 24) | (int(inBuf[a + 1]) << 16) | (int(inBuf[a + 2]) << 8) | int(inBuf[a + 3])
+			field = ((field << inBit) | (int(inBuf[a + 4]) >> (8 - inBit))) & 0xFFFFFFFF
+			return field
+		}
+
+		// The 64 bits at the read position, as an unsigned value.
+		def getbits64() uint64 {
+			let a = inAddr
+			let field uint64 = 0
+			for let i = 0; i < 8; i++ {
+				field = (field << 8) | uint64(inBuf[a + i])
+			}
+			field = (field << uint64(inBit)) | uint64(int(inBuf[a + 8]) >> (8 - inBit))
+			return field
+		}
+
+		// GetChar: a whole byte straight from the input, for PPM data.
+		def nextChar() int {
+			if inAddr > inBufSize - 30 {
+				unpReadBuf()
+				return 0 when inAddr >= inBufSize
+			}
+			let b = int(inBuf[inAddr])
+			inAddr++
+			return b
+		}
+
+		def decodeNumber(dec DecodeTable) int {
+			let field = getbits() & 0xFFFE
+			if field < dec.decodeLen[dec.quickBits] {
+				let code = field >> (16 - dec.quickBits)
+				addbits(dec.quickLen[code])
+				return dec.quickNum[code]
+			}
+			let bits = 15
+			for let i = dec.quickBits + 1; i < 15; i++ {
+				if field < dec.decodeLen[i] {
+					bits = i
+					break
+				}
+			}
+			addbits(bits)
+			let dist = (field - dec.decodeLen[bits - 1]) >> (16 - bits)
+			let pos = dec.decodePos[bits] + dist
+			pos = 0 when pos >= dec.maxNum
+			return dec.decodeNum[pos]
+		}
+
+		// --- window ---
+
+		def wrapUp(pos int) int {
+			return (pos >= maxWinSize) ?? (pos - maxWinSize, pos)
+		}
+
+		def wrapDown(pos int) int {
+			return (pos < 0) ?? (pos + maxWinSize, pos)
+		}
+
+		def insertOldDist(distance int) {
+			oldDist[3] = oldDist[2]
+			oldDist[2] = oldDist[1]
+			oldDist[1] = oldDist[0]
+			oldDist[0] = distance
+		}
+
+		// Copies `length` bytes from `distance` back, zeros for a distance
+		// that points before the data.
+		def copyString(length int, distance int) {
+			let src = unpPtr - distance
+			if distance > unpPtr {
+				src += maxWinSize
+				if distance > maxWinSize || !firstWinDone {
+					for let i = 0; i < length; i++ {
+						window[unpPtr] = 0
+						unpPtr = wrapUp(unpPtr + 1)
+					}
+					return
+				}
+			}
+			if src < maxWinSize - maxIncLzMatch && unpPtr < maxWinSize - maxIncLzMatch {
+				let dst = unpPtr
+				for let i = 0; i < length; i++ {
+					window[dst + i] = window[src + i]
+				}
+				unpPtr += length
+				return
+			}
+			for let i = 0; i < length; i++ {
+				window[unpPtr] = window[wrapUp(src)]
+				src++
+				unpPtr = wrapUp(unpPtr + 1)
+			}
+		}
+
+		// --- output ---
+
+		// Queues `data[at:at + n]` for the reader.
+		def emit(data byte[], at int, n int) {
+			return when n <= 0
+			if outLen + n > out.len() {
+				let size = out.len() * 2
+				size = outLen + n + 65536 when size < outLen + n + 65536
+				let grown byte[] = []
+				grown.len(size)
+				for let i = outHead; i < outLen; i++ {
+					grown[i - outHead] = out[i]
+				}
+				outLen -= outHead
+				outHead = 0
+				out = grown
+			}
+			for let i = 0; i < n; i++ {
+				out[outLen + i] = data[at + i]
+			}
+			outLen += n
+		}
+
+		def pending() int {
+			return outLen - outHead
+		}
+
+		// Moves queued bytes into p and returns how many.
+		def drain(p byte[]) int {
+			let n = outLen - outHead
+			n = p.len() when p.len() < n
+			for let i = 0; i < n; i++ {
+				p[i] = out[outHead + i]
+			}
+			outHead += n
+			if outHead == outLen {
+				outHead = 0
+				outLen = 0
+			}
+			return n
+		}
+
+		// UnpWriteData: queues bytes up to the file's size and counts them all.
+		def writeData(data byte[], at int, size int) {
+			if writtenFileSize < destUnpSize {
+				let n = size
+				let left = destUnpSize - writtenFileSize
+				n = left when n > left
+				emit(data, at, n)
+			}
+			writtenFileSize += size
+		}
+
+		// UnpWriteArea: the window from `start` to `end`.
+		def writeArea(start int, end int) {
+			if end < start {
+				writeData(window, start, maxWinSize - start)
+				writeData(window, 0, end)
+			} else {
+				writeData(window, start, end - start)
+			}
+		}
+	}
+
+	// A reader with nothing in it.
+	type EmptyReader {
+		def read(p byte[]) !int {
+			return 0
+		}
+	}
+
+	// A RAR 5 filter waiting for its block of the window to be complete.
+	type Filter5 {
+		kind        int
+		channels    int
+		nextWindow  bool
+		blockStart  int
+		blockLength int
+	}
+
+	const (
+		filterDelta = 0
+		filterE8    = 1
+		filterE8E9  = 2
+		filterArm   = 3
+		filterNone  = 10
+	)
+
+	// The RAR 5 and RAR 7 decoder (Unpack5). RAR 7 differs only in its
+	// larger distance alphabet (`extraDist`).
+	type Unpack50 {
+		c          UnpackCore
+		extraDist  bool
+		tablesRead bool
+		ld         DecodeTable
+		dd         DecodeTable
+		ldd        DecodeTable
+		rd         DecodeTable
+		bd         DecodeTable
+		filters    Filter5[]
+		filterSrc  byte[]
+		filterDst  byte[]
+		lengths    int[]
+
+		def new(core UnpackCore) {
+			c = core
+			ld = new DecodeTable()
+			dd = new DecodeTable()
+			ldd = new DecodeTable()
+			rd = new DecodeTable()
+			bd = new DecodeTable()
+			filters = []
+			filterSrc = []
+			filterDst = []
+			lengths = lengthsTable()
+		}
+
+		// Starts a file and reports whether its first block could be read.
+		def prepare(solid bool) bool {
+			c.initData(solid)
+			filters = []
+			if !solid {
+				tablesRead = false
+				ld.clear()
+				dd.clear()
+				ldd.clear()
+				rd.clear()
+				bd.clear()
+			}
+			return false unless c.unpReadBuf()
+			return false unless readBlockHeader()
+			return false unless readTables()
+			return tablesRead
+		}
+
+		// Decodes until a chunk of output is queued or the file ends; returns
+		// whether the file ended. Fails when a block header or table is
+		// corrupt.
+		def run() !bool {
+			for {
+				return false when c.pending() >= outputChunk
+				c.unpPtr = c.wrapUp(c.unpPtr)
+				c.firstWinDone = true when c.prevPtr > c.unpPtr
+				c.prevPtr = c.unpPtr
+				if c.inAddr >= c.readBorder {
+					let fileDone = false
+					for c.inAddr > c.blockStart + c.blockSize - 1 || (c.inAddr == c.blockStart + c.blockSize - 1 && c.inBit >= c.blockBitSize) {
+						if c.lastBlockInFile {
+							fileDone = true
+							break
+						}
+						fail "rar: corrupt compressed data" unless readBlockHeader() && readTables()
+					}
+					break when fileDone || !c.unpReadBuf()
+				}
+				if c.wrapDown(c.writeBorder - c.unpPtr) <= maxIncLzMatch && c.writeBorder != c.unpPtr {
+					writeBuf()
+					return true when c.writtenFileSize > c.destUnpSize
+				}
+				let slot = c.decodeNumber(ld)
+				if slot < 256 {
+					c.window[c.unpPtr] = byte(slot)
+					c.unpPtr++
+					continue
+				}
+				if slot >= 262 {
+					let length = slotToLength(slot - 262)
+					let distance = 1
+					let dslot = c.decodeNumber(dd)
+					let dbits = 0
+					if dslot < 4 {
+						distance += dslot
+					} else {
+						dbits = dslot / 2 - 1
+						distance += (2 | (dslot & 1)) << dbits
+					}
+					if dbits > 0 {
+						if dbits >= 4 {
+							if dbits > 4 {
+								if dbits > 36 {
+									distance += int(c.getbits64() >> uint64(68 - dbits)) << 4
+								} else {
+									distance += (c.getbits32() >> (36 - dbits)) << 4
+								}
+								c.addbits(dbits - 4)
+							}
+							distance += c.decodeNumber(ldd)
+						} else {
+							distance += c.getbits() >> (16 - dbits)
+							c.addbits(dbits)
+						}
+					}
+					if distance > 0x100 {
+						length++
+						if distance > 0x2000 {
+							length++
+							length++ when distance > 0x40000
+						}
+					}
+					c.insertOldDist(distance)
+					c.lastLength = length
+					c.copyString(length, distance)
+					continue
+				}
+				if slot == 256 {
+					let f = readFilter()
+					break when f is none
+					addFilter(f)
+					continue
+				}
+				if slot == 257 {
+					c.copyString(c.lastLength, c.oldDist[0]) when c.lastLength != 0
+					continue
+				}
+				let num = slot - 258
+				let distance = c.oldDist[num]
+				for let i = num; i > 0; i-- {
+					c.oldDist[i] = c.oldDist[i - 1]
+				}
+				c.oldDist[0] = distance
+				let length = slotToLength(c.decodeNumber(rd))
+				c.lastLength = length
+				c.copyString(length, distance)
+			}
+			writeBuf()
+			return true
+		}
+
+		def slotToLength(slot int) int {
+			let bits = 0
+			let length = 2
+			if slot < 8 {
+				length += slot
+			} else {
+				bits = slot / 4 - 1
+				length += (4 | (slot & 3)) << bits
+			}
+			if bits > 0 {
+				length += c.getbits() >> (16 - bits)
+				c.addbits(bits)
+			}
+			return length
+		}
+
+		def readFilterData() int {
+			let count = (c.getbits() >> 14) + 1
+			c.addbits(2)
+			let data = 0
+			for let i = 0; i < count; i++ {
+				data += (c.getbits() >> 8) << (i * 8)
+				c.addbits(8)
+			}
+			return data
+		}
+
+		def readFilter() ?Filter5 {
+			if c.inAddr > c.readTop - 16 {
+				return none unless c.unpReadBuf()
+			}
+			let f = new Filter5()
+			f.blockStart = readFilterData()
+			f.blockLength = readFilterData()
+			f.blockLength = 0 when f.blockLength > maxFilterBlock
+			f.kind = c.getbits() >> 13
+			c.addbits(3)
+			if f.kind == filterDelta {
+				f.channels = (c.getbits() >> 11) + 1
+				c.addbits(5)
+			}
+			return f
+		}
+
+		def addFilter(f Filter5) {
+			if filters.len() >= maxUnpackFilters {
+				writeBuf()
+				filters = [] when filters.len() >= maxUnpackFilters
+			}
+			f.nextWindow = c.wrPtr != c.unpPtr && c.wrapDown(c.wrPtr - c.unpPtr) <= f.blockStart
+			f.blockStart = (f.blockStart + c.unpPtr) % c.maxWinSize
+			filters.push(f)
+		}
+
+		// UnpWriteBuf: writes the window up to the decode position, running
+		// every filter whose block is complete.
+		def writeBuf() {
+			let written = c.wrPtr
+			let full = c.wrapDown(c.unpPtr - written)
+			let left = full
+			let notAll = false
+			for let i = 0; i < filters.len(); i++ {
+				let f = filters[i]
+				continue when f.kind == filterNone
+				if f.nextWindow {
+					f.nextWindow = false when c.wrapDown(f.blockStart - c.wrPtr) <= full
+					continue
+				}
+				let start = f.blockStart
+				let length = f.blockLength
+				if c.wrapDown(start - written) < left {
+					if written != start {
+						c.writeArea(written, start)
+						written = start
+						left = c.wrapDown(c.unpPtr - written)
+					}
+					if length <= left {
+						if length > 0 {
+							let end = c.wrapUp(start + length)
+							if filterSrc.len() < length {
+								filterSrc = []
+								filterSrc.len(length)
+							}
+							if start < end || end == 0 {
+								for let k = 0; k < length; k++ {
+									filterSrc[k] = c.window[start + k]
+								}
+							} else {
+								let first = c.maxWinSize - start
+								for let k = 0; k < first; k++ {
+									filterSrc[k] = c.window[start + k]
+								}
+								for let k = 0; k < end; k++ {
+									filterSrc[first + k] = c.window[k]
+								}
+							}
+							let result = applyFilter(filterSrc, length, f)
+							f.kind = filterNone
+							c.emit(result, 0, length) unless result is none
+							c.writtenFileSize += length
+							written = end
+							left = c.wrapDown(c.unpPtr - written)
+						}
+					} else {
+						c.wrPtr = written
+						for let j = i; j < filters.len(); j++ {
+							filters[j].nextWindow = false when filters[j].kind != filterNone
+						}
+						notAll = true
+						break
+					}
+				}
+			}
+			let kept Filter5[] = []
+			for let f in filters {
+				kept.push(f) when f.kind != filterNone
+			}
+			filters = kept
+			if !notAll {
+				c.writeArea(written, c.unpPtr)
+				c.wrPtr = c.unpPtr
+			}
+			let ahead = (c.maxWinSize < unpackMaxWrite) ?? (c.maxWinSize, unpackMaxWrite)
+			c.writeBorder = c.wrapUp(c.unpPtr + ahead)
+			c.writeBorder = c.wrPtr when c.writeBorder == c.unpPtr || (c.wrPtr != c.unpPtr && c.wrapDown(c.wrPtr - c.unpPtr) < c.wrapDown(c.writeBorder - c.unpPtr))
+		}
+
+		def applyFilter(data byte[], size int, f Filter5) ?byte[] {
+			let fileOffset = c.writtenFileSize & 0xFFFFFFFF
+			switch {
+				case f.kind == filterE8 || f.kind == filterE8E9:
+					let fileSize = 0x1000000
+					let cmp2 = (f.kind == filterE8E9) ?? (0xE9, 0xE8)
+					let pos = 0
+					for pos + 4 < size {
+						let b = int(data[pos])
+						pos++
+						if b == 0xE8 || b == cmp2 {
+							let offset = (pos + fileOffset) % fileSize
+							let addr = le32(data, pos)
+							if addr & 0x80000000 != 0 {
+								put32at(data, pos, addr + fileSize) when ((addr + offset) & 0x80000000) == 0
+							} else {
+								put32at(data, pos, addr - offset) when ((addr - fileSize) & 0x80000000) != 0
+							}
+							pos += 4
+						}
+					}
+					return data
+				case f.kind == filterArm:
+					for let pos = 0; pos + 3 < size; pos += 4 {
+						if data[pos + 3] == 0xEB {
+							let offset = int(data[pos]) + int(data[pos + 1]) * 0x100 + int(data[pos + 2]) * 0x10000
+							offset -= (fileOffset + pos) / 4
+							data[pos] = byte(offset)
+							data[pos + 1] = byte(offset >> 8)
+							data[pos + 2] = byte(offset >> 16)
+						}
+					}
+					return data
+				case f.kind == filterDelta:
+					if filterDst.len() < size {
+						filterDst = []
+						filterDst.len(size)
+					}
+					let src = 0
+					for let ch = 0; ch < f.channels; ch++ {
+						let prev = 0
+						for let dst = ch; dst < size; dst += f.channels {
+							prev = (prev - int(data[src])) & 0xFF
+							filterDst[dst] = byte(prev)
+							src++
+						}
+					}
+					return filterDst
+			}
+			return none
+		}
+
+		def readBlockHeader() bool {
+			if c.inAddr > c.readTop - 7 {
+				return false unless c.unpReadBuf()
+			}
+			c.addbits((8 - c.inBit) & 7)
+			let flags = c.getbits() >> 8
+			c.addbits(8)
+			let count = ((flags >> 3) & 3) + 1
+			return false when count == 4
+			c.blockBitSize = (flags & 7) + 1
+			let saved = c.getbits() >> 8
+			c.addbits(8)
+			let size = 0
+			for let i = 0; i < count; i++ {
+				size += (c.getbits() >> 8) << (i * 8)
+				c.addbits(8)
+			}
+			c.blockSize = size
+			let sum = (0x5A ^ flags ^ size ^ (size >> 8) ^ (size >> 16)) & 0xFF
+			return false when sum != saved
+			c.blockStart = c.inAddr
+			let limit = c.blockStart + c.blockSize - 1
+			c.readBorder = limit when limit < c.readBorder
+			c.lastBlockInFile = flags & 0x40 != 0
+			c.tablePresent = flags & 0x80 != 0
+			return true
+		}
+
+		def readTables() bool {
+			return true unless c.tablePresent
+			if c.inAddr > c.readTop - 25 {
+				return false unless c.unpReadBuf()
+			}
+			let bitLength int[] = []
+			bitLength.len(bc)
+			let i = 0
+			for i < bc {
+				let length = c.getbits() >> 12
+				c.addbits(4)
+				if length == 15 {
+					let zeros = c.getbits() >> 12
+					c.addbits(4)
+					if zeros == 0 {
+						bitLength[i] = 15
+						i++
+					} else {
+						zeros += 2
+						for zeros > 0 && i < bc {
+							bitLength[i] = 0
+							i++
+							zeros--
+						}
+					}
+				} else {
+					bitLength[i] = length
+					i++
+				}
+			}
+			bd.build(bitLength, 0, bc)
+			let dcodes = extraDist ?? (dcx, dcb)
+			let size = nc + dcodes + ldc + rc
+			i = 0
+			for i < size {
+				if c.inAddr > c.readTop - 5 {
+					return false unless c.unpReadBuf()
+				}
+				let num = c.decodeNumber(bd)
+				if num < 16 {
+					lengths[i] = num
+					i++
+				} else if num < 18 {
+					let n = 0
+					if num == 16 {
+						n = (c.getbits() >> 13) + 3
+						c.addbits(3)
+					} else {
+						n = (c.getbits() >> 9) + 11
+						c.addbits(7)
+					}
+					return false when i == 0
+					for n > 0 && i < size {
+						lengths[i] = lengths[i - 1]
+						i++
+						n--
+					}
+				} else {
+					let n = 0
+					if num == 18 {
+						n = (c.getbits() >> 13) + 3
+						c.addbits(3)
+					} else {
+						n = (c.getbits() >> 9) + 11
+						c.addbits(7)
+					}
+					for n > 0 && i < size {
+						lengths[i] = 0
+						i++
+						n--
+					}
+				}
+			}
+			tablesRead = true
+			return false when c.inAddr > c.readTop
+			ld.build(lengths, 0, nc)
+			dd.build(lengths, nc, dcodes)
+			ldd.build(lengths, nc + dcodes, ldc)
+			rd.build(lengths, nc + dcodes + ldc, rc)
+			return true
+		}
+	}
+}

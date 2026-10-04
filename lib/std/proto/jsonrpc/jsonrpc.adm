@@ -1,0 +1,996 @@
+// JSON-RPC 2.0 (https://www.jsonrpc.org/specification): requests,
+// notifications, responses and batches, independent of the transport.
+//
+// A Peer speaks it over a byte stream in both directions, as LSP and MCP do:
+//
+//     let peer = new jsonrpc.Peer(os.stdin, os.stdout)
+//     peer.handle("add", (req jsonrpc.Request) => {
+//         let args = new AddArgs()
+//         try req.bind(args)
+//         return args.a + args.b
+//     })
+//     peer.start()
+//     let sum = try peer.call("remote.add", [1, 2])
+//     peer.wait()
+//
+// A Dispatcher answers HTTP POST requests (`mux.handle("/rpc", dispatcher)`),
+// and an HttpClient calls such a server.
+partial module std.proto.jsonrpc {
+	use (
+		std.io
+		std.time
+		std.errors
+		std.data.encoding::(JSON)
+		std.net.http
+		std.proto.jsonrpc.wire::*
+	)
+
+	// How messages are delimited on a stream.
+	enum Framing {
+		// A `Content-Length: n` header block, a blank line, then n bytes of
+		// JSON: the Language Server Protocol's base protocol.
+		ContentLength,
+		// One JSON text per line: MCP's stdio transport, ndjson.
+		Newline
+	}
+
+	// Why a call failed: the error codes of the specification, plus the local
+	// failures of a call.
+	enum ErrorCode {
+		// -32700: the peer could not parse the JSON.
+		ParseError,
+		// -32600: the message was not a valid request.
+		InvalidRequest,
+		// -32601: no such method.
+		MethodNotFound,
+		// -32602: invalid method parameters.
+		InvalidParams,
+		// -32603: an internal error of the peer.
+		InternalError,
+		// -32000 to -32099: reserved for implementation-defined server errors.
+		ServerError,
+		// Any other code: defined by the application.
+		Application,
+		// The connection closed before the response arrived.
+		Closed,
+		// No response arrived within the call's timeout.
+		Timeout,
+		// The response was not valid JSON-RPC.
+		Protocol
+	}
+
+	// The error a call fails with, and the error a handler fails with to
+	// answer with a specific error object.
+	//
+	//     fail jsonrpc.errorOf(-32001, "busy", data = retryAfter)
+	struct RPCError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorCode
+		// The code of the error object, 0 for local failures (Closed,
+		// Timeout, Protocol).
+		number  int
+		// The error object's data member; none when absent.
+		data    any
+	}
+
+	// The error object number classifies as, for a handler to fail with.
+	def errorOf(number int, message string, data any = none) RPCError {
+		let kind = kindOf(number)
+		return RPCError{message: message, code: kind.name, kind: kind, number: number, data: data}
+	}
+
+	// The ErrorCode of an error object's code.
+	def kindOf(number int) ErrorCode {
+		match number {
+			case - 32700:
+				return ErrorCode.ParseError
+			case - 32600:
+				return ErrorCode.InvalidRequest
+			case - 32601:
+				return ErrorCode.MethodNotFound
+			case - 32602:
+				return ErrorCode.InvalidParams
+			case - 32603:
+				return ErrorCode.InternalError
+			default:
+				return ErrorCode.ServerError when number <= -32000 && number >= -32099
+				return ErrorCode.Application
+		}
+	}
+
+	// One incoming request or notification, as a handler sees it.
+	type Request {
+		// The method name.
+		method       string
+		// The params member: a `map<string, any>` for named parameters, an
+		// `any[]` for positional ones, none when absent. Values are what
+		// `JSON.parse` builds.
+		params       any
+		// The id of a request: an int, a float or a string; none for a
+		// notification and for a request whose id is null (see
+		// notification).
+		id           any
+		// Whether no response is expected.
+		notification bool
+
+		// Fills target's fields from named parameters (or a positional array
+		// into an array target) the way `JSON.decode` does. Fails with an
+		// InvalidParams RPCError when they do not fit, which a handler can
+		// pass on with `try`.
+		def bind(target any) !none {
+			let json = new JSON()
+			json.decode(json.encode(params), target) onerror (err error) {
+				fail errorOf(-32602, "invalid params: {err.message}")
+			}
+			return none
+		}
+	}
+
+	// Answers one request: the result to send, or a failure. Failing with an
+	// RPCError sends that error object; any other failure sends -32603
+	// (internal error) with the failure's message. For a notification the
+	// result is dropped.
+	type Handler = def(Request) !any
+
+	// One call of a batch.
+	struct Call {
+		method       string
+		params       any
+		// Send it as a notification: no id, no reply.
+		notification bool
+	}
+
+	// The outcome of one call of a batch: its result, or the error object
+	// the peer answered with. Both are none for a notification.
+	struct Reply {
+		result any
+		error  ?RPCError
+	}
+
+	// The methods a server answers, independent of the transport. It
+	// implements `http.Handler`: a POST body holding a request, a
+	// notification or a batch gets the response JSON back (204 when there
+	// is nothing to answer).
+	type Dispatcher {
+		internal names    string[]
+		internal handlers Handler[]
+
+		// Registers the handler of a method, replacing an earlier one.
+		def handle(method string, handler Handler) {
+			let i = names.indexOf(method)
+			if i >= 0 {
+				handlers[i] = handler
+				return
+			}
+			names.push(method)
+			handlers.push(handler)
+		}
+
+		// The handler of a method; none when there is none.
+		def handler(method string) ?Handler {
+			let i = names.indexOf(method)
+			return none when i < 0
+			return handlers[i]
+		}
+
+		// Answers one message (a request, a notification or a batch) and
+		// returns the response JSON, none when nothing is to be answered.
+		// Handlers run one after another; a malformed message gets the
+		// error response the specification asks for.
+		def dispatch(message byte[]) ?byte[] {
+			let doc = new JSON().parse(message) onerror (err error) {
+				recover ParseFailure{message: err.message}
+			}
+			match doc {
+				case ParseFailure:
+					return encodeError(none, -32700, "parse error: {doc.message}", none)
+				case any[]:
+					return encodeError(none, -32600, "empty batch", none) when doc.len() == 0
+					let replies any[] = []
+					for let item in doc {
+						let reply = answer(self, item)
+						replies.push(reply) unless reply is none
+					}
+					return none when replies.len() == 0
+					return new JSON().encode(replies)
+				default:
+					let reply = answer(self, doc)
+					return none when reply is none
+					return new JSON().encode(reply)
+			}
+		}
+
+		// Serves a JSON-RPC POST. Fails when the response write does.
+		def serve(ctx http.Context) !none {
+			if ctx.method() != http.Method.POST {
+				ctx.setHeader("Allow", "POST")
+				return try ctx.error(405)
+			}
+			let body = try ctx.bytes()
+			let reply = dispatch(body)
+			return try ctx.noContent() when reply is none
+			return try ctx.blob(200, "application/json", reply)
+		}
+	}
+
+	// Calls a JSON-RPC server over HTTP POST.
+	//
+	//     let rpc = new jsonrpc.HttpClient("https://example.com/rpc")
+	//     let n = try rpc.call("count", ["a"])
+	type HttpClient {
+		// The endpoint every call is posted to.
+		url           string
+		// The HTTP client the requests go through (timeouts, TLS, cookies).
+		client        http.Client
+		internal next int         = 1
+
+		def new(url string, client http.Client = new http.Client()) {
+			self.url = url
+			self.client = client
+		}
+
+		// Calls a method and returns its result as `JSON.parse` builds it.
+		// Fails with an RPCError carrying the error object the server
+		// answered with (or Protocol for a malformed answer), and with the
+		// HTTP client's error when the request fails.
+		def call(method string, params any = none) !any {
+			let id = take()
+			let answer = try post(new JSON().encode(requestObject(id, method, params)))
+			fail RPCError{message: "jsonrpc: no response to a request", code: "Protocol", kind: ErrorCode.Protocol} when answer is none
+			return try resultOf(answer, id)
+		}
+
+		// Calls a method and fills result from what it returns, the way
+		// `JSON.decode` does. Fails as call does, or when the result does
+		// not fit.
+		def call(method string, params any, result any) !none {
+			let value = try call(method, params)
+			let json = new JSON()
+			try json.decode(json.encode(value), result)
+			return none
+		}
+
+		// Sends a notification. Fails when the HTTP request does.
+		def notify(method string, params any = none) !none {
+			try post(new JSON().encode(notificationObject(method, params)))
+			return none
+		}
+
+		// Sends calls as one batch and returns a Reply per call, in the
+		// order of calls. Fails when the HTTP request does or the answer is
+		// malformed or misses a reply.
+		def batch(calls Call[]) !Reply[] {
+			let messages any[] = []
+			let ids int[] = []
+			for let c in calls {
+				if c.notification {
+					messages.push(notificationObject(c.method, c.params))
+					ids.push(0)
+				} else {
+					let id = take()
+					messages.push(requestObject(id, c.method, c.params))
+					ids.push(id)
+				}
+			}
+			let answer = try post(new JSON().encode(messages))
+			return try repliesOf(answer, ids)
+		}
+
+		internal atomic def take() int {
+			let id = next
+			next++
+			return id
+		}
+
+		// Posts a body and returns the parsed answer; none for an empty one.
+		internal def post(body byte[]) !any {
+			let res = try client.post(url, "application/json", body)
+			let data = try res.bytes()
+			fail http.HttpError{message: "jsonrpc: HTTP {res.status}", op: "jsonrpc", text: url} when res.status != 200 && res.status != 204
+			return none when data.len() == 0
+			return new JSON().parse(data) onerror (err error) {
+				fail RPCError{message: "jsonrpc: answer is not JSON: {err.message}", code: "Protocol", kind: ErrorCode.Protocol}
+			}
+		}
+	}
+
+	// Speaks JSON-RPC over a byte stream, both ways: it answers the methods
+	// registered with handle and makes calls of its own, matching responses
+	// to them by id.
+	//
+	// Requests are answered on tasks of their own, so a slow handler or one
+	// that calls back does not hold up the stream; notifications run in the
+	// order they arrive, before the next message is read, as LSP needs.
+	type Peer {
+		// How messages are delimited.
+		framing        Framing    = Framing.ContentLength
+		// The methods this side answers.
+		methods        Dispatcher
+		// How long a call waits for its response; 0s waits until the stream
+		// ends.
+		timeout        duration   = 0s
+		// The largest message read; a longer one ends the stream.
+		maxMessageSize int        = 64 << 20
+
+		internal reader  io.Reader
+		internal writer  io.Writer
+		internal buf     byte[]
+		internal at      int                         = 0
+		internal pending map<string, channel<Reply>>
+		internal next    int                         = 1
+		internal running bool
+		internal ended   bool
+		internal failure string                      = ""
+		internal done    channel<none>
+
+		def new(reader io.Reader, writer io.Writer, framing Framing = Framing.ContentLength) {
+			self.reader = reader
+			self.writer = writer
+			self.framing = framing
+			self.methods = new Dispatcher()
+			self.pending = {}
+			self.done = new channel<none>(1)
+		}
+
+		// Registers the handler of a method; see Dispatcher.handle.
+		def handle(method string, handler Handler) {
+			methods.handle(method, handler)
+		}
+
+		// Starts reading the stream on a task of its own. Register handlers
+		// first: a request for an unknown method is answered with -32601.
+		def start() {
+			return when running
+			running = true
+			let task = async readLoop()
+			task.keepAlive()
+		}
+
+		// Blocks until the stream ends: the reader reports its end, a read
+		// fails or a message cannot be read, or close is called.
+		def wait() {
+			return when !running
+			// The value stays in the channel, so every later wait returns at
+			// once too.
+			select {
+				case done:
+			}
+		}
+
+		// Why the stream ended; "" while it runs or when it ended cleanly.
+		def endReason() string {
+			return failure
+		}
+
+		// Calls a method and returns its result as `JSON.parse` builds it.
+		// Fails with an RPCError: the error object the peer answered with,
+		// or Closed, Timeout or Protocol; and with the writer's error when
+		// the request cannot be sent. start must have been called.
+		def call(method string, params any = none) !any {
+			let (id, ch) = try register()
+			let key = "n{id}"
+			send(new JSON().encode(requestObject(id, method, params))) onerror (err error) {
+				forget(key)
+				fail err
+			}
+			let reply = try waitFor(key, ch)
+			fail reply.error unless reply.error is none
+			return reply.result
+		}
+
+		// Calls a method and fills result from what it returns, the way
+		// `JSON.decode` does. Fails as call does, or when the result does
+		// not fit.
+		def call(method string, params any, result any) !none {
+			let value = try call(method, params)
+			let json = new JSON()
+			try json.decode(json.encode(value), result)
+			return none
+		}
+
+		// Sends a notification. Fails when the writer does or the peer has
+		// ended.
+		def notify(method string, params any = none) !none {
+			fail closedError(failure) when ended
+			return try send(new JSON().encode(notificationObject(method, params)))
+		}
+
+		// Sends calls as one batch and returns a Reply per call, in the
+		// order of calls (empty for notifications). Fails as call does.
+		def batch(calls Call[]) !Reply[] {
+			let messages any[] = []
+			let keys string[] = []
+			let chans channel<Reply>[] = []
+			for let c in calls {
+				if c.notification {
+					messages.push(notificationObject(c.method, c.params))
+					keys.push("")
+					chans.push(new channel<Reply>(1))
+				} else {
+					let (id, ch) = try register()
+					messages.push(requestObject(id, c.method, c.params))
+					keys.push("n{id}")
+					chans.push(ch)
+				}
+			}
+			send(new JSON().encode(messages)) onerror (err error) {
+				for let k in keys {
+					forget(k) when k != ""
+				}
+				fail err
+			}
+			let out Reply[] = []
+			for let (i, k) in keys {
+				if k == "" {
+					out.push(Reply{})
+				} else {
+					out.push(try waitFor(k, chans[i]))
+				}
+			}
+			return out
+		}
+
+		// Ends the peer: pending calls fail with Closed and wait returns.
+		// The reader and writer stay open; they belong to the caller, and
+		// closing the reader is what stops the reading task.
+		def close() {
+			stop("")
+		}
+
+		// Registers a pending call and returns its id.
+		internal atomic def register() !(int, channel<Reply>) {
+			fail RPCError{message: "jsonrpc: call before start", code: "Closed", kind: ErrorCode.Closed} unless running
+			fail closedError(failure) when ended
+			let id = next
+			next++
+			let ch = new channel<Reply>(1)
+			pending["n{id}"] = ch
+			return (id, ch)
+		}
+
+		internal atomic def forget(key string) {
+			pending.delete(key) when pending.hasKey(key)
+		}
+
+		// Hands a response to the call waiting for it; drops it when none is.
+		internal atomic def deliver(key string, reply Reply) {
+			return unless pending.hasKey(key)
+			let ch = pending[key]
+			pending.delete(key)
+			ch <- reply
+		}
+
+		// Waits for the reply of a pending call.
+		// Waits for the reply on the channel register handed out; deliver
+		// may already have put it there.
+		internal def waitFor(key string, ch channel<Reply>) !Reply {
+			if timeout <= 0s {
+				select {
+					case ch:
+						return <- ch
+				}
+			}
+			let sleep = time.sleepChan(timeout)
+			select {
+				case ch:
+					return <- ch
+				case sleep:
+					forget(key)
+					fail RPCError{message: "jsonrpc: no response within {timeout}", code: "Timeout", kind: ErrorCode.Timeout}
+			}
+		}
+
+		// Writes one message with the framing, as one unit.
+		internal atomic def send(body byte[]) !none {
+			if framing == Framing.ContentLength {
+				try writer.write("Content-Length: {body.len()}\r\n\r\n".bytes() + body)
+			} else {
+				try writer.write(body + [byte(0x0A)])
+			}
+			return none
+		}
+
+		// Marks the peer ended and fails every pending call.
+		internal atomic def stop(reason string) {
+			return when ended
+			ended = true
+			failure = reason
+			let err = closedError(reason)
+			for let (_, ch) in pending {
+				ch <- Reply{error: err}
+			}
+			pending = {}
+			done <- none when done.len() == 0
+		}
+
+		// Reads messages until the stream ends.
+		internal def readLoop() {
+			for !ended {
+				let message = readMessage() onerror (err error) {
+					stop(err.message)
+					return
+				}
+				if message is none {
+					stop("")
+					return
+				}
+				dispatchIncoming(message)
+			}
+		}
+
+		// Reads one framed message; none when the stream ends between
+		// messages.
+		internal def readMessage() !?byte[] {
+			if framing == Framing.Newline {
+				for {
+					let line = try readLine(maxMessageSize)
+					return none when line is none
+					let text = trimCR(line)
+					return text when text.len() > 0
+				}
+			}
+			let length = -1
+			let started = false
+			for {
+				let line = try readLine(8192)
+				if line is none {
+					return none unless started
+					fail "jsonrpc: stream ends inside a header block"
+				}
+				started = true
+				let text = string(trimCR(line))
+				break when text == ""
+				let colon = text.indexOf(":")
+				fail "jsonrpc: malformed header line {quoteLine(text)}" when colon <= 0
+				if text.slice(0, colon).trim().lower() == "content-length" {
+					let value = text.slice(colon + 1).trim()
+					fail "jsonrpc: bad Content-Length {quoteLine(value)}" when value == "" || !isDigits(value)
+					length = parseInt<int>(value)
+				}
+			}
+			fail "jsonrpc: header block without Content-Length" when length < 0
+			fail "jsonrpc: message of {length} bytes exceeds maxMessageSize" when length > maxMessageSize
+			return try readExact(length)
+		}
+
+		// Reads up to and including the next newline, returning the line
+		// without it; none at the end of the stream with nothing buffered.
+		internal def readLine(limit int) !?byte[] {
+			let scanned = at
+			for {
+				let nl = indexOfByte(buf, byte(0x0A), scanned)
+				if nl >= 0 {
+					let line = buf.slice(at, nl - at).clone()
+					at = nl + 1
+					compact()
+					return line
+				}
+				scanned = buf.len()
+				fail "jsonrpc: line longer than {limit} bytes" when buf.len() - at > limit
+				if !(try fill()) {
+					return none when buf.len() == at
+					fail "jsonrpc: stream ends inside a message"
+				}
+			}
+		}
+
+		internal def readExact(n int) !byte[] {
+			for buf.len() - at < n {
+				fail "jsonrpc: stream ends inside a message" when !(try fill())
+			}
+			let out = buf.slice(at, n).clone()
+			at += n
+			compact()
+			return out
+		}
+
+		// Reads more from the stream into the buffer; false at its end.
+		internal def fill() !bool {
+			let chunk byte[]
+			chunk.len(65536)
+			let n = try reader.read(chunk)
+			return false when n <= 0
+			buf += chunk.slice(0, n)
+			return true
+		}
+
+		// Drops consumed bytes once they make up most of the buffer.
+		internal def compact() {
+			return when at < 65536 || at * 2 < buf.len()
+			buf = buf.slice(at, buf.len() - at).clone()
+			at = 0
+		}
+
+		// Routes one incoming message: responses to their calls, requests to
+		// tasks, notifications in order.
+		internal def dispatchIncoming(message byte[]) {
+			let doc = new JSON().parse(message) onerror (err error) {
+				recover ParseFailure{message: err.message}
+			}
+			match doc {
+				case ParseFailure:
+					reply(encodeError(none, -32700, "parse error: {doc.message}", none))
+				case any[]:
+					if doc.len() == 0 {
+						reply(encodeError(none, -32600, "empty batch", none))
+						return
+					}
+					if isResponse(doc[0]) {
+						for let item in doc {
+							takeResponse(item)
+						}
+						return
+					}
+					let task = async answerBatch(doc)
+					task.keepAlive()
+				default:
+					if isResponse(doc) {
+						takeResponse(doc)
+						return
+					}
+					let req = requestOf(doc)
+					if req is none {
+						reply(new JSON().encode(errorObject(idOf(doc), -32600, "invalid request", none)))
+						return
+					}
+					if req.notification {
+						answer(methods, doc)
+						return
+					}
+					let task = async answerOne(doc)
+					task.keepAlive()
+			}
+		}
+
+		internal def answerOne(doc any) {
+			let out = answer(methods, doc)
+			reply(new JSON().encode(out)) unless out is none
+		}
+
+		internal def answerBatch(items any[]) {
+			let replies any[] = []
+			for let item in items {
+				let out = answer(methods, item)
+				replies.push(out) unless out is none
+			}
+			reply(new JSON().encode(replies)) when replies.len() > 0
+		}
+
+		// Sends a response; a failed write ends the peer, since the stream
+		// is then broken for every call.
+		internal def reply(body ?byte[]) {
+			return when body is none
+			send(body) onerror (err error) {
+				stop(err.message)
+				recover none
+			}
+		}
+
+		// Matches a response to its call by id.
+		internal def takeResponse(item any) {
+			match item {
+				case map<string, any>:
+					let key = idKey(member(item, "id"))
+					return when key == ""
+					let r = replyOf(item) onerror (err error) {
+						recover Reply{error: RPCError{message: err.message, code: "Protocol", kind: ErrorCode.Protocol}}
+					}
+					deliver(key, r)
+				default:
+			}
+		}
+	}
+
+	// A message that did not parse, carried through dispatch.
+	internal struct ParseFailure {
+		message string
+	}
+
+	// The Request an incoming object describes; none when it is not a valid
+	// request or notification.
+	internal def requestOf(item any) ?Request {
+		let invalid = false
+		let req = checkRequest(item) onerror (err error) {
+			invalid = true
+			recover new Request()
+		}
+		return none when invalid
+		return req
+	}
+
+	internal def checkRequest(item any) !Request {
+		match item {
+			case map<string, any>:
+				fail "not 2.0" unless item.hasKey("jsonrpc") && isVersion(member(item, "jsonrpc"))
+				fail "no method" unless item.hasKey("method")
+				let method = member(item, "method")
+				let req = new Request()
+				match method {
+					case string:
+						req.method = method
+					default:
+						fail "method is not a string"
+				}
+				if item.hasKey("params") {
+					let params = member(item, "params")
+					match params {
+						case map<string, any>, any[]:
+							req.params = params
+						default:
+							fail "params is neither an object nor an array"
+					}
+				}
+				req.notification = !item.hasKey("id")
+				if !req.notification {
+					let id = member(item, "id")
+					fail "id is neither a string, a number nor null" unless validId(id)
+					req.id = id
+				}
+				return req
+			default:
+				fail "not an object"
+		}
+	}
+
+	// The response object for one request value; none for a
+	// notification.
+	internal def answer(d Dispatcher, item any) ?map<string, any> {
+		let req = requestOf(item)
+		return errorObject(idOf(item), -32600, "invalid request", none) when req is none
+		let fn = d.handler(req.method)
+		if fn is none {
+			return none when req.notification
+			return errorObject(req.id, -32601, "method not found: {req.method}", none)
+		}
+		return run(fn, req)
+	}
+
+	// Runs a handler and builds the response object; none for a
+	// notification.
+	internal def run(fn Handler, req Request) ?map<string, any> {
+		let failed ?error = none
+		let result = fn(req) onerror (err error) {
+			failed = err
+			recover none
+		}
+		return none when req.notification
+		let err = failed
+		if err is none {
+			let out = map<string, any>{}
+			out["jsonrpc"] = "2.0"
+			out["result"] = result
+			out["id"] = req.id
+			return out
+		}
+		return errorObject(req.id, err.number, err.message, err.data) when err is RPCError
+		return errorObject(req.id, -32603, err.message, none)
+	}
+
+	// A Reply from a response object; fails when it is malformed.
+	internal def replyOf(item map<string, any>) !Reply {
+		expects {
+			assert item.hasKey("jsonrpc") && isVersion(member(item, "jsonrpc")) onerror fail "jsonrpc: response without \"jsonrpc\": \"2.0\""
+		}
+		let hasResult = item.hasKey("result")
+		let hasError = item.hasKey("error")
+		fail "jsonrpc: response with both result and error" when hasResult && hasError
+		return Reply{result: member(item, "result")} when hasResult
+		fail "jsonrpc: response with neither result nor error" unless hasError
+		let e = member(item, "error")
+		match e {
+			case map<string, any>:
+				let number = member(e, "code")
+				let message = member(e, "message")
+				let n = 0
+				match number {
+					case int:
+						n = number
+					default:
+						fail "jsonrpc: error code is not an integer"
+				}
+				let text = ""
+				match message {
+					case string:
+						text = message
+					default:
+						fail "jsonrpc: error message is not a string"
+				}
+				let err = errorOf(n, text, member(e, "data"))
+				return Reply{error: err}
+			default:
+				fail "jsonrpc: error is not an object"
+		}
+	}
+
+	// The result of the response to request id, or its error.
+	internal def resultOf(answer any, id int) !any {
+		match answer {
+			case map<string, any>:
+				fail RPCError{message: "jsonrpc: response id does not match the request", code: "Protocol", kind: ErrorCode.Protocol} when idKey(member(answer, "id")) != "n{id}" && answer.hasKey("result")
+				let r = replyOf(answer) onerror (err error) {
+					fail RPCError{message: err.message, code: "Protocol", kind: ErrorCode.Protocol}
+				}
+				fail r.error unless r.error is none
+				return r.result
+			default:
+				fail RPCError{message: "jsonrpc: response is not an object", code: "Protocol", kind: ErrorCode.Protocol}
+		}
+	}
+
+	// The replies to a batch, in the order of ids (0 for a notification).
+	internal def repliesOf(answer any, ids int[]) !Reply[] {
+		let byId = map<string, Reply>{}
+		match answer {
+			case any[]:
+				for let item in answer {
+					match item {
+						case map<string, any>:
+							let r = replyOf(item) onerror (err error) {
+								fail RPCError{message: err.message, code: "Protocol", kind: ErrorCode.Protocol}
+							}
+							byId[idKey(member(item, "id"))] = r
+						default:
+							fail RPCError{message: "jsonrpc: batch reply holds a non-object", code: "Protocol", kind: ErrorCode.Protocol}
+					}
+				}
+			case map<string, any>:
+				// A server answers a batch it cannot read with one error.
+				let r = replyOf(answer) onerror (err error) {
+					fail RPCError{message: err.message, code: "Protocol", kind: ErrorCode.Protocol}
+				}
+				fail r.error unless r.error is none
+				fail RPCError{message: "jsonrpc: batch answered with a single response", code: "Protocol", kind: ErrorCode.Protocol}
+			default:
+				let wanted = false
+				for let id in ids {
+					wanted = true when id != 0
+				}
+				fail RPCError{message: "jsonrpc: no reply to a batch", code: "Protocol", kind: ErrorCode.Protocol} when wanted
+		}
+		let out Reply[] = []
+		for let id in ids {
+			if id == 0 {
+				out.push(Reply{})
+				continue
+			}
+			let key = "n{id}"
+			fail RPCError{message: "jsonrpc: batch reply misses request {id}", code: "Protocol", kind: ErrorCode.Protocol} unless byId.hasKey(key)
+			out.push(byId[key])
+		}
+		return out
+	}
+
+	// The error a call fails with once the peer has ended.
+	internal def closedError(reason string) RPCError {
+		let text = reason == "" ?? ("jsonrpc: connection closed", "jsonrpc: connection closed: {reason}")
+		return RPCError{message: text, code: "Closed", kind: ErrorCode.Closed}
+	}
+}
+
+internal partial module std.proto.jsonrpc.wire {
+	use (
+		std.data.encoding::(JSON)
+		std.proto.jsonrpc::*
+	)
+
+	// The member of an object under key; none when absent.
+	def member(m map<string, any>, key string) any {
+		return none unless m.hasKey(key)
+		return m[key]
+	}
+
+	def isVersion(v any) bool {
+		match v {
+			case string:
+				return v == "2.0"
+			default:
+				return false
+		}
+	}
+
+	// Whether an id is allowed: a string, a number or null.
+	def validId(id any) bool {
+		return true when id is none
+		match id {
+			case string, int, float:
+				return true
+			default:
+				return false
+		}
+	}
+
+	// The id of an object when it has a valid one, else none (null).
+	def idOf(item any) any {
+		match item {
+			case map<string, any>:
+				let id = member(item, "id")
+				return id when item.hasKey("id") && validId(id)
+				return none
+			default:
+				return none
+		}
+	}
+
+	// The key pending calls are filed under: "n5" for 5, "s…" for a string
+	// id; "" for null and anything else.
+	def idKey(id any) string {
+		match id {
+			case int:
+				return "n{id}"
+			case string:
+				return "s{id}"
+			default:
+				return ""
+		}
+	}
+
+	// Reports whether an incoming object is a response rather than a
+	// request.
+	def isResponse(item any) bool {
+		match item {
+			case map<string, any>:
+				return !item.hasKey("method") && (item.hasKey("result") || item.hasKey("error"))
+			default:
+				return false
+		}
+	}
+
+	def requestObject(id int, method string, params any) map<string, any> {
+		let out = map<string, any>{}
+		out["jsonrpc"] = "2.0"
+		out["method"] = method
+		out["params"] = params unless params is none
+		out["id"] = id
+		return out
+	}
+
+	def notificationObject(method string, params any) map<string, any> {
+		let out = map<string, any>{}
+		out["jsonrpc"] = "2.0"
+		out["method"] = method
+		out["params"] = params unless params is none
+		return out
+	}
+
+	def errorObject(id any, number int, message string, data any) map<string, any> {
+		let e = map<string, any>{}
+		e["code"] = number
+		e["message"] = message
+		e["data"] = data unless data is none
+		let out = map<string, any>{}
+		out["jsonrpc"] = "2.0"
+		out["error"] = e
+		out["id"] = id
+		return out
+	}
+
+	def encodeError(id any, number int, message string, data any) byte[] {
+		return new JSON().encode(errorObject(id, number, message, data))
+	}
+
+	def trimCR(line byte[]) byte[] {
+		return line.slice(0, line.len() - 1) when line.len() > 0 && line[line.len() - 1] == byte(0x0D)
+		return line
+	}
+
+	def indexOfByte(b byte[], x byte, from int) int {
+		for let i = from; i < b.len(); i++ {
+			return i when b[i] == x
+		}
+		return -1
+	}
+
+	def isDigits(s string) bool {
+		for let c in s {
+			return false when c < '0' || c > '9'
+		}
+		return s.len() <= 10
+	}
+
+	def quoteLine(s string) string {
+		return "\"" + (s.len() > 80 ?? (s.slice(0, 80) + "…", s)) + "\""
+	}
+}

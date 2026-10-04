@@ -1,0 +1,704 @@
+internal partial module std.formats.archive.rar {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto.hash
+		std.formats.archive::*
+		std.formats.archive.stream::*
+	)
+
+	// Reads a record's packed bytes across the volumes they span.
+	type PartsReader {
+		volumes Source[]
+		parts   DataPart[]
+		index   int
+		cur     io.Reader
+		curLeft int
+
+		def new(volumes Source[], parts DataPart[]) {
+			self.volumes = volumes
+			self.parts = parts
+			index = -1
+			cur = new EmptyReader()
+		}
+
+		// Implements io.Reader. Fails when a volume cannot be read.
+		def read(p byte[]) !int {
+			return 0 when p.len() == 0
+			for curLeft == 0 {
+				index++
+				return 0 when index >= parts.len()
+				let part = parts[index]
+				fail "rar: the archive is truncated" when part.offset + part.size > volumes[part.volume].size()
+				cur = volumes[part.volume].reader(part.offset, part.size)
+				curLeft = part.size
+			}
+			let want = p.len()
+			want = curLeft when curLeft < want
+			let n = try cur.read(p[0:want])
+			fail "rar: the data ended early" when n <= 0
+			curLeft -= n
+			return n
+		}
+	}
+
+	// Decrypts a packed stream a whole number of cipher blocks at a time.
+	type DecryptReader {
+		src    io.Reader
+		dec    Decryptor
+		buf    byte[]
+		head   int
+		filled int
+		done   bool
+
+		def new(src io.Reader, dec Decryptor) {
+			self.src = src
+			self.dec = dec
+			buf = []
+			buf.len(64 * 1024)
+		}
+
+		// Implements io.Reader. Fails when the source does.
+		def read(p byte[]) !int {
+			return 0 when p.len() == 0
+			if head >= filled {
+				return 0 when done
+				let got = try readUpTo(src, buf)
+				let block = dec.blockSize()
+				got = got - got % block
+				if got == 0 {
+					done = true
+					return 0
+				}
+				dec.decrypt(buf, got)
+				head = 0
+				filled = got
+			}
+			let n = filled - head
+			n = p.len() when p.len() < n
+			(buf[head:head + n]).copy(p)
+			head += n
+			return n
+		}
+	}
+
+	// The shared decoder state of an archive: one core and a decoder per
+	// algorithm, with where in a solid stream they stand.
+	type Unpacker {
+		core  UnpackCore
+		v15   ?Unpack15
+		v20   ?Unpack20
+		v30   ?Unpack30
+		v50   ?Unpack50
+		// The record whose solid stream the state belongs to, -1 for none.
+		chain int
+		// The next record of that stream the state is ready for.
+		next  int
+		// The algorithm decoding the current file: 15, 20, 30 or 50.
+		algo  int
+		done  bool
+
+		def new() {
+			core = new UnpackCore()
+			v15 = none
+			v20 = none
+			v30 = none
+			v50 = none
+			chain = -1
+		}
+
+		// Starts decoding a file. Fails when its compression version is unknown
+		// or its data is corrupt from the start.
+		def start(rec RarRecord, format RarFormat, packed io.Reader, solid bool, window int) !none {
+			core.initWindow(window, solid)
+			core.startFile(packed, rec.unknownSize ?? (0x7FFFFFFFFFFFFFFF, rec.size))
+			done = false
+			let ver = rec.unpVer
+			let ok = false
+			if format != RarFormat.Rar50 && ver <= 15 {
+				algo = 15
+				if v15 is none {
+					v15 = new Unpack15(core)
+				}
+				let d = v15
+				ok = d.prepare(solid) unless d is none
+			} else if format != RarFormat.Rar50 && (ver := 20 || 26) {
+				algo = 20
+				if v20 is none {
+					v20 = new Unpack20(core)
+				}
+				let d = v20
+				ok = d.prepare(solid) unless d is none
+			} else if format != RarFormat.Rar50 && (ver := 29 || 36) {
+				algo = 30
+				if v30 is none {
+					v30 = new Unpack30(core)
+				}
+				let d = v30
+				ok = d.prepare(solid) unless d is none
+			} else if format == RarFormat.Rar50 && (ver := 50 || 70) {
+				algo = 50
+				if v50 is none {
+					v50 = new Unpack50(core)
+				}
+				let d = v50
+				if !(d is none) {
+					d.extraDist = ver == 70
+					ok = d.prepare(solid)
+				}
+			} else {
+				fail "rar: " + rec.name + " uses compression version {ver}, which this reader does not know"
+			}
+			if !ok {
+				fail "rar: " + rec.name + ": " + bareMessage(core.sourceError) unless core.sourceError.isEmpty()
+				done = true
+			}
+			return none
+		}
+
+		// Decodes the next chunk; reports whether the file is done.
+		def step() !bool {
+			return true when done
+			let finished = true
+			match algo {
+				case 15:
+					let d = v15
+					finished = d.run() unless d is none
+				case 20:
+					let d = v20
+					finished = d.run() unless d is none
+				case 30:
+					let d = v30
+					finished = try d.run() unless d is none
+				case 50:
+					let d = v50
+					finished = try d.run() unless d is none
+			}
+			fail "rar: " + bareMessage(core.sourceError) unless core.sourceError.isEmpty()
+			done = finished
+			return finished
+		}
+	}
+
+	// Checks an entry's bytes against the checksum its header stores.
+	type Verifier {
+		rec   RarRecord
+		key   byte[]
+		crc   hash.CRC32
+		blake hash.BLAKE2sp256
+		sum14 int
+
+		def new(rec RarRecord, key byte[]) {
+			self.rec = rec
+			self.key = key
+			crc = new hash.CRC32()
+			blake = new hash.BLAKE2sp256()
+		}
+
+		def write(b byte[]) {
+			if rec.sum14 {
+				sum14 = checksum14(sum14, b)
+				return
+			}
+			crc.write(b) when rec.hasCrc
+			blake.write(b) when rec.blake.len() == 32
+		}
+
+		// Fails when the data does not match.
+		def verify(secret bool) !none {
+			let bad = "rar: " + rec.name + ": " + (secret ?? ("wrong password or corrupt data", "checksum mismatch"))
+			fail "rar: " + rec.name + " continues in a volume that is missing" when rec.splitAfter
+			if rec.sum14 {
+				fail bad when sum14 != rec.crc
+				return none
+			}
+			if rec.hasCrc {
+				let got = int(crc.checksum ^ 0xFFFFFFFF)
+				got = crcToMac(got, key) when rec.useHashKey && key.len() > 0
+				fail bad when got != rec.crc
+			}
+			if rec.blake.len() == 32 {
+				let got = blake.hash()
+				got = blakeToMac(got, key) when rec.useHashKey && key.len() > 0
+				fail bad when got.hex() != rec.blake.hex()
+			}
+			return none
+		}
+	}
+
+	// A RAR archive over its volumes.
+	type RarArchive {
+		h        RarHeaders
+		password string
+		keys     KeyCache
+		list     Entry[]
+		// Index into h.records of each entry.
+		records  int[]
+		unpacker Unpacker
+		ticket   int
+
+		def new(h RarHeaders, password string, keys KeyCache) {
+			self.h = h
+			self.password = password
+			self.keys = keys
+			list = []
+			records = []
+			unpacker = new Unpacker()
+			for let (i, r) in h.records {
+				list.push(toEntry(r))
+				records.push(i)
+			}
+			for let (k, e) in list {
+				continue unless isLinkMode(e.mode) && e.linkTarget.isEmpty()
+				let target = readLink(e) onerror recover ""
+				list[k].linkTarget = target
+			}
+		}
+
+		def readLink(e Entry) !string {
+			return truncateAtZero(string(try readAll(try open(e))))
+		}
+
+		def hostName(r RarRecord) string {
+			if h.format == RarFormat.Rar50 {
+				return r.unixHost ?? ("unix", "windows")
+			}
+			match r.hostOS {
+				case 0:
+					return "msdos"
+				case 1:
+					return "os2"
+				case 2:
+					return "windows"
+				case 3:
+					return "unix"
+				case 4:
+					return "macos"
+				case 5:
+					return "beos"
+			}
+			return "unknown"
+		}
+
+		def methodName(r RarRecord) string {
+			return "" when r.isDir
+			return "store" when r.method == 0
+			return "rar15" when h.format != RarFormat.Rar50 && r.unpVer <= 15
+			return "rar20" when r.unpVer := 20 || 26
+			return "rar29" when r.unpVer := 29 || 36
+			return "rar50" when r.unpVer == 50
+			return "rar70" when r.unpVer == 70
+			return "rar{r.unpVer}"
+		}
+
+		def toEntry(r RarRecord) Entry {
+			let mode = os.FileMode(0o644)
+			if r.unixHost {
+				mode = fromUnixMode(r.attr)
+			} else if r.attr & 0x01 != 0 {
+				mode = os.FileMode(0o444)
+			}
+			let target = ""
+			let attrs = map<string, string>{}
+			attrs["rar.host"] = hostName(r)
+			attrs["rar.attributes"] = "{r.attr}"
+			attrs["rar.level"] = "{r.method}" unless r.isDir
+			attrs["rar.solid"] = "true" when r.solid
+			switch {
+				case r.redirType == redirUnixLink || r.redirType == redirWinLink || r.redirType == redirJunction:
+					mode = os.FileMode(int(os.FileMode.Symlink) | 0o777)
+					target = r.redirName.replace("\\", "/")
+					attrs["rar.redirect"] = (r.redirType == redirJunction) ?? ("junction", (r.redirType == redirWinLink) ?? ("windows-symlink", "unix-symlink"))
+				case r.redirType == redirHardLink || r.redirType == redirFileCopy:
+					mode = os.FileMode(int(mode) & 0o777)
+					attrs["rar.redirect"] = (r.redirType == redirHardLink) ?? ("hardlink", "filecopy")
+					attrs["rar.redirectTarget"] = r.redirName
+				default:
+			}
+			attrs["rar.blake2sp"] = r.blake.hex().lower() when r.blake.len() == 32 && !r.useHashKey
+			if r.isDir {
+				let perm = int(mode) & 0o777
+				perm = 0o755 when perm := 0o644 || 0o444 || 0
+				mode = os.FileMode(int(os.FileMode.Dir) | perm)
+			}
+			let plainCrc = r.hasCrc && !r.useHashKey && !r.sum14
+			return Entry{
+				name:           r.name,
+				comment:        r.comment,
+				mode:           mode,
+				crc32:          plainCrc ?? (uint32(r.crc), uint32(0)),
+				size:           uint64(r.size),
+				compressedSize: uint64(r.packSize),
+				modTime:        r.mtime,
+				accessTime:     r.atime,
+				createTime:     r.ctime,
+				linkTarget:     target,
+				encrypted:      r.crypt != CryptMethod.None,
+				method:         methodName(r),
+				attributes:     attrs,
+			}
+		}
+
+		// close implements io.Closer: closes every volume.
+		def close() !none {
+			let failure = ""
+			for let v in h.volumes {
+				v.close() onerror (e error) {
+					failure = e.message
+					recover none
+				}
+			}
+			fail failure unless failure.isEmpty()
+			return none
+		}
+
+		def entries() Entry[] {
+			return list
+		}
+
+		def entry(name string) ?Entry {
+			for let e in list {
+				return e when e.name == name
+			}
+			return none
+		}
+
+		def indexOf(name string) int {
+			for let (i, e) in list {
+				return i when e.name == name
+			}
+			return -1
+		}
+
+		// Whether a record's data goes through the decoder.
+		def compressed(r RarRecord) bool {
+			return !r.isDir && r.method != 0 && r.redirType == redirNone && !r.dataLink()
+		}
+
+		// The first record of the solid stream `k` belongs to.
+		def chainStart(k int) int {
+			let s = k
+			for s > 0 && h.records[s].solid {
+				let prev = s - 1
+				for prev > 0 && !compressed(h.records[prev]) {
+					prev--
+				}
+				break unless compressed(h.records[prev])
+				s = prev
+			}
+			return s
+		}
+
+		// The window a solid stream needs: its dictionary, cut down to the
+		// smallest power of two that holds all the stream's output.
+		def chainWindow(s int) int {
+			let dict = 0
+			let total = 0
+			let known = true
+			for let i = s; i < h.records.len(); i++ {
+				let r = h.records[i]
+				break when i > s && compressed(r) && !r.solid
+				continue unless compressed(r)
+				dict = r.winSize when r.winSize > dict
+				known = false when r.unknownSize
+				total += r.size
+			}
+			dict = 0x40000 when dict < 0x40000
+			return dict unless known
+			let need = 0x40000
+			for need < total && need < dict {
+				need *= 2
+			}
+			return (need < dict) ?? (need, dict)
+		}
+
+		def packedReader(r RarRecord) !io.Reader {
+			return try packedFor(h.volumes, r, password, keys)
+		}
+
+		def hashKey(r RarRecord) byte[] {
+			return hashKeyFor(r, password, keys)
+		}
+
+		// Decodes the rest of the file the decoder is in the middle of, so a
+		// solid stream can go on to the next one.
+		def finishCurrent() !none {
+			let un = unpacker
+			let sink byte[] = []
+			sink.len(64 * 1024)
+			for !un.done {
+				let finished = try un.step()
+				for un.core.drain(sink) > 0 {}
+				break when finished
+			}
+			return none
+		}
+
+		// Runs the decoder over records up to (not including) `k` of the solid
+		// stream starting at `s`, discarding their output.
+		def advanceTo(s int, k int) !none {
+			let un = unpacker
+			if un.chain != s || un.next > k {
+				un.chain = s
+				un.next = s
+			} else {
+				try finishCurrent()
+			}
+			for un.next < k {
+				let r = h.records[un.next]
+				un.next++
+				continue unless compressed(r)
+				let packed = try packedReader(r)
+				try un.start(r, h.format, packed, un.next - 1 != s, chainWindow(s))
+				let sink byte[] = []
+				sink.len(64 * 1024)
+				for {
+					let finished = try un.step()
+					for un.core.drain(sink) > 0 {}
+					break when finished
+				}
+			}
+			return none
+		}
+
+		def open(entry Entry) !io.Reader {
+			let k = indexOf(entry.name)
+			fail "rar: no entry named " + entry.name when k < 0
+			return try openRecord(records[k], 0)
+		}
+
+		def openRecord(index int, depth int) !io.Reader {
+			fail "rar: links between entries go round in a circle" when depth > 16
+			let r = h.records[index]
+			return new bytes.Reader([]) when r.isDir
+			switch {
+				case r.redirType == redirUnixLink || r.redirType == redirWinLink || r.redirType == redirJunction:
+					return new bytes.Reader(r.redirName.replace("\\", "/").bytes())
+				case r.redirType == redirHardLink || r.redirType == redirFileCopy:
+					let target = r.redirName.replace("\\", "/")
+					for let i = 0; i < index; i++ {
+						let t = h.records[i]
+						return try openRecord(i, depth + 1) when t.name == target && !t.isDir
+					}
+					fail "rar: " + r.name + " refers to " + target + ", which is not an earlier entry"
+				default:
+			}
+			ticket++
+			let verifier = new Verifier(r, hashKey(r))
+			if r.dataLink() {
+				let target = try readAll(try packedReader(r))
+				let text = target[0:(r.packSize < target.len()) ?? (r.packSize, target.len())]
+				let zero = text.indexOf(byte(0))
+				let link = (zero >= 0) ?? (text[0:zero], text)
+				verifier.write(link)
+				try verifier.verify(r.crypt != CryptMethod.None)
+				return new bytes.Reader(link)
+			}
+			if r.method == 0 {
+				let packed = try packedReader(r)
+				return new StoredReader(packed, r, verifier)
+			}
+			let s = chainStart(index)
+			try advanceTo(s, index)
+			let un = unpacker
+			let packed = try packedReader(r)
+			try un.start(r, h.format, packed, index != s, chainWindow(s))
+			un.next = index + 1
+			return new RarEntryReader(self, ticket, r, verifier)
+		}
+
+		def extract(dir string, opts ExtractOptions = ExtractOptions{}) !int {
+			return extractAll(self, dir, opts)
+		}
+
+		def extract(entry Entry, dir string, opts ExtractOptions = ExtractOptions{}) !none {
+			return extractEntry(self, entry, dir, opts)
+		}
+	}
+
+	// A stored entry: its packed bytes, cut at its size and checked.
+	type StoredReader {
+		src      io.Reader
+		rec      RarRecord
+		verifier Verifier
+		left     int
+		checked  bool
+
+		def new(src io.Reader, rec RarRecord, verifier Verifier) {
+			self.src = src
+			self.rec = rec
+			self.verifier = verifier
+			left = rec.unknownSize ?? (-1, rec.size)
+		}
+
+		// Implements io.Reader. Fails when the data is short or its checksum
+		// does not match.
+		def read(p byte[]) !int {
+			if p.len() == 0 || left == 0 {
+				try complete()
+				return 0
+			}
+			let want = p.len()
+			want = left when left > 0 && left < want
+			let n = try src.read(p[0:want])
+			if n <= 0 {
+				fail "rar: " + rec.name + ": the data ended early" when left > 0
+				try complete()
+				return 0
+			}
+			verifier.write(p[0:n])
+			left -= n when left > 0
+			if left == 0 {
+				try complete()
+			}
+			return n
+		}
+
+		def complete() !none {
+			return none when checked
+			checked = true
+			return verifier.verify(rec.crypt != CryptMethod.None)
+		}
+	}
+
+	// A compressed entry's bytes, decoded on demand through the archive's
+	// shared decoder.
+	type RarEntryReader {
+		arc      RarArchive
+		ticket   int
+		rec      RarRecord
+		verifier Verifier
+		left     int
+		checked  bool
+
+		def new(arc RarArchive, ticket int, rec RarRecord, verifier Verifier) {
+			self.arc = arc
+			self.ticket = ticket
+			self.rec = rec
+			self.verifier = verifier
+			left = rec.unknownSize ?? (-1, rec.size)
+		}
+
+		// Implements io.Reader. Fails when a later `open` took the decoder
+		// over, the data is corrupt or short, or its checksum does not match.
+		def read(p byte[]) !int {
+			return 0 when p.len() == 0
+			if left == 0 {
+				try complete()
+				return 0
+			}
+			fail "rar: this entry's reader was superseded by a later open" when arc.ticket != ticket
+			let un = arc.unpacker
+			for {
+				let want = p.len()
+				want = left when left > 0 && left < want
+				let n = un.core.drain(p[0:want])
+				if n > 0 {
+					verifier.write(p[0:n])
+					left -= n when left > 0
+					if left == 0 {
+						try complete()
+					}
+					return n
+				}
+				if un.done {
+					fail "rar: " + rec.name + ": " + ((rec.crypt != CryptMethod.None) ?? ("wrong password or corrupt data", "the data ended early")) when left > 0
+					try complete()
+					return 0
+				}
+				let failure = ""
+				un.step() onerror (e error) {
+					failure = e.message
+					recover true
+				}
+				if !failure.isEmpty() {
+					fail "rar: " + rec.name + ": wrong password or corrupt data" when rec.crypt != CryptMethod.None
+					fail "rar: " + rec.name + ": " + bareMessage(failure)
+				}
+			}
+			return 0
+		}
+
+		def complete() !none {
+			return none when checked
+			checked = true
+			return verifier.verify(rec.crypt != CryptMethod.None)
+		}
+	}
+
+	// Decodes a whole packed buffer: archive comments.
+	def unpackBuffer(data byte[], size int, unpVer int) !byte[] {
+		let un = new Unpacker()
+		let rec = new RarRecord()
+		rec.name = "comment"
+		rec.size = size
+		rec.unpVer = unpVer
+		try un.start(rec, RarFormat.Rar15, new bytes.Reader(data), false, 0x40000)
+		return try drainAll(un, size)
+	}
+
+	def drainAll(un Unpacker, size int) !byte[] {
+		let out byte[] = []
+		let buf byte[] = []
+		buf.len(64 * 1024)
+		for {
+			let finished = try un.step()
+			for {
+				let n = un.core.drain(buf)
+				break when n == 0
+				out = out + buf[0:n]
+			}
+			break when finished
+		}
+		return out[0:size].clone() when out.len() > size
+		return out
+	}
+
+	// The whole unpacked data of a record decoded on its own: service data
+	// such as comments. Fails when it cannot be read or does not match its
+	// checksum.
+	def readRecordData(h RarHeaders, r RarRecord, password string, keys KeyCache) !byte[] {
+		let packed = try packedFor(h.volumes, r, password, keys)
+		let verifier = new Verifier(r, hashKeyFor(r, password, keys))
+		let data byte[] = []
+		if r.method == 0 {
+			let all = try readAll(packed)
+			data = all[0:(r.size < all.len()) ?? (r.size, all.len())]
+		} else {
+			let un = new Unpacker()
+			try un.start(r, h.format, packed, false, (r.winSize < 0x40000) ?? (0x40000, r.winSize))
+			data = try drainAll(un, r.size)
+		}
+		verifier.write(data)
+		try verifier.verify(r.crypt != CryptMethod.None)
+		return data
+	}
+
+	// The decrypted packed bytes of a record. Fails when the record is
+	// encrypted and the password is missing or known to be wrong.
+	def packedFor(volumes Source[], r RarRecord, password string, keys KeyCache) !io.Reader {
+		let raw = new PartsReader(volumes, r.parts)
+		return raw when r.crypt == CryptMethod.None
+		fail "rar: " + r.name + " is encrypted; a password is needed" when password.isEmpty()
+		if r.crypt == CryptMethod.Rar50 {
+			fail "rar: " + r.name + " uses an unknown encryption version" when r.lg2 < 0 || r.lg2 > 24
+			let k = keys.rar50(password, r.salt, r.lg2)
+			fail "rar: wrong password for " + r.name when r.usePswCheck && k.pswCheck.hex() != r.pswCheck.hex()
+		}
+		let dec = newDecryptor(r.crypt, password, r.salt, r.iv, r.lg2, keys)
+		return new DecryptReader(raw, dec)
+	}
+
+	// The key that turns a RAR 5 entry's checksum into the HMAC its header
+	// stores, empty when it stores the plain checksum.
+	def hashKeyFor(r RarRecord, password string, keys KeyCache) byte[] {
+		return [] unless r.useHashKey && r.crypt == CryptMethod.Rar50 && !password.isEmpty()
+		return keys.rar50(password, r.salt, r.lg2).hashKey
+	}
+
+	// An error message without its "rar: " prefix, for wrapping.
+	def bareMessage(text string) string {
+		return text.startsWith("rar: ") ?? (text.slice(5, text.len()), text)
+	}
+}

@@ -1,0 +1,1016 @@
+internal partial module std.data.compress.ppm.model {
+	use std.io
+
+	// The PPMd variant H model (Dmitry Shkarin's PPMd, as 7-Zip's Ppmd7 and
+	// RAR 3.x use it) over one byte heap. Contexts, states and free blocks
+	// live in the heap at fixed byte layouts, so the allocator, and with it
+	// the point where the model runs out of memory and restarts, behaves
+	// exactly as the reference encoders' does.
+	//
+	// Layouts (little endian):
+	//   context, 12 bytes: numStats u16, summFreq u16, stats u32, suffix u32;
+	//     with one state, that state sits at +2 (symbol, freq, successor u32)
+	//   state, 6 bytes: symbol, freq, successor u32
+	//   free node, 12 bytes: stamp u16, nu u16, next u32, prev u32
+	const (
+		unitSize    = 12
+		maxFreq     = 124
+		intBits     = 7
+		periodBits  = 7
+		binScale    = 1 << 14
+		numIndexes  = 38
+		dummySee    = 400
+		kTop        = 1 << 24
+		kBot        = 1 << 15
+		mask32      = 0xFFFFFFFF
+		// What `decode` returns at the end mark and on corrupt data.
+		symbolEnd   = -1
+		symbolError = -2
+	)
+
+	internal const expEscape = int[25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2]
+	internal const initBinEsc = int[0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051]
+
+	// Model is the PPMd H context model with its range decoder.
+	//
+	// `rar` picks the RAR 3.x flavour: Subbotin's carryless range coder and
+	// unrar's signed comparison in the SEE escape estimate. Otherwise it is
+	// the 7-Zip flavour.
+	type Model {
+		rar         bool
+		heap        byte[]
+		size        int
+		alignOffset int
+		text        int
+		unitsStart  int
+		loUnit      int
+		hiUnit      int
+		glueCount   int
+		indx2Units  int[]
+		units2Indx  int[]
+		freeList    int[]
+		ns2Indx     int[]
+		ns2BSIndx   int[]
+		seeSumm     int[]
+		seeShift    int[]
+		seeCount    int[]
+		binSumm     int[]
+		minContext  int
+		maxContext  int
+		foundState  int
+		orderFall   int
+		initEsc     int
+		prevSuccess int
+		maxOrder    int
+		hiBitsFlag  int
+		runLength   int
+		initRL      int
+		escFreq     int
+		charMask    int[]
+		maskStamp   int
+		// The next coded byte, 0 once the input is exhausted.
+		input       def() int
+		range       int
+		code        int
+		low         int
+
+		def new(input def() int, rar bool) {
+			self.input = input
+			self.rar = rar
+			heap = []
+			indx2Units = []
+			indx2Units.len(numIndexes)
+			units2Indx = []
+			units2Indx.len(128)
+			freeList = []
+			freeList.len(numIndexes)
+			ns2Indx = []
+			ns2Indx.len(256)
+			ns2BSIndx = []
+			ns2BSIndx.len(256)
+			seeSumm = []
+			seeSumm.len(401)
+			seeShift = []
+			seeShift.len(401)
+			seeCount = []
+			seeCount.len(401)
+			binSumm = []
+			binSumm.len(128 * 64)
+			charMask = []
+			charMask.len(256)
+			let k = 0
+			for let i = 0; i < numIndexes; i++ {
+				let step = (i >= 12) ?? (4, (i >> 2) + 1)
+				for let j = 0; j < step; j++ {
+					units2Indx[k] = i
+					k++
+				}
+				indx2Units[i] = k
+			}
+			ns2BSIndx[0] = 0
+			ns2BSIndx[1] = 2
+			for let i = 2; i < 11; i++ {
+				ns2BSIndx[i] = 4
+			}
+			for let i = 11; i < 256; i++ {
+				ns2BSIndx[i] = 6
+			}
+			for let i = 0; i < 3; i++ {
+				ns2Indx[i] = i
+			}
+			let m = 3
+			let left = 1
+			for let i = 3; i < 256; i++ {
+				ns2Indx[i] = m
+				left--
+				if left == 0 {
+					m++
+					left = m - 2
+				}
+			}
+		}
+
+		// Whether a model was set up by `start`.
+		def ready() bool {
+			return size > 0
+		}
+
+		// start allocates `memory` bytes of model heap and resets the model to
+		// `order`.
+		def start(order int, memory int) {
+			if heap.len() == 0 || size != memory {
+				alignOffset = (4 - memory) & 3
+				heap = []
+				heap.len(alignOffset + memory + unitSize)
+				size = memory
+			}
+			maxOrder = order
+			restart()
+		}
+
+		// --- heap access ---
+
+		def u16(at int) int {
+			return int(heap[at]) | (int(heap[at + 1]) << 8)
+		}
+
+		def set16(at int, v int) {
+			heap[at] = byte(v)
+			heap[at + 1] = byte(v >> 8)
+		}
+
+		def u32(at int) int {
+			return int(heap[at]) | (int(heap[at + 1]) << 8) | (int(heap[at + 2]) << 16) | (int(heap[at + 3]) << 24)
+		}
+
+		def set32(at int, v int) {
+			heap[at] = byte(v)
+			heap[at + 1] = byte(v >> 8)
+			heap[at + 2] = byte(v >> 16)
+			heap[at + 3] = byte(v >> 24)
+		}
+
+		def copyBytes(dst int, src int, n int) {
+			for let i = 0; i < n; i++ {
+				heap[dst + i] = heap[src + i]
+			}
+		}
+
+		// Exchanges the 6-byte states at `a` and `b`.
+		def swapStates(a int, b int) {
+			for let i = 0; i < 6; i++ {
+				let t = heap[a + i]
+				heap[a + i] = heap[b + i]
+				heap[b + i] = t
+			}
+		}
+
+		def i2u(indx int) int {
+			return indx2Units[indx]
+		}
+
+		def u2i(nu int) int {
+			return units2Indx[nu - 1]
+		}
+
+		// --- allocator ---
+
+		def insertNode(node int, indx int) {
+			set32(node, freeList[indx])
+			freeList[indx] = node
+		}
+
+		def removeNode(indx int) int {
+			let node = freeList[indx]
+			freeList[indx] = u32(node)
+			return node
+		}
+
+		def splitBlock(ptr int, oldIndx int, newIndx int) {
+			let nu = i2u(oldIndx) - i2u(newIndx)
+			let at = ptr + unitSize * i2u(newIndx)
+			let i = u2i(nu)
+			if i2u(i) != nu {
+				i--
+				let k = i2u(i)
+				insertNode(at + unitSize * k, nu - k - 1)
+			}
+			insertNode(at, i)
+		}
+
+		def glueFreeBlocks() {
+			let n = 0
+			glueCount = 255
+			set16(loUnit, 1) when loUnit != hiUnit
+			for let i = 0; i < numIndexes; i++ {
+				let nu = i2u(i)
+				let next = freeList[i]
+				freeList[i] = 0
+				for next != 0 {
+					let node = next
+					next = u32(node)
+					set16(node, 0)
+					set16(node + 2, nu)
+					set32(node + 4, n)
+					n = node
+				}
+			}
+			let head = n
+			// The node whose next field links to the current one, -1 for head.
+			let prev = -1
+			for n != 0 {
+				let node = n
+				let nu = u16(node + 2)
+				n = u32(node + 4)
+				if nu == 0 {
+					if prev < 0 {
+						head = n
+					} else {
+						set32(prev + 4, n)
+					}
+					continue
+				}
+				prev = node
+				for {
+					let node2 = node + nu * unitSize
+					nu += u16(node2 + 2)
+					break when u16(node2) != 0 || nu >= 0x10000
+					set16(node + 2, nu)
+					set16(node2 + 2, 0)
+				}
+			}
+			n = head
+			for n != 0 {
+				let node = n
+				let nu = u16(node + 2)
+				n = u32(node + 4)
+				continue when nu == 0
+				for nu > 128 {
+					insertNode(node, numIndexes - 1)
+					nu -= 128
+					node += 128 * unitSize
+				}
+				let i = u2i(nu)
+				if i2u(i) != nu {
+					i--
+					let k = i2u(i)
+					insertNode(node + k * unitSize, nu - k - 1)
+				}
+				insertNode(node, i)
+			}
+		}
+
+		// Returns 0 when the heap is exhausted.
+		def allocUnitsRare(indx int) int {
+			if glueCount == 0 {
+				glueFreeBlocks()
+				return removeNode(indx) when freeList[indx] != 0
+			}
+			let i = indx
+			for {
+				i++
+				if i == numIndexes {
+					let numBytes = unitSize * i2u(indx)
+					let us = unitsStart
+					glueCount--
+					if us - text > numBytes {
+						unitsStart = us - numBytes
+						return unitsStart
+					}
+					return 0
+				}
+				break when freeList[i] != 0
+			}
+			let block = removeNode(i)
+			splitBlock(block, i, indx)
+			return block
+		}
+
+		def allocUnits(indx int) int {
+			return removeNode(indx) when freeList[indx] != 0
+			let numBytes = unitSize * i2u(indx)
+			let lo = loUnit
+			if hiUnit - lo >= numBytes {
+				loUnit = lo + numBytes
+				return lo
+			}
+			return allocUnitsRare(indx)
+		}
+
+		// --- model ---
+
+		def restart() {
+			for let i = 0; i < numIndexes; i++ {
+				freeList[i] = 0
+			}
+			text = alignOffset
+			hiUnit = text + size
+			unitsStart = hiUnit - size / 8 / unitSize * 7 * unitSize
+			loUnit = unitsStart
+			glueCount = 0
+			orderFall = maxOrder
+			initRL = -((maxOrder < 12) ?? (maxOrder, 12)) - 1
+			runLength = initRL
+			prevSuccess = 0
+
+			hiUnit -= unitSize
+			let mc = hiUnit
+			let s = loUnit
+			loUnit += unitSize * 128
+			maxContext = mc
+			minContext = mc
+			foundState = s
+			set16(mc, 256)
+			set16(mc + 2, 257)
+			set32(mc + 4, s)
+			set32(mc + 8, 0)
+			for let i = 0; i < 256; i++ {
+				heap[s] = byte(i)
+				heap[s + 1] = 1
+				set32(s + 2, 0)
+				s += 6
+			}
+			for let i = 0; i < 128; i++ {
+				for let k = 0; k < 8; k++ {
+					let v = binScale - initBinEsc[k] / (i + 2)
+					for let m = 0; m < 64; m += 8 {
+						binSumm[i * 64 + k + m] = v
+					}
+				}
+			}
+			for let i = 0; i < 25; i++ {
+				let summ = (5 * i + 10) << (periodBits - 4)
+				for let k = 0; k < 16; k++ {
+					seeSumm[i * 16 + k] = summ
+					seeShift[i * 16 + k] = periodBits - 4
+					seeCount[i * 16 + k] = 4
+				}
+			}
+			seeSumm[dummySee] = 0
+			seeShift[dummySee] = periodBits
+			seeCount[dummySee] = 64
+		}
+
+		def createSuccessors() int {
+			let c = minContext
+			let upBranch = u32(foundState + 2)
+			let ps int[] = []
+			ps.len(64)
+			let numPs = 0
+			if orderFall != 0 {
+				ps[numPs] = foundState
+				numPs++
+			}
+			for u32(c + 8) != 0 {
+				c = u32(c + 8)
+				let s = c + 2
+				if u16(c) != 1 {
+					let sym = heap[foundState]
+					s = u32(c + 4)
+					for heap[s] != sym {
+						s += 6
+					}
+				}
+				let successor = u32(s + 2)
+				if successor != upBranch {
+					c = successor
+					return c when numPs == 0
+					break
+				}
+				ps[numPs] = s
+				numPs++
+			}
+			let newSym = heap[upBranch]
+			upBranch++
+			let newFreq = 0
+			if u16(c) == 1 {
+				newFreq = int(heap[c + 3])
+			} else {
+				let s = u32(c + 4)
+				for heap[s] != newSym {
+					s += 6
+				}
+				let cf = int(heap[s + 1]) - 1
+				let s0 = u16(c + 2) - u16(c) - cf
+				if 2 * cf <= s0 {
+					newFreq = 1 + ((5 * cf > s0) ?? (1, 0))
+				} else {
+					newFreq = 1 + (2 * cf + s0 - 1) / (2 * s0) + 1
+				}
+			}
+			for {
+				let c1 = 0
+				if hiUnit != loUnit {
+					hiUnit -= unitSize
+					c1 = hiUnit
+				} else if freeList[0] != 0 {
+					c1 = removeNode(0)
+				} else {
+					c1 = allocUnitsRare(0)
+					return 0 when c1 == 0
+				}
+				set16(c1, 1)
+				heap[c1 + 2] = newSym
+				heap[c1 + 3] = byte(newFreq)
+				set32(c1 + 4, upBranch)
+				set32(c1 + 8, c)
+				numPs--
+				set32(ps[numPs] + 2, c1)
+				c = c1
+				break when numPs == 0
+			}
+			return c
+		}
+
+		def updateModel() {
+			let fs = foundState
+			let fsym = heap[fs]
+			let ffreq = int(heap[fs + 1])
+			if ffreq < maxFreq / 4 && u32(minContext + 8) != 0 {
+				let c = u32(minContext + 8)
+				if u16(c) == 1 {
+					let s = c + 2
+					heap[s + 1] = heap[s + 1] + 1 when heap[s + 1] < 32
+				} else {
+					let s = u32(c + 4)
+					if heap[s] != fsym {
+						for {
+							s += 6
+							break when heap[s] == fsym
+						}
+						if heap[s + 1] >= heap[s - 5] {
+							swapStates(s, s - 6)
+							s -= 6
+						}
+					}
+					if int(heap[s + 1]) < maxFreq - 9 {
+						heap[s + 1] = byte(int(heap[s + 1]) + 2)
+						set16(c + 2, u16(c + 2) + 2)
+					}
+				}
+			}
+
+			if orderFall == 0 {
+				minContext = createSuccessors()
+				maxContext = minContext
+				if minContext == 0 {
+					restart()
+					return
+				}
+				set32(foundState + 2, minContext)
+				return
+			}
+
+			heap[text] = fsym
+			text++
+			if text >= unitsStart {
+				restart()
+				return
+			}
+			let maxSuccessor = text
+			let minSuccessor = u32(fs + 2)
+			if minSuccessor != 0 {
+				if minSuccessor <= maxSuccessor {
+					let cs = createSuccessors()
+					if cs == 0 {
+						restart()
+						return
+					}
+					minSuccessor = cs
+				}
+				orderFall--
+				if orderFall == 0 {
+					maxSuccessor = minSuccessor
+					text -= 1 when maxContext != minContext
+				}
+			} else {
+				set32(fs + 2, maxSuccessor)
+				minSuccessor = minContext
+			}
+
+			let mc = minContext
+			let c = maxContext
+			minContext = minSuccessor
+			maxContext = minSuccessor
+			return when c == mc
+			let ns = u16(mc)
+			let s0 = u16(mc + 2) - ns - (ffreq - 1)
+			for {
+				let ns1 = u16(c)
+				let sum = 0
+				if ns1 != 1 {
+					if ns1 & 1 == 0 {
+						let oldNU = ns1 >> 1
+						let i = u2i(oldNU)
+						if i != u2i(oldNU + 1) {
+							let ptr = allocUnits(i + 1)
+							if ptr == 0 {
+								restart()
+								return
+							}
+							let oldPtr = u32(c + 4)
+							copyBytes(ptr, oldPtr, oldNU * unitSize)
+							insertNode(oldPtr, i)
+							set32(c + 4, ptr)
+						}
+					}
+					sum = u16(c + 2)
+					let a = (2 * ns1 < ns) ?? (1, 0)
+					let b = ((4 * ns1 <= ns) && (sum <= 8 * ns1)) ?? (1, 0)
+					sum += a + 2 * b
+				} else {
+					let s = allocUnits(0)
+					if s == 0 {
+						restart()
+						return
+					}
+					let freq = int(heap[c + 3])
+					heap[s] = heap[c + 2]
+					set32(s + 2, u32(c + 4))
+					set32(c + 4, s)
+					freq = (freq < maxFreq / 4 - 1) ?? (freq << 1, maxFreq - 4)
+					heap[s + 1] = byte(freq)
+					sum = freq + initEsc + ((ns > 3) ?? (1, 0))
+				}
+				let s = u32(c + 4) + 6 * ns1
+				let cf = 2 * (sum + 6) * ffreq
+				let sf = s0 + sum
+				heap[s] = fsym
+				set16(c, ns1 + 1)
+				set32(s + 2, maxSuccessor)
+				if cf < 6 * sf {
+					cf = 1 + ((cf > sf) ?? (1, 0)) + ((cf >= 4 * sf) ?? (1, 0))
+					sum += 3
+				} else {
+					cf = 4 + ((cf >= 9 * sf) ?? (1, 0)) + ((cf >= 12 * sf) ?? (1, 0)) + ((cf >= 15 * sf) ?? (1, 0))
+					sum += cf
+				}
+				set16(c + 2, sum)
+				heap[s + 1] = byte(cf)
+				c = u32(c + 8)
+				break when c == mc
+			}
+		}
+
+		def rescale() {
+			let mc = minContext
+			let stats = u32(mc + 4)
+			let s = foundState
+			// Move the found state to the front.
+			if s != stats {
+				let t0 = heap[s]
+				let t1 = heap[s + 1]
+				let t2 = u32(s + 2)
+				for s != stats {
+					copyBytes(s, s - 6, 6)
+					s -= 6
+				}
+				heap[s] = t0
+				heap[s + 1] = t1
+				set32(s + 2, t2)
+			}
+			let sumFreq = int(heap[s + 1])
+			let esc = u16(mc + 2) - sumFreq
+			let adder = (orderFall != 0) ?? (1, 0)
+			sumFreq = (sumFreq + 4 + adder) >> 1
+			let i = u16(mc) - 1
+			heap[s + 1] = byte(sumFreq)
+			for {
+				s += 6
+				let freq = int(heap[s + 1])
+				esc -= freq
+				freq = (freq + adder) >> 1
+				sumFreq += freq
+				heap[s + 1] = byte(freq)
+				if freq > int(heap[s - 5]) {
+					let t0 = heap[s]
+					let t1 = heap[s + 1]
+					let t2 = u32(s + 2)
+					let s1 = s
+					for {
+						copyBytes(s1, s1 - 6, 6)
+						s1 -= 6
+						break when s1 == stats || freq <= int(heap[s1 - 5])
+					}
+					heap[s1] = t0
+					heap[s1 + 1] = t1
+					set32(s1 + 2, t2)
+				}
+				i--
+				break when i == 0
+			}
+			if heap[s + 1] == 0 {
+				let zeros = 0
+				for {
+					zeros++
+					s -= 6
+					break when heap[s + 1] != 0
+				}
+				esc += zeros
+				let numStats = u16(mc)
+				let numStatsNew = numStats - zeros
+				set16(mc, numStatsNew)
+				let n0 = (numStats + 1) >> 1
+				if numStatsNew == 1 {
+					let freq = int(heap[stats + 1])
+					for {
+						esc >>= 1
+						freq = (freq + 1) >> 1
+						break when esc <= 1
+					}
+					let one = mc + 2
+					copyBytes(one, stats, 6)
+					heap[one + 1] = byte(freq)
+					foundState = one
+					insertNode(stats, u2i(n0))
+					return
+				}
+				let n1 = (numStatsNew + 1) >> 1
+				if n0 != n1 {
+					let i0 = u2i(n0)
+					let i1 = u2i(n1)
+					if i0 != i1 {
+						if freeList[i1] != 0 {
+							let ptr = removeNode(i1)
+							set32(mc + 4, ptr)
+							copyBytes(ptr, stats, n1 * unitSize)
+							insertNode(stats, i0)
+						} else {
+							splitBlock(stats, i0, i1)
+						}
+					}
+				}
+			}
+			set16(mc + 2, sumFreq + esc - (esc >> 1))
+			foundState = u32(mc + 4)
+		}
+
+		// The SEE context for an escape from the current context with
+		// `numMasked` symbols excluded; sets `escFreq`.
+		def makeEscFreq(numMasked int) int {
+			let mc = minContext
+			let numStats = u16(mc)
+			if numStats == 256 {
+				escFreq = 1
+				return dummySee
+			}
+			let nonMasked = numStats - numMasked
+			let diff = u16(u32(mc + 8)) - numStats
+			// 7-Zip compares unsigned, unrar signed; they part only when the
+			// suffix has fewer symbols than the context.
+			let fewer = rar ?? (nonMasked < diff, diff < 0 || nonMasked < diff)
+			let see = ns2Indx[nonMasked - 1] * 16 + (fewer ?? (1, 0)) + 2 * ((u16(mc + 2) < 11 * numStats) ?? (1, 0)) + 4 * ((numMasked > nonMasked) ?? (1, 0)) + hiBitsFlag
+			let summ = seeSumm[see]
+			let r = summ >> seeShift[see]
+			seeSumm[see] = (summ - r) & 0xFFFF
+			escFreq = r + ((r == 0) ?? (1, 0))
+			return see
+		}
+
+		def seeUpdate(see int) {
+			if seeShift[see] < periodBits {
+				seeCount[see] = seeCount[see] - 1
+				if seeCount[see] == 0 {
+					seeSumm[see] = (seeSumm[see] << 1) & 0xFFFF
+					seeCount[see] = (3 << seeShift[see]) & 0xFF
+					seeShift[see] = seeShift[see] + 1
+				}
+			}
+		}
+
+		def nextContext() {
+			let c = u32(foundState + 2)
+			if orderFall == 0 && c > text {
+				minContext = c
+				maxContext = c
+			} else {
+				updateModel()
+			}
+		}
+
+		def update1() {
+			let s = foundState
+			let freq = int(heap[s + 1]) + 4
+			set16(minContext + 2, u16(minContext + 2) + 4)
+			heap[s + 1] = byte(freq)
+			if freq > int(heap[s - 5]) {
+				swapStates(s, s - 6)
+				foundState = s - 6
+				rescale() when freq > maxFreq
+			}
+			nextContext()
+		}
+
+		def update1First() {
+			let s = foundState
+			let mc = minContext
+			let freq = int(heap[s + 1])
+			let summFreq = u16(mc + 2)
+			prevSuccess = (2 * freq > summFreq) ?? (1, 0)
+			runLength += prevSuccess
+			set16(mc + 2, summFreq + 4)
+			freq += 4
+			heap[s + 1] = byte(freq)
+			rescale() when freq > maxFreq
+			nextContext()
+		}
+
+		def update2() {
+			let s = foundState
+			let freq = int(heap[s + 1]) + 4
+			runLength = initRL
+			set16(minContext + 2, u16(minContext + 2) + 4)
+			heap[s + 1] = byte(freq)
+			rescale() when freq > maxFreq
+			updateModel()
+		}
+
+		def hiBits3(sym int) int {
+			return ((sym + 0xC0) >> (8 - 3)) & (1 << 3)
+		}
+
+		def hiBits4(sym int) int {
+			return ((sym + 0xC0) >> (8 - 4)) & (1 << 4)
+		}
+
+		def binSummIndex() int {
+			let mc = minContext
+			let one = mc + 2
+			hiBitsFlag = hiBits3(int(heap[foundState]))
+			let col = prevSuccess + ((runLength >> 26) & 0x20) + ns2BSIndx[u16(u32(mc + 8)) - 1] + hiBits4(int(heap[one])) + hiBitsFlag
+			return (int(heap[one + 1]) - 1) * 64 + col
+		}
+
+		// Excludes every symbol of the current context from the next escape
+		// round. `maskStamp` marks masked entries, so starting a fresh mask is
+		// one increment instead of clearing 256 entries.
+		def newMask() {
+			maskStamp++
+		}
+
+		def masked(sym int) bool {
+			return charMask[sym] == maskStamp
+		}
+
+		// --- range decoders ---
+
+		// startCoder reads the range decoder's first bytes and reports whether
+		// they are valid.
+		def startCoder() bool {
+			code = 0
+			range = mask32
+			low = 0
+			if !rar {
+				return false when input() != 0
+			}
+			for let i = 0; i < 4; i++ {
+				code = ((code << 8) | input()) & mask32
+			}
+			return code < mask32
+		}
+
+		def normalize() {
+			if rar {
+				for {
+					if (low ^ ((low + range) & mask32)) >= kTop {
+						break when range >= kBot
+						range = (0 - low) & (kBot - 1)
+					}
+					code = ((code << 8) | input()) & mask32
+					range = (range << 8) & mask32
+					low = (low << 8) & mask32
+				}
+				return
+			}
+			// 7-Zip normalizes at most twice after a decode.
+			step7z() when range < kTop
+			step7z() when range < kTop
+		}
+
+		// normalize1 is the normalization after a hit in a binary context:
+		// once in the 7-Zip flavour.
+		def normalize1() {
+			if rar {
+				normalize()
+				return
+			}
+			step7z() when range < kTop
+		}
+
+		def step7z() {
+			code = ((code << 8) | input()) & mask32
+			range = (range << 8) & mask32
+		}
+
+		def decodeRange(start int, size int) {
+			if rar {
+				let s = (start * range) & mask32
+				low = (low + s) & mask32
+				code = (code - s) & mask32
+				range = (range * size) & mask32
+			} else {
+				code = (code - start * range) & mask32
+				range = (range * size) & mask32
+			}
+		}
+
+		def threshold(total int) int {
+			range = range / total
+			return code / range
+		}
+
+		// decode returns the next byte, `symbolEnd` at the end mark or
+		// `symbolError` for corrupt data.
+		def decode() int {
+			let mc = minContext
+			if u16(mc) != 1 {
+				let s = u32(mc + 4)
+				let summFreq = u16(mc + 2)
+				return symbolError when rar && summFreq > range
+				let count = threshold(summFreq)
+				let hiCnt = count
+				count -= int(heap[s + 1])
+				if count < 0 {
+					decodeRange(0, int(heap[s + 1]))
+					normalize()
+					foundState = s
+					let sym = int(heap[s])
+					update1First()
+					return sym
+				}
+				prevSuccess = 0
+				let i = u16(mc) - 1
+				for {
+					s += 6
+					count -= int(heap[s + 1])
+					if count < 0 {
+						let f = int(heap[s + 1])
+						decodeRange((hiCnt - count) - f, f)
+						normalize()
+						foundState = s
+						let sym = int(heap[s])
+						update1()
+						return sym
+					}
+					i--
+					break when i == 0
+				}
+				return symbolError when hiCnt >= summFreq
+				hiCnt -= count
+				decodeRange(hiCnt, summFreq - hiCnt)
+				hiBitsFlag = hiBits3(int(heap[foundState]))
+				newMask()
+				let s2 = u32(mc + 4)
+				for s2 <= s {
+					charMask[int(heap[s2])] = maskStamp
+					s2 += 6
+				}
+			} else {
+				let one = mc + 2
+				let bi = binSummIndex()
+				let pr = binSumm[bi]
+				let size0 = (range >> 14) * pr
+				pr = pr - ((pr + (1 << (periodBits - 2))) >> periodBits)
+				if code < size0 {
+					binSumm[bi] = pr + (1 << intBits)
+					range = size0
+					normalize1()
+					let freq = int(heap[one + 1])
+					let c = u32(one + 2)
+					let sym = int(heap[one])
+					foundState = one
+					prevSuccess = 1
+					runLength++
+					heap[one + 1] = byte(freq + ((freq < 128) ?? (1, 0)))
+					if orderFall == 0 && c > text {
+						minContext = c
+						maxContext = c
+					} else {
+						updateModel()
+					}
+					return sym
+				}
+				binSumm[bi] = pr
+				initEsc = expEscape[pr >> 10]
+				if rar {
+					low = (low + size0) & mask32
+					code = (code - size0) & mask32
+					range = (range & ~(binScale - 1)) - size0
+				} else {
+					code = (code - size0) & mask32
+					range = (range - size0) & mask32
+				}
+				newMask()
+				charMask[int(heap[one])] = maskStamp
+				prevSuccess = 0
+			}
+			for {
+				normalize()
+				let c = minContext
+				let numMasked = u16(c)
+				for {
+					orderFall++
+					return symbolEnd when u32(c + 8) == 0
+					c = u32(c + 8)
+					break when u16(c) != numMasked
+				}
+				let n = u16(c)
+				let hiCnt = 0
+				let s = u32(c + 4)
+				minContext = c
+				for let k = 0; k < n; k++ {
+					hiCnt += int(heap[s + 1]) unless masked(int(heap[s]))
+					s += 6
+				}
+				let see = makeEscFreq(numMasked)
+				let freqSum = escFreq + hiCnt
+				return symbolError when rar && freqSum > range
+				let count = threshold(freqSum)
+				if count < hiCnt {
+					s = u32(c + 4)
+					let hit = count
+					for {
+						count -= int(heap[s + 1]) unless masked(int(heap[s]))
+						s += 6
+						break when count < 0
+					}
+					s -= 6
+					let f = int(heap[s + 1])
+					decodeRange((hit - count) - f, f)
+					normalize()
+					seeUpdate(see)
+					foundState = s
+					let sym = int(heap[s])
+					update2()
+					return sym
+				}
+				return symbolError when count >= freqSum
+				decodeRange(hiCnt, freqSum - hiCnt)
+				seeSumm[see] = (seeSumm[see] + freqSum) & 0xFFFF
+				s = u32(c + 4)
+				for let k = 0; k < n; k++ {
+					charMask[int(heap[s])] = maskStamp
+					s += 6
+				}
+			}
+			return symbolError
+		}
+	}
+
+	// A buffered byte view of an io.Reader for the range coder. A read error
+	// ends the input; the Reader reports it.
+	type ReaderSource {
+		r       io.Reader
+		buf     byte[]
+		head    int
+		filled  int
+		ended   bool
+		failure string
+
+		def new(r io.Reader) {
+			self.r = r
+			buf = []
+			buf.len(64 * 1024)
+		}
+
+		// The next byte, 0 once the reader is exhausted or failed.
+		def nextByte() int {
+			if head >= filled {
+				return 0 when ended
+				let n = r.read(buf) onerror (e error) {
+					failure = e.message
+					recover 0
+				}
+				if n <= 0 {
+					ended = true
+					return 0
+				}
+				head = 0
+				filled = n
+			}
+			let b = int(buf[head])
+			head++
+			return b
+		}
+	}
+}
