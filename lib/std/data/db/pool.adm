@@ -1,0 +1,464 @@
+partial module std.data.db {
+	use (
+		std.net.url
+		std.time
+		std.data.db.pooling::*
+		std.data.db.registry::*
+	)
+
+	// pool returns a pool of connections to the database a URL names. No
+	// connection is opened yet: the first statement opens the first.
+	// Fails with a DbError of ErrorKind.NoDriver when the program links no
+	// driver for the URL's scheme, and with a UrlError when the text is not
+	// a URL.
+	def pool(target string, limit int = 8) !Pool {
+		let parsed = try url.parse(target)
+		let found = registry.find(parsed.scheme)
+		fail errorOf(ErrorKind.NoDriver, "no driver for '{parsed.scheme}'") when found is none
+		return new Pool(found, parsed, limit)
+	}
+
+	// Pool keeps up to `limit` connections to one database and lends one to
+	// each statement, so tasks share the database without sharing a
+	// connection:
+	//
+	//     let shop = try db.pool("postgres://app:secret@db.internal/shop", 16)
+	//     try shop.exec("UPDATE stock SET left = left - 1 WHERE id = $1", id)
+	//
+	// It implements Connection. `exec` borrows a connection for the call.
+	// `query` keeps one until its rows end or are closed, `beginTx` until
+	// the transaction is committed or rolled back, `prepare` until the
+	// statement is closed. With every connection lent, the next borrower
+	// waits for one to come back.
+	//
+	// A connection that failed with ErrorKind.Connection, Closed or TimedOut
+	// is closed, not reused; one that sat idle for longer than `idleCheck`
+	// is pinged before it is lent again and replaced when it does not
+	// answer.
+	type Pool {
+		// The most connections open at once, behind `limit()`.
+		internal most   int
+		// How long a connection may sit idle before it is checked.
+		idleCheck       duration      = 30s
+		internal driver Driver
+		internal target url.URL
+		// One token per connection that may still be lent.
+		internal slots  channel<bool>
+		internal idle   Connection[]
+		internal parked time.Time[]
+		internal shut   bool
+
+		def new(driver Driver, target url.URL, limit int) {
+			self.driver = driver
+			self.target = target
+			most = limit < 1 ?? (1, limit)
+			slots = new channel<bool>(size = most)
+			for let i = 0; i < most; i++ {
+				slots <- true
+			}
+		}
+
+		// placeholder implements Queryable.
+		def placeholder() Placeholder {
+			return driver.placeholder()
+		}
+
+		// exec implements Queryable.
+		// Fails with a DbError as the driver's `exec` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def exec(statement string, args ...any) !Result {
+			let conn = try borrow()
+			let res = conn.exec(statement, ...args) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			giveBack(conn, false)
+			return res
+		}
+
+		// exec implements Queryable.
+		// Fails with a DbError as the driver's `exec` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def exec(statement string, named map<string, any>, args ...any) !Result {
+			let conn = try borrow()
+			let res = conn.exec(statement, named, ...args) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			giveBack(conn, false)
+			return res
+		}
+
+		// query implements Queryable. The rows hold their connection until
+		// they end or are closed.
+		// Fails with a DbError as the driver's `query` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def query(statement string, args ...any) !Rows {
+			let conn = try borrow()
+			let rows = conn.query(statement, ...args) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			return new PooledRows(self, conn, rows)
+		}
+
+		// query implements Queryable. The rows hold their connection until
+		// they end or are closed.
+		// Fails with a DbError as the driver's `query` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def query(statement string, named map<string, any>, args ...any) !Rows {
+			let conn = try borrow()
+			let rows = conn.query(statement, named, ...args) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			return new PooledRows(self, conn, rows)
+		}
+
+		// prepare implements Queryable. The statement holds its connection
+		// until it is closed.
+		// Fails with a DbError as the driver's `prepare` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def prepare(statement string) !Statement {
+			let conn = try borrow()
+			let prepared = conn.prepare(statement) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			return new PooledStatement(self, conn, prepared)
+		}
+
+		// beginTx implements Connection. The transaction holds its
+		// connection until it is committed or rolled back.
+		// Fails with a DbError as the driver's `beginTx` does, and with
+		// ErrorKind.Closed once the pool is closed.
+		def beginTx(isolation Isolation = Isolation.Default, readOnly bool = false) !Transaction {
+			let conn = try borrow()
+			let tx = conn.beginTx(isolation, readOnly) onerror (err error) {
+				giveBack(conn, isBroken(err))
+				fail err
+			}
+			return new PooledTransaction(self, conn, tx)
+		}
+
+		// ping implements Connection: one connection is checked.
+		// Fails with a DbError when the database does not answer, and with
+		// ErrorKind.Closed once the pool is closed.
+		def ping() !none {
+			let conn = try borrow()
+			conn.ping() onerror (err error) {
+				giveBack(conn, true)
+				fail err
+			}
+			giveBack(conn, false)
+			return none
+		}
+
+		// close implements Connection: idle connections close now, lent ones
+		// when they come back, and nothing more is lent.
+		// Fails with the first DbError a connection reports while closing.
+		def close() !none {
+			let failure ?error = none
+			for let (_, conn) in drainIdle() {
+				conn.close() onerror (err error) {
+					failure = err when failure is none
+					recover none
+				}
+			}
+			fail failure unless failure is none
+			return none
+		}
+
+		// limit is the most connections the pool has open at once.
+		def limit() int {
+			return most
+		}
+
+		// idleCount is how many open connections wait to be lent.
+		atomic def idleCount() int {
+			return idle.len()
+		}
+
+		// borrow lends a connection: an idle one, else a new one, waiting
+		// when `limit` are lent.
+		// Fails with a DbError: ErrorKind.Closed once the pool is closed,
+		// else as the driver's `connect` does.
+		def borrow() !Connection {
+			fail errorOf(ErrorKind.Closed, "the connection pool is closed") when shut
+			<-slots
+			if shut {
+				slots <- true
+				fail errorOf(ErrorKind.Closed, "the connection pool is closed")
+			}
+			let (found, rested) = takeIdle()
+			if !(found is none) {
+				return found when rested < idleCheck
+				let alive = true
+				found.ping() onerror (err error) {
+					alive = false
+					recover none
+				}
+				return found when alive
+				found.close() onerror recover none
+			}
+			return driver.connect(target) onerror (err error) {
+				slots <- true
+				fail err
+			}
+		}
+
+		// giveBack takes a lent connection back: kept for the next borrower,
+		// or closed when it is broken or the pool is closed.
+		def giveBack(conn Connection, broken bool) {
+			if broken || !park(conn) {
+				conn.close() onerror recover none
+			}
+			slots <- true
+		}
+
+		// The idle connection used last and how long it has rested.
+		internal atomic def takeIdle() (?Connection, duration) {
+			let n = idle.len()
+			return (none, 0s) when n == 0
+			let conn = idle[n - 1]
+			let rested = time.since(parked[n - 1])
+			idle.len(n - 1)
+			parked.len(n - 1)
+			return (conn, rested)
+		}
+
+		// Keeps a connection for the next borrower; false once the pool is
+		// closed.
+		internal atomic def park(conn Connection) bool {
+			return false when shut
+			idle.push(conn)
+			parked.push(time.now())
+			return true
+		}
+
+		// Closes the pool to borrowers and hands over the idle connections.
+		internal atomic def drainIdle() Connection[] {
+			shut = true
+			let all = idle.clone()
+			idle.len(0)
+			parked.len(0)
+			return all
+		}
+	}
+}
+
+internal partial module std.data.db.pooling {
+	use std.data.db::*
+
+	// Reports whether a failure leaves its connection unusable.
+	def isBroken(err error) bool {
+		return (err.kind := ErrorKind.Connection || ErrorKind.Closed || ErrorKind.TimedOut) when err is DbError
+		return true
+	}
+
+	// PooledRows is rows read on a connection borrowed from a pool; the
+	// connection goes back when the rows end, fail or are closed.
+	type PooledRows {
+		pool  Pool
+		conn  Connection
+		rows  Rows
+		given bool
+
+		def new(pool Pool, conn Connection, rows Rows) {
+			self.pool = pool
+			self.conn = conn
+			self.rows = rows
+		}
+
+		def columns() Column[] {
+			return rows.columns()
+		}
+
+		def next() !bool {
+			return false when given
+			let has = rows.next() onerror (err error) {
+				release(isBroken(err))
+				fail err
+			}
+			release(false) unless has
+			return has
+		}
+
+		def isNull(column int) bool {
+			return rows.isNull(column)
+		}
+
+		def bool(column int) !bool {
+			return rows.bool(column)
+		}
+
+		def int(column int) !int {
+			return rows.int(column)
+		}
+
+		def float(column int) !float {
+			return rows.float(column)
+		}
+
+		def string(column int) !string {
+			return rows.string(column)
+		}
+
+		def bytes(column int) !byte[] {
+			return rows.bytes(column)
+		}
+
+		def value(column int) !any {
+			return rows.value(column)
+		}
+
+		def close() !none {
+			return none when given
+			let failure ?error = none
+			rows.close() onerror (err error) {
+				failure = err
+				recover none
+			}
+			release(!(failure is none))
+			fail failure unless failure is none
+			return none
+		}
+
+		def release(broken bool) {
+			return when given
+			given = true
+			pool.giveBack(conn, broken)
+		}
+
+		def dispose() {
+			return when given
+			rows.close() onerror recover none
+			release(false)
+		}
+	}
+
+	// PooledTransaction is a transaction on a connection borrowed from a
+	// pool; the connection goes back when the transaction ends.
+	type PooledTransaction {
+		pool  Pool
+		conn  Connection
+		tx    Transaction
+		given bool
+
+		def new(pool Pool, conn Connection, tx Transaction) {
+			self.pool = pool
+			self.conn = conn
+			self.tx = tx
+		}
+
+		def placeholder() Placeholder {
+			return tx.placeholder()
+		}
+
+		def exec(statement string, args ...any) !Result {
+			return tx.exec(statement, ...args)
+		}
+
+		def exec(statement string, named map<string, any>, args ...any) !Result {
+			return tx.exec(statement, named, ...args)
+		}
+
+		def query(statement string, args ...any) !Rows {
+			return tx.query(statement, ...args)
+		}
+
+		def query(statement string, named map<string, any>, args ...any) !Rows {
+			return tx.query(statement, named, ...args)
+		}
+
+		def prepare(statement string) !Statement {
+			return tx.prepare(statement)
+		}
+
+		def commitTx() !none {
+			tx.commitTx() onerror (err error) {
+				release(isBroken(err))
+				fail err
+			}
+			release(false)
+			return none
+		}
+
+		def rollbackTx() !none {
+			return none when given
+			tx.rollbackTx() onerror (err error) {
+				release(true)
+				fail err
+			}
+			release(false)
+			return none
+		}
+
+		def release(broken bool) {
+			return when given
+			given = true
+			pool.giveBack(conn, broken)
+		}
+
+		def dispose() {
+			return when given
+			let failed = false
+			tx.rollbackTx() onerror (err error) {
+				failed = true
+				recover none
+			}
+			release(failed)
+		}
+	}
+
+	// PooledStatement is a prepared statement on a connection borrowed from
+	// a pool; the connection goes back when the statement is closed.
+	type PooledStatement {
+		pool     Pool
+		conn     Connection
+		prepared Statement
+		given    bool
+
+		def new(pool Pool, conn Connection, prepared Statement) {
+			self.pool = pool
+			self.conn = conn
+			self.prepared = prepared
+		}
+
+		def exec(args ...any) !Result {
+			return prepared.exec(...args)
+		}
+
+		def exec(named map<string, any>, args ...any) !Result {
+			return prepared.exec(named, ...args)
+		}
+
+		def query(args ...any) !Rows {
+			return prepared.query(...args)
+		}
+
+		def query(named map<string, any>, args ...any) !Rows {
+			return prepared.query(named, ...args)
+		}
+
+		def close() !none {
+			return none when given
+			given = true
+			let failure ?error = none
+			prepared.close() onerror (err error) {
+				failure = err
+				recover none
+			}
+			pool.giveBack(conn, !(failure is none))
+			fail failure unless failure is none
+			return none
+		}
+
+		def dispose() {
+			return when given
+			given = true
+			prepared.close() onerror recover none
+			pool.giveBack(conn, false)
+		}
+	}
+}
