@@ -1,0 +1,563 @@
+// LZ4: the block format and the frame format (`.lz4` files), both ways.
+//
+// ```
+// use std.data.compress.lz4
+//
+// let packed = lz4.compress(data)
+// let back = try lz4.decompress(packed)
+// ```
+partial module std.data.compress.lz4 {
+	use (
+		std.bytes
+		std.crypto.hash::(XXH32, xxh32)
+		std.io
+		std.mem
+	)
+
+	// Compresses the bytes into one LZ4 frame: independent blocks of up to
+	// 4 MiB, with the content's size and its checksum, as the `lz4` tool
+	// writes by default.
+	def compress(src byte[]) byte[] {
+		let out = new bytes.Buffer()
+		let writer = new Writer(out, src.len())
+		writer.write(src) onerror recover 0
+		writer.close() onerror recover none
+		return out.bytes()
+	}
+
+	// Decompresses LZ4 frames held in memory: one frame or several in a row,
+	// skippable frames passed over, legacy frames (`lz4 -l`) included.
+	// `sizeHint` is the decompressed length when the caller knows it; `dict`
+	// is the dictionary of a frame that names one.
+	// Fails when the data is not an LZ4 frame, ends early, is damaged (a
+	// block that does not decode, a checksum or content size that does not
+	// match) or needs a dictionary that was not given.
+	def decompress(src byte[], sizeHint int = 0, dict byte[] = []) !byte[] {
+		let reader = new Reader(new bytes.Reader(src), dict)
+		let out byte[] = []
+		let total = 0
+		let room = sizeHint > 0 ?? (sizeHint, src.len() * 3 + 65536)
+		for {
+			out.len(total + room) when out.len() - total < 65536
+			let n = try reader.read(out[total:])
+			break when n == 0
+			total += n
+			room = total
+		}
+		out.len(total)
+		return out
+	}
+
+	// Compresses the bytes into one LZ4 block, the raw form other formats
+	// embed. The block does not record its decompressed size.
+	def compressBlock(src byte[]) byte[] {
+		let out byte[] = []
+		encodeBlock(src, 0, src.len(), out)
+		return out
+	}
+
+	// Decompresses one LZ4 block of at most `maxSize` decompressed bytes.
+	// `dict` is what the block's matches may reach back into before its own
+	// start (the last 64 KiB count).
+	// Fails when the block is damaged or decompresses to more than `maxSize`.
+	def decompressBlock(src byte[], maxSize int, dict byte[] = []) !byte[] {
+		let out byte[] = []
+		let history = dict.len().min(65536)
+		for let i = dict.len() - history; i < dict.len(); i++ {
+			out.push(dict[i])
+		}
+		out.len(history + maxSize)
+		let end = try decodeBlock(src, 0, src.len(), out, history)
+		return out[history:end].clone()
+	}
+
+	// Reader decompresses LZ4 frames from another reader as they are read.
+	type Reader {
+		internal source   io.Reader
+		internal dict     byte[]
+		// The decompressed bytes of the current frame still in reach of a
+		// match (the last 64 KiB) followed by the bytes not yet handed out.
+		internal window   byte[]
+		internal served   int
+		internal filled   int
+		internal inFrame  bool
+		internal legacy   bool
+		internal linked   bool
+		internal blockSum bool
+		internal fullSum  bool
+		internal blockMax int
+		internal expected int64
+		internal produced int64
+		internal content  XXH32
+		internal ended    bool
+
+		// A reader of the frames `source` gives. `dict` is the dictionary of
+		// frames that name one.
+		def new(source io.Reader, dict byte[] = []) {
+			self.source = source
+			self.dict = dict
+			window = []
+			served = 0
+			filled = 0
+			inFrame = false
+			legacy = false
+			linked = false
+			blockSum = false
+			fullSum = false
+			blockMax = 0
+			expected = int64(-1)
+			produced = int64(0)
+			content = new XXH32()
+			ended = false
+		}
+
+		// read implements std.io.Reader: decompressed bytes, 0 at the end of
+		// the last frame.
+		// Fails when the source does, or on data that is not a valid frame
+		// (see `decompress`).
+		def read(p byte[]) !int {
+			for served == filled {
+				return 0 when ended
+				try nextBlock()
+			}
+			let n = (filled - served).min(p.len())
+			mem.copyN(p, window[served:served + n], n)
+			served += n
+			return n
+		}
+
+		// Decodes the next block of the current frame into the window,
+		// starting the next frame first when one ended.
+		internal def nextBlock() !none {
+			if !inFrame {
+				let more = try frameHeader()
+				if !more {
+					ended = true
+					return none
+				}
+			}
+			let head byte[] = []
+			head.len(4)
+			let got = try readSome(head)
+			if legacy && got == 0 {
+				inFrame = false
+				return none
+			}
+			fail "lz4: unexpected end of data in a frame" when got != 4
+			let word = le32At(head, 0)
+			if legacy && (word == 0x184D2204 || word == 0x184C2102 || (word & 0xFFFFFFF0) == 0x184D2A50) {
+				// A legacy frame has no end mark: the next frame's magic
+				// number ends it.
+				inFrame = false
+				return startFrame(word)
+			}
+			if !legacy && word == 0 {
+				try endFrame()
+				return none
+			}
+			let stored = !legacy && word & 0x80000000 != 0
+			let size = int(word & 0x7FFFFFFF)
+			fail "lz4: a block of {size} bytes is larger than the frame allows" when size > blockMax + (legacy ?? (blockMax / 255 + 16, 0))
+			let block byte[] = []
+			block.len(size)
+			fail "lz4: unexpected end of data in a block" when (try readSome(block)) != size
+			if blockSum {
+				fail "lz4: unexpected end of data in a block checksum" when (try readSome(head)) != 4
+				fail "lz4: a block's checksum does not match" when le32At(head, 0) != xxh32(block)
+			}
+
+			// Keep what a match may reach: the last 64 KiB when blocks are
+			// linked, nothing otherwise.
+			let keep = linked ?? (filled.min(65536), 0)
+			mem.moveN(window, window[filled - keep:filled], keep) when keep > 0 && filled > keep
+			filled = keep
+			served = keep
+			window.len(keep + blockMax)
+			if stored {
+				fail "lz4: a stored block is larger than the frame allows" when size > blockMax
+				mem.copyN(window[keep:], block, size)
+				filled = keep + size
+			} else {
+				filled = try decodeBlock(block, 0, size, window, keep)
+			}
+			produced += int64(filled - keep)
+			content.write(window[keep:filled]) when fullSum
+			return none
+		}
+
+		// Reads a frame's header. False when the data ended where a frame
+		// could start.
+		internal def frameHeader() !bool {
+			let head byte[] = []
+			head.len(4)
+			let got = try readSome(head)
+			return false when got == 0
+			fail "lz4: unexpected end of data in a frame's magic number" when got != 4
+			try startFrame(le32At(head, 0))
+			return true
+		}
+
+		// Starts the frame the magic number announces, passing over
+		// skippable frames.
+		internal def startFrame(magic uint32) !none {
+			let word = magic
+			let head byte[] = []
+			head.len(4)
+			for (word & 0xFFFFFFF0) == 0x184D2A50 {
+				fail "lz4: unexpected end of data in a skippable frame" when (try readSome(head)) != 4
+				let skip byte[] = []
+				skip.len(int(le32At(head, 0)))
+				fail "lz4: unexpected end of data in a skippable frame" when (try readSome(skip)) != skip.len()
+				let got = try readSome(head)
+				if got == 0 {
+					ended = true
+					inFrame = false
+					return none
+				}
+				fail "lz4: unexpected end of data in a frame's magic number" when got != 4
+				word = le32At(head, 0)
+			}
+			filled = 0
+			served = 0
+			produced = int64(0)
+			expected = int64(-1)
+			content.reset()
+			inFrame = true
+			if word == 0x184C2102 {
+				legacy = true
+				linked = false
+				blockSum = false
+				fullSum = false
+				blockMax = 8388608
+				return none
+			}
+			fail "lz4: not an LZ4 frame" when word != 0x184D2204
+			legacy = false
+			let descriptor byte[] = []
+			descriptor.len(2)
+			fail "lz4: unexpected end of data in a frame header" when (try readSome(descriptor)) != 2
+			let flags = int(descriptor[0])
+			fail "lz4: frame version {flags >> 6} is not supported" when flags >> 6 != 1
+			fail "lz4: a reserved bit is set in the frame header" when flags & 2 != 0 || int(descriptor[1]) & 0x8F != 0
+			linked = flags & 0x20 == 0
+			blockSum = flags & 0x10 != 0
+			fullSum = flags & 0x04 != 0
+			let size = (int(descriptor[1]) >> 4) & 7
+			fail "lz4: block size code {size} is not valid" when size < 4
+			blockMax = 1 << (8 + 2 * size)
+			let extra = (flags & 0x08 != 0 ?? (8, 0)) + (flags & 0x01 != 0 ?? (4, 0))
+			let rest byte[] = []
+			rest.len(extra + 1)
+			fail "lz4: unexpected end of data in a frame header" when (try readSome(rest)) != rest.len()
+			let at = 0
+			if flags & 0x08 != 0 {
+				expected = int64(le32At(rest, 0)) | (int64(le32At(rest, 4)) << 32)
+				at = 8
+			}
+			for let i = 0; i < extra; i++ {
+				descriptor.push(rest[i])
+			}
+			fail "lz4: the frame header's checksum does not match" when byte((xxh32(descriptor) >> 8) & 0xFF) != rest[extra]
+			if flags & 0x01 != 0 {
+				fail "lz4: the frame needs a dictionary (id {le32At(rest, at)})" when dict.len() == 0
+			}
+			// A dictionary is the history before the first block.
+			let history = dict.len().min(65536)
+			window.len(history)
+			for let i = 0; i < history; i++ {
+				window[i] = dict[dict.len() - history + i]
+			}
+			filled = history
+			served = history
+			linked = linked || history > 0
+			return none
+		}
+
+		// Checks what a frame promised once its end mark is read.
+		internal def endFrame() !none {
+			if fullSum {
+				let tail byte[] = []
+				tail.len(4)
+				fail "lz4: unexpected end of data in the content checksum" when (try readSome(tail)) != 4
+				fail "lz4: the content's checksum does not match" when le32At(tail, 0) != content.sum()
+			}
+			fail "lz4: the frame holds {produced} bytes, its header says {expected}" when expected >= int64(0) && expected != produced
+			inFrame = false
+			return none
+		}
+
+		// Fills `p` from the source; less than its length only at the end.
+		internal def readSome(p byte[]) !int {
+			let total = 0
+			for total < p.len() {
+				let n = try source.read(p[total:])
+				break when n == 0
+				total += n
+			}
+			return total
+		}
+	}
+
+	// Writer compresses what is written to it into one LZ4 frame on another
+	// writer. `close` ends the frame.
+	type Writer {
+		internal sink    io.Writer
+		internal pending byte[]
+		internal started bool
+		internal closed  bool
+		internal size    int
+		internal written int
+		internal content XXH32
+
+		// A writer of one frame to `sink`. `size` is the length of what will
+		// be written, when known: the frame then records it, and `close`
+		// fails when another amount was written.
+		def new(sink io.Writer, size int = -1) {
+			self.sink = sink
+			self.size = size
+			pending = []
+			started = false
+			closed = false
+			written = 0
+			content = new XXH32()
+		}
+
+		// write implements std.io.Writer: the bytes go into the frame, a
+		// block at a time.
+		// Fails when the frame is closed or the sink fails.
+		def write(p byte[]) !int {
+			fail "lz4: the frame is closed" when closed
+			try header() unless started
+			content.write(p)
+			written += p.len()
+			let at = 0
+			// Whole blocks go out straight from the caller's bytes.
+			for pending.len() == 0 && p.len() - at >= writerBlock {
+				try block(p, at, at + writerBlock)
+				at += writerBlock
+			}
+			let held = pending.len()
+			pending.len(held + p.len() - at)
+			mem.copyN(pending[held:], p[at:], p.len() - at) when p.len() > at
+			for pending.len() >= writerBlock {
+				try block(pending, 0, writerBlock)
+				pending = pending[writerBlock:].clone()
+			}
+			return p.len()
+		}
+
+		// close writes what is pending, the end mark and the content's
+		// checksum. It does not close the sink.
+		// Fails when the frame is closed already, the sink fails, or the
+		// amount written is not the size the frame was opened with.
+		def close() !none {
+			fail "lz4: the frame is closed" when closed
+			fail "lz4: the frame was opened for {size} bytes and got {written}" when size >= 0 && size != written
+			try header() unless started
+			try block(pending, 0, pending.len()) when pending.len() > 0
+			pending = []
+			closed = true
+			let tail byte[] = [0, 0, 0, 0]
+			putLE32(tail, content.sum())
+			try sink.write(tail)
+			return none
+		}
+
+		internal def header() !none {
+			started = true
+			let head byte[] = []
+			putLE32(head, 0x184D2204)
+			// Version 1, independent blocks, content checksum, 4 MiB blocks.
+			let flags = 0x64
+			flags |= 0x08 when size >= 0
+			let descriptor byte[] = [byte(flags), 0x70]
+			if size >= 0 {
+				putLE32(descriptor, uint32(size & 0xFFFFFFFF))
+				putLE32(descriptor, uint32((size >> 32) & 0xFFFFFFFF))
+			}
+			for let (_, b) in descriptor {
+				head.push(b)
+			}
+			head.push(byte((xxh32(descriptor) >> 8) & 0xFF))
+			try sink.write(head)
+			return none
+		}
+
+		// Writes `src[from:to]` as one block: compressed, or stored when
+		// compression does not make it smaller.
+		internal def block(src byte[], from int, to int) !none {
+			let n = to - from
+			let packed byte[] = []
+			packed.cap(n / 2 + 64)
+			encodeBlock(src, from, to, packed)
+			let head byte[] = []
+			if packed.len() < n {
+				putLE32(head, uint32(packed.len()))
+				try sink.write(head)
+				try sink.write(packed)
+				return none
+			}
+			putLE32(head, uint32(n) | 0x80000000)
+			try sink.write(head)
+			try sink.write(src[from:to])
+			return none
+		}
+	}
+
+	// The size of the blocks a Writer makes.
+	internal const writerBlock = 4194304
+
+	internal def le32At(p byte[], at int) uint32 {
+		return uint32(p[at]) | (uint32(p[at + 1]) << 8) | (uint32(p[at + 2]) << 16) | (uint32(p[at + 3]) << 24)
+	}
+
+	internal def putLE32(out byte[], v uint32) {
+		out.push(byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 24) & 0xFF))
+	}
+
+	// Decodes the block `src[from:to]` into `out` from position `at`, where
+	// `out[0:at]` is the history matches may reach. Returns the position
+	// after the last decoded byte.
+	// Fails on a block that reads or writes past its bounds, or whose match
+	// reaches before the history.
+	internal def decodeBlock(src byte[], from int, to int, out byte[], at int) !int {
+		let pos = from
+		let o = at
+		let cap = out.len()
+		for pos < to {
+			let token = int(src[pos])
+			pos++
+			let literals = token >> 4
+			if literals == 15 {
+				for {
+					fail "lz4: a literal length runs past the block" when pos >= to
+					let more = int(src[pos])
+					pos++
+					literals += more
+					break when more != 255
+				}
+			}
+			fail "lz4: literals run past the block" when pos + literals > to
+			fail "lz4: the block decompresses past its size" when o + literals > cap
+			if literals >= 32 {
+				mem.copyN(out[o:], src[pos:], literals)
+			} else {
+				for let i = 0; i < literals; i++ {
+					out[o + i] = src[pos + i]
+				}
+			}
+			pos += literals
+			o += literals
+			break when pos == to
+
+			fail "lz4: a match offset runs past the block" when pos + 2 > to
+			let offset = int(src[pos]) | (int(src[pos + 1]) << 8)
+			pos += 2
+			fail "lz4: a match reaches before the start of the data" when offset == 0 || offset > o
+			let length = (token & 15) + 4
+			if token & 15 == 15 {
+				for {
+					fail "lz4: a match length runs past the block" when pos >= to
+					let more = int(src[pos])
+					pos++
+					length += more
+					break when more != 255
+				}
+			}
+			fail "lz4: the block decompresses past its size" when o + length > cap
+			let back = o - offset
+			if length >= 32 && offset >= length {
+				mem.copyN(out[o:], out[back:], length)
+			} else {
+				// A match that overlaps its own output repeats a pattern,
+				// so it is copied in order.
+				for let i = 0; i < length; i++ {
+					out[o + i] = out[back + i]
+				}
+			}
+			o += length
+		}
+		return o
+	}
+
+	// Compresses `src[from:to]` as one block appended to `out`: a hash table
+	// of the last position of each 4-byte sequence finds the matches.
+	internal def encodeBlock(src byte[], from int, to int, out byte[]) {
+		let size = to - from
+		let anchor = from
+		// The last match must start 12 bytes before the end and the last
+		// 5 bytes are literals.
+		let matchLimit = to - 12
+		let extendLimit = to - 5
+		if size >= 13 {
+			let table int[] = []
+			table.len(65536)
+			table.fill(-1)
+			let pos = from
+			// Misses since the last match: the search steps faster through
+			// data that does not compress.
+			let misses = 0
+			for pos <= matchLimit {
+				let word = le32At(src, pos)
+				let slot = int(((word * 2654435761) >> 16) & 0xFFFF)
+				let found = table[slot]
+				table[slot] = pos
+				if found < 0 || pos - found > 65535 || le32At(src, found) != word {
+					misses++
+					pos += 1 + (misses >> 6)
+					continue
+				}
+				misses = 0
+				let length = 4
+				for pos + length < extendLimit && src[found + length] == src[pos + length] {
+					length++
+				}
+				// Take bytes before the match into it while they agree.
+				for pos > anchor && found > from && src[pos - 1] == src[found - 1] {
+					pos--
+					found--
+					length++
+				}
+				emitSequence(src, anchor, pos - anchor, pos - found, length, out)
+				pos += length
+				anchor = pos
+			}
+		}
+		emitSequence(src, anchor, to - anchor, 0, 0, out)
+	}
+
+	// Appends one sequence: its literals and, when `length` is not 0, its
+	// match.
+	internal def emitSequence(src byte[], literalsAt int, literals int, offset int, length int, out byte[]) {
+		let token = literals.min(15) << 4
+		token |= (length - 4).min(15) when length > 0
+		out.push(byte(token))
+		if literals >= 15 {
+			let rest = literals - 15
+			for rest >= 255 {
+				out.push(byte(255))
+				rest -= 255
+			}
+			out.push(byte(rest))
+		}
+		if literals >= 32 {
+			let at = out.len()
+			out.len(at + literals)
+			mem.copyN(out[at:], src[literalsAt:], literals)
+		} else {
+			for let i = 0; i < literals; i++ {
+				out.push(src[literalsAt + i])
+			}
+		}
+		return when length == 0
+		out.push(byte(offset & 0xFF), byte(offset >> 8))
+		if length - 4 >= 15 {
+			let rest = length - 4 - 15
+			for rest >= 255 {
+				out.push(byte(255))
+				rest -= 255
+			}
+			out.push(byte(rest))
+		}
+	}
+}

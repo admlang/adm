@@ -1,0 +1,510 @@
+partial module std.data.compress.zstd {
+	use (
+		std.bytes
+		std.crypto.hash::(XXH64, xxh64)
+		std.io
+		std.mem
+	)
+
+	// The window of the frames written here: matches reach at most 8 MiB
+	// back, so a reader needs that much memory at most.
+	internal const writeWindow = 8388608
+
+	// Compresses the bytes into one Zstandard frame with the content's size
+	// and checksum.
+	def compress(src byte[]) byte[] {
+		let out byte[] = []
+		out.cap(src.len() / 3 + 64)
+		let size = src.len()
+		writeFrameHeader(out, size)
+		let state = new BlockEncoder()
+		let at = 0
+		for {
+			let end = (at + 131072).min(size)
+			state.block(src, at, end, end == size, out)
+			at = end
+			break when at >= size
+		}
+		let sum = uint32(xxh64(src) & uint64(0xFFFFFFFF))
+		out.push(byte(sum & 0xFF), byte((sum >> 8) & 0xFF), byte((sum >> 16) & 0xFF), byte((sum >> 24) & 0xFF))
+		return out
+	}
+
+	// Writer compresses what is written to it into one Zstandard frame on
+	// another writer. `close` ends the frame.
+	type Writer {
+		internal sink    io.Writer
+		// The data matches may reach, then the bytes not compressed yet.
+		internal buffer  byte[]
+		internal done    int
+		internal state   BlockEncoder
+		internal started bool
+		internal closed  bool
+		internal content XXH64
+
+		def new(sink io.Writer) {
+			self.sink = sink
+			buffer = []
+			done = 0
+			state = new BlockEncoder()
+			started = false
+			closed = false
+			content = new XXH64()
+		}
+
+		// write implements std.io.Writer: the bytes go into the frame, a
+		// block of 128 KiB at a time.
+		// Fails when the frame is closed or the sink fails.
+		def write(p byte[]) !int {
+			fail "zstd: the frame is closed" when closed
+			content.write(p)
+			let held = buffer.len()
+			buffer.len(held + p.len())
+			mem.copyN(buffer[held:], p, p.len()) when p.len() > 0
+			for buffer.len() - done > 131072 {
+				try emit(done + 131072, false)
+			}
+			return p.len()
+		}
+
+		// close writes what is pending as the last block, then the
+		// content's checksum. It does not close the sink.
+		// Fails when the frame is closed already or the sink fails.
+		def close() !none {
+			fail "zstd: the frame is closed" when closed
+			try emit(buffer.len(), true)
+			closed = true
+			let sum = uint32(content.sum() & uint64(0xFFFFFFFF))
+			try sink.write(byte[byte(sum & 0xFF), byte((sum >> 8) & 0xFF), byte((sum >> 16) & 0xFF), byte((sum >> 24) & 0xFF)])
+			return none
+		}
+
+		// Compresses `buffer[done:end]` as one block and writes it.
+		internal def emit(end int, last bool) !none {
+			let out byte[] = []
+			if !started {
+				started = true
+				writeFrameHeader(out, -1)
+			}
+			state.block(buffer, done, end, last, out)
+			done = end
+			try sink.write(out)
+			// Drop what no match can reach any more.
+			if done > writeWindow * 3 {
+				let cut = done - writeWindow
+				buffer = buffer[cut:].clone()
+				done -= cut
+				state.forget()
+			}
+			return none
+		}
+	}
+
+	// Appends a frame header: for a known size (0 or more) the content size,
+	// in one segment when it fits the window; for -1 the window alone.
+	internal def writeFrameHeader(out byte[], size int) {
+		out.push(byte(0x28), byte(0xB5), byte(0x2F), byte(0xFD))
+		if size < 0 {
+			out.push(byte(0x04), byte(0x68))
+			return
+		}
+		let single = size <= writeWindow
+		let flag = 3
+		let width = 8
+		if size <= 255 && single {
+			flag = 0
+			width = 1
+		} else if size >= 256 && size <= 65791 {
+			flag = 1
+			width = 2
+		} else if size <= 0xFFFFFFFF {
+			flag = 2
+			width = 4
+		}
+		out.push(byte((flag << 6) | (single ?? (0x20, 0)) | 0x04))
+		out.push(byte(0x68)) unless single
+		let value = flag == 1 ?? (size - 256, size)
+		for let i = 0; i < width; i++ {
+			out.push(byte((value >> (8 * i)) & 0xFF))
+		}
+	}
+
+	// Compresses the blocks of one frame: it remembers where 4-byte
+	// sequences were last seen and the last three offsets.
+	internal type BlockEncoder {
+		table    int[]
+		recent   int[]
+		// The sequences of the block being built.
+		runs     int[]
+		lengths  int[]
+		offsets  int[]
+		literals byte[]
+
+		def new() {
+			table = []
+			table.len(131072)
+			table.fill(-1)
+			recent = [1, 4, 8]
+			runs = []
+			lengths = []
+			offsets = []
+			literals = []
+		}
+
+		// Forgets the positions seen: they are about to change.
+		def forget() {
+			table.fill(-1)
+		}
+
+		// Appends `data[from:to]` to `out` as one block: compressed, or as
+		// it is when that is not smaller, or as one repeated byte.
+		def block(data byte[], from int, to int, last bool, out byte[]) {
+			let size = to - from
+			let flag = last ?? (1, 0)
+			if size > 1 && sameBytes(data, from, to) {
+				putBlockHeader(out, size, 1, flag)
+				out.push(data[from])
+				return
+			}
+			let saved = [recent[0], recent[1], recent[2]]
+			let body byte[] = []
+			if size >= 16 {
+				findSequences(data, from, to)
+				writeLiterals(body)
+				writeSequences(body)
+			}
+			if size < 16 || body.len() >= size {
+				recent[0] = saved[0]
+				recent[1] = saved[1]
+				recent[2] = saved[2]
+				putBlockHeader(out, size, 0, flag)
+				let at = out.len()
+				out.len(at + size)
+				mem.copyN(out[at:], data[from:to], size) when size > 0
+				return
+			}
+			putBlockHeader(out, body.len(), 2, flag)
+			out.push(...body)
+		}
+
+		// Finds the matches of `data[from:to]` and fills the block's
+		// sequences and literals.
+		internal def findSequences(data byte[], from int, to int) {
+			runs.len(0)
+			lengths.len(0)
+			offsets.len(0)
+			literals.len(0)
+			let anchor = from
+			let limit = to - 8
+			let pos = from
+			let misses = 0
+			for pos < limit {
+				let word = le32(data, pos)
+				let slot = int(((word * 2654435761) >> 15) & 0x1FFFF)
+				let found = table[slot]
+				table[slot] = pos
+				// The last offset again is the cheapest match there is.
+				let again = pos - recent[0]
+				if again >= 0 && pos > anchor && le32(data, again) == word {
+					found = again
+				} else if found < 0 || pos - found > writeWindow || le32(data, found) != word {
+					misses++
+					pos += 1 + (misses >> 6)
+					continue
+				}
+				let length = 4
+				for pos + length < to && data[found + length] == data[pos + length] {
+					length++
+				}
+				let start = pos
+				for start > anchor && found > 0 && data[start - 1] == data[found - 1] {
+					start--
+					found--
+					length++
+				}
+				// A short match far back costs more bits than its bytes
+				// do as literals; the last offset again costs almost none.
+				if length < 6 && start - found != recent[0] {
+					misses++
+					pos += 1 + (misses >> 6)
+					continue
+				}
+				misses = 0
+				pos = start
+				let run = pos - anchor
+				let at = literals.len()
+				literals.len(at + run)
+				mem.copyN(literals[at:], data[anchor:pos], run) when run > 0
+				runs.push(run)
+				lengths.push(length)
+				offsets.push(offsetValue(pos - found, run))
+				// Remember a place inside the match too.
+				if length > 8 && pos + length < limit {
+					let inside = pos + length - 3
+					table[int(((le32(data, inside) * 2654435761) >> 15) & 0x1FFFF)] = inside
+				}
+				pos += length
+				anchor = pos
+			}
+			let rest = to - anchor
+			let at = literals.len()
+			literals.len(at + rest)
+			mem.copyN(literals[at:], data[anchor:to], rest) when rest > 0
+		}
+
+		// The value an offset is written as (1 to 3 name a recent offset),
+		// updating the recent offsets as a reader will.
+		internal def offsetValue(offset int, run int) int {
+			let value = offset + 3
+			if run > 0 {
+				if offset == recent[0] {
+					value = 1
+				} else if offset == recent[1] {
+					value = 2
+				} else if offset == recent[2] {
+					value = 3
+				}
+			} else if offset == recent[1] {
+				value = 1
+			} else if offset == recent[2] {
+				value = 2
+			} else if offset == recent[0] - 1 && offset > 0 {
+				value = 3
+			}
+			if value > 3 {
+				recent[2] = recent[1]
+				recent[1] = recent[0]
+				recent[0] = offset
+				return value
+			}
+			let pick = run == 0 ?? (value, value - 1)
+			if pick > 0 {
+				recent[2] = recent[1] when pick > 1
+				recent[1] = recent[0]
+				recent[0] = offset
+			}
+			return value
+		}
+
+		// Appends the literals section: Huffman-coded when that is smaller,
+		// one repeated byte, or as they are.
+		internal def writeLiterals(out byte[]) {
+			let size = literals.len()
+			if size > 1 && sameBytes(literals, 0, size) {
+				putLiteralsHeader(out, 1, size)
+				out.push(literals[0])
+				return
+			}
+			if size >= 32 {
+				let packed byte[] = []
+				if huffmanLiterals(packed) {
+					out.push(...packed)
+					return
+				}
+			}
+			putLiteralsHeader(out, 0, size)
+			out.push(...literals)
+		}
+
+		// Builds the Huffman-coded literals section into `out`. False when
+		// it would not be smaller than the literals themselves.
+		internal def huffmanLiterals(out byte[]) bool {
+			let size = literals.len()
+			let occurs int[] = []
+			occurs.len(256)
+			occurs.fill(0)
+			for let i = 0; i < size; i++ {
+				occurs[int(literals[i])]++
+			}
+			let codeLengths = huffmanLengths(occurs)
+			let (codes, longest) = huffmanCodes(codeLengths)
+			let body byte[] = []
+			return false unless writeHuffmanTable(body, codeLengths, longest)
+			let four = size > 255
+			if four {
+				let part = (size + 3) / 4
+				let streams byte[][]
+				for let i = 0; i < 4; i++ {
+					let stream byte[] = []
+					let start = part * i
+					let end = i == 3 ?? (size, part * (i + 1))
+					writeHuffmanStream(stream, literals, start, end, codes, codeLengths)
+					streams.push(stream)
+				}
+				for let i = 0; i < 3; i++ {
+					return false when streams[i].len() > 65535
+					body.push(byte(streams[i].len() & 0xFF), byte(streams[i].len() >> 8))
+				}
+				for let i = 0; i < 4; i++ {
+					body.push(...streams[i])
+				}
+			} else {
+				writeHuffmanStream(body, literals, 0, size, codes, codeLengths)
+			}
+			let packed = body.len()
+			return false when packed >= size
+			// Sizes of 10, 14 or 18 bits each; one stream only in the first.
+			let format = 0
+			let width = 10
+			if four {
+				format = 1
+				if size > 1023 || packed > 1023 {
+					format = 2
+					width = 14
+				}
+				if size > 16383 || packed > 16383 {
+					format = 3
+					width = 18
+				}
+			}
+			let word = uint64(2 | (format << 2)) | (uint64(size) << uint64(4)) | (uint64(packed) << uint64(4 + width))
+			let bytes = format < 2 ?? (3, format + 2)
+			for let i = 0; i < bytes; i++ {
+				out.push(byte((word >> uint64(8 * i)) & uint64(0xFF)))
+			}
+			out.push(...body)
+			return true
+		}
+
+		// Appends the sequences section: the count, the three tables and
+		// the bitstream.
+		internal def writeSequences(out byte[]) {
+			let count = runs.len()
+			if count < 128 {
+				out.push(byte(count))
+			} else if count < 0x7F00 {
+				out.push(byte((count >> 8) + 128), byte(count & 0xFF))
+			} else {
+				out.push(byte(255), byte((count - 0x7F00) & 0xFF), byte((count - 0x7F00) >> 8))
+			}
+			return when count == 0
+
+			let literalCodes int[] = []
+			let matchCodes int[] = []
+			let offsetCodes int[] = []
+			literalCodes.len(count)
+			matchCodes.len(count)
+			offsetCodes.len(count)
+			for let i = 0; i < count; i++ {
+				literalCodes[i] = codeOf(literalBase, runs[i])
+				matchCodes[i] = codeOf(matchBase, lengths[i])
+				offsetCodes[i] = highBit(offsets[i])
+			}
+			let modesAt = out.len()
+			out.push(byte(0))
+			let literalTable = new FseEncoder()
+			let offsetTable = new FseEncoder()
+			let matchTable = new FseEncoder()
+			let literalMode = chooseTable(out, literalCodes, 36, literalDefault, 6, 9, 35, literalTable)
+			let offsetMode = chooseTable(out, offsetCodes, 32, offsetDefault, 5, 8, 28, offsetTable)
+			let matchMode = chooseTable(out, matchCodes, 53, matchDefault, 6, 9, 52, matchTable)
+			out[modesAt] = byte((literalMode << 6) | (offsetMode << 4) | (matchMode << 2))
+
+			// The reader takes the sequences in order from the end of the
+			// stream, so they are written from the last to the first.
+			let writer = new BitWriter(out)
+			let n = count - 1
+			let matchState = matchTable.first(matchCodes[n])
+			let offsetState = offsetTable.first(offsetCodes[n])
+			let literalState = literalTable.first(literalCodes[n])
+			writer.add(runs[n] - literalBase[literalCodes[n]], literalBits[literalCodes[n]])
+			writer.add(lengths[n] - matchBase[matchCodes[n]], matchBits[matchCodes[n]])
+			addWide(writer, offsets[n] - (1 << offsetCodes[n]), offsetCodes[n])
+			for let i = count - 2; i >= 0; i-- {
+				offsetState = offsetTable.encode(writer, offsetState, offsetCodes[i])
+				matchState = matchTable.encode(writer, matchState, matchCodes[i])
+				literalState = literalTable.encode(writer, literalState, literalCodes[i])
+				writer.add(runs[i] - literalBase[literalCodes[i]], literalBits[literalCodes[i]])
+				writer.add(lengths[i] - matchBase[matchCodes[i]], matchBits[matchCodes[i]])
+				addWide(writer, offsets[i] - (1 << offsetCodes[i]), offsetCodes[i])
+			}
+			matchTable.flush(writer, matchState)
+			offsetTable.flush(writer, offsetState)
+			literalTable.flush(writer, literalState)
+			writer.close()
+		}
+
+		// Picks how one kind of code is written and builds its table: one
+		// symbol (mode 1), the predefined table (0) for few sequences whose
+		// codes it covers, else a table of its own (2), described in `out`.
+		internal def chooseTable(out byte[], codes int[], symbols int, defaults int[], defaultAccuracy int, maxAccuracy int, defaultMax int, table FseEncoder) int {
+			let occurs int[] = []
+			occurs.len(symbols)
+			occurs.fill(0)
+			let highest = 0
+			for let (_, code) in codes {
+				occurs[code]++
+				highest = code when code > highest
+			}
+			let distinct = 0
+			for let (_, n) in occurs {
+				distinct++ when n > 0
+			}
+			if distinct == 1 {
+				table.single()
+				out.push(byte(codes[0]))
+				return 1
+			}
+			if codes.len() < 64 && highest <= defaultMax {
+				table.build(defaults, defaultAccuracy)
+				return 0
+			}
+			occurs.len(highest + 1)
+			let accuracy = chooseAccuracy(occurs, codes.len(), 5, maxAccuracy)
+			let counts = normalizeCounts(occurs, codes.len(), accuracy)
+			writeFseCounts(out, counts, accuracy)
+			table.build(counts, accuracy)
+			return 2
+		}
+	}
+
+	// Adds up to 31 bits in two steps of at most 16.
+	internal def addWide(writer BitWriter, value int, width int) {
+		if width > 16 {
+			writer.add(value & 0xFFFF, 16)
+			writer.add(value >> 16, width - 16)
+			return
+		}
+		writer.add(value, width)
+	}
+
+	// The code whose range holds the value: the last one that starts at or
+	// below it.
+	internal def codeOf(base int[], value int) int {
+		let code = base.len() - 1
+		for base[code] > value {
+			code--
+		}
+		return code
+	}
+
+	internal def sameBytes(data byte[], from int, to int) bool {
+		let first = data[from]
+		for let i = from + 1; i < to; i++ {
+			return false when data[i] != first
+		}
+		return true
+	}
+
+	internal def le32(p byte[], at int) uint32 {
+		return uint32(p[at]) | (uint32(p[at + 1]) << 8) | (uint32(p[at + 2]) << 16) | (uint32(p[at + 3]) << 24)
+	}
+
+	// Appends a block header: the size, the type (0 raw, 1 one repeated
+	// byte, 2 compressed) and whether it is the frame's last block.
+	internal def putBlockHeader(out byte[], size int, kind int, last int) {
+		let word = (size << 3) | (kind << 1) | last
+		out.push(byte(word & 0xFF), byte((word >> 8) & 0xFF), byte((word >> 16) & 0xFF))
+	}
+
+	// Appends the header of raw (0) or repeated-byte (1) literals.
+	internal def putLiteralsHeader(out byte[], kind int, size int) {
+		if size < 32 {
+			out.push(byte(kind | (size << 3)))
+		} else if size < 4096 {
+			out.push(byte(kind | 0x04 | ((size & 15) << 4)), byte(size >> 4))
+		} else {
+			out.push(byte(kind | 0x0C | ((size & 15) << 4)), byte((size >> 4) & 0xFF), byte(size >> 12))
+		}
+	}
+}

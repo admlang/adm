@@ -1,0 +1,327 @@
+// Zstandard (RFC 8878): `.zst` frames.
+//
+// ```
+// use std.data.compress.zstd
+//
+// let back = try zstd.decompress(packed)
+// ```
+partial module std.data.compress.zstd {
+	use (
+		std.bytes
+		std.crypto.hash::(XXH64)
+		std.io
+		std.mem
+	)
+
+	// The largest window a frame may ask for unless a Reader is told
+	// otherwise: 128 MiB, as the `zstd` tool allows by default.
+	const defaultMaxWindow = 134217728
+
+	// Decompresses Zstandard frames held in memory: one frame or several in
+	// a row, skippable frames passed over. `sizeHint` is the decompressed
+	// length when the caller knows it; `dict` is the dictionary the frames
+	// were compressed with, a formatted one or plain content.
+	// Fails when the data is not a Zstandard frame, ends early, is damaged
+	// (a block that does not decode, a checksum or content size that does
+	// not match), asks for a window above 128 MiB, or names a dictionary
+	// other than the one given.
+	def decompress(src byte[], sizeHint int = 0, dict byte[] = []) !byte[] {
+		let reader = new Reader(new bytes.Reader(src), dict)
+		let out byte[] = []
+		let total = 0
+		let room = sizeHint > 0 ?? (sizeHint, src.len() * 4 + 131072)
+		for {
+			out.len(total + room) when out.len() - total < 131072
+			let n = try reader.read(out[total:])
+			break when n == 0
+			total += n
+			room = total
+		}
+		out.len(total)
+		return out
+	}
+
+	// Reader decompresses Zstandard frames from another reader as they are
+	// read.
+	type Reader {
+		// The largest window a frame may ask for; a frame that wants more
+		// fails. Memory use is about twice the window of the frame read.
+		maxWindow int = defaultMaxWindow
+
+		internal source     io.Reader
+		internal dict       byte[]
+		internal dictId     int
+		internal blocks     BlockDecoder
+		// Seeded from a formatted dictionary: what every frame starts from.
+		internal seeded     BlockDecoder
+		// The data matches may reach, then the bytes not handed out yet.
+		internal window     byte[]
+		internal served     int
+		internal filled     int
+		internal inFrame    bool
+		internal windowSize int
+		internal blockMax   int
+		internal checked    bool
+		internal expected   int64
+		internal produced   int64
+		internal content    XXH64
+		internal ended      bool
+		internal lastBlock  bool
+
+		// A reader of the frames `source` gives. `dict` is the dictionary
+		// they were compressed with, when there is one.
+		def new(source io.Reader, dict byte[] = []) {
+			self.source = source
+			self.dict = dict
+			dictId = 0
+			blocks = new BlockDecoder()
+			seeded = new BlockDecoder()
+			window = []
+			served = 0
+			filled = 0
+			inFrame = false
+			windowSize = 0
+			blockMax = 0
+			checked = false
+			expected = int64(-1)
+			produced = int64(0)
+			content = new XXH64()
+			ended = false
+			lastBlock = false
+		}
+
+		// read implements std.io.Reader: decompressed bytes, 0 at the end of
+		// the last frame.
+		// Fails when the source does, or on data that is not a valid frame
+		// (see `decompress`).
+		def read(p byte[]) !int {
+			for served == filled {
+				return 0 when ended
+				try nextBlock()
+			}
+			let n = (filled - served).min(p.len())
+			mem.copyN(p, window[served:served + n], n)
+			served += n
+			return n
+		}
+
+		internal def nextBlock() !none {
+			if !inFrame {
+				let more = try frameHeader()
+				if !more {
+					ended = true
+					return none
+				}
+			}
+			let head byte[] = []
+			head.len(3)
+			fail "zstd: unexpected end of data in a block header" when (try readSome(head)) != 3
+			let word = int(head[0]) | (int(head[1]) << 8) | (int(head[2]) << 16)
+			lastBlock = word & 1 != 0
+			let kind = (word >> 1) & 3
+			let size = word >> 3
+			fail "zstd: block type 3 is reserved" when kind == 3
+			fail "zstd: a block of {size} bytes is larger than the frame allows" when size > blockMax
+
+			// Make room for one block, keeping the window before it.
+			if filled + blockMax > window.len() {
+				let keep = filled.min(windowSize)
+				mem.moveN(window, window[filled - keep:filled], keep) when keep > 0 && filled > keep
+				filled = keep
+				let room = keep + blockMax
+				window.len(room.max(windowSize * 2 + blockMax)) when window.len() < room
+			}
+			served = filled
+			let start = filled
+			if kind == 1 {
+				let one byte[] = []
+				one.len(1)
+				fail "zstd: unexpected end of data in a block" when (try readSome(one)) != 1
+				window.fill(one[0], start, start + size) when size > 0
+				filled = start + size
+			} else {
+				let block byte[] = []
+				block.len(size)
+				fail "zstd: unexpected end of data in a block" when (try readSome(block)) != size
+				if kind == 0 {
+					mem.copyN(window[start:], block, size) when size > 0
+					filled = start + size
+				} else {
+					// A block decodes to at most blockMax bytes: the slice
+					// bounds it.
+					filled = try blocks.decode(block, 0, size, window[0:start + blockMax], start)
+				}
+			}
+			produced += int64(filled - start)
+			content.write(window[start:filled]) when checked
+			try endFrame() when lastBlock
+			return none
+		}
+
+		// Reads a frame's header, passing over skippable frames. False when
+		// the data ended where a frame could start.
+		internal def frameHeader() !bool {
+			let head byte[] = []
+			head.len(4)
+			let magic = uint32(0)
+			for {
+				let got = try readSome(head)
+				return false when got == 0
+				fail "zstd: unexpected end of data in a frame's magic number" when got != 4
+				magic = uint32(head[0]) | (uint32(head[1]) << 8) | (uint32(head[2]) << 16) | (uint32(head[3]) << 24)
+				break when (magic & 0xFFFFFFF0) != 0x184D2A50
+				fail "zstd: unexpected end of data in a skippable frame" when (try readSome(head)) != 4
+				let skip byte[] = []
+				skip.len(int(uint32(head[0]) | (uint32(head[1]) << 8) | (uint32(head[2]) << 16) | (uint32(head[3]) << 24)))
+				fail "zstd: unexpected end of data in a skippable frame" when (try readSome(skip)) != skip.len()
+			}
+			fail "zstd: not a Zstandard frame" when magic != 0xFD2FB528
+
+			let one byte[] = []
+			one.len(1)
+			fail "zstd: unexpected end of data in a frame header" when (try readSome(one)) != 1
+			let descriptor = int(one[0])
+			fail "zstd: a reserved bit is set in the frame header" when descriptor & 0x08 != 0
+			let single = descriptor & 0x20 != 0
+			checked = descriptor & 0x04 != 0
+			let idBytes = int[0, 1, 2, 4][descriptor & 3]
+			let sizeFlag = descriptor >> 6
+			let sizeBytes = int[0, 2, 4, 8][sizeFlag]
+			sizeBytes = 1 when sizeFlag == 0 && single
+			let rest byte[] = []
+			rest.len((single ?? (0, 1)) + idBytes + sizeBytes)
+			fail "zstd: unexpected end of data in a frame header" when (try readSome(rest)) != rest.len()
+			let at = 0
+			windowSize = 0
+			if !single {
+				let exponent = int(rest[0]) >> 3
+				let mantissa = int(rest[0]) & 7
+				let base = 1 << (10 + exponent)
+				windowSize = base + (base >> 3) * mantissa
+				at = 1
+			}
+			let named = 0
+			for let i = 0; i < idBytes; i++ {
+				named |= int(rest[at + i]) << (8 * i)
+			}
+			at += idBytes
+			expected = int64(-1)
+			if sizeBytes > 0 {
+				let value = uint64(0)
+				for let i = 0; i < sizeBytes; i++ {
+					value |= uint64(rest[at + i]) << uint64(8 * i)
+				}
+				value += uint64(256) when sizeBytes == 2
+				expected = int64(value)
+			}
+			if single {
+				fail "zstd: a frame of {expected} bytes in one segment is above the window limit of {maxWindow}" when expected > int64(maxWindow)
+				windowSize = int(expected)
+			}
+			fail "zstd: the frame's window of {windowSize} bytes is above the limit of {maxWindow}" when windowSize > maxWindow
+			blockMax = windowSize.min(131072)
+			blockMax = 1 when blockMax < 1
+
+			if dict.len() > 0 && !dictRead {
+				dictRead = true
+				try loadDictionary()
+			}
+			fail "zstd: the frame needs dictionary {named} and none was given" when named != 0 && dict.len() == 0
+			fail "zstd: the frame needs dictionary {named}, the one given is {dictId}" when named != 0 && dictId != 0 && named != dictId
+
+			// A frame starts from the dictionary: its content as the data
+			// before the first byte, its tables as the ones to repeat.
+			blocks.reset()
+			if dict.len() > 0 {
+				blocks.recent[0] = seeded.recent[0]
+				blocks.recent[1] = seeded.recent[1]
+				blocks.recent[2] = seeded.recent[2]
+				if seeded.hasHuffman {
+					blocks.huffman.copyFrom(seeded.huffman)
+					blocks.literalTable.copyFrom(seeded.literalTable)
+					blocks.offsetTable.copyFrom(seeded.offsetTable)
+					blocks.matchTable.copyFrom(seeded.matchTable)
+					blocks.hasHuffman = true
+					blocks.hasLiteral = true
+					blocks.hasOffset = true
+					blocks.hasMatch = true
+				}
+			}
+			let prefix = history()
+			window.len(prefix.len() + windowSize + blockMax) when window.len() < prefix.len() + blockMax
+			mem.copyN(window, prefix, prefix.len()) when prefix.len() > 0
+			filled = prefix.len()
+			served = filled
+			// The window reaches into the dictionary while the frame is short.
+			windowSize += prefix.len()
+			produced = int64(0)
+			content.reset()
+			inFrame = true
+			return true
+		}
+
+		// The dictionary's content: what follows the tables of a formatted
+		// dictionary, or the whole of a plain one.
+		internal def history() byte[] {
+			return dict[contentAt:] when contentAt > 0
+			return dict
+		}
+
+		internal contentAt int  = 0
+		internal dictRead  bool = false
+
+		// Reads a formatted dictionary's id, tables and offsets into
+		// `seeded`. A dictionary without the magic number is plain content.
+		internal def loadDictionary() !none {
+			return none when dict.len() < 8
+			let magic = uint32(dict[0]) | (uint32(dict[1]) << 8) | (uint32(dict[2]) << 16) | (uint32(dict[3]) << 24)
+			return none when magic != 0xEC30A437
+			dictId = int(uint32(dict[4]) | (uint32(dict[5]) << 8) | (uint32(dict[6]) << 16) | (uint32(dict[7]) << 24))
+			let pos = try readHuffmanTable(dict, 8, dict.len(), seeded.huffman)
+			seeded.hasHuffman = true
+			let forward = new ForwardBits(dict, pos, dict.len())
+			let (offsetCounts, offsetAccuracy) = try readFseCounts(forward, 8, 32)
+			try seeded.offsetTable.build(offsetCounts, offsetAccuracy)
+			forward = new ForwardBits(dict, forward.byteAfter(), dict.len())
+			let (matchCounts, matchAccuracy) = try readFseCounts(forward, 9, 53)
+			try seeded.matchTable.build(matchCounts, matchAccuracy)
+			forward = new ForwardBits(dict, forward.byteAfter(), dict.len())
+			let (literalCounts, literalAccuracy) = try readFseCounts(forward, 9, 36)
+			try seeded.literalTable.build(literalCounts, literalAccuracy)
+			pos = forward.byteAfter()
+			fail "zstd: the dictionary ends inside its tables" when pos + 12 > dict.len()
+			for let i = 0; i < 3; i++ {
+				let at = pos + 4 * i
+				seeded.recent[i] = int(uint32(dict[at]) | (uint32(dict[at + 1]) << 8) | (uint32(dict[at + 2]) << 16) | (uint32(dict[at + 3]) << 24))
+				fail "zstd: the dictionary holds an offset of zero" when seeded.recent[i] == 0
+			}
+			contentAt = pos + 12
+			return none
+		}
+
+		// Checks what a frame promised once its last block is read.
+		internal def endFrame() !none {
+			if checked {
+				let tail byte[] = []
+				tail.len(4)
+				fail "zstd: unexpected end of data in the content checksum" when (try readSome(tail)) != 4
+				let stored = uint32(tail[0]) | (uint32(tail[1]) << 8) | (uint32(tail[2]) << 16) | (uint32(tail[3]) << 24)
+				fail "zstd: the content's checksum does not match" when stored != uint32(content.sum() & uint64(0xFFFFFFFF))
+			}
+			fail "zstd: the frame holds {produced} bytes, its header says {expected}" when expected >= int64(0) && expected != produced
+			inFrame = false
+			return none
+		}
+
+		// Fills `p` from the source; less than its length only at the end.
+		internal def readSome(p byte[]) !int {
+			let total = 0
+			for total < p.len() {
+				let n = try source.read(p[total:])
+				break when n == 0
+				total += n
+			}
+			return total
+		}
+	}
+}
