@@ -1,0 +1,1530 @@
+// The media of a peer connection: what its tracks send and receive as
+// RTP over the transport, and the RTCP that goes with it (reports, NACK,
+// keyframe requests, REMB).
+internal std.net.webrtc partial module std.net.webrtc.peer {
+	use (
+		std.crypto::(rand)
+		std.mem
+		std.net
+		std.net.rtp
+		std.net.sequence::(expand)
+		std.net.waiting::(Signal, awaitSignal)
+		std.net.webrtc::*
+		std.time
+	)
+
+	// Packets a sender keeps to answer a NACK from, a power of two.
+	const sentRing = 512
+	// The largest RTP payload: a 1200-byte datagram less the RTP header,
+	// the SRTP tag and room for a header extension.
+	const payloadRoom = 1140
+	// How often the media task looks for missing packets, and how often
+	// it sends reports, in nanoseconds.
+	const mediaTick = 50000000
+	const reportEvery = 1000000000
+	// How long a frame may stay incomplete before it is given up and a
+	// keyframe asked for.
+	const frameWait = 500000000
+	// A packet is asked for again a round trip and a quarter after it was
+	// last asked for (20 ms at least), `askTries` times at most; the asking is
+	// remembered by sequence number modulo `askRing`, which is the room of
+	// a receiver's jitter buffer: the numbers that can be missing at one
+	// time lie within it, so no two share a place.
+	const askTries = 10
+	const askRing = 512
+	const askSpacing = 20000000
+
+	// Arrival is how a packet reached a receiver: in its stream, as a
+	// retransmission, or put back from a repair packet.
+	enum Arrival {
+		Itself,
+		Again,
+		Repaired,
+	}
+	// Bytes after which what a sender spent on media and on repair is
+	// halved: the share of repair is that of the last second or so.
+	const spentWindow = 250000
+
+	// Where the estimate of a path starts and the least it falls to, in
+	// bits per second; packets leave at `pacingFactor` halves of the
+	// estimate, a `pacingInterval` of them at a time.
+	const startBitrate = 300000
+	const leastBitrate = 30000
+	const pacingFactor = 5
+	const pacingInterval = 5000000
+	// Seconds between 1900 and 1970, for NTP timestamps.
+	const ntpEpoch = 2208988800
+
+	// clockRateOf is the RTP clock of a format: 48 kHz for Opus (RFC 7587
+	// §4.1), 90 kHz for video.
+	def clockRateOf(format rtp.PayloadFormat) int {
+		return format == rtp.PayloadFormat.Opus ?? (48000, 90000)
+	}
+
+	def isAudio(format rtp.PayloadFormat) bool {
+		return format == rtp.PayloadFormat.Opus
+	}
+
+	// Sender is the sending side of one track: it cuts frames into RTP
+	// packets, numbers and stamps them, has them protected and sent, and
+	// keeps the last ones to send again when the peer asks.
+	type Sender {
+		format         rtp.PayloadFormat
+		ssrc           int               = 0
+		trackID        string            = ""
+		payloadType    int               = -1
+		transport      ?Transport        = none
+		packetizer     rtp.Packetizer
+		header         rtp.Packet
+		sequence       int               = 0
+		timestamp      int               = 0
+		// The packets sent last, as they went out (protected), by
+		// sequence number modulo the ring; their lengths and numbers.
+		ring           byte[][]          = []
+		sizes          int[]             = []
+		numbers        int[]             = []
+		packets        int               = 0
+		octets         int               = 0
+		resent         int               = 0
+		// Repair packets sent (FlexFEC and ULPFEC), and the bytes that
+		// lately went into media and into repair (repair packets and
+		// retransmissions): the bitrate an encoder may use is the track's
+		// less the share repair takes.
+		repairs        int               = 0
+		spentMedia     int               = 0
+		spentRepair    int               = 0
+		// The peer asked for a keyframe (PLI or FIR) and none was
+		// written since.
+		keyframeWanted bool              = false
+		// Bits per second the track may use: its own limit, lowered to
+		// what the peer's REMB says.
+		maxBitrate     int               = 0
+		estimate       int               = 0
+		// What the peer's last reception report said: the fraction lost
+		// (in 1/256) and its interarrival jitter.
+		fractionLost   int               = 0
+		peerJitter     int               = 0
+		peerLost       int               = 0
+		roundTrip      int               = 0
+		// Retransmissions as a stream of their own (RFC 4588) when the
+		// answer took them: their payload type (0 without), source and
+		// next sequence number, and the buffer packets are protected in.
+		// The ring then keeps the packets as they were before protection.
+		rtxType        int               = 0
+		rtxSsrc        int               = 0
+		rtxSequence    int               = 0
+		scratch        byte[]            = []
+		// FlexFEC (RFC 8627) when the answer took it: the repair stream's
+		// source and first sequence number, its maker, and the buffer a
+		// repair packet is built and protected in.
+		fecSsrc        int               = 0
+		fecSequence    int               = 0
+		fec            ?rtp.FecSender    = none
+		fecOut         byte[]            = []
+		// Transport-wide numbers (congestion control) when the answer
+		// took them: the header extension's number, where its two bytes
+		// lie in a header, and the estimator that hands the numbers out.
+		wideID         int               = 0
+		wideAt         int               = -1
+		control        ?Estimator        = none
+		// Packets wait in the ring for the pacing task when there is one
+		// (video only): which slots are staged, the next number to send,
+		// and the signal that wakes the task.
+		staged         bool[]            = []
+		unsent         int               = 0
+		paced          ?Signal           = none
+		// Packets the peer asked for again that wait for the pacing
+		// task, and which of the last packets the next probe repeats.
+		resends        int[]             = []
+		padTurn        int               = 0
+		// ULPFEC inside the stream (RFC 5109) when the answer took it:
+		// the payload type every packet then goes under (redundant data,
+		// RFC 2198), the one that marks repair blocks, the one
+		// retransmissions of such packets come under, the maker of the
+		// blocks, and the buffers a packet is laid out in without its
+		// redundancy header and a block is built in. Repair packets are
+		// made while the peer reports loss, or always.
+		redType        int               = 0
+		ulpType        int               = 0
+		redRtxType     int               = 0
+		ulp            ?rtp.FecSender    = none
+		ulpAlways      bool              = false
+		// Sound sent as redundant data: the payload of the packet before
+		// and its timestamp, to carry it again in the next one.
+		past           byte[]            = []
+		pastTime       int               = 0
+		lossyUntil     int               = 0
+		plain          byte[]            = []
+		block          byte[]            = []
+		blocks         byte[][]          = []
+		// The simulcast layer the sender is (RFC 8853), empty for a
+		// track with one stream; where the header of the element that
+		// names it lies in a packet's header, and the number
+		// retransmissions name it under.
+		rid            string            = ""
+		ridAt          int               = -1
+		repairedID     int               = 0
+
+		def new(format rtp.PayloadFormat, start byte[]) {
+			self.format = format
+			packetizer = new rtp.Packetizer(format, payloadRoom)
+			header = new rtp.Packet()
+			ssrc = (int(start[0]) << 24 | int(start[1]) << 16 | int(start[2]) << 8 | int(start[3])) | 1
+			sequence = int(start[4]) << 8 | int(start[5])
+			unsent = sequence
+			timestamp = int(start[6]) << 24 | int(start[7]) << 16 | int(start[8]) << 8 | int(start[9])
+			rtxSsrc = (int(start[10]) << 24 | int(start[11]) << 16 | int(start[12]) << 8 | int(start[13])) | 1
+			rtxSequence = int(start[14]) << 8 | int(start[15])
+			fecSsrc = (int(start[16]) << 24 | int(start[17]) << 16 | int(start[18]) << 8 | int(start[19])) | 1
+			fecSequence = int(start[20]) << 8 | int(start[21])
+			maxBitrate = isAudio(format) ?? (64000, 1500000)
+			estimate = maxBitrate
+			for let i = 0; i < sentRing; i++ {
+				let slot byte[]
+				ring.push(slot)
+				sizes.push(0)
+				numbers.push(-1)
+				staged.push(false)
+			}
+		}
+
+		// carry connects the sender to the transport.
+		atomic def carry(over Transport) {
+			transport = over
+		}
+
+		// number gives the sender the payload type the answer chose, and
+		// the media section its packets name in the MID header extension
+		// when one was agreed (RFC 9143 §15).
+		atomic def number(payloadType int, mid string, midID int, rtxType int, fecType int = 0, wideID int = 0, rid string = "", ridID int = 0, repairedID int = 0) {
+			self.payloadType = payloadType
+			self.rtxType = rtxType
+			let guard = fec
+			if fecType > 0 && guard is none {
+				let made = new rtp.FecSender(fecType, fecSsrc, fecSequence)
+				made.extension = wideID
+				fec = made
+			}
+			header.writeExtension(midID, mid.bytes()) when midID > 0
+			header.writeExtension(wideID, byte[0, 0]) when wideID > 0
+			self.wideID = wideID
+			self.rid = rid
+			self.repairedID = repairedID
+			header.writeExtension(ridID, rid.bytes()) when rid != "" && ridID > 0
+			// Offsets last: an element added lays the others out again.
+			wideAt = wideID > 0 ?? (header.extensionOffset(wideID), -1)
+			ridAt = rid != "" && ridID > 0 && header.extensionProfile == 0xBEDE ?? (header.extensionOffset(ridID) - 1, -1)
+		}
+
+		// guard has the sender wrap its packets as redundant data and
+		// protect them with ULPFEC under the payload types the answer
+		// took; `always` makes a repair packet for every group whatever
+		// the peer reports. 0 for `redType` turns it off.
+		atomic def guard(redType int, ulpType int, redRtxType int, always bool) {
+			self.redType = ulpType > 0 || isAudio(format) ?? (redType, 0)
+			self.ulpType = ulpType
+			self.redRtxType = redRtxType
+			ulpAlways = always
+			ulp = new rtp.FecSender(ulpType, ssrc, 0) when self.redType > 0 && ulpType > 0 && ulp is none
+		}
+
+		// repairing is the payload type retransmissions go under: the one
+		// for redundant data while packets are wrapped, else the stream's
+		// own, 0 for none.
+		internal def repairing() int {
+			return redType > 0 ?? (redRtxType, rtxType)
+		}
+
+		// steer gives the sender the connection's estimator and, for
+		// video, the signal of the task that paces its packets.
+		atomic def steer(control Estimator, paced Signal) {
+			self.control = control
+			self.paced = paced unless isAudio(format)
+		}
+
+		atomic def carried() bool {
+			return !(transport is none)
+		}
+
+		// write takes one encoded frame that lasts `length`: its payloads
+		// (`rtp.Packetizer`) each behind an RTP header in a slot of the
+		// ring. Audio, and video without a pacing task, is sent at once;
+		// paced video waits there for its turn. Fails with WebRtcError
+		// while the connection does not carry the track, as the transport
+		// does otherwise.
+		atomic def write(frame byte[], length duration, keyframe bool, layer int = -1) !none {
+			let over = transport
+			fail transportError("the connection does not carry the track yet") when over is none || payloadType < 0
+			let payloads = packetizer.packetize(frame, keyframe, layer)
+			let room = over.rtpOverhead()
+			let pacing = paced
+			let wrapped = redType > 0
+			let shield = ulp
+			let shielding = wrapped && !(shield is none) && (ulpAlways || lossyUntil > int(time.monoNs()))
+			header.timestamp = timestamp & 0xFFFFFFFF
+			header.ssrc = ssrc
+			for let (i, payload) in payloads {
+				header.payloadType = wrapped ?? (redType, payloadType)
+				header.sequence = sequence & 0xFFFF
+				// The marker ends a video frame (RFC 7741 §4.1 and the
+				// like); audio sets none here.
+				header.marker = !isAudio(format) && i == payloads.len() - 1
+				let place = sequence & (sentRing - 1)
+				let slot = ring[place]
+				// Sound carries the packet before it again (RFC 2198):
+				// the peer plays it when that one was lost.
+				let behind = timestamp - pastTime
+				let again = wrapped && isAudio(format) && past.len() > 0 && past.len() <= rtp.redundantMaxSize && behind > 0 && behind <= rtp.redundantMaxAge
+				let size = header.headerSize() + payload.len() + (wrapped ?? (1, 0)) + (again ?? (4 + past.len(), 0))
+				slot.cap(1500) when slot.cap() < size + room
+				slot.len(size + room)
+				let at = header.writeHeader(slot, 0)
+				at = rtp.writeRedundant(slot, at, payloadType, behind, past.len()) when again
+				if wrapped {
+					// The primary block: the payload under its own type.
+					slot[at] = byte(payloadType & 0x7F)
+					at++
+				}
+				if again {
+					mem.copyN(slot, at, past, 0, past.len())
+					at += past.len()
+				}
+				mem.copyN(slot, at, payload, 0, payload.len())
+				if wrapped && isAudio(format) {
+					past.len(payload.len())
+					mem.copyN(past, 0, payload, 0, payload.len())
+					pastTime = timestamp
+				}
+				ring[place] = slot
+				numbers[place] = sequence & 0xFFFF
+				sizes[place] = size
+				staged[place] = true
+				sequence++
+				packets++
+				octets += payload.len()
+				spend(size, 0)
+				// A queue longer than the ring has lost its oldest packets.
+				unsent = sequence - sentRing + 1 when sequence - unsent >= sentRing
+				try next() when pacing is none
+				continue unless shielding && !(shield is none)
+				// The repair block covers the packet as it is without the
+				// redundancy header. Blocks wait for the end of the frame:
+				// a receiver puts a frame together from packets whose
+				// numbers follow each other.
+				header.payloadType = payloadType
+				plain.cap(1500) when plain.cap() < size
+				plain.len(size - 1)
+				let head = header.writeHeader(plain, 0)
+				payload.copy(plain[head:])
+				block.cap(1600) when block.cap() < 1600
+				block.len(1600)
+				let made = shield.protectUlp(plain, size - 1, block) onerror recover 0
+				blocks.push(block[0:made].clone()) when made > 0
+			}
+			if shielding && !(shield is none) {
+				// What is left of the last group, then every block as a
+				// packet of the stream with the next numbers.
+				block.cap(1600) when block.cap() < 1600
+				block.len(1600)
+				let made = shield.flushUlp(block) onerror recover 0
+				blocks.push(block[0:made].clone()) when made > 0
+				for let repair in blocks {
+					header.payloadType = redType
+					header.sequence = sequence & 0xFFFF
+					header.marker = false
+					let spot = sequence & (sentRing - 1)
+					let extra = ring[spot]
+					let whole = header.headerSize() + 1 + repair.len()
+					extra.cap(1700) when extra.cap() < whole + room
+					extra.len(whole + room)
+					let behind = header.writeHeader(extra, 0)
+					extra[behind] = byte(ulpType & 0x7F)
+					repair.copy(extra[behind + 1:])
+					ring[spot] = extra
+					numbers[spot] = sequence & 0xFFFF
+					sizes[spot] = whole
+					staged[spot] = true
+					repairs++
+					spend(0, whole)
+					sequence++
+					unsent = sequence - sentRing + 1 when sequence - unsent >= sentRing
+					try next() when pacing is none
+				}
+				blocks.flush()
+			}
+			pacing.raise() unless pacing is none
+			timestamp += int(length) * clockRateOf(format) / 1000000000
+			keyframeWanted = false when keyframe
+			return none
+		}
+
+		// skip lets `length` pass without a frame: the next frame's
+		// timestamp is that much later (sound an encoder left out as
+		// silence).
+		atomic def skip(length duration) {
+			timestamp += int(length) * clockRateOf(format) / 1000000000
+		}
+
+		// next sends the oldest staged packet and returns its length on
+		// the wire, 0 when none waits: it gets its transport-wide number,
+		// goes into the repair packet being built (a group that it
+		// completes is sent behind it), is protected and sent. Fails as
+		// the transport does.
+		atomic def next() !int {
+			let over = transport
+			return 0 when over is none
+			// What the peer misses goes before anything new.
+			for resends.len() > 0 {
+				let size = resend(resends.shift(), false)
+				return size when size > 0
+			}
+			for unsent < sequence && !staged[unsent & (sentRing - 1)] {
+				unsent++
+			}
+			return 0 when unsent >= sequence
+			let place = unsent & (sentRing - 1)
+			unsent++
+			staged[place] = false
+			let slot = ring[place]
+			let size = sizes[place]
+			let room = over.rtpOverhead()
+			let estimator = control
+			// The repair packet is made from the packet before it gets its
+			// transport-wide number: receivers take the values a sender
+			// fills in on the way out for zero.
+			let guard = fec
+			let repairSize = 0
+			if !(guard is none) {
+				fecOut.cap(1700) when fecOut.cap() < 1700
+				fecOut.len(1700)
+				repairSize = guard.protect(slot, size, fecOut) onerror recover 0
+			}
+			if wideAt >= 0 && !(estimator is none) {
+				let wide = estimator.sending(size + room, int(time.monoNs()))
+				slot[wideAt] = byte(wide >> 8)
+				slot[wideAt + 1] = byte(wide & 0xFF)
+			}
+			if repairing() > 0 {
+				// The ring keeps the packet as it is; it is protected
+				// in a copy, since a retransmission wraps the plain one.
+				slot.len(size)
+				scratch.cap(1600) when scratch.cap() < size + room
+				scratch.len(size + room)
+				slot.copy(scratch)
+				try over.sendRtp(scratch, size)
+			} else {
+				sizes[place] = try over.sendRtp(slot, size)
+			}
+			if repairSize > 0 {
+				repairs++
+				spend(0, repairSize)
+				if wideAt >= 0 && !(estimator is none) {
+					let wide = estimator.sending(repairSize + room, int(time.monoNs()))
+					fecOut[rtp.extensionOffset] = byte(wide >> 8)
+					fecOut[rtp.extensionOffset + 1] = byte(wide & 0xFF)
+				}
+				try over.sendRtp(fecOut, repairSize)
+			}
+			return size + room
+		}
+
+		// again sends a packet the peer missed once more, when the ring
+		// still holds it: at once for a track that is not paced, in the
+		// pacing task's next turn for one that is.
+		atomic def again(number int) {
+			let place = number & (sentRing - 1)
+			return when numbers[place] != number || sizes[place] == 0 || staged[place]
+			let pacing = paced
+			if pacing is none {
+				resend(number, false)
+				return
+			}
+			resends.push(number) unless resends.len() >= sentRing || resends.includes(number)
+			pacing.raise()
+		}
+
+		// pad sends one of the last eight packets once more as a
+		// retransmission, for a probe of the path to have something to
+		// send, and returns its length on the wire: 0 for a track without
+		// retransmissions as a stream of their own or with nothing sent.
+		atomic def pad() int {
+			return 0 when repairing() == 0 || wideAt < 0
+			for let tries = 0; tries < 8; tries++ {
+				let number = (sequence - 1 - padTurn) & 0xFFFF
+				padTurn = (padTurn + 1) & 7
+				let size = resend(number, true)
+				return size when size > 0
+			}
+			return 0
+		}
+
+		// resend sends the packet with the number again, as a
+		// retransmission packet (RFC 4588) when the answer took them, and
+		// returns its length on the wire, 0 when the ring no longer holds
+		// it or the transport refused it. A `padding` one is not counted
+		// as resent.
+		internal def resend(number int, padding bool) int {
+			let place = number & (sentRing - 1)
+			let over = transport
+			return 0 when over is none || numbers[place] != number || sizes[place] == 0 || staged[place]
+			if !padding {
+				resent++
+				spend(0, sizes[place])
+			}
+			if repairing() == 0 {
+				over.sendAgain(ring[place], sizes[place]) onerror recover none
+				return sizes[place]
+			}
+			let room = over.rtpOverhead()
+			scratch.cap(1600) when scratch.cap() < sizes[place] + 2 + room
+			scratch.len(sizes[place] + 2 + room)
+			let size = rtp.retransmission(ring[place], sizes[place], scratch, repairing(), rtxSsrc, rtxSequence) onerror recover 0
+			return 0 when size == 0
+			rtxSequence = (rtxSequence + 1) & 0xFFFF
+			// A retransmission names the layer it repairs under the other
+			// extension (RFC 8852 §3.2): the same element, renumbered.
+			scratch[ridAt] = byte((repairedID << 4) | (int(scratch[ridAt]) & 0x0F)) when ridAt >= 0 && repairedID > 0
+			let estimator = control
+			if wideAt >= 0 && !(estimator is none) {
+				let wide = estimator.sending(size + room, int(time.monoNs()), padding)
+				scratch[wideAt] = byte(wide >> 8)
+				scratch[wideAt + 1] = byte(wide & 0xFF)
+			}
+			over.sendRtp(scratch, size) onerror recover 0
+			return size + room
+		}
+
+		// spend counts bytes that went into media and into repair.
+		internal def spend(media int, repair int) {
+			spentMedia += media
+			spentRepair += repair
+			return when spentMedia + spentRepair < spentWindow
+			spentMedia = spentMedia / 2
+			spentRepair = spentRepair / 2
+		}
+
+		atomic def wantKeyframe() {
+			keyframeWanted = true
+		}
+
+		// takeKeyframeRequest reports whether the peer asked for a
+		// keyframe since the last one was written, once per request.
+		atomic def takeKeyframeRequest() bool {
+			let wanted = keyframeWanted
+			keyframeWanted = false
+			return wanted
+		}
+
+		atomic def limit(bitrate int) {
+			estimate = bitrate.min(maxBitrate)
+		}
+
+		atomic def most() int {
+			return maxBitrate
+		}
+
+		// queued is the number of packets that wait for the pacing task.
+		atomic def queued() int {
+			return sequence - unsent + resends.len()
+		}
+
+		atomic def turn() int {
+			return roundTrip
+		}
+
+		// allowed is the bits per second the track's frames may take: its
+		// part of the estimate less the share that repair packets and
+		// retransmissions took of what was sent lately, at most half.
+		atomic def allowed() int {
+			let all = spentMedia + spentRepair
+			return estimate when spentRepair == 0 || all == 0
+			return estimate * spentMedia.max(all / 2) / all
+		}
+
+		// heard takes the peer's reception report of this source; with
+		// the middle of the NTP time of now, the round trip follows from
+		// the sender report it answers (RFC 3550 §6.4.1).
+		atomic def heard(report rtp.ReceptionReport, nowMiddle int) {
+			fractionLost = report.fractionLost
+			// Repair packets are worth their bits for ten seconds after
+			// the peer last reported a loss.
+			lossyUntil = int(time.monoNs()) + 10000000000 when report.fractionLost > 0
+			peerJitter = report.jitter
+			peerLost = report.lost
+			return when report.lastSenderReport == 0
+			let turn = (nowMiddle - report.lastSenderReport - report.delay) & 0xFFFFFFFF
+			roundTrip = turn * 1000000000 / 65536 when turn < 0x80000000
+		}
+
+		// statistics is what the sender counted and what the peer last
+		// reported of it.
+		atomic def statistics() SendStats {
+			return SendStats{packets: packets, bytes: octets, resent: resent, repairs: repairs, lost: peerLost, fractionLost: float(fractionLost) / 256.0, jitter: duration(peerJitter * 1000000000 / clockRateOf(format)), roundTrip: duration(roundTrip), bitrate: estimate}
+		}
+
+		// report is the sender report of this moment (RFC 3550 §6.4.1).
+		atomic def report(wallNs int) rtp.SenderReport {
+			return rtp.SenderReport{ssrc: ssrc, ntpSeconds: wallNs / 1000000000 + ntpEpoch, ntpFraction: (wallNs % 1000000000) * 4294967296 / 1000000000, rtpTime: timestamp & 0xFFFFFFFF, packetCount: packets, octetCount: octets}
+		}
+	}
+
+	// Receiver is the receiving side of one media section: its packets go
+	// into a jitter buffer, whole frames come out in order, and what
+	// arrived is counted for the reception reports.
+	type Receiver {
+		mid           string
+		format        rtp.PayloadFormat
+		payloadType   int
+		// The sources the peer's description named, and the one packets
+		// came from (-1 before the first).
+		announced     int[]             = []
+		source        int               = -1
+		// The number of the MID header extension, 0 without it.
+		midID         int               = 0
+		// The simulcast layer the receiver takes (empty for a section
+		// with one stream) and the numbers of the header extensions that
+		// name a packet's layer and the layer a retransmission repairs.
+		rid           string            = ""
+		ridID         int               = 0
+		repairedID    int               = 0
+		// The payload type retransmissions come under (0 without) and the
+		// sources they come from.
+		rtxType       int               = 0
+		repairs       int[]             = []
+		// The payload type FlexFEC repair packets come under (0 without),
+		// the sources they come from, and what puts lost packets back.
+		fecType       int               = 0
+		fecSources    int[]             = []
+		fec           ?rtp.FecReceiver  = none
+		fecOut        byte[]            = []
+		// ULPFEC inside the stream when the answer took it: the payload
+		// types of redundant data, of repair blocks and of
+		// retransmissions of such packets (0 without), and the buffer a
+		// block is turned into a repair packet in.
+		redType       int               = 0
+		ulpType       int               = 0
+		redRtxType    int               = 0
+		flexed        byte[]            = []
+		taken         int               = 0
+		frames        int               = 0
+		jitter        rtp.JitterBuffer
+		packet        rtp.Packet
+		arrived       channel<none>
+		closed        bool              = false
+		// Reception statistics (RFC 3550 §6.4.1, Appendix A.3, A.8):
+		// `received` counts the packets that came in the stream itself,
+		// which is what the reports go by (RFC 4588 §4: loss is reported
+		// as it was before repair); `resent` and `repaired` those a
+		// retransmission or a repair packet put back.
+		received      int               = 0
+		resent        int               = 0
+		repaired      int               = 0
+		// Packets asked for again, each counted once, and keyframes asked
+		// for; per sequence number modulo `askRing`, the number last asked
+		// for there, when, and how often.
+		requested     int               = 0
+		pictureAsks   int               = 0
+		askedNumber   int[]             = []
+		askedAt       int[]             = []
+		askedTimes    int[]             = []
+		// A packet came that left numbers out before it: the media task
+		// is woken to ask for them.
+		gapped        bool              = false
+		// The length of the header of the stream's own packets: a packet
+		// that came as a retransmission under another header is not what
+		// a repair packet was made from.
+		ownHeader     int               = 0
+		// The retransmission stream, which has reports of its own (RFC
+		// 4588 §4): its source (-1 before a packet of it), its first and
+		// highest sequence numbers, and its packets counted.
+		againSource   int               = -1
+		againFirst    int               = -1
+		againHighest  int               = -1
+		againCount    int               = 0
+		againExpected int               = 0
+		againCounted  int               = 0
+		first         int               = -1
+		highest       int               = -1
+		expectedThen  int               = 0
+		receivedThen  int               = 0
+		transit       int               = 0
+		variation     int               = 0
+		lastReport    int               = 0
+		lastReportAt  int               = 0
+		// When the frame at the head was first seen incomplete, 0 when
+		// nothing is missing; when a keyframe was last asked for.
+		stuckSince    int               = 0
+		pictureAt     int               = 0
+		wantsPicture  bool              = false
+
+		def new(mid string, format rtp.PayloadFormat, payloadType int, announced int[]) {
+			self.mid = mid
+			self.format = format
+			self.payloadType = payloadType
+			self.announced = announced
+			jitter = new rtp.JitterBuffer(format, askRing)
+			packet = new rtp.Packet()
+			arrived = new channel<none>(1)
+			askedNumber.len(askRing)
+			askedNumber.fill(-1)
+			askedAt.len(askRing)
+			askedTimes.len(askRing)
+		}
+
+		// primary is the source of the stream itself: the one packets
+		// came from, else the first announced; -1 when neither is known.
+		atomic def primary() int {
+			return source when source >= 0
+			return announced.len() > 0 ?? (announced[0], -1)
+		}
+
+		// protect has the receiver put lost packets back from FlexFEC
+		// repair packets of a payload type and sources (RFC 8627).
+		atomic def protect(fecType int, fecSources int[]) {
+			self.fecType = fecType
+			self.fecSources = fecSources
+			fec = new rtp.FecReceiver() when fecType > 0 && fec is none
+		}
+
+		// guard has the receiver take redundant data and ULPFEC repair
+		// blocks under the payload types the answer took.
+		atomic def guard(redType int, ulpType int, redRtxType int) {
+			self.redType = ulpType > 0 || isAudio(format) ?? (redType, 0)
+			self.ulpType = ulpType
+			self.redRtxType = redRtxType
+			fec = new rtp.FecReceiver() when self.redType > 0 && ulpType > 0 && fec is none
+		}
+
+		// unwrap takes a packet of redundant data (RFC 2198) apart in
+		// place and returns its new length: the primary block under its
+		// own payload type, as the packet was before it was wrapped. A
+		// repair block is used here (the packet it puts back is taken as
+		// if it had arrived, and its number counts as seen) and 0
+		// returned, as for a packet that ends inside its headers.
+		atomic def unwrap(data byte[], now int) int {
+			let failed = false
+			packet.read(data) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return 0 when failed
+			let (kind, from) = rtp.redBlock(data, packet.payloadStart, packet.payloadEnd)
+			return 0 when kind < 0
+			if isAudio(format) {
+				// The packets sound carries again are taken as if they had
+				// arrived, each under the number the buffer finds for its
+				// time below the block behind it (the blocks name none):
+				// one that did arrive is known by its time. The marker of
+				// the packet it was is not carried: written as unset.
+				let start = packet.payloadStart
+				let end = packet.payloadEnd
+				let number = packet.sequence
+				let stamp = packet.timestamp
+				let count = rtp.redundantCount(data, start, end)
+				let below = number
+				for let i = count - 1; i >= 0; i-- {
+					let (carried, at, length, behind) = rtp.redundant(data, start, end, i)
+					let then = (stamp - behind) & 0xFFFFFFFF
+					let early = carried == payloadType && length > 0 ?? (jitter.placeFor(then, below), -1)
+					below = early < 0 ?? ((below - 1) & 0xFFFF, early)
+					continue when early < 0
+					fecOut.cap(1700) when fecOut.cap() < 1700
+					fecOut.len(start + length)
+					mem.copyN(fecOut, 0, data, 0, start)
+					fecOut[1] = byte(carried)
+					fecOut[2] = byte(early >> 8)
+					fecOut[3] = byte(early & 0xFF)
+					fecOut[4] = byte(then >> 24)
+					fecOut[5] = byte((then >> 16) & 0xFF)
+					fecOut[6] = byte((then >> 8) & 0xFF)
+					fecOut[7] = byte(then & 0xFF)
+					mem.copyN(fecOut, start, data, at, length)
+					admit(fecOut, now, Arrival.Repaired)
+				}
+				// `admit` read the last of them into `packet`.
+				if count > 0 {
+					packet.read(data) onerror recover none
+				}
+			}
+			if kind != ulpType {
+				let moved = packet.payloadEnd - from
+				data[from:packet.payloadEnd].copy(data[packet.payloadStart:])
+				data[1] = byte((int(data[1]) & 0x80) | kind)
+				return packet.payloadStart + moved
+			}
+			source = packet.ssrc
+			let number = highest < 0 ?? (packet.sequence, expand(highest, packet.sequence, 16))
+			first = number when first < 0
+			gapped = true when highest >= 0 && number > highest + 1
+			highest = number when number > highest
+			received++
+			jitter.pass(packet)
+			let guard = fec
+			return 0 when guard is none
+			flexed.cap(1700) when flexed.cap() < 1700
+			flexed.len(1700)
+			let made = rtp.ulpAsFlex(data, from, packet.payloadEnd, packet.ssrc, flexed)
+			return 0 when made == 0
+			flexed.len(made)
+			fecOut.cap(1700) when fecOut.cap() < 1700
+			fecOut.len(1700)
+			let size = guard.repair(flexed, fecOut) onerror recover 0
+			return 0 when size == 0
+			fecOut.len(size)
+			admit(fecOut, now, Arrival.Repaired)
+			flexed.len(1700)
+			guard.keep(fecOut, flexed)
+			return 0
+		}
+
+		// take takes an RTP packet read from the transport, one that came
+		// as a retransmission when `again`; with FlexFEC it is remembered,
+		// and a packet it lets a waiting repair packet put back is taken
+		// behind it.
+		atomic def take(data byte[], now int, again bool = false) {
+			admit(data, now, again ?? (Arrival.Again, Arrival.Itself))
+			let guard = fec
+			return when guard is none
+			if again {
+				return when packet.payloadStart != ownHeader
+			} else {
+				ownHeader = packet.payloadStart
+			}
+			fecOut.cap(1700) when fecOut.cap() < 1700
+			fecOut.len(1700)
+			let size = guard.keep(data, fecOut)
+			return when size == 0
+			fecOut.len(size)
+			admit(fecOut, now, Arrival.Repaired)
+		}
+
+		// mend takes a FlexFEC repair packet: the packet it puts back,
+		// when it lacks exactly one, is taken as if it had arrived.
+		atomic def mend(data byte[], now int) {
+			let guard = fec
+			return when guard is none
+			fecOut.cap(1700) when fecOut.cap() < 1700
+			fecOut.len(1700)
+			let size = guard.repair(data, fecOut) onerror recover 0
+			return when size == 0
+			fecOut.len(size)
+			admit(fecOut, now, Arrival.Repaired)
+			guard.keep(fecOut, data)
+		}
+
+		internal def admit(data byte[], now int, came Arrival) {
+			let failed = false
+			packet.read(data) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return when failed
+			source = packet.ssrc
+			let number = highest < 0 ?? (packet.sequence, expand(highest, packet.sequence, 16))
+			first = number when first < 0
+			gapped = true when came == Arrival.Itself && highest >= 0 && number > highest + 1
+			highest = number when number > highest
+			let fresh = jitter.push(packet)
+			if came == Arrival.Itself {
+				received++
+				// Interarrival jitter in timestamp units (A.8).
+				let arrival = now / 1000 * clockRateOf(format) / 1000000
+				let moved = arrival - packet.timestamp
+				variation += ((moved - transit).abs() - variation) / 16 when received > 1
+				transit = moved
+			} else if fresh {
+				resent++ when came == Arrival.Again
+				repaired++ when came == Arrival.Repaired
+			}
+			return unless fresh
+			taken += packet.payloadEnd - packet.payloadStart
+			arrived.offer(none)
+		}
+
+		// heardAgain counts a packet of the retransmission stream.
+		atomic def heardAgain(sequence int, source int) {
+			if againSource != source {
+				againSource = source
+				againFirst = -1
+				againHighest = -1
+				againCount = 0
+				againExpected = 0
+				againCounted = 0
+			}
+			let number = againHighest < 0 ?? (sequence, expand(againHighest, sequence, 16))
+			againFirst = number when againFirst < 0
+			againHighest = number when number > againHighest
+			againCount++
+		}
+
+		// repairReception is the reception report of the retransmission
+		// stream at this moment, none before a packet of it came.
+		atomic def repairReception() ?rtp.ReceptionReport {
+			return none when againSource < 0
+			let expected = againHighest - againFirst + 1
+			let expectedNow = expected - againExpected
+			let countedNow = againCount - againCounted
+			againExpected = expected
+			againCounted = againCount
+			let fraction = expectedNow > 0 && expectedNow > countedNow ?? ((expectedNow - countedNow) * 256 / expectedNow, 0)
+			return rtp.ReceptionReport{ssrc: againSource, fractionLost: fraction.min(255), lost: (expected - againCount).max(0), highestSequence: againHighest & 0xFFFFFFFF, jitter: 0, lastSenderReport: 0, delay: 0}
+		}
+
+		// takeGap reports whether numbers were left out since the last
+		// call.
+		atomic def takeGap() bool {
+			let seen = gapped
+			gapped = false
+			return seen
+		}
+
+		// pop is the next whole frame, none while there is none. Fails
+		// with RtpError for payloads that are not of the format.
+		atomic def pop() !?rtp.Frame {
+			let frame = try jitter.pop()
+			if !(frame is none) {
+				stuckSince = 0
+				frames++
+			}
+			return frame
+		}
+
+		// lacking is the packets to ask for now: those missing in front
+		// of the newest one that were not asked for within the last
+		// `roundTrip` nor `askTries` times already. With forward error
+		// correction a packet is first asked for when it has been missing
+		// for `askSpacing`: the repair packet behind its frame may put it
+		// back. Sound is not asked for again. A frame that stays
+		// incomplete past the wait is given up, and a keyframe is wanted
+		// instead.
+		atomic def lacking(now int, roundTrip int) int[] {
+			return [] when isAudio(format)
+			let missing = jitter.missing()
+			if missing.len() == 0 {
+				stuckSince = 0
+				return missing
+			}
+			stuckSince = now when stuckSince == 0
+			if now - stuckSince >= frameWait {
+				jitter.skip()
+				stuckSince = 0
+				wantsPicture = true
+				arrived.offer(none)
+				return []
+			}
+			let due int[]
+			for let number in missing {
+				let place = number & (askRing - 1)
+				if askedNumber[place] != number {
+					// Seen missing now: `askedAt` is that moment until
+					// the packet is asked for.
+					askedNumber[place] = number
+					askedTimes[place] = 0
+					askedAt[place] = now
+				}
+				// A quarter more than a round trip: a sender does not send
+				// a packet again within one of sending it.
+				let wait = askedTimes[place] > 0 ?? ((roundTrip * 5 / 4).max(askSpacing), fec is none ?? (0, askSpacing))
+				continue when askedTimes[place] >= askTries || now - askedAt[place] < wait
+				requested++ when askedTimes[place] == 0
+				askedTimes[place]++
+				askedAt[place] = now
+				due.push(number)
+			}
+			return due
+		}
+
+		atomic def askForPicture() {
+			wantsPicture = true
+		}
+
+		// takePictureRequest reports whether a keyframe is to be asked
+		// for, at most once in half a second.
+		atomic def takePictureRequest(now int) bool {
+			return false unless wantsPicture && now - pictureAt >= frameWait
+			wantsPicture = false
+			pictureAt = now
+			pictureAsks++
+			return true
+		}
+
+		atomic def heardSender(report rtp.SenderReport, now int) {
+			lastReport = ((report.ntpSeconds & 0xFFFF) << 16) | ((report.ntpFraction >> 16) & 0xFFFF)
+			lastReportAt = now
+		}
+
+		// statistics is what the receiver counted.
+		atomic def statistics() ReceiveStats {
+			let expected = first < 0 ?? (0, highest - first + 1)
+			return ReceiveStats{packets: received, bytes: taken, frames: frames, lost: (expected - received - resent - repaired - jitter.hollow).max(0), requested: requested, resent: resent, repaired: repaired, keyframeRequests: pictureAsks, jitter: duration(variation * 1000000000 / clockRateOf(format))}
+		}
+
+		// reception is the reception report of this moment, none before a
+		// packet came.
+		atomic def reception(now int) ?rtp.ReceptionReport {
+			return none when source < 0
+			let expected = highest - first + 1
+			let lost = (expected - received).max(0)
+			let expectedNow = expected - expectedThen
+			let receivedNow = received - receivedThen
+			expectedThen = expected
+			receivedThen = received
+			let fraction = expectedNow > 0 && expectedNow > receivedNow ?? ((expectedNow - receivedNow) * 256 / expectedNow, 0)
+			let since = lastReportAt == 0 ?? (0, (now - lastReportAt) * 65536 / 1000000000)
+			return rtp.ReceptionReport{ssrc: source, fractionLost: fraction.min(255), lost: lost, highestSequence: highest & 0xFFFFFFFF, jitter: variation, lastSenderReport: lastReport, delay: since}
+		}
+
+		atomic def close() {
+			closed = true
+			arrived.offer(none)
+		}
+	}
+
+	// Media is the senders and receivers of one connection. The
+	// transport's reading task hands RTP and RTCP here; one task sends
+	// the NACKs, keyframe requests and reports.
+	type Media {
+		transport ?Transport    = none
+		senders   Sender[]      = []
+		receivers Receiver[]    = []
+		// Receivers `accept` has not handed out.
+		offered   Receiver[]    = []
+		changed   channel<none>
+		done      bool          = false
+		// The name every source of this side shares (RFC 3550 §6.5.1) and
+		// the source its reports come from when nothing is sent.
+		cname     string        = ""
+		// A packet to read the header of a new source with.
+		probe     rtp.Packet
+		reporter  int           = 1
+		// Congestion control: the estimator of what the path carries,
+		// the arrivals to report to the peer, the number of the
+		// transport-wide header extension each way (0 without it), the
+		// source the last numbered packet came from, and the channel
+		// that wakes the pacing task.
+		control   Estimator
+		arrivals  Arrivals
+		wideOut   int           = 0
+		wideIn    int           = 0
+		heardFrom int           = 0
+		paced     Signal
+		// Wakes the media task before its tick: numbers were left out.
+		nudge     channel<none>
+
+		def new() {
+			changed = new channel<none>(1)
+			paced = new Signal()
+			nudge = new channel<none>(1)
+			probe = new rtp.Packet()
+			control = new Estimator(startBitrate, leastBitrate, startBitrate)
+			arrivals = new Arrivals()
+		}
+
+		// name gives the media its canonical name, once.
+		atomic def name(bytes byte[]) {
+			return unless cname == ""
+			cname = bytes.hex().lower()
+			reporter = (int(bytes[0]) << 24 | int(bytes[1]) << 16 | int(bytes[2]) << 8 | int(bytes[3])) | 1
+		}
+
+		atomic def canonicalName() string {
+			return cname
+		}
+
+		// attach gives the media its transport: RTP and RTCP it opens
+		// come here, and the media task starts.
+		def attach(over Transport) {
+			over.rtpSink = takeRtp
+			over.rtcpSink = takeRtcp
+			// Another transport is another path: what was learnt of the
+			// old one says nothing of it.
+			control.restart() unless carrier() is none
+			for let sender in keep(over) {
+				sender.carry(over)
+			}
+			let task = async run(over)
+			task.keepAlive()
+			let pacing = async pace(over)
+			pacing.keepAlive()
+		}
+
+		internal atomic def keep(over Transport) Sender[] {
+			transport = over
+			return senders.clone()
+		}
+
+		// send has a sender send with a payload type for a media section,
+		// over the transport once there is one.
+		atomic def send(sender Sender, payloadType int, mid string, midID int, rtxType int = 0, fecType int = 0, wideID int = 0, rid string = "", ridID int = 0, repairedID int = 0) {
+			senders.push(sender) unless senders.includes(sender)
+			sender.number(payloadType, mid, midID, rtxType, fecType, wideID, rid, ridID, repairedID)
+			sender.steer(control, paced)
+			if wideID > 0 && wideOut == 0 {
+				wideOut = wideID
+				control.numbered()
+			}
+			share()
+			let over = transport
+			sender.carry(over) unless over is none
+		}
+
+		// receive makes the receiver of a media section, or gives the one
+		// it has its new payload type and sources.
+		atomic def receive(mid string, format rtp.PayloadFormat, payloadType int, announced int[], midID int, rtxType int = 0, repairs int[] = [], fecType int = 0, fecSources int[] = [], wideID int = 0, rid string = "", ridID int = 0, repairedID int = 0) {
+			wideIn = wideID when wideID > 0
+			for let known in receivers {
+				continue unless known.mid == mid && known.rid == rid
+				known.ridID = ridID
+				known.repairedID = repairedID
+				known.payloadType = payloadType
+				known.announced = announced
+				known.midID = midID
+				known.rtxType = rtxType
+				known.repairs = repairs
+				known.protect(fecType, fecSources)
+				return
+			}
+			let receiver = new Receiver(mid, format, payloadType, announced)
+			receiver.midID = midID
+			receiver.rid = rid
+			receiver.ridID = ridID
+			receiver.repairedID = repairedID
+			receiver.rtxType = rtxType
+			receiver.repairs = repairs
+			receiver.protect(fecType, fecSources)
+			receivers.push(receiver)
+			offered.push(receiver)
+			changed.offer(none)
+		}
+
+		// guard turns ULPFEC inside the stream on for a sender and for
+		// the receivers of a media section, under the payload types the
+		// answer took.
+		atomic def guard(sender ?Sender, mid string, redType int, ulpType int, redRtxType int, always bool) {
+			sender.guard(redType, ulpType, redRtxType, always) unless sender is none
+			for let known in receivers {
+				known.guard(redType, ulpType, redRtxType) when known.mid == mid
+			}
+		}
+
+		// accept waits for a receiver the peer's description brought.
+		// Fails with NetError (TimedOut), WebRtcError once the connection
+		// is closed.
+		def accept(timeout duration) !Receiver {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let receiver = try takeOffered()
+				return receiver unless receiver is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no track before the timeout") unless awaitSignal(changed, deadline)
+			}
+			fail transportError("unreachable")
+		}
+
+		internal atomic def takeOffered() !?Receiver {
+			return offered.shift() when offered.len() > 0
+			fail transportError("the connection is closed") when done
+			return none
+		}
+
+		// frame waits for the next whole frame of a receiver. Fails with
+		// NetError (TimedOut), RtpError for payloads that are not of the
+		// format, WebRtcError once the connection is closed.
+		def frame(receiver Receiver, timeout duration) !rtp.Frame {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let next = try receiver.pop()
+				return next unless next is none
+				fail transportError("the track ended") when receiver.closed
+				fail net.errorOf(net.ErrorCode.TimedOut, "read", "", "no frame before the timeout") unless awaitSignal(receiver.arrived, deadline)
+			}
+			fail transportError("unreachable")
+		}
+
+		// receiverOf is the receiver of a source that is known: one that
+		// took it before, or was told of it.
+		internal atomic def receiverOf(source int) ?Receiver {
+			for let receiver in receivers {
+				return receiver when receiver.source == source || receiver.announced.includes(source) || receiver.repairs.includes(source) || receiver.fecSources.includes(source)
+			}
+			return none
+		}
+
+		// route is the receiver a packet of a new source belongs to: the
+		// one of the media section its MID header extension names, else
+		// the one of its payload type that has no source yet (RFC 9143
+		// §9.2).
+		internal atomic def route(data byte[]) ?Receiver {
+			let failed = false
+			probe.read(data) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return none when failed
+			for let receiver in receivers {
+				if receiver.midID > 0 {
+					let named = probe.extension(receiver.midID)
+					continue when named is none || string(named) != receiver.mid
+				} else if receiver.rid == "" {
+					continue
+				}
+				if receiver.rid != "" {
+					// A layer's packets name it; its retransmissions name
+					// the layer they repair.
+					let layer = probe.extension(receiver.ridID)
+					let repaired = receiver.repairedID > 0 ?? (probe.extension(receiver.repairedID), none)
+					let own = !(layer is none) && string(layer) == receiver.rid
+					let repair = !(repaired is none) && string(repaired) == receiver.rid
+					continue unless own || repair
+					receiver.repairs.push(probe.ssrc) when repair && !receiver.repairs.includes(probe.ssrc)
+					return receiver
+				}
+				receiver.repairs.push(probe.ssrc) when probe.payloadType == receiver.rtxType
+				return receiver
+			}
+			for let receiver in receivers {
+				return receiver when receiver.payloadType == probe.payloadType && receiver.source < 0 && receiver.rid == ""
+			}
+			return none
+		}
+
+		// takeRtp takes an RTP packet the transport opened, on its
+		// reading task.
+		def takeRtp(data byte[]) {
+			return when data.len() < 12
+			let source = int(data[8]) << 24 | int(data[9]) << 16 | int(data[10]) << 8 | int(data[11])
+			let wide = numbering()
+			if wide > 0 {
+				// Every numbered packet is an arrival to report, whatever
+				// becomes of it.
+				let read = true
+				probe.read(data) onerror (err error) {
+					read = false
+					recover none
+				}
+				let at = read ?? (probe.extensionOffset(wide), -1)
+				noteArrival(int(data[at]) << 8 | int(data[at + 1]), source) when at >= 0
+			}
+			let receiver = receiverOf(source)
+			receiver = route(data) when receiver is none
+			return when receiver is none
+			if receiver.fecType > 0 && (int(data[1]) & 0x7F) == receiver.fecType {
+				receiver.mend(data, int(time.monoNs()))
+				return
+			}
+			let kind = int(data[1]) & 0x7F
+			let viaRtx = receiver.rtxType > 0 && kind == receiver.rtxType
+			let viaRedRtx = receiver.redRtxType > 0 && kind == receiver.redRtxType
+			if viaRtx || viaRedRtx {
+				// A retransmission: the packet it carries is put back as it
+				// was (RFC 4588 §4); one before any packet of the stream
+				// itself cannot be told whose it is.
+				receiver.heardAgain(int(data[2]) << 8 | int(data[3]), source)
+				let primary = receiver.primary()
+				return when primary < 0
+				let size = rtp.original(data, viaRtx ?? (receiver.payloadType, receiver.redType), primary) onerror recover 0
+				return when size == 0
+				data.len(size)
+			}
+			if receiver.redType > 0 && (int(data[1]) & 0x7F) == receiver.redType {
+				let size = receiver.unwrap(data, int(time.monoNs()))
+				if size > 0 {
+					data.len(size)
+					receiver.take(data, int(time.monoNs()), viaRedRtx)
+				}
+			} else {
+				receiver.take(data, int(time.monoNs()), viaRtx)
+			}
+			nudge.offer(none) when receiver.takeGap()
+		}
+
+		// takeRtcp takes a compound RTCP packet: NACKs are answered from
+		// the senders' rings, PLI and FIR ask the track for a keyframe,
+		// REMB lowers its bitrate, reports are noted.
+		def takeRtcp(data byte[]) {
+			let failed = false
+			let compound = rtp.parseRtcp(data.clone()) onerror (err error) {
+				failed = true
+				recover new rtp.Compound()
+			}
+			return when failed
+			let now = int(time.monoNs())
+			for let nack in compound.nacks {
+				let sender = senderOf(nack.media)
+				continue when sender is none
+				for let number in nack.lost {
+					sender.again(number)
+				}
+			}
+			for let pli in compound.plis {
+				let sender = senderOf(pli.media)
+				sender.wantKeyframe() unless sender is none
+			}
+			for let fir in compound.firs {
+				let sender = senderOf(fir.media)
+				sender.wantKeyframe() unless sender is none
+			}
+			for let feedback in compound.transportFeedback {
+				control.heard(feedback, now)
+			}
+			for let remb in compound.rembs {
+				control.limit(remb.bitrate)
+			}
+			share() when compound.transportFeedback.len() > 0 || compound.rembs.len() > 0
+			for let report in compound.senderReports {
+				let receiver = receiverOf(report.ssrc)
+				receiver.heardSender(report, now) unless receiver is none
+				hear(report.reports)
+			}
+			for let bye in compound.byes {
+				for let source in bye.ssrcs {
+					let receiver = receiverOf(source)
+					receiver.close() unless receiver is none
+				}
+			}
+			for let report in compound.receiverReports {
+				hear(report.reports)
+			}
+		}
+
+		internal def hear(reports rtp.ReceptionReport[]) {
+			let wall = int(time.now().unixNs())
+			let middle = (((wall / 1000000000 + ntpEpoch) & 0xFFFF) << 16) | (((wall % 1000000000) * 65536 / 1000000000) & 0xFFFF)
+			let now = int(time.monoNs())
+			for let report in reports {
+				let sender = senderOf(report.ssrc)
+				continue when sender is none
+				sender.heard(report, middle)
+				control.timed(sender.turn())
+				// Without transport-wide feedback the reports' loss is
+				// what there is to go by.
+				control.lost(report.fractionLost, now) when numberedOut() == 0
+			}
+			share()
+		}
+
+		internal atomic def numbering() int {
+			return wideIn
+		}
+
+		internal atomic def numberedOut() int {
+			return wideOut
+		}
+
+		internal def noteArrival(number int, source int) {
+			arrivals.note(number, int(time.monoNs()))
+			heardFrom = source
+		}
+
+		// share gives every sender its part of what the estimator allows:
+		// audio what it asks for, video the rest in proportion to what
+		// each may use at most.
+		internal def share() {
+			let all = sending()
+			let voice = 0
+			let pictures = 0
+			for let sender in all {
+				if isAudio(sender.format) {
+					voice += sender.most()
+				} else {
+					pictures += sender.most()
+				}
+			}
+			control.bound(leastBitrate, (voice + pictures).max(leastBitrate))
+			return when pictures == 0
+			let left = (control.target() - voice).max(leastBitrate)
+			for let sender in all {
+				sender.limit(left * sender.most() / pictures) unless isAudio(sender.format)
+			}
+		}
+
+		// ---- The pacing task ----
+
+		// pace sends the video packets that wait in the senders' rings,
+		// at `pacingFactor` times the estimate and at most a burst at a
+		// time, so a large frame leaves over a few intervals instead of
+		// at once (draft-ietf-rmcat-gcc-02 §4). It sleeps while nothing
+		// waits.
+		internal def pace(over Transport) {
+			let budget = 0
+			let last = int(time.monoNs())
+			for !ended() {
+				let current = carrier()
+				break when current is none || current != over
+				let now = int(time.monoNs())
+				// A probe sets the pace while it lasts: what waits goes
+				// out at its rate, and repeats of the last packets fill
+				// what is missing.
+				let probing = control.probe(now)
+				let rate = probing > 0 ?? (probing, control.target() * pacingFactor / 2)
+				let burst = rate * pacingInterval / 8000000000
+				budget += rate * (now - last).min(10 * pacingInterval) / 8000000000
+				budget = burst when budget > burst
+				last = now
+				let left = probing > 0
+				let all = sending()
+				for budget > 0 {
+					let sent = 0
+					for let sender in all {
+						sent += sender.next() onerror recover 0
+					}
+					if sent == 0 && probing > 0 {
+						for let sender in all {
+							sent = sender.pad() when sent == 0
+						}
+					}
+					break when sent == 0
+					budget -= sent
+				}
+				for let sender in all {
+					left = true when sender.queued() > 0
+				}
+				if left {
+					time.sleep(duration(probing > 0 ?? (pacingInterval / 5, pacingInterval)))
+				} else {
+					paced.wait(now + 200000000)
+					last = int(time.monoNs())
+				}
+			}
+		}
+
+		internal atomic def senderOf(source int) ?Sender {
+			for let sender in senders {
+				return sender when sender.ssrc == source
+			}
+			return none
+		}
+
+		// ---- The media task ----
+
+		internal def run(over Transport) {
+			let nextReport = int(time.monoNs()) + reportEvery / 2
+			let nextTick = int(time.monoNs()) + mediaTick
+			for !ended() {
+				// A tick, or sooner when a receiver saw numbers left out:
+				// they are asked for at once.
+				awaitSignal(nudge, nextTick)
+				// A transport that was replaced has a task of its own.
+				let current = carrier()
+				break when current is none || current != over
+				let now = int(time.monoNs())
+				let early = now < nextTick
+				let compound = new rtp.Compound()
+				let urgent = false
+				let turn = control.turn()
+				for let receiver in listening() {
+					let missing = receiver.lacking(now, turn)
+					if missing.len() > 0 && receiver.source >= 0 {
+						compound.nacks.push(rtp.Nack{sender: reporter, media: receiver.source, lost: missing})
+						urgent = true
+					}
+					if receiver.takePictureRequest(now) && receiver.source >= 0 {
+						compound.plis.push(rtp.Pli{sender: reporter, media: receiver.source})
+						urgent = true
+					}
+				}
+				// Arrivals are reported once a tick.
+				let feedback = early ?? (none, arrivals.report(reporter, heardFrom))
+				nextTick = now + mediaTick unless early
+				if !(feedback is none) {
+					compound.transportFeedback.push(feedback)
+					urgent = true
+				}
+				let reporting = now >= nextReport
+				continue unless urgent || reporting
+				nextReport = now + reportEvery when reporting
+				// A compound packet starts with a report (RFC 3550 §6.1):
+				// the reception reports ride on it.
+				let blocks rtp.ReceptionReport[]
+				for let receiver in listening() {
+					let block = receiver.reception(now)
+					blocks.push(block) unless block is none || !reporting
+					let again = reporting ?? (receiver.repairReception(), none)
+					blocks.push(again) unless again is none
+				}
+				let wall = int(time.now().unixNs())
+				let first = true
+				for let sender in sending() {
+					continue unless reporting && sender.carried()
+					let report = sender.report(wall)
+					report.reports = blocks when first
+					first = false
+					compound.senderReports.push(report)
+					compound.descriptions.push(rtp.SourceDescription{ssrc: sender.ssrc, cname: canonicalName()})
+				}
+				if compound.senderReports.len() == 0 {
+					compound.receiverReports.push(rtp.ReceiverReport{ssrc: reporter, reports: blocks})
+					compound.descriptions.push(rtp.SourceDescription{ssrc: reporter, cname: canonicalName()})
+				}
+				let bytes = compound.encode()
+				let room byte[]
+				room.len(bytes.len() + over.rtcpOverhead())
+				bytes.copy(room)
+				over.sendRtcp(room, bytes.len()) onerror recover none
+			}
+		}
+
+		internal atomic def ended() bool {
+			return done
+		}
+
+		internal atomic def listening() Receiver[] {
+			return receivers.clone()
+		}
+
+		internal atomic def sending() Sender[] {
+			return senders.clone()
+		}
+
+		// statistics is the statistics of every sender and receiver.
+		atomic def statistics() (SendStats[], ReceiveStats[]) {
+			let sent SendStats[]
+			let got ReceiveStats[]
+			for let sender in senders {
+				sent.push(sender.statistics())
+			}
+			for let receiver in receivers {
+				got.push(receiver.statistics())
+			}
+			return (sent, got)
+		}
+
+		// farewell tells the peer this side's sources are gone (BYE, RFC
+		// 3550 §6.6).
+		def farewell() {
+			let over = carrier()
+			return when over is none
+			let compound = new rtp.Compound()
+			let sources int[]
+			for let sender in sending() {
+				sources.push(sender.ssrc) when sender.carried()
+			}
+			return when sources.len() == 0
+			compound.receiverReports.push(rtp.ReceiverReport{ssrc: reporter})
+			compound.byes.push(rtp.Bye{ssrcs: sources})
+			let bytes = compound.encode()
+			let room byte[]
+			room.len(bytes.len() + over.rtcpOverhead())
+			bytes.copy(room)
+			over.sendRtcp(room, bytes.len()) onerror recover none
+		}
+
+		internal atomic def carrier() ?Transport {
+			return transport
+		}
+
+		// shut ends the media: waiting readers fail.
+		atomic def shut() {
+			done = true
+			for let receiver in receivers {
+				receiver.close()
+			}
+			changed.offer(none)
+		}
+	}
+
+	// startOf is random numbers for a sender to start from (RFC 3550
+	// §5.1). Fails when the system gives no random bytes.
+	def startOf() !byte[] {
+		return try rand(22)
+	}
+}

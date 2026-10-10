@@ -1,0 +1,1583 @@
+// The ICE agent of a peer connection (RFC 8445): it gathers this side's
+// candidates (host, server-reflexive through STUN, relayed through TURN),
+// pairs them with the peer's, checks the pairs, nominates one, keeps
+// consent to send fresh (RFC 7675), and carries everything that is not
+// STUN over the pair it selected.
+internal std.net.webrtc partial module std.net.webrtc.ice {
+	use (
+		std.crypto::(UUID, rand)
+		std.net
+		std.net.dns
+		std.net.dns.mdns
+		std.net.sdp
+		std.net.stun
+		std.net.udp
+		std.net.waiting::(awaitSignal)
+		std.net.webrtc::*
+		std.services.network::(Network)
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// Type preferences of candidate priorities (RFC 8445 §5.1.2.2).
+	const preferHost = 126
+	const preferPeerReflexive = 110
+	const preferServerReflexive = 100
+	const preferRelay = 0
+	// TCP candidates (RFC 6544 §4.2): their host type preference, and the
+	// direction preferences that go into the local preference.
+	const preferHostTcp = 90
+	const directionActive = 6
+	const directionPassive = 4
+	// The largest frame read from a TCP candidate's connection (RFC 4571).
+	const frameSize = 65535
+	// The largest datagram read.
+	const datagramSize = 2048
+	// Datagrams held for `receive` before the oldest is dropped.
+	const inboxSize = 512
+
+	// PairState is the state of a candidate pair (RFC 8445 §6.1.2.6).
+	enum PairState {
+		Frozen,
+		Waiting,
+		InProgress,
+		Succeeded,
+		Failed
+	}
+
+	// Nomination is how the controlling side picks the pair: one check
+	// with USE-CANDIDATE on the best valid pair (RFC 8445 §8.1.1), or
+	// USE-CANDIDATE on every check, the highest-priority pair that
+	// succeeds being used (the aggressive nomination of RFC 5245).
+	enum Nomination {
+		Regular,
+		Aggressive
+	}
+
+	// AgentConfig steers an agent: the servers to gather through and which
+	// paths are allowed, how it nominates, the local addresses to gather
+	// on (empty: every interface that is up, the loopback only when
+	// asked), whether IPv6 addresses are gathered, whether host candidates
+	// hide their address behind an mDNS name, whether TCP candidates are
+	// gathered, and the timers: the
+	// pace of checks (Ta), the first retransmission timeout and the number
+	// of sends of a check (RFC 8445 §14), how often consent is asked and
+	// how long it lasts without an answer (RFC 7675), how long gathering
+	// waits for servers, and how long the controlling side waits for a
+	// better pair before it nominates.
+	struct AgentConfig {
+		servers        IceServer[]        = []
+		policy         IceTransportPolicy = IceTransportPolicy.All
+		nomination     Nomination         = Nomination.Regular
+		addresses      string[]           = []
+		loopback       bool               = false
+		ipv6           bool               = true
+		// Host candidates carry an mDNS name made for the connection
+		// instead of the address, as browsers write them, so the peer's
+		// application cannot read this host's addresses
+		// (draft-ietf-mmusic-mdns-ice-candidates); the name is answered
+		// for on the link while the agent lives.
+		mdnsNames      bool               = false
+		// Gather TCP candidates too (RFC 6544): a passive one per local
+		// address, which the peer connects to, and an active one, from
+		// which this side connects to the peer's passive ones. For peers
+		// whose network lets no UDP through.
+		tcp            bool               = false
+		// Gather UDP host candidates; off leaves TCP ones and relays.
+		udp            bool               = true
+		pace           duration           = 50ms
+		rto            duration           = 500ms
+		requests       int                = 7
+		consentEvery   duration           = 5s
+		consentTimeout duration           = 30s
+		gatherTimeout  duration           = 5s
+		patience       duration           = 300ms
+	}
+
+	// Base is a local transport address checks are sent from: a UDP
+	// socket, or a TURN allocation.
+	type Base {
+		index   int
+		host    string
+		port    int
+		ip      byte[]
+		relayed bool             = false
+		socket  ?udp.Client      = none
+		relay   ?stun.Allocation = none
+		client  ?stun.Client     = none
+		open    bool             = true
+		// A TCP candidate's connection to one peer address: its stream,
+		// that address as the stream reports it, and the local candidate
+		// it stands for. Datagrams are framed with their length (RFC
+		// 4571).
+		tcp     bool             = false
+		stream  ?net.Connection  = none
+		peer    net.Address
+		peerIP  byte[]           = []
+		own     ?sdp.Candidate   = none
+		frame   byte[]           = []
+
+		def new(index int, host string, port int, ip byte[]) {
+			self.index = index
+			self.host = host
+			self.port = port
+			self.ip = ip
+		}
+
+		// sendTo sends a datagram to "ip:port" from this base. Fails as
+		// the socket or the allocation does.
+		def sendTo(data byte[], to string) !none {
+			return try sendFramed(data) when tcp
+			let through = relay
+			return try through.send(data, to) unless through is none
+			let sock = socket
+			try sock.sendTo(data, to, 5s) unless sock is none
+			return none
+		}
+
+		// sendFramed writes a datagram to the base's stream behind its
+		// length (RFC 4571 §2), one writer at a time. Fails as the stream
+		// does.
+		atomic def sendFramed(data byte[]) !none {
+			let conn = stream
+			return none when conn is none
+			frame.len(2 + data.len())
+			frame[0] = byte((data.len() >> 8) & 0xFF)
+			frame[1] = byte(data.len() & 0xFF)
+			data.copy(frame[2:])
+			return try net.writeAll(conn, frame, 5s)
+		}
+
+		def close() {
+			open = false
+			let conn = stream
+			if !(conn is none) {
+				conn.close() onerror recover none
+			}
+			let through = relay
+			if !(through is none) {
+				through.close() onerror recover none
+			}
+			let sock = socket
+			if !(sock is none) {
+				sock.close() onerror recover none
+			}
+		}
+	}
+
+	// Local is a local candidate and the base it is sent from.
+	struct Local {
+		candidate sdp.Candidate
+		base      int
+	}
+
+	// Remote is a candidate of the peer: its address as "ip:port" and as
+	// bytes, the host text the sockets report it with once it was heard
+	// from, and whether a check to it succeeded.
+	type Remote {
+		candidate sdp.Candidate
+		text      string
+		ip        byte[]
+		seenHost  string        = ""
+		validated bool          = false
+
+		def new(candidate sdp.Candidate, text string, ip byte[]) {
+			self.candidate = candidate
+			self.text = text
+			self.ip = ip
+		}
+	}
+
+	// Pair is a candidate pair: a base, a remote candidate, its priority
+	// and state, and the check in flight.
+	type Pair {
+		base              int
+		remote            int
+		priority          int       = 0
+		state             PairState = PairState.Frozen
+		valid             bool      = false
+		nominated         bool      = false
+		// The peer nominated it before this side's check succeeded.
+		nominateOnSuccess bool      = false
+		requestID         byte[]    = []
+		request           byte[]    = []
+		usedCandidate     bool      = false
+		sentControlling   bool      = false
+		sends             int       = 0
+		nextAt            int       = 0
+		rto               int       = 0
+		// When the peer last answered on it.
+		lastAnswer        int       = 0
+
+		def new(base int, remote int) {
+			self.base = base
+			self.remote = remote
+		}
+	}
+
+	// Route is where data goes: a base and the peer's address.
+	type Route {
+		base Base
+		to   string
+
+		def new(base Base, to string) {
+			self.base = base
+			self.to = to
+		}
+	}
+
+	// Gather is a Binding request to a STUN server from a base, for a
+	// server-reflexive candidate.
+	type Gather {
+		base      int
+		server    string
+		requestID byte[]
+		request   byte[]
+		sends     int    = 1
+		nextAt    int    = 0
+		rto       int    = 0
+
+		def new(base int, server string, requestID byte[], request byte[]) {
+			self.base = base
+			self.server = server
+			self.requestID = requestID
+			self.request = request
+		}
+	}
+
+	def iceError(message string) WebRtcError {
+		return WebRtcError{message: "ice: {message}", code: "webrtc.ice"}
+	}
+
+	// candidatePriority is the priority of a candidate of a type with a
+	// local preference, for component 1 (RFC 8445 §5.1.2.1).
+	def candidatePriority(typePreference int, localPreference int) int {
+		return (typePreference << 24) | (localPreference << 8) | 255
+	}
+
+	// pairPriority is the priority of a pair from the priorities of the
+	// controlling and the controlled side's candidates (§6.1.2.3).
+	def pairPriority(controlling int, controlled int) int {
+		return (controlling.min(controlled) << 32) + 2 * controlling.max(controlled) + (controlling > controlled ?? (1, 0))
+	}
+
+	// newAgent makes an agent with fresh credentials. Fails when the
+	// system gives no random bytes.
+	def newAgent(config AgentConfig = AgentConfig{}) !Agent {
+		let agent = new Agent(config, try rand(8))
+		try agent.renew()
+		agent.drive()
+		return agent
+	}
+
+	// Agent is one ICE agent for one data stream of one component (what
+	// BUNDLE and rtcp-mux leave of a peer connection). Its state changes
+	// under its lock; what it decides to send is queued and sent outside
+	// it. A task per base reads, one task runs the timers. It is a
+	// net.DatagramTransport for everything that is not STUN.
+	type Agent {
+		config       AgentConfig
+		localUfrag   string             = ""
+		localPwd     string             = ""
+		remoteUfrag  string             = ""
+		remotePwd    string             = ""
+		controlling  bool               = true
+		tiebreaker   byte[]
+		state        IceConnectionState = IceConnectionState.New
+		gathering    IceGatheringState  = IceGatheringState.New
+		bases        Base[]             = []
+		locals       Local[]            = []
+		remotes      Remote[]           = []
+		pairs        Pair[]             = []
+		// Pairs to check before the ordinary ones (§6.1.4.1).
+		triggered    int[]              = []
+		gathers      Gather[]           = []
+		// The mDNS responders that answer for this side's candidate names.
+		responders   mdns.Responder[]   = []
+		// The listeners of the passive TCP candidates, and candidates that
+		// are signalled without a base of their own (the active TCP ones).
+		listeners    net.Listener[]     = []
+		advertised   sdp.Candidate[]    = []
+		// Gathering tasks still at work, and local candidates not handed
+		// out yet.
+		gatherers    int                = 0
+		fresh        sdp.Candidate[]    = []
+		foundations  string[]           = []
+		started      bool               = false
+		remoteDone   bool               = false
+		closed       bool               = false
+		// The pair in use (-1 none), the one a nominating check is out for.
+		selected     int                = -1
+		nominating   int                = -1
+		route        ?Route             = none
+		// The peer's address on the pair in use when a restart began:
+		// data from it is taken until a new pair is selected.
+		keptHost     string             = ""
+		keptPort     int                = 0
+		// Called on the reading task with each datagram that is not STUN;
+		// without one they wait for `receive`.
+		sink         ?def (byte[])      = none
+		nextCheckAt  int                = 0
+		firstValidAt int                = 0
+		// When the checks were started.
+		startedAt    int                = 0
+		consentAt    int                = 0
+		consentID    byte[]             = []
+		outData      byte[][]           = []
+		outBase      int[]              = []
+		outTo        string[]           = []
+		inbox        byte[][]           = []
+		pool         byte[][]           = []
+		// Signalled on a change of state, a datagram for `receive`, a new
+		// local candidate.
+		changed      channel<none>
+		arrived      channel<none>
+		gathered     channel<none>
+		// Wakes the timer task when there is something new to do.
+		wake         channel<none>
+
+		def new(config AgentConfig, tiebreaker byte[]) {
+			self.config = config
+			self.tiebreaker = tiebreaker
+			changed = new channel<none>(1)
+			arrived = new channel<none>(1)
+			gathered = new channel<none>(1)
+			wake = new channel<none>(1)
+		}
+
+		// drive starts the task that runs the agent's timers.
+		def drive() {
+			let driver = async run()
+			driver.keepAlive()
+		}
+
+		// ---- Credentials and state ----
+
+		// renew gives the agent a new username fragment and password
+		// (RFC 8445 §5.3). Fails when the system gives no random bytes.
+		atomic def renew() !none {
+			localUfrag = (try rand(6)).base64().replace("=", "")
+			localPwd = (try rand(18)).base64().replace("=", "")
+			return none
+		}
+
+		atomic def credentials() (string, string) {
+			return (localUfrag, localPwd)
+		}
+
+		atomic def currentState() IceConnectionState {
+			return state
+		}
+
+		atomic def gatheringState() IceGatheringState {
+			return gathering
+		}
+
+		atomic def isControlling() bool {
+			return controlling
+		}
+
+		// selectedPair is the local and the remote candidate of the pair in
+		// use, none before one is selected.
+		atomic def selectedPair() ?(sdp.Candidate, sdp.Candidate) {
+			return none when selected < 0
+			let pair = pairs[selected]
+			return (hostCandidate(pair.base), remotes[pair.remote].candidate)
+		}
+
+		internal def moveTo(next IceConnectionState) {
+			return when state == next || state == IceConnectionState.Closed
+			state = next
+			changed.offer(none)
+		}
+
+		// waitConnected waits until a pair is selected. Fails with
+		// WebRtcError when the agent fails or closes first, NetError
+		// (TimedOut) after the timeout.
+		def waitConnected(timeout duration = 30s) !none {
+			let deadline = int(time.monoNs()) + int(timeout)
+			for {
+				let now = currentState()
+				return none when now := IceConnectionState.Connected || IceConnectionState.Completed
+				fail iceError("no candidate pair works") when now == IceConnectionState.Failed
+				fail iceError("the agent is closed") when now == IceConnectionState.Closed
+				fail net.errorOf(net.ErrorCode.TimedOut, "connect", "", "no candidate pair was selected in time") unless awaitSignal(changed, deadline)
+			}
+			fail iceError("unreachable")
+		}
+
+		// ---- Gathering ----
+
+		// gather starts collecting candidates: a socket per local address,
+		// then the servers. Candidates come out of `nextCandidate` as they
+		// are found. Fails with NetError when the interfaces cannot be
+		// listed or no socket can be bound.
+		def gather() !none {
+			try beginGather()
+			if config.policy == IceTransportPolicy.All {
+				let addresses = config.addresses
+				addresses = try localAddresses() when addresses.len() == 0
+				let bound = 0
+				for let address in addresses {
+					if config.udp {
+						bindHost(address) onerror recover none
+					}
+					if config.tcp {
+						listenTcp(address) onerror recover none
+					}
+					bound = baseCount() + listenerCount()
+				}
+				fail net.errorOf(net.ErrorCode.AddrNotAvail, "gather", "", "no local address could be bound") when bound == 0
+			}
+			for let server in config.servers {
+				for let url in server.urls {
+					addGatherer(1)
+					let task = async gatherFrom(url, server)
+					task.keepAlive()
+				}
+			}
+			addGatherer(0)
+			return none
+		}
+
+		internal atomic def beginGather() !none {
+			fail iceError("the agent is closed") when closed
+			fail iceError("candidates were gathered already") unless gathering == IceGatheringState.New
+			gathering = IceGatheringState.Gathering
+			return none
+		}
+
+		internal atomic def baseCount() int {
+			return bases.len()
+		}
+
+		internal atomic def listenerCount() int {
+			return listeners.len()
+		}
+
+		// ---- TCP candidates (RFC 6544) ----
+
+		// listenTcp listens on a local address and offers it as a passive
+		// TCP candidate, beside an active one (port 9) that stands for the
+		// connections this side makes. Fails as the socket does.
+		internal def listenTcp(address string) !none {
+			let ip = net.parseIPText(address)
+			fail net.errorOf(net.ErrorCode.BadAddress, "gather", address, "not an IP address") when ip is none
+			try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "webrtc://" + net.withPort(address, 0))
+			let sock = try net.socket(ip.len() == 16 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			try sock.bind(net.withPort(address, 0))
+			let listener = try sock.listen(16)
+			let passive = offerTcp(listener, address, listener.address().port)
+			let task = async acceptTcp(listener, passive)
+			task.keepAlive()
+			return none
+		}
+
+		internal atomic def offerTcp(listener net.Listener, host string, port int) sdp.Candidate {
+			let place = listeners.len()
+			listeners.push(listener)
+			let there = new net.Address()
+			there.parse(net.withPort(host, port)) onerror recover none
+			let passive = sdp.Candidate{foundation: foundation("tcp-passive", host, ""), transport: sdp.CandidateTransport.TCP, priority: candidatePriority(preferHostTcp, (directionPassive << 13) | (8191 - place)), address: there, kind: sdp.CandidateType.Host, tcpType: "passive"}
+			let from = new net.Address()
+			from.parse(net.withPort(host, 9)) onerror recover none
+			let active = sdp.Candidate{foundation: foundation("tcp-active", host, ""), transport: sdp.CandidateTransport.TCP, priority: candidatePriority(preferHostTcp, (directionActive << 13) | (8191 - place)), address: from, kind: sdp.CandidateType.Host, tcpType: "active"}
+			advertised.push(passive, active)
+			fresh.push(passive, active)
+			gathered.offer(none)
+			return passive
+		}
+
+		// acceptTcp takes the connections peers make to a passive
+		// candidate: each is a base of its own.
+		internal def acceptTcp(listener net.Listener, passive sdp.Candidate) {
+			for !isClosed() {
+				let failed = false
+				let conn = listener.accept() onerror (err error) {
+					failed = true
+					recover new net.Connection(-1)
+				}
+				break when failed
+				let base = addStreamBase(conn, passive)
+				let reader = async readStream(base, conn)
+				reader.keepAlive()
+			}
+		}
+
+		// dialTcp connects to a passive TCP candidate of the peer; the
+		// connection is a base that stands for an active candidate.
+		internal def dialTcp(text string) {
+			let failed = false
+			let conn = net.dialStream(text, 5s) onerror (err error) {
+				failed = true
+				recover new net.Connection(-1)
+			}
+			return when failed
+			let here = conn.localAddr()
+			let active = sdp.Candidate{foundation: "tcp{here.port}", transport: sdp.CandidateTransport.TCP, priority: candidatePriority(preferHostTcp, (directionActive << 13) | 8191), address: here, kind: sdp.CandidateType.Host, tcpType: "active"}
+			let base = addStreamBase(conn, active)
+			let reader = async readStream(base, conn)
+			reader.keepAlive()
+		}
+
+		internal atomic def addStreamBase(conn net.Connection, own sdp.Candidate) Base {
+			let there = conn.remoteAddr()
+			let here = conn.localAddr()
+			let ip = net.parseIPText(here.host)
+			let base = new Base(bases.len(), here.host, here.port, ip is none ?? ([], ip))
+			base.tcp = true
+			base.stream = conn
+			base.peer = there
+			let remoteIP = net.parseIPText(there.host)
+			base.peerIP = remoteIP is none ?? ([], remoteIP)
+			base.own = own
+			bases.push(base)
+			for let i = 0; i < remotes.len(); i++ {
+				formPair(base.index, i)
+			}
+			return base
+		}
+
+		// readStream reads the framed datagrams of a TCP base until its
+		// connection ends; the pairs over it fail then.
+		internal def readStream(base Base, conn net.Connection) {
+			let head byte[]
+			head.len(2)
+			let buf byte[]
+			buf.cap(datagramSize)
+			for base.open {
+				let ended = false
+				let quiet = false
+				net.readFull(conn, head, 30s) onerror (err error) {
+					quiet = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					ended = !quiet
+					recover none
+				}
+				break when ended
+				continue when quiet
+				let size = int(head[0]) << 8 | int(head[1])
+				continue when size == 0
+				buf.len(size)
+				net.readFull(conn, buf, 10s) onerror (err error) {
+					ended = true
+					recover none
+				}
+				break when ended
+				dispatch(base, base.peer, buf) onerror recover none
+			}
+			lost(base)
+		}
+
+		internal atomic def lost(base Base) {
+			base.open = false
+			for let pair in pairs {
+				continue unless pair.base == base.index
+				pair.state = PairState.Failed
+				pair.valid = false
+			}
+			if selected >= 0 && pairs[selected].base == base.index {
+				route = none
+				moveTo(IceConnectionState.Failed)
+			}
+		}
+
+		// addGatherer counts a gathering task in (1) or out (-1); with
+		// none at work and no request to a STUN server open, gathering is
+		// complete.
+		internal atomic def addGatherer(change int) {
+			gatherers += change
+			finishGathering()
+		}
+
+		internal def finishGathering() {
+			return unless gathering == IceGatheringState.Gathering && gatherers == 0 && gathers.len() == 0
+			gathering = IceGatheringState.Complete
+			gathered.offer(none)
+			changed.offer(none)
+		}
+
+		// localAddresses is the addresses of the interfaces that are up:
+		// no loopback unless asked, no link-local IPv6, IPv6 only when
+		// asked. Fails as the Network service does.
+		internal def localAddresses() !string[] {
+			let out string[]
+			for let iface in try Network.netIface() {
+				continue unless iface.up() && (config.loopback || !iface.loopback())
+				for let entry in iface.addrs {
+					let address = entry.split("/")[0].split("%")[0]
+					let ip = net.parseIPText(address)
+					continue when ip is none
+					continue when ip.len() == 16 && (!config.ipv6 || (ip[0] == byte(0xFE) && (ip[1] & byte(0xC0)) == byte(0x80)))
+					out.push(address)
+				}
+			}
+			return out
+		}
+
+		// bindHost binds a socket on a local address and offers it as a
+		// host candidate. Fails as the socket does.
+		internal def bindHost(address string) !none {
+			let ip = net.parseIPText(address)
+			fail net.errorOf(net.ErrorCode.BadAddress, "gather", address, "not an IP address") when ip is none
+			try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "webrtc://" + net.withPort(address, 0))
+			let sock = new udp.Client()
+			try sock.start(ip.len() == 16 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4))
+			try sock.bind(net.withPort(address, 0))
+			let local = try sock.localAddr()
+			let shown = config.mdnsNames ?? (try announce(address), address)
+			let base = addHostBase(sock, address, local.port, ip, shown)
+			let reader = async readSocket(base)
+			reader.keepAlive()
+			return none
+		}
+
+		// announce answers on the link for a new name with a local
+		// address (mDNS) and returns the name. Fails as the responder does:
+		// on a host without multicast, or when the policy denies it.
+		internal def announce(address string) !string {
+			let responder = new mdns.Responder((new UUID()).str())
+			responder.addresses = [address]
+			try responder.start()
+			keepResponder(responder)
+			return responder.hostName()
+		}
+
+		internal atomic def keepResponder(responder mdns.Responder) {
+			responders.push(responder)
+		}
+
+		internal atomic def allListeners() net.Listener[] {
+			return listeners.clone()
+		}
+
+		internal atomic def allResponders() mdns.Responder[] {
+			return responders.clone()
+		}
+
+		internal atomic def addHostBase(sock udp.Client, host string, port int, ip byte[], shown string) Base {
+			let base = new Base(bases.len(), host, port, ip)
+			base.socket = sock
+			bases.push(base)
+			let address = new net.Address()
+			address.parse(net.withPort(host, port)) onerror recover none
+			if shown != host {
+				address.host = shown
+				address.raw = "{shown}:{port}"
+			}
+			offer(sdp.Candidate{foundation: foundation("host", host, ""), priority: candidatePriority(preferHost, 65535 - base.index), address: address, kind: sdp.CandidateType.Host}, base.index)
+			return base
+		}
+
+		// foundation is the foundation of candidates of a type from a base
+		// address through a server (§5.1.1.3): the same for the same three.
+		internal def foundation(kind string, host string, server string) string {
+			let key = "{kind} {host} {server}"
+			let place = foundations.indexOf(key)
+			if place < 0 {
+				foundations.push(key)
+				place = foundations.len() - 1
+			}
+			return "{place + 1}"
+		}
+
+		// offer adds a local candidate, hands it out, and pairs it when it
+		// is a base of its own.
+		internal def offer(candidate sdp.Candidate, base int) {
+			// A candidate with the address of one of its base adds
+			// nothing (§5.1.3): a server-reflexive one on a host that is
+			// not behind a NAT, a peer-reflexive one that is known.
+			for let known in locals {
+				return when known.base == base && known.candidate.address.host == candidate.address.host && known.candidate.address.port == candidate.address.port
+			}
+			locals.push(Local{candidate: candidate, base: base})
+			if candidate.kind != sdp.CandidateType.PeerReflexive {
+				fresh.push(candidate)
+				gathered.offer(none)
+			}
+			return unless candidate.kind := sdp.CandidateType.Host || sdp.CandidateType.Relay
+			for let i = 0; i < remotes.len(); i++ {
+				formPair(base, i)
+			}
+		}
+
+		// hostCandidate is the candidate a base stands for: its host or
+		// relayed one.
+		internal def hostCandidate(base int) sdp.Candidate {
+			let own = bases[base].own
+			return own unless own is none
+			for let local in locals {
+				return local.candidate when local.base == base && (local.candidate.kind := sdp.CandidateType.Host || sdp.CandidateType.Relay)
+			}
+			return locals[0].candidate
+		}
+
+		// gatherFrom gathers through one server: a Binding request from
+		// every base for "stun", an allocation for "turn". What fails
+		// leaves no candidate.
+		internal def gatherFrom(url string, server IceServer) {
+			gatherThrough(url, server) onerror recover none
+			addGatherer(-1)
+		}
+
+		internal def gatherThrough(url string, server IceServer) !none {
+			let uri = try stun.parseURI(url)
+			if uri.scheme := "stun" || "stuns" {
+				return none unless config.policy == IceTransportPolicy.All
+				for let address in try stun.resolveURI(uri) {
+					askReflexive(address)
+				}
+				return try flush()
+			}
+			let client = try stun.dial(url, stun.ClientConfig{username: server.username, password: server.credential})
+			let allocation = try client.allocate()
+			for let relayed in allocation.relayed {
+				let address = try net.parseAddress(relayed)
+				let ip = net.parseIPText(address.host)
+				continue when ip is none
+				let base = addRelayBase(client, allocation, address, ip, url)
+				let reader = async readRelay(base, allocation)
+				reader.keepAlive()
+			}
+			return none
+		}
+
+		internal atomic def addRelayBase(client stun.Client, allocation stun.Allocation, address net.Address, ip byte[], server string) Base {
+			let base = new Base(bases.len(), address.host, address.port, ip)
+			base.relayed = true
+			base.relay = allocation
+			base.client = client
+			bases.push(base)
+			let mapped = new net.Address()
+			mapped.parse(allocation.mapped) onerror recover none
+			offer(sdp.Candidate{foundation: foundation("relay", address.host, server), priority: candidatePriority(preferRelay, 65535 - base.index), address: address, kind: sdp.CandidateType.Relay, related: mapped}, base.index)
+			// The relay forwards only from peers it has a permission for.
+			for let remote in remotes {
+				let task = async permit(allocation, remote.text)
+				task.keepAlive()
+			}
+			return base
+		}
+
+		internal def permit(allocation stun.Allocation, peer string) {
+			allocation.permit([peer]) onerror recover none
+		}
+
+		// askReflexive sends a Binding request to a STUN server from every
+		// socket of its address family.
+		internal atomic def askReflexive(server string) {
+			let address = net.parseAddress(server) onerror recover new net.Address()
+			let ip = net.parseIPText(address.host)
+			return when ip is none
+			let now = int(time.monoNs())
+			for let base in bases {
+				continue when base.relayed || base.tcp || base.ip.len() != ip.len()
+				let message = stun.request(stun.Method.Binding) onerror recover new stun.Message(stun.MessageClass.Request, stun.Method.Binding, tiebreaker + tiebreaker[0:4])
+				let gather = new Gather(base.index, server, message.transactionID, message.encode())
+				gather.rto = int(config.rto)
+				gather.nextAt = now + gather.rto
+				gathers.push(gather)
+				queue(base.index, gather.request, server)
+			}
+		}
+
+		// nextCandidate waits for the next local candidate; none once
+		// gathering is complete and all were handed out. Fails with
+		// NetError (TimedOut) after the timeout.
+		def nextCandidate(timeout duration = 30s) !?sdp.Candidate {
+			let deadline = int(time.monoNs()) + int(timeout)
+			for {
+				let (candidate, done) = takeCandidate()
+				return candidate unless candidate is none
+				return none when done
+				fail net.errorOf(net.ErrorCode.TimedOut, "gather", "", "no candidate before the timeout") unless awaitSignal(gathered, deadline)
+			}
+			fail iceError("unreachable")
+		}
+
+		internal atomic def takeCandidate() (?sdp.Candidate, bool) {
+			return (fresh.shift(), false) when fresh.len() > 0
+			return (none, gathering == IceGatheringState.Complete || closed)
+		}
+
+		// waitGathered waits until gathering is complete. Fails with
+		// NetError (TimedOut), WebRtcError when the agent closes first.
+		def waitGathered(timeout duration = 30s) !none {
+			let deadline = int(time.monoNs()) + int(timeout)
+			for {
+				return none when gatheringState() == IceGatheringState.Complete
+				fail iceError("the agent is closed") when isClosed()
+				fail net.errorOf(net.ErrorCode.TimedOut, "gather", "", "gathering did not finish in time") unless awaitSignal(changed, deadline)
+			}
+			fail iceError("unreachable")
+		}
+
+		// localCandidates is every local candidate found so far that is
+		// signalled to the peer.
+		atomic def localCandidates() sdp.Candidate[] {
+			let out sdp.Candidate[]
+			for let local in locals {
+				out.push(local.candidate) unless local.candidate.kind == sdp.CandidateType.PeerReflexive
+			}
+			for let candidate in advertised {
+				out.push(candidate)
+			}
+			return out
+		}
+
+		// ---- The peer's side ----
+
+		// setRemote takes the peer's username fragment and password.
+		atomic def setRemote(ufrag string, pwd string) {
+			remoteUfrag = ufrag
+			remotePwd = pwd
+		}
+
+		// addRemote takes a candidate of the peer, at any time (trickle,
+		// RFC 8838). A ".local" name is resolved over mDNS first. Fails
+		// with WebRtcError for a TCP candidate when none are gathered here,
+		// or a candidate whose address is no IP address, with PolicyDenied when the policy denies
+		// connecting to it.
+		def addRemote(candidate sdp.Candidate) !none {
+			let overTcp = candidate.transport == sdp.CandidateTransport.TCP
+			fail iceError("TCP candidates are not gathered on this connection") when overTcp && !config.tcp
+			return none unless candidate.componentID == 1
+			// The peer connects to this side's passive candidate from its
+			// active ones: only its passive ones are connected to.
+			return none when overTcp && candidate.tcpType != "passive"
+			if dns.isLocalName(candidate.address.host) {
+				let task = async resolveLocal(candidate)
+				task.keepAlive()
+				return none
+			}
+			let ip = net.parseIPText(candidate.address.host)
+			fail iceError("the candidate address {candidate.address.host} is not an IP address") when ip is none
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "webrtc://" + net.withPort(candidate.address.host, candidate.address.port))
+			let relays = takeRemote(candidate, ip)
+			let text = net.withPort(candidate.address.host, candidate.address.port)
+			if overTcp {
+				let task = async dialTcp(text)
+				task.keepAlive()
+				return none
+			}
+			for let relay in relays {
+				let task = async permit(relay, text)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		// resolveLocal asks the link for the address behind a ".local"
+		// name of a candidate and adds the candidate with it.
+		internal def resolveLocal(candidate sdp.Candidate) {
+			let records = mdns.query(candidate.address.host, dns.RecordType.A, 1s) onerror recover []
+			return when records.len() == 0
+			let address = new net.Address()
+			address.parse(net.withPort(records[0].address, candidate.address.port)) onerror recover none
+			let resolved = candidate
+			resolved.address = address
+			addRemote(resolved) onerror recover none
+		}
+
+		// takeRemote adds a candidate of the peer and pairs it; returns
+		// the allocations that need a permission for it.
+		internal atomic def takeRemote(candidate sdp.Candidate, ip byte[]) stun.Allocation[] {
+			let relays stun.Allocation[]
+			let index = remoteAt(ip, candidate.address.port, candidate.transport == sdp.CandidateTransport.TCP)
+			if index >= 0 {
+				// Known already, perhaps learned from a check: the
+				// signalled type and priority are the right ones.
+				let known = remotes[index]
+				known.candidate = candidate when known.candidate.kind == sdp.CandidateType.PeerReflexive
+				return relays
+			}
+			addRemoteCandidate(candidate, ip)
+			for let base in bases {
+				let through = base.relay
+				relays.push(through) unless through is none
+			}
+			return relays
+		}
+
+		internal def addRemoteCandidate(candidate sdp.Candidate, ip byte[]) int {
+			remotes.push(new Remote(candidate, net.withPort(candidate.address.host, candidate.address.port), ip))
+			let index = remotes.len() - 1
+			for let base in bases {
+				formPair(base.index, index)
+			}
+			return index
+		}
+
+		internal def remoteAt(ip byte[], port int, tcp bool) int {
+			for let (i, remote) in remotes {
+				return i when remote.candidate.address.port == port && (remote.candidate.transport == sdp.CandidateTransport.TCP) == tcp && remote.ip.equals(ip)
+			}
+			return -1
+		}
+
+		// endOfCandidates says the peer has no more candidates: once every
+		// pair has failed the agent fails.
+		atomic def endOfCandidates() {
+			remoteDone = true
+		}
+
+		// formPair pairs a base with a remote candidate of its address
+		// family (§6.1.2.2). Server-reflexive candidates make no pairs of
+		// their own: they are sent from their base (§6.1.2.4).
+		internal def formPair(base int, remote int) int {
+			for let (i, pair) in pairs {
+				return i when pair.base == base && pair.remote == remote
+			}
+			let from = bases[base]
+			let to = remotes[remote]
+			return -1 unless from.ip.len() == to.ip.len() && from.tcp == (to.candidate.transport == sdp.CandidateTransport.TCP)
+			// A TCP base is a connection to one address of the peer.
+			return -1 when from.tcp && !(from.peer.port == to.candidate.address.port && from.peerIP.equals(to.ip))
+			let pair = new Pair(base, remote)
+			pair.priority = priorityOf(pair)
+			pair.state = started ?? (PairState.Waiting, PairState.Frozen)
+			pairs.push(pair)
+			wake.offer(none)
+			return pairs.len() - 1
+		}
+
+		internal def priorityOf(pair Pair) int {
+			let mine = hostCandidate(pair.base).priority
+			let theirs = remotes[pair.remote].candidate.priority
+			return controlling ?? (pairPriority(mine, theirs), pairPriority(theirs, mine))
+		}
+
+		// start begins the checks in a role. The peer's credentials must
+		// be set; its candidates may still come.
+		atomic def start(asControlling bool) {
+			return when closed
+			controlling = asControlling
+			started = true
+			startedAt = int(time.monoNs())
+			wake.offer(none)
+			for let pair in pairs {
+				pair.priority = priorityOf(pair)
+				pair.state = PairState.Waiting when pair.state == PairState.Frozen
+			}
+			moveTo(IceConnectionState.Checking) when state == IceConnectionState.New
+		}
+
+		// restart begins an ICE restart (§2.4): new credentials, the peer's
+		// candidates and every pair forgotten; the pair in use goes on
+		// carrying data until a new one is selected. The local candidates
+		// stay and are signalled again with the new credentials. Fails
+		// when the system gives no random bytes.
+		atomic def restart() !none {
+			try renew()
+			if selected >= 0 {
+				let old = remotes[pairs[selected].remote]
+				keptHost = old.seenHost
+				keptPort = old.candidate.address.port
+			}
+			remoteUfrag = ""
+			remotePwd = ""
+			remotes = []
+			pairs = []
+			triggered = []
+			selected = -1
+			nominating = -1
+			started = false
+			remoteDone = false
+			fresh = []
+			for let local in locals {
+				fresh.push(local.candidate) unless local.candidate.kind == sdp.CandidateType.PeerReflexive
+			}
+			for let candidate in advertised {
+				fresh.push(candidate)
+			}
+			gathered.offer(none)
+			firstValidAt = 0
+			consentID = []
+			moveTo(IceConnectionState.New)
+			return none
+		}
+
+		// ---- Sending ----
+
+		internal def queue(base int, data byte[], to string) {
+			wake.offer(none)
+			outData.push(data)
+			outBase.push(base)
+			outTo.push(to)
+		}
+
+		// flush sends what was queued. A send that fails is a lost
+		// datagram: the checks are sent again.
+		def flush() !none {
+			for {
+				let (base, data, to) = takeQueued()
+				return none when base is none
+				base.sendTo(data, to) onerror recover none
+			}
+			return none
+		}
+
+		internal atomic def takeQueued() (?Base, byte[], string) {
+			return (none, [], "") when outData.len() == 0
+			return (bases[outBase.shift()], outData.shift(), outTo.shift())
+		}
+
+		// send sends a datagram to the peer over the selected pair, or the
+		// best valid one before a nomination (§12.1). Fails with NetError
+		// when no pair is valid yet or consent was lost, as the socket
+		// does otherwise.
+		def send(data byte[], timeout duration) !none {
+			let over = route
+			fail net.errorOf(net.ErrorCode.Closed, "send", "", "no candidate pair to send over") when over is none
+			return try over.base.sendTo(data, over.to)
+		}
+
+		// receive waits for the next datagram of the peer that is not
+		// STUN. Fails with NetError: TimedOut, Closed once the agent is
+		// closed, Other for a datagram longer than the buffer.
+		def receive(buf byte[], timeout duration) !int {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let n = try takeDatagram(buf)
+				return n when n >= 0
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "timed out") unless awaitSignal(arrived, deadline)
+			}
+			fail iceError("unreachable")
+		}
+
+		internal atomic def takeDatagram(buf byte[]) !int {
+			if inbox.len() == 0 {
+				fail net.errorOf(net.ErrorCode.Closed, "receive", "", "the agent is closed") when closed
+				return -1
+			}
+			let datagram = inbox.shift()
+			let n = datagram.len()
+			pool.push(datagram) when pool.len() < 64
+			fail net.errorOf(net.ErrorCode.Other, "receive", "", "a datagram of {n} bytes does not fit the buffer") when n > buf.len()
+			datagram.copy(buf)
+			return n
+		}
+
+		def isOpen() bool {
+			return !closed
+		}
+
+		// close ends the agent: sockets and allocations are closed. Never
+		// fails.
+		def close() !none {
+			for let base in shut() {
+				base.close()
+			}
+			for let responder in allResponders() {
+				responder.close()
+			}
+			for let listener in allListeners() {
+				listener.close() onerror recover none
+			}
+			return none
+		}
+
+		internal atomic def shut() Base[] {
+			return [] when closed
+			closed = true
+			wake.offer(none)
+			route = none
+			state = IceConnectionState.Closed
+			changed.offer(none)
+			arrived.offer(none)
+			gathered.offer(none)
+			return bases
+		}
+
+		// ---- Reading ----
+
+		// readSocket reads a base's socket until it closes.
+		internal def readSocket(base Base) {
+			let buf byte[]
+			buf.len(datagramSize)
+			for base.open {
+				let idle = false
+				readOnce(base, buf) onerror (err error) {
+					idle = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover none
+				}
+				// A socket that reports a failure (the peer's closed port)
+				// stays in use.
+				time.sleep(10ms) when idle && base.open
+			}
+		}
+
+		internal def readOnce(base Base, buf byte[]) !none {
+			let sock = base.socket
+			return none when sock is none
+			let (n, from) = try sock.recvFrom(buf, 250ms)
+			buf.len(n)
+			let failure ?error = none
+			dispatch(base, from, buf) onerror (err error) {
+				failure = err
+				recover none
+			}
+			buf.len(datagramSize)
+			fail failure unless failure is none
+			return none
+		}
+
+		// dispatch takes one datagram read on a base: a STUN message is
+		// acted on, anything else handed on. Fails with StunError for a
+		// malformed message.
+		internal def dispatch(base Base, from net.Address, data byte[]) !none {
+			if stun.isMessage(data) {
+				let message = try stun.parseMessage(data.clone())
+				takeStun(base.index, from, message, int(time.monoNs()))
+				return try flush()
+			}
+			deliver(from, data)
+			return none
+		}
+
+		// readRelay reads what a TURN allocation relays until it closes.
+		internal def readRelay(base Base, allocation stun.Allocation) {
+			for base.open {
+				let idle = false
+				relayOnce(base, allocation) onerror (err error) {
+					idle = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover none
+				}
+				time.sleep(10ms) when idle && base.open
+			}
+		}
+
+		internal def relayOnce(base Base, allocation stun.Allocation) !none {
+			let item = try allocation.receive(250ms)
+			return none when item.data.len() == 0
+			let from = try net.parseAddress(item.peer)
+			if stun.isMessage(item.data) {
+				takeStun(base.index, from, try stun.parseMessage(item.data), int(time.monoNs()))
+				return try flush()
+			}
+			deliver(from, item.data)
+			return none
+		}
+
+		// deliverTo has every datagram that is not STUN handed to a
+		// function on the task that read it, instead of kept for
+		// `receive`: no copy and no second task on the way. The array is
+		// the reader's and holds the datagram only during the call.
+		atomic def deliverTo(handler def (byte[])) {
+			sink = handler
+		}
+
+		// deliver hands on a datagram from a candidate a check succeeded
+		// with (§12.1); others are dropped.
+		internal def deliver(from net.Address, data byte[]) {
+			let handler = accepted(from, data)
+			handler(data) unless handler is none
+		}
+
+		// accepted checks where a datagram comes from; it returns the
+		// function to call with it, or keeps it for `receive` and returns
+		// none.
+		internal atomic def accepted(from net.Address, data byte[]) ?def (byte[]) {
+			let known = keptPort == from.port && keptHost == from.host
+			for let remote in remotes {
+				break when known
+				continue unless remote.validated && remote.candidate.address.port == from.port && remote.seenHost == from.host
+				known = true
+			}
+			return none unless known
+			return sink unless sink is none
+			let slot byte[]
+			if pool.len() > 0 {
+				slot = pool.pop()
+			} else {
+				slot.cap(datagramSize)
+			}
+			slot.len(data.len())
+			data.copy(slot)
+			pool.push(inbox.shift()) when inbox.len() >= inboxSize
+			inbox.push(slot)
+			arrived.offer(none)
+			return none
+		}
+
+		// ---- STUN in (RFC 8445 §7.2, §7.3) ----
+
+		internal atomic def takeStun(base int, from net.Address, message stun.Message, now int) {
+			return when closed || message.method != stun.Method.Binding
+			if message.class == stun.MessageClass.Request {
+				takeRequest(base, from, message, now)
+			} else if message.class := stun.MessageClass.SuccessResponse || stun.MessageClass.ErrorResponse {
+				takeResponse(base, from, message, now)
+			}
+		}
+
+		// atLeast reports whether this side's tiebreaker is at least the
+		// peer's (eight bytes, big-endian).
+		internal def atLeast(theirs byte[]) bool {
+			return true unless theirs.len() == 8
+			for let i = 0; i < 8; i++ {
+				return tiebreaker[i] > theirs[i] unless tiebreaker[i] == theirs[i]
+			}
+			return true
+		}
+
+		internal def switchRole(toControlling bool) {
+			controlling = toControlling
+			for let pair in pairs {
+				pair.priority = priorityOf(pair)
+			}
+		}
+
+		// takeRequest answers a check of the peer and checks the pair it
+		// came on in turn (a triggered check, §7.3.1.4).
+		internal def takeRequest(base int, from net.Address, message stun.Message, now int) {
+			let name = message.text(stun.AttributeType.Username)
+			return when name is none || !name.startsWith(localUfrag + ":") || !message.checkIntegrity(localPwd.bytes())
+			// Both sides in one role: the tiebreakers decide (§7.3.1.1).
+			let theirControlling = message.get(stun.AttributeType.IceControlling)
+			let theirControlled = message.get(stun.AttributeType.IceControlled)
+			let conflict = false
+			if controlling && !(theirControlling is none) {
+				conflict = atLeast(theirControlling)
+				switchRole(false) unless conflict
+			} else if !controlling && !(theirControlled is none) {
+				conflict = !atLeast(theirControlled)
+				switchRole(true) unless conflict
+			}
+			if conflict {
+				let refusal = stun.response(message, false)
+				refusal.add(stun.ErrorCode.RoleConflict)
+				queue(base, refusal.encode(localPwd.bytes(), stun.Integrity.SHA1, true), from.raw)
+				return
+			}
+			let answer = stun.response(message, true)
+			answer.add(stun.AttributeType.XorMappedAddress, from, true) onerror recover none
+			queue(base, answer.encode(localPwd.bytes(), stun.Integrity.SHA1, true), from.raw)
+
+			let ip = net.parseIPText(from.host)
+			return when ip is none
+			let remote = remoteAt(ip, from.port, bases[base].tcp)
+			if remote < 0 {
+				// A candidate nobody signalled: peer reflexive (§7.3.1.3).
+				let priority = message.uint32(stun.AttributeType.Priority)
+				remote = addRemoteCandidate(sdp.Candidate{foundation: "prflx{remotes.len()}", priority: priority is none ?? (0, priority), address: from, kind: sdp.CandidateType.PeerReflexive, transport: bases[base].tcp ?? (sdp.CandidateTransport.TCP, sdp.CandidateTransport.UDP), tcpType: bases[base].tcp ?? ("active", "")}, ip)
+			}
+			remotes[remote].seenHost = from.host
+			let index = formPair(base, remote)
+			return when index < 0
+			let pair = pairs[index]
+			if pair.state := PairState.Frozen || PairState.Waiting || PairState.Failed {
+				pair.state = PairState.Waiting
+				triggered.push(index) unless triggered.includes(index)
+				wake.offer(none)
+			}
+			return unless message.has(stun.AttributeType.UseCandidate) && !controlling
+			if pair.state == PairState.Succeeded {
+				nominate(index, now)
+			} else {
+				pair.nominateOnSuccess = true
+			}
+		}
+
+		// takeResponse takes the answer to a check, to a consent request
+		// or to a request to a STUN server.
+		internal def takeResponse(base int, from net.Address, message stun.Message, now int) {
+			for let (i, gather) in gathers {
+				continue unless gather.requestID.equals(message.transactionID)
+				gathers.remove(i)
+				let mapped = message.xorAddress(stun.AttributeType.XorMappedAddress)
+				if !(mapped is none) && message.class == stun.MessageClass.SuccessResponse {
+					let own = bases[gather.base]
+					let related = new net.Address()
+					related.parse(net.withPort(own.host, own.port)) onerror recover none
+					offer(sdp.Candidate{foundation: foundation("srflx", own.host, gather.server), priority: candidatePriority(preferServerReflexive, 65535 - own.index), address: mapped, kind: sdp.CandidateType.ServerReflexive, related: related}, own.index)
+				}
+				finishGathering()
+				return
+			}
+			if selected >= 0 && consentID.equals(message.transactionID) {
+				return unless message.class == stun.MessageClass.SuccessResponse && message.checkIntegrity(remotePwd.bytes())
+				pairs[selected].lastAnswer = now
+				consentID = []
+				moveTo(nominatedState()) when state == IceConnectionState.Disconnected
+				return
+			}
+			for let (i, pair) in pairs {
+				continue unless pair.state == PairState.InProgress && pair.requestID.equals(message.transactionID)
+				return unless message.checkIntegrity(remotePwd.bytes())
+				pair.requestID = []
+				nominating = -1 when nominating == i
+				if message.class == stun.MessageClass.ErrorResponse {
+					let refusal = message.refusal()
+					if !(refusal is none) && refusal.code == int(stun.ErrorCode.RoleConflict) {
+						// The peer keeps the role this check claimed too
+						// (§7.2.5.1): take the other and check again.
+						switchRole(!pair.sentControlling) when controlling == pair.sentControlling
+						pair.state = PairState.Waiting
+						triggered.push(i) unless triggered.includes(i)
+						return
+					}
+					pair.state = pair.valid ?? (PairState.Succeeded, PairState.Failed)
+					return
+				}
+				let remote = remotes[pair.remote]
+				let ip = net.parseIPText(from.host)
+				// The answer comes from where the check went (§7.2.5.2.1).
+				if ip is none || !remote.ip.equals(ip) || remote.candidate.address.port != from.port {
+					pair.state = PairState.Failed
+					return
+				}
+				// The address the peer saw, when new, is a peer-reflexive
+				// candidate of this side (§7.2.5.3.1).
+				let mapped = message.xorAddress(stun.AttributeType.XorMappedAddress)
+				offer(sdp.Candidate{foundation: foundation("prflx", bases[pair.base].host, remote.text), priority: candidatePriority(preferPeerReflexive, 65535 - pair.base), address: mapped, kind: sdp.CandidateType.PeerReflexive}, pair.base) unless mapped is none || bases[pair.base].tcp
+				pair.state = PairState.Succeeded
+				pair.valid = true
+				pair.lastAnswer = now
+				remote.validated = true
+				remote.seenHost = from.host
+				firstValidAt = now when firstValidAt == 0
+				if pair.usedCandidate || pair.nominateOnSuccess {
+					nominate(i, now)
+				} else {
+					reroute()
+				}
+				return
+			}
+		}
+
+		// nominate marks a valid pair nominated; the nominated pair of the
+		// highest priority is the one in use.
+		internal def nominate(index int, now int) {
+			let pair = pairs[index]
+			pair.nominated = true
+			if selected < 0 || pair.priority > pairs[selected].priority {
+				selected = index
+				keptPort = 0
+				consentAt = now + int(config.consentEvery)
+				consentID = []
+			}
+			reroute()
+			moveTo(nominatedState())
+		}
+
+		// nominatedState is Completed when nothing is left to check, else
+		// Connected.
+		internal def nominatedState() IceConnectionState {
+			for let pair in pairs {
+				return IceConnectionState.Connected when pair.state := PairState.Frozen || PairState.Waiting || PairState.InProgress
+			}
+			return IceConnectionState.Completed
+		}
+
+		// reroute points data at the selected pair, or before a nomination
+		// at the valid pair of the highest priority.
+		internal def reroute() {
+			let best = selected
+			if best < 0 {
+				for let (i, pair) in pairs {
+					best = i when pair.valid && (best < 0 || pair.priority > pairs[best].priority)
+				}
+			}
+			if best < 0 {
+				route = none
+				return
+			}
+			let to = remotes[pairs[best].remote].text
+			let current = route
+			return when !(current is none) && current.base.index == pairs[best].base && current.to == to
+			route = new Route(bases[pairs[best].base], to)
+		}
+
+		// ---- The timers ----
+
+		// run serves the timers until the agent closes: it sleeps until
+		// the next thing is due, or until something new to do wakes it.
+		internal def run() {
+			for !isClosed() {
+				let next = tick(int(time.monoNs()))
+				flush() onerror recover none
+				awaitSignal(wake, next)
+			}
+		}
+
+		internal atomic def isClosed() bool {
+			return closed
+		}
+
+		// tick does what is due and answers when the next thing is due
+		// (monotonic nanoseconds): the next retransmission of a request to
+		// a server, the next check while pairs are open, the next consent
+		// request or the end of consent on a selected pair; an hour ahead
+		// with nothing to do.
+		atomic def tick(now int) int {
+			let pace = int(config.pace)
+			let idle = now + 3600000000000
+			return idle when closed
+			let next = idle
+			for let i = gathers.len() - 1; i >= 0; i-- {
+				let gather = gathers[i]
+				continue when now < gather.nextAt
+				if gather.sends >= config.requests || now - (gather.nextAt - gather.rto) > int(config.gatherTimeout) {
+					gathers.remove(i)
+					finishGathering()
+					continue
+				}
+				gather.sends++
+				gather.rto = gather.rto * 2
+				gather.nextAt = now + gather.rto
+				queue(gather.base, gather.request, gather.server)
+			}
+			for let gather in gathers {
+				next = gather.nextAt when gather.nextAt < next
+			}
+			return next unless started && remotePwd != ""
+			for let (i, pair) in pairs {
+				continue unless pair.state == PairState.InProgress && now >= pair.nextAt
+				if pair.sends >= config.requests {
+					// No answer: the pair fails, unless it worked before and
+					// only the nominating check was lost.
+					pair.state = pair.valid ?? (PairState.Succeeded, PairState.Failed)
+					pair.requestID = []
+					nominating = -1 when nominating == i
+					continue
+				}
+				pair.sends++
+				pair.rto = pair.rto * 2
+				pair.nextAt = now + pair.rto
+				queue(pair.base, pair.request, remotes[pair.remote].text)
+			}
+			if now >= nextCheckAt {
+				let due = nextPair()
+				if due >= 0 {
+					sendCheck(due, now, controlling && config.nomination == Nomination.Aggressive)
+					nextCheckAt = now + pace
+				}
+			}
+			considerNomination(now)
+			keepConsent(now)
+			settle(now)
+			for let pair in pairs {
+				// Pairs still to check, or a nomination to decide: the
+				// pace of the checks.
+				next = now + pace when (pair.state := PairState.Frozen || PairState.Waiting || PairState.InProgress) || (controlling && selected < 0 && pair.valid)
+			}
+			if selected >= 0 && !(route is none) {
+				let ends = pairs[selected].lastAnswer + int(config.consentTimeout)
+				next = consentAt when consentAt < next
+				next = ends when ends < next
+			}
+			return next
+		}
+
+		// nextPair is the pair to check next: a triggered one, else the
+		// waiting pair of the highest priority (§6.1.4.2).
+		internal def nextPair() int {
+			for triggered.len() > 0 {
+				let index = triggered.shift()
+				return index when index < pairs.len() && pairs[index].state == PairState.Waiting
+			}
+			let best = -1
+			for let (i, pair) in pairs {
+				best = i when pair.state == PairState.Waiting && (best < 0 || pair.priority > pairs[best].priority)
+			}
+			return best
+		}
+
+		// sendCheck sends a Binding request on a pair (§7.2.2, §7.2.4).
+		internal def sendCheck(index int, now int, useCandidate bool) {
+			let pair = pairs[index]
+			let bytes = checkBytes(pair, useCandidate)
+			return when bytes.len() == 0
+			pair.request = bytes
+			pair.usedCandidate = useCandidate
+			pair.sentControlling = controlling
+			pair.sends = 1
+			pair.rto = int(config.rto)
+			pair.nextAt = now + pair.rto
+			pair.state = PairState.InProgress
+			queue(pair.base, bytes, remotes[pair.remote].text)
+		}
+
+		// checkBytes is a signed Binding request for a pair; its
+		// transaction becomes the pair's.
+		internal def checkBytes(pair Pair, useCandidate bool) byte[] {
+			let failed = false
+			let message = stun.request(stun.Method.Binding) onerror (err error) {
+				failed = true
+				recover new stun.Message(stun.MessageClass.Request, stun.Method.Binding, [])
+			}
+			return [] when failed
+			message.add(stun.AttributeType.Username, "{remoteUfrag}:{localUfrag}")
+			// The priority this side's candidate would have were it
+			// learned from this check (§7.1.1).
+			message.add(stun.AttributeType.Priority, uint32(candidatePriority(preferPeerReflexive, 65535 - pair.base)))
+			message.add(controlling ?? (stun.AttributeType.IceControlling, stun.AttributeType.IceControlled), tiebreaker)
+			let nothing byte[] = []
+			message.add(stun.AttributeType.UseCandidate, nothing) when useCandidate
+			pair.requestID = message.transactionID
+			return message.encode(remotePwd.bytes(), stun.Integrity.SHA1, true)
+		}
+
+		// considerNomination has the controlling side nominate the best
+		// valid pair (§8.1.1) once no better pair is still being checked,
+		// or the patience for one ran out.
+		internal def considerNomination(now int) {
+			return unless controlling && config.nomination == Nomination.Regular && selected < 0 && nominating < 0
+			let best = -1
+			let betterOpen = false
+			for let (i, pair) in pairs {
+				best = i when pair.valid && pair.state == PairState.Succeeded && (best < 0 || pair.priority > pairs[best].priority)
+			}
+			return when best < 0
+			for let pair in pairs {
+				betterOpen = true when pair.priority > pairs[best].priority && (pair.state := PairState.Frozen || PairState.Waiting || PairState.InProgress)
+			}
+			return when betterOpen && now - firstValidAt < int(config.patience)
+			nominating = best
+			sendCheck(best, now, true)
+		}
+
+		// keepConsent asks the peer on the selected pair whether it still
+		// wants the data (RFC 7675 §5.1): without an answer for the
+		// consent timeout nothing is sent to it any more.
+		internal def keepConsent(now int) {
+			return when selected < 0
+			let pair = pairs[selected]
+			if now - pair.lastAnswer > int(config.consentTimeout) {
+				route = none
+				moveTo(IceConnectionState.Failed)
+				return
+			}
+			moveTo(IceConnectionState.Disconnected) when now - pair.lastAnswer > 2 * int(config.consentEvery) + int(config.rto) && (state := IceConnectionState.Connected || IceConnectionState.Completed)
+			return when now < consentAt
+			let message = stun.request(stun.Method.Binding) onerror recover new stun.Message(stun.MessageClass.Request, stun.Method.Binding, [])
+			return when message.transactionID.len() == 0
+			message.add(stun.AttributeType.Username, "{remoteUfrag}:{localUfrag}")
+			message.add(stun.AttributeType.Priority, uint32(candidatePriority(preferPeerReflexive, 65535 - pair.base)))
+			message.add(controlling ?? (stun.AttributeType.IceControlling, stun.AttributeType.IceControlled), tiebreaker)
+			consentID = message.transactionID
+			queue(pair.base, message.encode(remotePwd.bytes(), stun.Integrity.SHA1, true), remotes[pair.remote].text)
+			// Spread over 0.8 to 1.2 of the interval (§5.1).
+			let interval = int(config.consentEvery)
+			consentAt = now + interval * 4 / 5 + (now % (interval * 2 / 5 + 1))
+		}
+
+		// settle moves the state on once the checks are over: Completed
+		// with a pair selected, Failed when the peer has no more candidates
+		// and every pair failed.
+		internal def settle(now int) {
+			if selected >= 0 {
+				moveTo(IceConnectionState.Completed) when state == IceConnectionState.Connected && nominatedState() == IceConnectionState.Completed
+				return
+			}
+			return unless remoteDone && state == IceConnectionState.Checking && gathering == IceGatheringState.Complete
+			for let pair in pairs {
+				return unless pair.state == PairState.Failed
+			}
+			// Without a pair yet (TCP candidates pair when their connection
+			// is made) the agent waits as long as a check would be tried.
+			return when pairs.len() == 0 && now - startedAt < int(config.rto) * ((1 << config.requests) - 1)
+			moveTo(IceConnectionState.Failed)
+		}
+	}
+}

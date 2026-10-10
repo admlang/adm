@@ -1,0 +1,188 @@
+partial module std.net.http.http3 {
+	use (
+		std.crypto.x509::(CertPool, parseCertificatesPEM)
+		std.net.http.http2::(HeaderField)
+		std.net.http.httptest.testcert::(testCertPEM, testKeyPEM)
+		std.net.quic
+		std.net.tls
+		std.testing
+		std.time
+	)
+
+	// Pair is an HTTP/3 client and server connected over loopback.
+	internal type Pair {
+		listener quic.Listener
+		client   Conn
+		server   Conn
+
+		def new(listener quic.Listener, client Conn, server Conn) {
+			self.listener = listener
+			self.client = client
+			self.server = server
+		}
+
+		def close() {
+			client.close() onerror recover none
+			listener.close() onerror recover none
+		}
+	}
+
+	internal def connectPair() !Pair {
+		let pair = try tls.parseKeyPair(testCertPEM, testKeyPEM)
+		let listener = try quic.listen("127.0.0.1:0", quic.Config{tls: tls.Config{certificates: [pair], alpn: [alpn]}})
+		let pool = new CertPool()
+		for let cert in try parseCertificatesPEM(testCertPEM) {
+			pool.addCert(cert)
+		}
+		let dialing = async quic.dial("127.0.0.1:{listener.address().port}", quic.Config{tls: tls.Config{rootCAs: pool, serverName: "localhost", alpn: [alpn]}})
+		let accepted = try listener.accept(5s)
+		let client = new Conn(try await dialing, true)
+		let server = new Conn(accepted, false)
+		try server.start()
+		try client.start()
+		return new Pair(listener, client, server)
+	}
+
+	internal def readBody(s Stream) !string {
+		let out byte[] = []
+		let buf byte[] = []
+		buf.len(4096)
+		for {
+			let n = try s.read(buf)
+			return string(out) when n == 0
+			out.push(...buf[:n])
+		}
+		fail "unreachable"
+	}
+
+	internal def failureOf(err error) string {
+		return "http3 {err.errorCode} {err.streamID >= 0}" when err is Http3Error
+		return "application {err.appCode}" when err is quic.ApplicationError
+		return err.message
+	}
+
+	internal def headersFailure(s Stream) string {
+		let seen = ""
+		s.readHeaders() onerror (err error) {
+			seen = failureOf(err)
+			recover []
+		}
+		return seen
+	}
+
+	check "HTTP/3 connection" {
+		@test()
+		def carriesARequestAndItsResponse() !none {
+			let pair = try connectPair()
+			let request = try pair.client.newStream()
+			request.deadline = time.now() + 5s
+			try request.writeHeaders([HeaderField{name:":method", value:"POST"}, HeaderField{name:":scheme", value:"https"}, HeaderField{name:":authority", value:"localhost"}, HeaderField{name:":path", value:"/things"}, HeaderField{name:"x-tag", value:"first"}])
+			try request.write("request ".bytes())
+			try request.write("body".bytes())
+			try request.end([HeaderField{name:"x-trailer", value:"sent"}])
+
+			let seen = try pair.server.acceptStream(5s)
+			assert seen.id() == request.id()
+			let fields = try seen.readHeaders()
+			assert valueOf(fields, ":method") == "POST" && valueOf(fields, ":path") == "/things" && valueOf(fields, "x-tag") == "first" && valueOf(fields, "nothing") == ""
+			assert (try readBody(seen)) == "request body"
+			assert valueOf(seen.trailers, "x-trailer") == "sent"
+			try seen.writeHeaders([HeaderField{name:":status", value:"103"}])
+			try seen.writeHeaders([HeaderField{name:":status", value:"200"}, HeaderField{name:"content-type", value:"text/plain"}])
+			try seen.write("response".bytes())
+			try seen.end()
+
+			assert valueOf(try request.readHeaders(), ":status") == "103"
+			assert valueOf(try request.readHeaders(), "content-type") == "text/plain"
+			assert (try readBody(request)) == "response"
+			assert request.trailers.len() == 0
+
+			// Both ends learned the other's settings.
+			for let i = 0; i < 200 && !(pair.client.peerSettingsSeen && pair.server.peerSettingsSeen); i++ {
+				time.sleep(5ms)
+			}
+			assert pair.client.peer.qpackCapacity == 4096 && pair.server.peer.maxFieldSectionSize == 1048576
+			// A field section encodes and decodes through the connection.
+			let section = try pair.client.encodeSection([HeaderField{name:"accept", value:"*/*"}])
+			let back = try pair.server.decodeSection(64, section, 1s)
+			assert back.len() == 1 && back[0].name == "accept"
+			pair.close()
+			return none
+		}
+
+		@test()
+		def cancelsAndGoesAway() !none {
+			let pair = try connectPair()
+			assert pair.client.accepting()
+			// A cancelled request shows as a reset with the code.
+			let request = try pair.client.newStream()
+			try request.writeHeaders([HeaderField{name:":method", value:"GET"}, HeaderField{name:":scheme", value:"https"}, HeaderField{name:":path", value:"/slow"}])
+			let seen = try pair.server.acceptStream(5s)
+			try seen.readHeaders()
+			request.cancel(ErrorCode.RequestCancelled)
+			let outcome = ""
+			readBody(seen) onerror (err error) {
+				outcome = failureOf(err)
+				recover ""
+			}
+			assert outcome == "application {ErrorCode.RequestCancelled.value}"
+
+			// After GOAWAY the client opens no more requests.
+			try pair.server.goAway()
+			for let i = 0; i < 200 && pair.client.accepting(); i++ {
+				time.sleep(5ms)
+			}
+			assert !pair.client.accepting() && pair.client.goAwayID == 4
+			let refused = ""
+			newStreamOrFail(pair.client) onerror (err error) {
+				refused = failureOf(err)
+				recover none
+			}
+			assert refused == "http3 RequestRejected false"
+			pair.close()
+			return none
+		}
+
+		@test()
+		def rejectsWhatBreaksTheProtocol() !none {
+			// DATA before the field section is a connection error.
+			let pair = try connectPair()
+			let raw = try pair.client.transport.openStream()
+			try raw.write([0x00, 0x03, 0x61, 0x62, 0x63])
+			let seen = try pair.server.acceptStream(5s)
+			assert headersFailure(seen) == "http3 FrameUnexpected false"
+			pair.close()
+
+			// A stream that ends before its field section is incomplete.
+			let second = try connectPair()
+			let hollow = try second.client.transport.openStream()
+			try hollow.closeWrite()
+			assert headersFailure(try second.server.acceptStream(5s)) == "http3 RequestIncomplete true"
+			// A second control stream ends the connection.
+			let extra = try second.client.transport.openSendStream()
+			try extra.write([0x00, 0x04, 0x00])
+			for let i = 0; i < 200 && second.server.failure is none; i++ {
+				time.sleep(5ms)
+			}
+			let ended = second.server.failure
+			assert !(ended is none) && failureOf(ended) == "http3 StreamCreationError false"
+			second.close()
+
+			// `abort` closes the connection with the error's code.
+			let third = try connectPair()
+			third.server.abort(connError(ErrorCode.ExcessiveLoad, "too much"))
+			for let i = 0; i < 200 && third.client.failure is none; i++ {
+				time.sleep(5ms)
+			}
+			let told = third.client.failure
+			assert !(told is none) && failureOf(told) == "http3 ExcessiveLoad false"
+			third.close()
+			return none
+		}
+	}
+
+	internal def newStreamOrFail(conn Conn) !none {
+		try conn.newStream()
+		return none
+	}
+}

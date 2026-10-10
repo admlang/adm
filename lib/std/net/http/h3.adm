@@ -1,0 +1,525 @@
+partial module std.net.http {
+	// HTTP3Mode is when a `Transport` uses HTTP/3 for an https request.
+	enum HTTP3Mode {
+		// Never.
+		Off,
+		// For an origin that advertised it in an `Alt-Svc` response
+		// header (RFC 7838); the first request to an origin goes over
+		// TCP, and so does every request while HTTP/3 does not answer.
+		Advertised,
+		// For every https request, with no fallback: for servers known
+		// to speak it.
+		Always,
+	}
+}
+
+// The bridge between std.net.http's messages and HTTP/3 streams.
+internal partial module std.net.http.h3 {
+	use (
+		std.net.http.h2::*
+		std.net.http.server::*
+		std.net.http.transport::(joinHostPort, checkEndpoint)
+		std.net
+		std.net.http.http2
+		std.net.http.http3
+		std.net.quic
+		std.net.tls
+		std.time
+		std.net.http::*
+	)
+
+	// How long an HTTP/3 endpoint that failed is left alone.
+	const brokenFor = 300s
+
+	// QuicSink frames a response as HTTP/3 onto one request stream.
+	type QuicSink {
+		stream http3.Stream
+
+		def new(stream http3.Stream) {
+			self.stream = stream
+		}
+
+		def writeInterim(status int, headers Header) !none {
+			return try stream.writeHeaders(headerBlock(status, headers), false)
+		}
+
+		def writeHead(status int, headers Header, length int, hasBody bool) !none {
+			headers.set("Content-Length", length.str()) when length >= 0 && statusHasBody(status) && !headers.has("Content-Length")
+			let last = !hasBody || (length == 0 && !headers.has("Trailer"))
+			return try stream.writeHeaders(headerBlock(status, headers), last)
+		}
+
+		def writeBody(buf byte[]) !none {
+			try stream.write(buf)
+			return none
+		}
+
+		def end(trailer ?Header) !none {
+			let fields http2.HeaderField[] = []
+			fields = headerFields(trailer) unless trailer is none
+			return try stream.end(fields)
+		}
+	}
+
+	// QuicBody is a message body read from a request stream; at its end
+	// the trailing fields become the message's trailer.
+	type QuicBody {
+		stream  http3.Stream
+		trailer Header
+
+		def new(stream http3.Stream, trailer Header) {
+			self.stream = stream
+			self.trailer = trailer
+		}
+
+		// Implements io.Reader.
+		def read(buf byte[]) !int {
+			let n = try stream.read(buf)
+			return n when n > 0 || buf.len() == 0
+			for let f in stream.trailers {
+				trailer.add(f.name, f.value)
+			}
+			return 0
+		}
+	}
+
+	// QuicServer is the HTTP/3 side of a `Server`: a QUIC listener on
+	// the UDP port beside the TCP one, and the connections it carries.
+	type QuicServer {
+		listener      quic.Listener
+		atomic conns  http3.Conn[]  = []
+		atomic active int           = 0
+		running       bool          = true
+
+		def new(listener quic.Listener) {
+			self.listener = listener
+		}
+
+		// The `Alt-Svc` value that advertises this endpoint.
+		def advertisement() string {
+			return "h3=\":{listener.address().port}\"; ma=86400"
+		}
+
+		// run accepts connections until the listener closes.
+		def run(srv Server) {
+			for running {
+				let conn = acceptOne() onerror recover none
+				return when conn is none
+				let task = async serveConnection(srv, conn)
+				task.keepAlive()
+			}
+		}
+
+		def acceptOne() !?quic.Connection {
+			return try listener.accept()
+		}
+
+		def serveConnection(srv Server, transport quic.Connection) {
+			let conn = new http3.Conn(transport, false)
+			let failed = false
+			conn.start() onerror (err error) {
+				failed = true
+				recover none
+			}
+			return when failed
+			track(conn)
+			let remote = net.parseAddress(transport.remoteAddr()) onerror recover new net.Address()
+			for {
+				let s = nextStream(conn) onerror recover none
+				break when s is none
+				let task = async answer(srv, s, remote, transport.tlsState())
+				task.keepAlive()
+			}
+			untrack(conn)
+		}
+
+		def nextStream(conn http3.Conn) !?http3.Stream {
+			return try conn.acceptStream()
+		}
+
+		def answer(srv Server, s http3.Stream, remote net.Address, state tls.ConnectionState) {
+			count(1)
+			serveQuicStream(srv, s, remote, state) onerror (err error) {
+				srv.report(err, none)
+				s.cancel(http3.ErrorCode.InternalError)
+				recover none
+			}
+			count(-1)
+		}
+
+		atomic def count(change int) {
+			active += change
+		}
+
+		atomic def track(conn http3.Conn) {
+			conns.push(conn)
+		}
+
+		atomic def untrack(conn http3.Conn) {
+			let kept http3.Conn[] = []
+			for let other in conns {
+				kept.push(other) unless other == conn
+			}
+			conns = kept
+		}
+
+		// close ends every connection now.
+		def close() {
+			running = false
+			listener.close(http3.ErrorCode.NoError.value) onerror recover none
+		}
+
+		// drain tells clients to open no more requests and waits for the
+		// running ones until the time is up; false when some were cut.
+		def drain(limit time.Time) bool {
+			running = false
+			for let conn in conns {
+				conn.goAway() onerror recover none
+			}
+			for active > 0 {
+				if time.now().after(limit) {
+					close()
+					return false
+				}
+				time.sleep(5ms)
+			}
+			close()
+			return true
+		}
+	}
+
+	// startQuicServer binds the UDP port of `at` and serves HTTP/3 on it
+	// with the server's TLS settings.
+	// Fails with PolicyDenied or NetError when the port cannot be bound.
+	def startQuicServer(srv Server, base tls.Config, at net.Address) !QuicServer {
+		let cfg = tls.withServerName(base, base.serverName)
+		cfg.alpn = [http3.alpn]
+		let host = at.isIPv6 ?? ("[{at.host}]", at.host)
+		let listener = try quic.listen("{host}:{at.port}", quic.Config{tls: cfg, maxStreams: srv.maxConcurrentStreams, idleTimeout: srv.idleTimeout})
+		let made = new QuicServer(listener)
+		let task = async made.run(srv)
+		task.keepAlive()
+		return made
+	}
+
+	// `startQuicServer` as an optional, so a failure can recover to none.
+	def tryStartQuicServer(srv Server, base tls.Config, at net.Address) !?QuicServer {
+		return try startQuicServer(srv, base, at)
+	}
+
+	// serveQuicStream answers one HTTP/3 request stream as `serveStream`
+	// does an HTTP/2 one.
+	def serveQuicStream(srv Server, s http3.Stream, remote net.Address, state tls.ConnectionState) !none {
+		s.deadline = time.now() + srv.readHeaderTimeout when srv.readHeaderTimeout > 0s
+		let fields = try s.readHeaders()
+		s.deadline = none
+		s.deadline = time.now() + srv.readTimeout when srv.readTimeout > 0s
+		let sink = new QuicSink(s)
+		let failure ?error = none
+		let parsed ?Request = none
+		parsed = buildQuicRequest(s, fields) onerror (err error) {
+			failure = err
+			recover none
+		}
+		let req = parsed
+		if req is none {
+			srv.report(failure, none) unless failure is none
+			let refusal = new ResponseWriter(new Request(), sink)
+			refusal.error(400) onerror recover none
+			return try refusal.end()
+		}
+		req.remote = remote
+		req.tls = true
+		req.tlsState = state
+		req.deadline = s.deadline
+		req.limitBody(srv.maxBodyBytes) when srv.maxBodyBytes > 0
+		let body = req.body
+		req.body = new ContinueReader(body, sink) when req.expectsContinue() && !(body is none)
+		let writer = new ResponseWriter(req, sink)
+		writer.headers.set("Server", srv.serverHeader) when srv.serverHeader != ""
+		let ctx = new Context(req, writer)
+		ctx.server = srv
+		let handler = srv.handler
+		let h Handler = handler is none ?? (notFoundHandler(), handler)
+		srv.countRequest()
+		h.serve(ctx) onerror (err error) {
+			srv.report(err, ctx)
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			// Past the head nothing can say the body is broken but a reset.
+			if writer.written() {
+				s.cancel(http3.ErrorCode.InternalError)
+				return none
+			}
+			answerHandlerFailure(writer, failure)
+		}
+		s.deadline = none
+		s.deadline = time.now() + srv.writeTimeout when srv.writeTimeout > 0s
+		try writer.end()
+		// A body the handler left unread: tell the client to stop sending
+		// (RFC 9114 §4.1.1).
+		s.stopReading(http3.ErrorCode.NoError)
+		return none
+	}
+
+	// buildQuicRequest builds the request a field section describes; none
+	// never comes back, the optional lets a failure recover to none.
+	// Fails with HttpError (status 400) for a section without the
+	// pseudo-headers a request needs (RFC 9114 §4.3.1).
+	def buildQuicRequest(s http3.Stream, fields http2.HeaderField[]) !?Request {
+		let method = http3.valueOf(fields, ":method")
+		let connect = method == "CONNECT"
+		fail HttpError{message: "a request without :method, :scheme or :path", status: 400, op: "request"} when method == "" || (!connect && (http3.valueOf(fields, ":scheme") == "" || http3.valueOf(fields, ":path") == ""))
+		let sawRegular = false
+		for let f in fields {
+			if f.name.startsWith(":") {
+				fail HttpError{message: "a pseudo-header after a regular field", status: 400, op: "request", text: f.name} when sawRegular
+				fail HttpError{message: "unknown pseudo-header {f.name}", status: 400, op: "request", text: f.name} unless f.name := ":method" || ":scheme" || ":authority" || ":path" || ":protocol"
+				continue
+			}
+			sawRegular = true
+			fail HttpError{message: "a field name in upper case", status: 400, op: "request", text: f.name} when f.name != f.name.lower()
+			fail HttpError{message: "the connection-specific field {f.name}", status: 400, op: "request", text: f.name} when connectionSpecific(f.name)
+		}
+		let req = try requestHead(fields, "HTTP/3.0")
+		let declared = try req.headers.contentLength()
+		req.contentLength = declared unless declared is none
+		req.body = new QuicBody(s, req.trailer)
+		return req
+	}
+
+	// exchangeHTTP3 sends a request on a new stream of the connection
+	// and reads the response head; the body reads from the stream.
+	// Fails with Http3Error (`RequestRejected` when the connection takes
+	// no new request, so it may go again elsewhere), HttpError (op
+	// "transport") for a malformed response, NetError (TimedOut) past the
+	// request's deadline or `headerTimeout`.
+	def exchangeHTTP3(conn http3.Conn, req Request, headerTimeout duration) !Response {
+		let limit = req.deadline
+		let s = try conn.newStream()
+		s.deadline = limit
+		let size = req.bodyLength()
+		try s.writeHeaders(requestBlock(req), size == 0)
+		if size != 0 {
+			let failure ?error = none
+			sendQuicBody(req, s) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				s.cancel(http3.ErrorCode.RequestCancelled)
+				fail failure
+			}
+		}
+		if headerTimeout > 0s {
+			let until = time.now() + headerTimeout
+			s.deadline = until when limit is none || until.before(limit)
+		}
+		let fields = try s.readHeaders()
+		let status = http3.valueOf(fields, ":status")
+		// Interim responses come first and are not the answer (RFC 9114
+		// §4.1).
+		for status.len() == 3 && status.startsWith("1") {
+			fields = try s.readHeaders()
+			status = http3.valueOf(fields, ":status")
+		}
+		s.deadline = limit
+		let res = new Response()
+		res.proto = "HTTP/3.0"
+		res.request = req
+		fail HttpError{message: "malformed :status: {status}", op: "transport", text: status} unless status.len() == 3 && status.isNumeric()
+		res.status = status.toInt<int>()
+		for let f in fields {
+			res.headers.add(f.name, f.value) unless f.name.startsWith(":")
+		}
+		if req.method == Method.HEAD || !statusHasBody(res.status) {
+			res.contentLength = 0
+			res.body = new EmptyBody()
+			return res
+		}
+		let declared = try res.headers.contentLength()
+		res.contentLength = declared unless declared is none
+		res.body = new QuicBody(s, res.trailer)
+		return res
+	}
+
+	def sendQuicBody(req Request, s http3.Stream) !none {
+		try req.writeBody(s, false)
+		return try s.end()
+	}
+
+	// AltService is where an origin said HTTP/3 is served, and until when
+	// the statement holds.
+	struct AltService {
+		authority string
+		expires   time.Time
+	}
+
+	// QuicPool is the HTTP/3 side of a `Transport`: what origins
+	// advertised, the connections open to them, and the endpoints that
+	// did not answer.
+	type QuicPool {
+		atomic services map<string, AltService>
+		atomic sessions map<string, http3.Conn>
+		atomic broken   map<string, time.Time>
+
+		// learn records the `Alt-Svc` header of a response from an origin
+		// ("host:port"): the first `h3` alternative, or nothing after
+		// `clear`.
+		def learn(origin string, host string, value string) {
+			return when value == ""
+			if value.trim().lower() == "clear" {
+				forget(origin)
+				return
+			}
+			for let entry in value.split(",") {
+				let parts = entry.split(";")
+				let pair = parts[0].trim()
+				continue unless pair.startsWith("h3=")
+				let authority = pair[3:].trim().trimPrefix("\"").trimSuffix("\"")
+				continue when authority == ""
+				authority = host + authority when authority.startsWith(":")
+				let age = 86400
+				for let i = 1; i < parts.len(); i++ {
+					let p = parts[i].trim()
+					let digits = p.startsWith("ma=") ?? (p[3:].trim(), "")
+					age = digits.toInt<int>() when digits != "" && digits.isNumeric() && digits.len() < 10
+				}
+				remember(origin, AltService{authority: authority, expires: time.now() + duration(age * 1000000000)})
+				return
+			}
+		}
+
+		atomic def remember(origin string, known AltService) {
+			services[origin] = known
+		}
+
+		atomic def forget(origin string) {
+			services.delete(origin)
+		}
+
+		// authorityFor is where HTTP/3 is served for an origin: the
+		// advertised alternative while it holds and has not just failed;
+		// "" for none.
+		atomic def authorityFor(origin string) string {
+			let known = services.get(origin)
+			return "" when known is none
+			if time.now().after(known.expires) {
+				services.delete(origin)
+				return ""
+			}
+			let until = broken.get(known.authority)
+			if !(until is none) {
+				return "" unless time.now().after(until)
+				broken.delete(known.authority)
+			}
+			return known.authority
+		}
+
+		atomic def markBroken(authority string) {
+			broken[authority] = time.now() + brokenFor
+		}
+
+		atomic def session(authority string) ?http3.Conn {
+			let conn = sessions.get(authority)
+			return none when conn is none
+			return conn when conn.accepting()
+			sessions.delete(authority)
+			return none
+		}
+
+		atomic def adopt(authority string, conn http3.Conn) http3.Conn {
+			// Two tasks may have dialed at once: the first one in stays.
+			let existing = sessions.get(authority)
+			if !(existing is none) && existing.accepting() {
+				conn.close() onerror recover none
+				return existing
+			}
+			sessions[authority] = conn
+			return conn
+		}
+
+		atomic def drop(authority string, conn http3.Conn) {
+			let current = sessions.get(authority)
+			sessions.delete(authority) when !(current is none) && current == conn
+		}
+
+		// connect returns the HTTP/3 connection to an authority, dialing
+		// it when there is none. The certificate must be valid for the
+		// origin's host, wherever the alternative is (RFC 7838 §2.1).
+		def connect(authority string, originHost string, base ?tls.Config, timeout duration) !http3.Conn {
+			let open = session(authority)
+			return open unless open is none
+			let given = tls.Config{}
+			given = base unless base is none
+			let cfg = tls.withServerName(given, given.serverName == "" ?? (originHost, given.serverName))
+			cfg.alpn = [http3.alpn]
+			let transport = try quic.dial(authority, quic.Config{tls: cfg, handshakeTimeout: timeout})
+			let conn = new http3.Conn(transport, true)
+			conn.start() onerror (err error) {
+				transport.close() onerror recover none
+				fail err
+			}
+			return adopt(authority, conn)
+		}
+
+		// send carries the request over HTTP/3 when the mode and the
+		// origin allow; none means: use TCP.
+		// Fails as `exchangeHTTP3` does; under `Advertised` a connection
+		// that cannot be made is not a failure but a reason for TCP.
+		def send(req Request, mode HTTP3Mode, base ?tls.Config, dialTimeout duration, headerTimeout duration) !?Response {
+			let host = req.url.hostname()
+			let origin = joinHostPort(host, req.url.effectivePort())
+			let authority = mode == HTTP3Mode.Always ?? (origin, authorityFor(origin))
+			return none when authority == ""
+			try checkEndpoint(req.url)
+			let failure ?error = none
+			let conn = tryConnect(authority, host, base, dialTimeout) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if conn is none {
+				fail failure when mode == HTTP3Mode.Always && !(failure is none)
+				markBroken(authority)
+				return none
+			}
+			let res = tryExchange(conn, req, headerTimeout) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return res unless res is none
+			drop(authority, conn) unless conn.accepting()
+			fail HttpError{message: "exchange failed without an error", op: "transport"} when failure is none
+			// A request the connection never took may go over TCP; one
+			// that may have reached the server is the caller's to repeat.
+			return none when mode == HTTP3Mode.Advertised && failure is http3.Http3Error && failure.errorCode == http3.ErrorCode.RequestRejected
+			fail failure
+		}
+
+		def tryConnect(authority string, originHost string, base ?tls.Config, timeout duration) !?http3.Conn {
+			return try connect(authority, originHost, base, timeout)
+		}
+
+		def tryExchange(conn http3.Conn, req Request, headerTimeout duration) !?Response {
+			return try exchangeHTTP3(conn, req, headerTimeout)
+		}
+
+		// closeAll closes every connection.
+		def closeAll() {
+			for let conn in takeAll() {
+				conn.close() onerror recover none
+			}
+		}
+
+		atomic def takeAll() http3.Conn[] {
+			let out http3.Conn[] = []
+			for let (_, conn) in sessions {
+				out.push(conn)
+			}
+			sessions = {}
+			return out
+		}
+	}
+}

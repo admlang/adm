@@ -1,0 +1,285 @@
+partial module std.net.http {
+	use (
+		std.data.encoding
+		std.io
+		std.net
+		std.net.http.forward::*
+		std.net.http.transport::(joinHostPort)
+		std.net.proxy::(relay)
+		std.services.policy::(Policy)
+	)
+
+	// ForwardProxy is a handler that serves as an HTTP proxy for its
+	// clients (RFC 9110 §7.6): a `CONNECT` request becomes a tunnel to
+	// the host it names, and a request with an absolute URL is sent on
+	// and its response returned, hop-by-hop fields removed and `Via`
+	// added both ways. A zero proxy serves every client and reaches every
+	// host.
+	//
+	//     let forward = new http.ForwardProxy()
+	//     forward.authenticate(def (user string, password string) bool { return user == "ana" && password == "secret" })
+	//     try (new http.Server("127.0.0.1:3128", forward)).listenAndServe()
+	type ForwardProxy {
+		// Sends the forwarded requests; none uses a `Transport` that
+		// connects directly, whatever the environment says.
+		transport          ?RoundTripper   = none
+		// The time a connection for a tunnel may take.
+		dialTimeout        duration        = 30s
+		// A tunnel with nothing moving in either direction this long ends.
+		idleTimeout        duration        = 300s
+		// The realm of the `Proxy-Authenticate` challenge.
+		realm              string          = "proxy"
+		// The name this proxy signs `Via` with.
+		name               string          = "adm"
+		internal authHook  ?ProxyAuthHook  = none
+		internal allowHook ?ProxyAllowHook = none
+		internal direct    ?Transport      = none
+
+		// authenticate makes clients present `Proxy-Authorization: Basic`
+		// credentials that fn accepts; others read 407 with the challenge.
+		def authenticate(fn def (string, string) bool) {
+			authHook = new ProxyAuthHook(fn)
+		}
+
+		// allow lets fn decide by host and port whether a request may
+		// leave; a refused client reads 403.
+		def allow(fn def (string, int) bool) {
+			allowHook = new ProxyAllowHook(fn)
+		}
+
+		// Implements Handler.
+		// Fails with HttpError: 400 for a request that is not for a
+		// proxy, 502 when the host cannot be reached, 504 when it does
+		// not answer in time.
+		def serve(ctx Context) !none {
+			let req = ctx.request
+			if !authorized(req) {
+				ctx.setHeader("Proxy-Authenticate", "Basic realm=\"" + realm.replace("\"", "") + "\", charset=\"UTF-8\"")
+				return try ctx.error(407, "proxy authentication required")
+			}
+			return try tunnel(ctx) when req.method == Method.CONNECT
+			fail ctx.abort(400, "a proxy request names an absolute URL") when req.url.scheme == "" || req.url.host == ""
+			return try forward(ctx)
+		}
+
+		// Whether the request carries credentials the hook accepts; true
+		// without an `authenticate` hook.
+		internal def authorized(req Request) bool {
+			let hook = authHook
+			return true when hook is none
+			let (user, password, ok) = proxyCredentials(req.header("Proxy-Authorization"))
+			return ok && hook.fn(user, password)
+		}
+
+		internal def allowed(host string, port int) bool {
+			let hook = allowHook
+			return true when hook is none
+			return hook.fn(host, port)
+		}
+
+		// CONNECT: open the connection, answer 200, then the client's
+		// socket and the target's carry each other's bytes.
+		internal def tunnel(ctx Context) !none {
+			let req = ctx.request
+			let (host, port) = connectTarget(req)
+			fail ctx.abort(400, "CONNECT names a host and a port") when host == "" || port <= 0
+			return try ctx.error(403, "the proxy does not tunnel to {host}:{port}") unless allowed(host, port)
+			let address = joinHostPort(host, port)
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "tcp://" + address)
+			let out = net.dialStream(address, dialTimeout) onerror (err error) {
+				fail ctx.abort(gatewayStatus(err), "cannot reach {address}: {err.message}")
+			}
+			let failure ?error = none
+			let taken = takeOver(ctx) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				out.close() onerror recover none
+				fail failure
+			}
+			if taken is none {
+				out.close() onerror recover none
+				return none
+			}
+			let (client, early) = taken
+			let greeting = "HTTP/1.1 200 Connection established\r\nVia: 1.1 {name}\r\n\r\n"
+			let opened = true
+			sendAll(client, greeting.bytes()) onerror (err error) {
+				opened = false
+				recover none
+			}
+			// What the client sent right behind its request belongs to
+			// the tunnel.
+			opened = opened && drainInto(early, out)
+			if !opened {
+				client.close() onerror recover none
+				out.close() onerror recover none
+				return none
+			}
+			relay(client, out, idleTimeout)
+			return none
+		}
+
+		// An absolute-URL request: send it on, return what comes back.
+		internal def forward(ctx Context) !none {
+			let req = ctx.request
+			let port = req.url.effectivePort()
+			return try ctx.error(403, "the proxy does not reach {req.url.host}") unless allowed(req.url.hostname(), port)
+			let out = try newRequest(req.method, req.url, req.body)
+			out.rawMethod = req.rawMethod
+			out.contentLength = req.contentLength
+			for let key in req.headers.keys() {
+				for let value in req.headers.values(key) {
+					out.headers.add(key, value)
+				}
+			}
+			out.headers.stripHopByHop()
+			out.headers.del("Proxy-Authorization")
+			out.headers.del("Proxy-Authenticate")
+			out.headers.add("Via", "{viaVersion(req.proto)} {name}")
+			let res = sender().roundTrip(out) onerror (err error) {
+				fail ctx.abort(gatewayStatus(err), "cannot reach {req.url.host}: {err.message}")
+			}
+			let target = ctx.response
+			res.headers.stripHopByHop()
+			for let key in res.headers.keys() {
+				continue when key := "Content-Length" || "Date"
+				for let value in res.headers.values(key) {
+					target.headers.add(key, value)
+				}
+			}
+			target.headers.add("Via", "{viaVersion(res.proto)} {name}")
+			target.headers.set("Content-Length", res.contentLength.str()) when res.contentLength >= 0
+			target.status = res.status
+			let body = res.body
+			if !(body is none) {
+				let buf byte[] = []
+				buf.len(32768)
+				for {
+					let n = try body.read(buf)
+					break when n <= 0
+					try target.write(buf[:n])
+				}
+			}
+			res.close() onerror recover none
+			return try target.end()
+		}
+
+		internal def sender() RoundTripper {
+			let given = transport
+			return given unless given is none
+			let made = direct
+			return made unless made is none
+			let fresh = new Transport()
+			direct = fresh
+			return fresh
+		}
+	}
+}
+
+internal partial module std.net.http.forward {
+	use (
+		std.data.encoding
+		std.io
+		std.net
+		std.net.http::*
+	)
+
+	type ProxyAuthHook {
+		fn def (string, string) bool
+
+		def new(fn def (string, string) bool) {
+			self.fn = fn
+		}
+	}
+
+	type ProxyAllowHook {
+		fn def (string, int) bool
+
+		def new(fn def (string, int) bool) {
+			self.fn = fn
+		}
+	}
+
+	// proxyCredentials reads a `Proxy-Authorization: Basic` value: the
+	// user, the password, and whether the value was one.
+	def proxyCredentials(value string) (string, string, bool) {
+		let text = value.trim()
+		return ("", "", false) unless text.len() > 6 && text[:6].lower() == "basic "
+		let decoded = encoding.base64decode(text[6:].trim()) onerror recover []
+		let pair = string(decoded)
+		let colon = pair.indexOf(":")
+		return ("", "", false) when colon < 0
+		return (pair[:colon], pair[colon + 1:], true)
+	}
+
+	// connectTarget is the host and port a CONNECT request names in its
+	// target ("host:port", RFC 9110 §9.3.6); ("", 0) when it names none.
+	def connectTarget(req Request) (string, int) {
+		let authority = req.host
+		let colon = -1
+		for let i = authority.len() - 1; i >= 0; i-- {
+			break when authority[i] == ']'
+			if authority[i] == ':' {
+				colon = i
+				break
+			}
+		}
+		return ("", 0) when colon <= 0
+		let portText = authority[colon + 1:]
+		return ("", 0) unless portText != "" && portText.isNumeric() && portText.len() <= 5
+		let port = portText.toInt<int>()
+		return ("", 0) when port > 65535
+		return (authority[:colon].trimPrefix("[").trimSuffix("]"), port)
+	}
+
+	// gatewayStatus is the status a proxy answers when the next hop
+	// failed: 504 for a timeout, 502 otherwise.
+	def gatewayStatus(err error) int {
+		return 504 when err is net.NetError && err.kind == net.ErrorCode.TimedOut
+		return 504 when err is HttpError && err.op == "timeout"
+		return 502
+	}
+
+	// viaVersion is the protocol version a `Via` field names: "1.1" for
+	// "HTTP/1.1".
+	def viaVersion(proto string) string {
+		return proto.startsWith("HTTP/") ?? (proto[5:], proto)
+	}
+
+	// takeOver is `Context.hijack` as an optional, so a failure can
+	// recover to none.
+	def takeOver(ctx Context) !?(net.Stream, io.Reader) {
+		return try ctx.hijack()
+	}
+
+	// sendAll writes every byte of data to the stream.
+	def sendAll(stream net.Stream, data byte[]) !none {
+		let off = 0
+		for off < data.len() {
+			let n = try stream.write(data[off:], 30s)
+			fail net.errorOf(net.ErrorCode.Pipe, "write", "", "wrote nothing") when n == 0
+			off += n
+		}
+		return none
+	}
+
+	// drainInto writes what the reader still holds to the stream; false
+	// when the stream refused it.
+	def drainInto(early io.Reader, out net.Stream) bool {
+		let buf byte[] = []
+		buf.len(4096)
+		for {
+			let n = early.read(buf) onerror recover 0
+			return true when n <= 0
+			let ok = true
+			sendAll(out, buf[:n]) onerror (err error) {
+				ok = false
+				recover none
+			}
+			return false unless ok
+		}
+		return true
+	}
+}

@@ -1,0 +1,195 @@
+// Loss detection and congestion control (RFC 9002): round-trip time
+// estimation and the NewReno congestion window of one connection. Times
+// are microseconds of the monotonic clock.
+internal partial module std.net.quic.core {
+	use std.time
+
+	// What a sent frame was, for acknowledgment and for sending the same
+	// information again when its packet is lost.
+	const sentCrypto = 1
+	const sentStream = 2
+	const sentMaxData = 3
+	const sentMaxStreamData = 4
+	const sentMaxStreamsBidi = 5
+	const sentMaxStreamsUni = 6
+	const sentResetStream = 7
+	const sentStopSending = 8
+	const sentNewConnectionID = 9
+	const sentRetireConnectionID = 10
+	const sentHandshakeDone = 11
+	const sentAck = 12
+	const sentNewToken = 13
+
+	// SentFrame is one frame of a sent packet, reduced to what settles it.
+	struct SentFrame {
+		kind     int
+		streamID int  = 0
+		offset   int  = 0
+		size     int  = 0
+		fin      bool = false
+		// A sequence number, or the largest packet number an ACK covered.
+		value    int  = 0
+	}
+
+	// SentPacket is a packet awaiting acknowledgment.
+	struct SentPacket {
+		pn           int
+		sentAt       int
+		size         int
+		ackEliciting bool
+		// Counts toward the congestion window: every packet but one that
+		// carries only ACK and CONNECTION_CLOSE frames.
+		inFlight     bool
+		frames       SentFrame[]
+	}
+
+	// nowMicros is the monotonic clock in microseconds.
+	def nowMicros() int {
+		return int(time.monoNs() / 1000)
+	}
+
+	// The timer granularity of RFC 9002 §6.1.2: 1 ms.
+	const granularity = 1000
+	// The initial round-trip time of RFC 9002 §6.2.2: 333 ms.
+	const initialRTT = 333000
+	// Packets a later acknowledgment must pass before one is lost.
+	const packetThreshold = 3
+
+	// Recovery is the round-trip estimate and congestion state of a path.
+	type Recovery {
+		latestRTT     int  = 0
+		smoothedRTT   int  = initialRTT
+		rttVar        int  = initialRTT / 2
+		minRTT        int  = 0
+		hasRTT        bool = false
+		// The peer's max_ack_delay, microseconds.
+		maxAckDelay   int  = 25000
+		maxDatagram   int  = 1200
+		cwnd          int  = 12000
+		ssthresh      int  = 4611686018427387903
+		bytesInFlight int  = 0
+		// Packets sent before this time do not start another recovery
+		// period; -1 outside recovery.
+		recoveryStart int  = -1
+		ptoCount      int  = 0
+
+		def new(maxDatagram int = 1200) {
+			self.maxDatagram = maxDatagram
+			cwnd = initialWindow()
+		}
+
+		// RFC 9002 §7.2: ten datagrams, capped at 14720 bytes, at least
+		// two datagrams.
+		def initialWindow() int {
+			let window = 10 * maxDatagram
+			window = 14720 when window > 14720
+			window = 2 * maxDatagram when window < 2 * maxDatagram
+			return window
+		}
+
+		def minimumWindow() int {
+			return 2 * maxDatagram
+		}
+
+		// updateRTT takes a sample from a newly acknowledged largest
+		// packet (RFC 9002 §5): `ackDelay` is the peer's reported delay,
+		// trusted up to its max_ack_delay once the handshake is confirmed.
+		def updateRTT(sample int, ackDelay int, confirmed bool) {
+			latestRTT = sample < 1 ?? (1, sample)
+			if !hasRTT {
+				hasRTT = true
+				minRTT = latestRTT
+				smoothedRTT = latestRTT
+				rttVar = latestRTT / 2
+				return
+			}
+			minRTT = latestRTT when latestRTT < minRTT
+			let delay = ackDelay
+			delay = maxAckDelay when confirmed && delay > maxAckDelay
+			let adjusted = latestRTT
+			adjusted = latestRTT - delay when latestRTT >= minRTT + delay
+			let difference = smoothedRTT - adjusted
+			difference = -difference when difference < 0
+			rttVar = (3 * rttVar + difference) / 4
+			smoothedRTT = (7 * smoothedRTT + adjusted) / 8
+		}
+
+		// The probe timeout before backoff (RFC 9002 §6.2.1); the peer's
+		// max_ack_delay counts only for application data.
+		def ptoInterval(applicationSpace bool) int {
+			let variance = 4 * rttVar
+			variance = granularity when variance < granularity
+			return smoothedRTT + variance + (applicationSpace ?? (maxAckDelay, 0))
+		}
+
+		// The time after which an unacknowledged packet older than an
+		// acknowledged one is lost (RFC 9002 §6.1.2).
+		def lossDelay() int {
+			let base = latestRTT > smoothedRTT ?? (latestRTT, smoothedRTT)
+			let delay = base * 9 / 8
+			return delay < granularity ?? (granularity, delay)
+		}
+
+		// Whether the window has room for another full datagram.
+		def canSend() bool {
+			return bytesInFlight + maxDatagram <= cwnd
+		}
+
+		def onSent(p SentPacket) {
+			bytesInFlight += p.size when p.inFlight
+		}
+
+		// onAcked grows the window for a newly acknowledged packet (RFC
+		// 9002 §7.3): by its size in slow start, by a datagram per window
+		// in congestion avoidance, not at all inside a recovery period.
+		def onAcked(p SentPacket) {
+			return unless p.inFlight
+			bytesInFlight -= p.size
+			bytesInFlight = 0 when bytesInFlight < 0
+			return when recoveryStart >= 0 && p.sentAt <= recoveryStart
+			if cwnd < ssthresh {
+				cwnd += p.size
+			} else {
+				cwnd += maxDatagram * p.size / cwnd
+			}
+		}
+
+		// onLost takes lost packets out of flight and halves the window
+		// once per recovery period (RFC 9002 §7.3.2); `persistent`
+		// collapses it to the minimum (§7.6).
+		def onLost(lost SentPacket[], now int, persistent bool) {
+			let newest = -1
+			for let p in lost {
+				continue unless p.inFlight
+				bytesInFlight -= p.size
+				newest = p.sentAt when p.sentAt > newest
+			}
+			bytesInFlight = 0 when bytesInFlight < 0
+			return when newest < 0
+			if recoveryStart < 0 || newest > recoveryStart {
+				recoveryStart = now
+				ssthresh = cwnd / 2
+				ssthresh = minimumWindow() when ssthresh < minimumWindow()
+				cwnd = ssthresh
+			}
+			if persistent {
+				cwnd = minimumWindow()
+				recoveryStart = -1
+			}
+		}
+
+		// discard forgets packets of a space whose keys are gone.
+		def discard(packets SentPacket[]) {
+			for let p in packets {
+				bytesInFlight -= p.size when p.inFlight
+			}
+			bytesInFlight = 0 when bytesInFlight < 0
+		}
+
+		// The span that makes losses across it persistent congestion
+		// (RFC 9002 §7.6.1): three probe timeouts.
+		def persistentDuration() int {
+			return ptoInterval(true) * 3
+		}
+	}
+}

@@ -1,0 +1,920 @@
+// PeerConnection: one connection to a peer, set up by exchanging session
+// descriptions and ICE candidates over a signalling channel of the
+// program's own (JSEP, RFC 9429).
+//
+//     let pc = new webrtc.PeerConnection(webrtc.Configuration{iceServers: [webrtc.IceServer{urls: ["stun:stun.example.org:3478"]}]})
+//     let chat = try pc.createDataChannel("chat")
+//     let offer = try pc.createOffer()
+//     try pc.setLocalDescription(offer)
+//     // send offer.str() to the peer, read its answer
+//     try pc.setRemoteDescription(try sdp.parse(answerText))
+//     // for each candidate of the peer: try pc.addCandidate(candidate)
+//     try pc.waitConnected()
+//     try chat.send("hello")
+partial module std.net.webrtc {
+	use (
+		std.crypto::(rand)
+		std.metrics
+		std.net
+		std.net.rtp
+		std.net.sctp
+		std.net.sdp
+		std.net.tls
+		std.net.waiting::(awaitSignal)
+		std.net.webrtc.ice::(Agent, AgentConfig, newAgent)
+		std.services.diagnostics::(metric)
+		std.net.webrtc.peer::(Channels, LocalTransport, Media, MediaPlan, Transport, chosen, dataSection, directionOf, fecNumber, fecOf, fingerprintOf, isAudio, mediaSection, wideNumber, wideNumberOf, extensionNumberOf, layersOf, encodedAs, redEncoding, redNumber, redRtxNumber, ulpEncoding, ulpNumber, repairedExtension, repairedNumber, ridExtension, ridNumber, midNumber, midNumberOf, nextSignaling, repairsOf, rtxOf, payloadTypeOf, receives, soundRedNumber, soundRedOf, rejected, selfSigned, sends, sessionFor)
+		std.time
+	)
+
+	// SessionDescription is a session description as std.net.sdp reads
+	// and writes it: `sdp.parse(text)`, `description.str()`.
+	type SessionDescription = sdp.SessionDescription
+
+	// IceCandidate is one candidate as signalling carries it: the
+	// candidate, the media section it belongs to by mid and index, and
+	// the username fragment of the ICE generation it was gathered for.
+	struct IceCandidate {
+		candidate        sdp.Candidate
+		mid              string        = "0"
+		mLineIndex       int           = 0
+		usernameFragment string        = ""
+	}
+
+	// Configuration steers a connection: the STUN and TURN servers to
+	// gather through, whether only relayed paths may be used, the
+	// certificate to show (none: a new one per connection), the local
+	// addresses to gather on (empty: every interface that is up; the
+	// loopback only when asked), and how long connecting may take.
+	struct Configuration {
+		iceServers             IceServer[]        = []
+		iceTransportPolicy     IceTransportPolicy = IceTransportPolicy.All
+		certificate            ?tls.KeyPair       = none
+		addresses              string[]           = []
+		loopback               bool               = false
+		// Gather TCP candidates too (RFC 6544), for peers whose network
+		// lets no UDP through; and whether host candidates carry an mDNS
+		// name instead of the address, as browsers write them.
+		tcpCandidates          bool               = false
+		mdnsCandidates         bool               = false
+		// Offer FlexFEC (RFC 8627) for the video this side sends: one
+		// repair packet for every five packets, a fifth more data, so a
+		// lost packet is put back without a retransmission.
+		forwardErrorCorrection bool               = false
+		connectTimeout         duration           = 30s
+	}
+
+	// Stats is a connection at one moment: its states, the candidate pair
+	// in use (none before one is selected), and the statistics of every
+	// track it sends and receives.
+	struct Stats {
+		state           PeerConnectionState
+		iceState        IceConnectionState
+		localCandidate  ?sdp.Candidate      = none
+		remoteCandidate ?sdp.Candidate      = none
+		sending         SendStats[]         = []
+		receiving       ReceiveStats[]      = []
+	}
+
+	// PeerConnection is one connection to a peer. Its methods may be
+	// called from any task.
+	type PeerConnection {
+		config Configuration
+		internal ice ?Agent = none
+		internal identity ?tls.KeyPair = none
+		internal path ?Transport = none
+		internal link ?sctp.Association = none
+		internal channels Channels
+		internal media Media
+		// The tracks added, this side's media sections, the sections of
+		// an offer it refused, and every section's mid in the order of
+		// the description.
+		internal tracks LocalTrack[] = []
+		// For each track, the layers it is the first of when it was added
+		// as simulcast (itself included), else none.
+		internal layered LocalTrack[][] = []
+		internal plans MediaPlan[] = []
+		internal refused sdp.MediaDescription[] = []
+		internal order string[] = []
+		// The tracks that only send (their sections take nothing back),
+		// and the formats of sections that only receive, not offered yet.
+		internal oneWay LocalTrack[] = []
+		internal expected rtp.PayloadFormat[] = []
+		internal signaling SignalingState = SignalingState.Stable
+		internal connection PeerConnectionState = PeerConnectionState.New
+		internal failure ?error = none
+		// The descriptions in force, and the offer not answered yet.
+		internal local ?SessionDescription = none
+		internal remote ?SessionDescription = none
+		internal pendingLocal ?SessionDescription = none
+		internal pendingRemote ?SessionDescription = none
+		// This side made the offer; its DTLS role as the descriptions
+		// last said; the mid of the data section ("" for none).
+		internal offerer bool = false
+		internal localSetup sdp.Setup = sdp.Setup.ActPass
+		internal remoteSetup sdp.Setup = sdp.Setup.ActPass
+		internal dataMid string = ""
+		internal prints sdp.Fingerprint[] = []
+		internal remotePort int = 5000
+		internal sessionID string = ""
+		internal version int = 0
+		internal establishing bool = false
+		// The peer's username fragment as last described, and whether its
+		// certificate changed since the DTLS connection was made.
+		internal remoteUfrag string = ""
+		internal renewing bool = false
+		internal changed channel<none>
+		@metric("net.webrtc.connections")
+		internal connected metrics.Counter
+		@metric("net.webrtc.failures")
+		internal failures metrics.Counter
+
+		def new(config Configuration = Configuration{}) {
+			self.config = config
+			channels = new Channels()
+			media = new Media()
+			changed = new channel<none>(1)
+		}
+
+		// ---- Offer and answer ----
+
+		// createOffer writes an offer for what this side wants: a media
+		// section per track, a data section when a data channel was made.
+		// With `iceRestart` on a connection that has gathered, the offer
+		// carries new ICE credentials and a new path is looked for while
+		// the old one goes on carrying data. Fails with WebRtcError
+		// when the connection is closed, as the system does when it gives
+		// no random bytes.
+		atomic def createOffer(iceRestart bool = false) !SessionDescription {
+			let agent = try ready()
+			// An ICE restart (RFC 8445 §2.4): new credentials in this
+			// offer; the checks start over when its answer is in force.
+			try agent.restart() when iceRestart && agent.gatheringState() != IceGatheringState.New
+			for let (index, track) in tracks {
+				continue when planned(index)
+				plans.push(MediaPlan{mid: "{order.len()}", format: track.format, payloadType: payloadTypeOf(track.format), direction: oneWay.includes(track) ?? (sdp.Direction.SendOnly, sdp.Direction.SendRecv), track: index, ssrc: track.sender.ssrc, trackID: track.id, midID: midNumber, wideID: wideNumber, rtxType: isAudio(track.format) ?? (0, payloadTypeOf(track.format) + 1), rtxSsrc: track.sender.rtxSsrc, fecType: isAudio(track.format) || !config.forwardErrorCorrection || layered[index].len() > 0 ?? (0, fecNumber), fecSsrc: track.sender.fecSsrc, rids: namesOf(layered[index]), ridID: ridNumber, repairedID: repairedNumber, redType: shieldable(track, index) ?? (redNumber, isAudio(track.format) ?? (soundRedNumber, 0)), redRtxType: shieldable(track, index) ?? (redRtxNumber, 0), ulpType: shieldable(track, index) ?? (ulpNumber, 0)})
+				order.push("{order.len()}")
+			}
+			for let format in expected {
+				plans.push(MediaPlan{mid: "{order.len()}", format: format, payloadType: payloadTypeOf(format), direction: sdp.Direction.RecvOnly, midID: midNumber, wideID: wideNumber, rtxType: isAudio(format) ?? (0, payloadTypeOf(format) + 1), redType: isAudio(format) ?? (soundRedNumber, redNumber), redRtxType: isAudio(format) ?? (0, redRtxNumber), ulpType: isAudio(format) ?? (0, ulpNumber)})
+				order.push("{order.len()}")
+			}
+			expected = []
+			if dataMid == "" && channels.wanted() {
+				dataMid = "{order.len()}"
+				order.push(dataMid)
+			}
+			version++
+			return try describe(agent, sdp.Setup.ActPass)
+		}
+
+		// createAnswer writes the answer to the peer's offer: its data
+		// section is taken, its other sections are refused. Fails with
+		// WebRtcError when no offer of the peer is waiting.
+		atomic def createAnswer() !SessionDescription {
+			let agent = try ready()
+			let offer = pendingRemote
+			fail WebRtcError{message: "webrtc: there is no offer of the peer to answer in the state {signaling}", code: "webrtc.invalid-state"} when offer is none || signaling != SignalingState.HaveRemoteOffer
+			// The offerer leaves the DTLS role open; the answerer takes
+			// the active one (RFC 5763 §5).
+			let setup = remoteSetup == sdp.Setup.Active ?? (sdp.Setup.Passive, sdp.Setup.Active)
+			version++
+			let kept = plans
+			plans = []
+			order = []
+			refused = []
+			for let (index, section) in offer.media {
+				let key = section.mid() == "" ?? ("#{index}", section.mid())
+				order.push(key)
+				if section.media == "application" && section.port != 0 {
+					dataMid = key
+					continue
+				}
+				let plan = planFor(offer, section, key, kept)
+				if plan is none {
+					refused.push(section)
+				} else {
+					plans.push(plan)
+				}
+			}
+			return try describe(agent, setup)
+		}
+
+		// shieldable reports whether a track's section offers ULPFEC:
+		// video with one stream, when FlexFEC is not what is offered.
+		internal def shieldable(track LocalTrack, index int) bool {
+			return !isAudio(track.format) && layered[index].len() == 0 && !config.forwardErrorCorrection
+		}
+
+		internal def planned(track int) bool {
+			for let plan in plans {
+				return true when plan.track == track
+			}
+			return false
+		}
+
+		// planFor is this side's answer to an offered audio or video
+		// section: a format both sides have, a local track of its kind
+		// that is not on a section yet when the offer takes one, and the
+		// direction that follows. None when the section is refused.
+		internal def planFor(offer SessionDescription, section sdp.MediaDescription, key string, kept MediaPlan[]) ?MediaPlan {
+			return none unless section.port != 0 && (section.media := "audio" || "video")
+			let offered = offer.direction(section)
+			let track = -1
+			for let plan in kept {
+				track = plan.track when plan.mid == key
+			}
+			if track < 0 && receives(offered) {
+				for let (index, candidate) in tracks {
+					continue unless track < 0 && isAudio(candidate.format) == (section.media == "audio")
+					let taken = false
+					for let plan in kept {
+						taken = true when plan.track == index
+					}
+					for let plan in plans {
+						taken = true when plan.track == index
+					}
+					track = index unless taken
+				}
+			}
+			let choice = track >= 0 ?? (chosen(section, tracks[track].format), chosen(section, none))
+			if choice is none {
+				track = -1
+				choice = chosen(section, none)
+			}
+			return none when choice is none || isAudio(choice.format) != (section.media == "audio")
+			let sending = track >= 0 && receives(offered)
+			return none unless sending || sends(offered)
+			let plan = MediaPlan{mid: key, format: choice.format, payloadType: choice.payloadType, direction: directionOf(sending, sends(offered)), track: sending ?? (track, -1), ssrc: sending ?? (tracks[track].sender.ssrc, 0), trackID: sending ?? (tracks[track].id, ""), midID: midNumberOf(section), wideID: wideNumberOf(section), rtxType: rtxOf(section, choice.payloadType), rtxSsrc: sending ?? (tracks[track].sender.rtxSsrc, 0), fecType: fecOf(section), fecSsrc: sending ?? (tracks[track].sender.fecSsrc, 0)}
+			// Simulcast the offer sends is taken layer by layer; simulcast
+			// it asks for is sent when the track has layers, under the
+			// names the offer gives, as many as there are of both.
+			let coming = layersOf(section, true)
+			let wanted = layersOf(section, false)
+			if coming.len() > 0 && sends(offered) {
+				plan.rids = coming
+				plan.ridsReceived = true
+			} else if wanted.len() > 0 && sending && layered[track].len() > 0 {
+				plan.rids = wanted[:wanted.len().min(layered[track].len())]
+			}
+			if plan.rids.len() > 0 {
+				plan.ridID = extensionNumberOf(section, ridExtension)
+				plan.repairedID = extensionNumberOf(section, repairedExtension)
+				plan.fecType = 0
+			} else if section.media == "audio" {
+				plan.redType = soundRedOf(section, choice.payloadType)
+			} else if plan.fecType == 0 && section.media == "video" {
+				// ULPFEC inside the stream when the offer has both its
+				// payload types and no FlexFEC was taken.
+				let red = encodedAs(section, redEncoding)
+				let ulp = encodedAs(section, ulpEncoding)
+				if red > 0 && ulp > 0 {
+					plan.redType = red
+					plan.ulpType = ulp
+					plan.redRtxType = rtxOf(section, red)
+				}
+			}
+			return plan
+		}
+
+		// ready is the ICE agent, made with the certificate and the
+		// session number at the first use.
+		internal def ready() !Agent {
+			fail WebRtcError{message: "webrtc: the connection is closed", code: "webrtc.invalid-state"} when signaling == SignalingState.Closed
+			let have = ice
+			return have unless have is none
+			let agent = try newAgent(AgentConfig{servers: config.iceServers, policy: config.iceTransportPolicy, addresses: config.addresses, loopback: config.loopback, tcp: config.tcpCandidates, mdnsNames: config.mdnsCandidates})
+			let given = config.certificate
+			identity = given is none ?? (try selfSigned(), given)
+			let digits = try rand(8)
+			let number = 0
+			for let b in digits {
+				number = number << 8 | int(b)
+			}
+			sessionID = "{number & 0x7FFFFFFFFFFFFFFF}"
+			ice = agent
+			return agent
+		}
+
+		internal def localTransport(agent Agent, setup sdp.Setup) !LocalTransport {
+			let (ufrag, password) = agent.credentials()
+			let shown = identity
+			fail WebRtcError{message: "webrtc: the connection has no certificate"} when shown is none
+			return LocalTransport{ufrag: ufrag, password: password, fingerprint: fingerprintOf(shown.chain[0]), setup: setup, candidates: agent.localCandidates(), complete: agent.gatheringState() == IceGatheringState.Complete}
+		}
+
+		internal def describe(agent Agent, setup sdp.Setup) !SessionDescription {
+			let sections sdp.MediaDescription[]
+			let transport = try localTransport(agent, setup)
+			for let (index, key) in order {
+				if key == dataMid {
+					sections.push(dataSection(dataMid, transport))
+					continue
+				}
+				let found = false
+				for let plan in plans {
+					continue unless plan.mid == key && !found
+					sections.push(mediaSection(plan, transport, media.canonicalName()))
+					found = true
+				}
+				for let section in refused {
+					continue unless !found && (section.mid() == key || key == "#{index}")
+					sections.push(rejected(section))
+					found = true
+				}
+			}
+			return sessionFor(sessionID, version, sections)
+		}
+
+		// setLocalDescription puts a description of this side in force:
+		// an offer made with `createOffer`, or the answer made with
+		// `createAnswer`; gathering of candidates begins with the first.
+		// Without a kind it is an offer, or the answer when an offer of
+		// the peer is waiting. Fails with WebRtcError (code
+		// "webrtc.invalid-state") when the kind cannot be set now, as
+		// gathering does otherwise.
+		atomic def setLocalDescription(description SessionDescription, kind ?SdpType = none) !none {
+			let actual = SdpType.Offer
+			actual = SdpType.Answer when signaling := SignalingState.HaveRemoteOffer || SignalingState.HaveLocalPrAnswer
+			actual = kind unless kind is none
+			let next = try nextSignaling(signaling, true, actual)
+			let agent = try ready()
+			if actual == SdpType.Rollback {
+				pendingLocal = none
+				signaling = next
+				return none
+			}
+			for let section in description.media {
+				continue when section.port == 0
+				let setup = description.transport(section).setup
+				localSetup = setup unless setup is none
+				break
+			}
+			if actual == SdpType.Offer {
+				pendingLocal = description
+				offerer = true
+			} else {
+				local = description
+				remote = pendingRemote when actual == SdpType.Answer
+			}
+			signaling = next
+			try agent.gather() when agent.gatheringState() == IceGatheringState.New
+			try negotiate(agent) when actual == SdpType.Answer
+			return none
+		}
+
+		// setRemoteDescription takes a description of the peer: its
+		// offer, or its answer to this side's offer (the kind, when not
+		// given, follows from the state). Its ICE credentials,
+		// fingerprints and candidates are taken from it. Fails with
+		// WebRtcError: code "webrtc.invalid-state" when the kind cannot be
+		// set now, else when the description names no ICE credentials or
+		// no fingerprint.
+		atomic def setRemoteDescription(description SessionDescription, kind ?SdpType = none) !none {
+			let actual = SdpType.Offer
+			actual = SdpType.Answer when signaling := SignalingState.HaveLocalOffer || SignalingState.HaveRemotePrAnswer
+			actual = kind unless kind is none
+			let next = try nextSignaling(signaling, false, actual)
+			let agent = try ready()
+			if actual == SdpType.Rollback {
+				pendingRemote = none
+				signaling = next
+				return none
+			}
+			let found = false
+			for let section in description.media {
+				continue when section.port == 0
+				if !found {
+					let transport = description.transport(section)
+					fail WebRtcError{message: "webrtc: the peer's description names no ICE credentials"} when transport.ufrag == "" || transport.password == ""
+					fail WebRtcError{message: "webrtc: the peer's description names no certificate fingerprint"} when transport.fingerprints.len() == 0
+					// New credentials in an offer: the peer restarts ICE,
+					// and this side answers with new ones of its own.
+					try agent.restart() when actual == SdpType.Offer && remoteUfrag != "" && remoteUfrag != transport.ufrag
+					remoteUfrag = transport.ufrag
+					agent.setRemote(transport.ufrag, transport.password)
+					// Another certificate: a new DTLS connection, and what
+					// runs over it, once the answer is in force (RFC 8842).
+					renewing = true when prints.len() > 0 && !samePrints(prints, transport.fingerprints)
+					prints = transport.fingerprints
+					let setup = transport.setup
+					remoteSetup = setup is none ?? (sdp.Setup.ActPass, setup)
+					found = true
+				}
+				for let candidate in section.candidates() {
+					// A candidate this side cannot check (TCP) is left out.
+					agent.addRemote(candidate) onerror recover none
+				}
+				agent.endOfCandidates() when section.has("end-of-candidates")
+				continue unless section.media == "application"
+				remotePort = section.sctpPort() == 0 ?? (5000, section.sctpPort())
+				// Without the attribute the peer takes 64 kB (RFC 8841 §6.1).
+				channels.maxMessageSize = section.has("max-message-size") ?? (section.maxMessageSize(), 65536)
+			}
+			fail WebRtcError{message: "webrtc: the peer's description has no media section in use"} unless found || description.media.len() == 0
+			if actual == SdpType.Offer {
+				pendingRemote = description
+				offerer = false
+			} else {
+				remote = description
+				local = pendingLocal when actual == SdpType.Answer
+			}
+			signaling = next
+			try negotiate(agent) when actual == SdpType.Answer
+			return none
+		}
+
+		// negotiate acts on an offer and its answer: the ICE checks begin
+		// (the offerer controls), and a task brings the connection up.
+		internal def negotiate(agent Agent) !none {
+			pendingLocal = none
+			pendingRemote = none
+			// The answer names the DTLS roles (RFC 5763 §5).
+			let active = offerer ?? (remoteSetup == sdp.Setup.Passive, localSetup != sdp.Setup.Passive)
+			fail WebRtcError{message: "webrtc: the answer leaves the DTLS role open"} when offerer && !(remoteSetup := sdp.Setup.Active || sdp.Setup.Passive)
+			agent.start(offerer)
+			applyMedia()
+			if establishing && renewing {
+				renewing = false
+				let task = async renew(agent, active)
+				task.keepAlive()
+				return none
+			}
+			if establishing {
+				// Negotiated again on a connection that is up: data
+				// channels may have been added.
+				let up = path
+				if !(up is none) && link is none && dataMid != "" && connection == PeerConnectionState.Connected {
+					let task = async addData(up, active)
+					task.keepAlive()
+				}
+				return none
+			}
+			establishing = true
+			moveTo(PeerConnectionState.Connecting)
+			let task = async establish(agent, active)
+			task.keepAlive()
+			return none
+		}
+
+		// applyMedia sets the senders and receivers up as the offer and
+		// its answer agreed: per media section the format and payload type
+		// of the answer, sending when this side sends and the peer
+		// receives, receiving the other way round.
+		internal def applyMedia() {
+			let mine = local
+			let theirs = remote
+			return when mine is none || theirs is none
+			for let plan in plans {
+				let own = mine.find(plan.mid)
+				let other = theirs.find(plan.mid)
+				continue when own is none || other is none
+				continue when own.port == 0 || other.port == 0
+				let choice = chosen(offerer ?? (other, own), none)
+				continue when choice is none
+				let midID = midNumberOf(offerer ?? (other, own))
+				let wideID = wideNumberOf(offerer ?? (other, own))
+				let rtxType = rtxOf(offerer ?? (other, own), choice.payloadType)
+				let fecType = fecOf(offerer ?? (other, own))
+				let agreed = offerer ?? (other, own)
+				let redType = encodedAs(agreed, redEncoding)
+				let ulpType = encodedAs(agreed, ulpEncoding)
+				let shielded = redType > 0 && ulpType > 0 && fecType == 0
+				let doubled = isAudio(choice.format) ?? (soundRedOf(agreed, choice.payloadType), 0)
+				let ridID = extensionNumberOf(offerer ?? (other, own), ridExtension)
+				let repairedID = extensionNumberOf(offerer ?? (other, own), repairedExtension)
+				if plan.track >= 0 && sends(mine.direction(own)) && receives(theirs.direction(other)) {
+					// The layers both descriptions name are sent, each from
+					// its own track; a peer that takes no simulcast gets
+					// the first layer as a plain stream.
+					let taken = layersOf(other, false)
+					let sent = 0
+					for let (place, rid) in plan.ridsReceived ?? ([], plan.rids) {
+						continue unless ridID > 0 && taken.includes(rid) && place < layered[plan.track].len()
+						media.send(layered[plan.track][place].sender, choice.payloadType, plan.mid, midID, rtxType, 0, wideID, rid, ridID, repairedID)
+						sent++
+					}
+					media.send(tracks[plan.track].sender, choice.payloadType, plan.mid, midID, rtxType, fecType, wideID) when sent == 0
+					media.guard(tracks[plan.track].sender, plan.mid, redType, ulpType, rtxOf(agreed, redType), config.forwardErrorCorrection) when sent == 0 && shielded
+					media.guard(tracks[plan.track].sender, plan.mid, doubled, 0, 0, false) when doubled > 0
+				}
+				continue unless receives(mine.direction(own)) && sends(theirs.direction(other))
+				if plan.ridsReceived && ridID > 0 {
+					let given = layersOf(other, true)
+					for let rid in plan.rids {
+						media.receive(plan.mid, choice.format, choice.payloadType, [], midID, rtxType, [], 0, [], wideID, rid, ridID, repairedID) when given.includes(rid)
+					}
+					continue
+				}
+				let sources int[]
+				for let source in other.sources() {
+					sources.push(source.ssrc) unless sources.includes(source.ssrc)
+				}
+				let repairs int[]
+				let pairs = repairsOf(other)
+				for let i = 1; i < pairs.len(); i += 2 {
+					repairs.push(pairs[i])
+					sources.pull(pairs[i])
+				}
+				let guards int[]
+				let guarded = repairsOf(other, "FEC-FR")
+				for let i = 1; i < guarded.len(); i += 2 {
+					guards.push(guarded[i])
+					sources.pull(guarded[i])
+				}
+				media.receive(plan.mid, choice.format, choice.payloadType, sources, midID, rtxType, repairs, fecType, guards, wideID)
+				media.guard(none, plan.mid, redType, ulpType, rtxOf(agreed, redType), false) when shielded
+				media.guard(none, plan.mid, doubled, 0, 0, false) when doubled > 0
+			}
+		}
+
+		internal def moveTo(next PeerConnectionState) {
+			return when connection == next || connection == PeerConnectionState.Closed
+			connection = next
+			changed.offer(none)
+		}
+
+		// ---- Bringing the connection up ----
+
+		// establish waits for an ICE path, runs the DTLS handshake over
+		// it, and opens the SCTP association when data channels were
+		// agreed. A failure fails the connection.
+		internal def establish(agent Agent, active bool) {
+			bringUp(agent, active) onerror (err error) {
+				failed(err)
+				recover none
+			}
+		}
+
+		internal def bringUp(agent Agent, active bool) !none {
+			try agent.waitConnected(config.connectTimeout)
+			let transport = new Transport(agent)
+			let (shown, theirs, withData) = plan(transport)
+			fail WebRtcError{message: "webrtc: the connection has no certificate"} when shown is none
+			try transport.connect(active, shown, theirs, config.connectTimeout)
+			media.attach(transport)
+			if withData {
+				try openData(transport, active)
+			} else {
+				// No association reads the DTLS connection: a task does.
+				transport.serve()
+			}
+			up()
+			return none
+		}
+
+		// renew replaces the DTLS connection, SRTP and the SCTP
+		// association when the peer shows another certificate: over the
+		// path the restarted ICE finds. The data channels of the old
+		// association close.
+		internal def renew(agent Agent, active bool) {
+			let (oldLink, oldPath) = retire()
+			oldLink.abort() unless (oldLink is none)
+			if !(oldPath is none) {
+				oldPath.close() onerror recover none
+			}
+			bringUp(agent, active) onerror (err error) {
+				failed(err)
+				recover none
+			}
+		}
+
+		internal atomic def retire() (?sctp.Association, ?Transport) {
+			let oldLink = link
+			let oldPath = path
+			link = none
+			path = none
+			moveTo(PeerConnectionState.Connecting)
+			return (oldLink, oldPath)
+		}
+
+		// samePrints reports whether two lists of fingerprints name the
+		// same certificates.
+		internal def samePrints(a sdp.Fingerprint[], b sdp.Fingerprint[]) bool {
+			return false unless a.len() == b.len()
+			for let (i, print) in a {
+				return false unless print.algorithm == b[i].algorithm && print.digest.equals(b[i].digest)
+			}
+			return true
+		}
+
+		internal atomic def plan(transport Transport) (?tls.KeyPair, sdp.Fingerprint[], bool) {
+			path = transport
+			return (identity, prints, dataMid != "")
+		}
+
+		// openData opens the SCTP association over the DTLS connection,
+		// both sides at once as RFC 8841 has it, and gives it to the data
+		// channels.
+		internal def openData(transport Transport, active bool) !none {
+			let conn = try transport.data()
+			// The retransmission timer starts at half a second and never
+			// goes below 200 ms: data channels run over paths the ICE
+			// checks have just measured in milliseconds, where the second
+			// RFC 9260 asks for as a floor is a visible stall.
+			let association = try sctp.connect(conn, sctp.Options{remotePort: peerPort(), mtu: conn.maxPayload() / 4 * 4, connectTimeout: config.connectTimeout, rtoInitial: 500ms, rtoMin: 200ms})
+			keep(association)
+			channels.attach(association, active)
+			return none
+		}
+
+		internal def addData(transport Transport, active bool) {
+			openData(transport, active) onerror (err error) {
+				failed(err)
+				recover none
+			}
+		}
+
+		internal atomic def peerPort() int {
+			return remotePort
+		}
+
+		internal atomic def keep(association sctp.Association) {
+			link = association
+		}
+
+		internal atomic def up() {
+			connected.inc()
+			moveTo(PeerConnectionState.Connected)
+		}
+
+		internal atomic def failed(err error) {
+			failure = err when failure is none
+			failures.inc()
+			moveTo(PeerConnectionState.Failed)
+		}
+
+		// ---- Candidates ----
+
+		// nextCandidate waits for the next candidate of this side to
+		// signal to the peer; none once all were handed out. Fails with
+		// WebRtcError before a local description was set, NetError
+		// (TimedOut) after the timeout.
+		def nextCandidate(timeout duration = 30s) !?IceCandidate {
+			let agent = try gathering()
+			let candidate = try agent.nextCandidate(timeout)
+			return none when candidate is none
+			let (ufrag, _) = agent.credentials()
+			return IceCandidate{candidate: candidate, mid: section(), usernameFragment: ufrag}
+		}
+
+		internal atomic def gathering() !Agent {
+			let agent = ice
+			fail WebRtcError{message: "webrtc: candidates are gathered once a local description is set", code: "webrtc.invalid-state"} when agent is none || agent.gatheringState() == IceGatheringState.New
+			return agent
+		}
+
+		internal atomic def section() string {
+			return order.len() == 0 ?? ("0", order[0])
+		}
+
+		// gatheringComplete waits until every candidate of this side was
+		// found; `localDescription()` then holds them all, for signalling
+		// without trickle. Fails as `nextCandidate` does.
+		def gatheringComplete(timeout duration = 30s) !none {
+			let agent = try gathering()
+			return try agent.waitGathered(timeout)
+		}
+
+		// addCandidate takes a candidate of the peer. Fails with
+		// WebRtcError before the peer's description was set, or for a
+		// candidate whose address is no IP address or mDNS name.
+		def addCandidate(candidate IceCandidate) !none {
+			let agent = try signalled()
+			return try agent.addRemote(candidate.candidate)
+		}
+
+		// endOfCandidates says the peer has no more candidates. Fails with
+		// WebRtcError before the peer's description was set.
+		def endOfCandidates() !none {
+			let agent = try signalled()
+			agent.endOfCandidates()
+			return none
+		}
+
+		internal atomic def signalled() !Agent {
+			let agent = ice
+			fail WebRtcError{message: "webrtc: the peer's candidates are taken once its description is set", code: "webrtc.invalid-state"} when agent is none || (remote is none && pendingRemote is none)
+			return agent
+		}
+
+		// localDescription is this side's description in force, or its
+		// offer not answered yet, with the candidates gathered so far;
+		// none before one was set.
+		atomic def localDescription() ?SessionDescription {
+			let agent = ice
+			return none when agent is none || (local is none && pendingLocal is none)
+			let failed = false
+			let current = describe(agent, localSetup) onerror (err error) {
+				failed = true
+				recover new sdp.SessionDescription()
+			}
+			return local when failed
+			return current
+		}
+
+		// remoteDescription is the peer's description in force, or its
+		// offer not answered yet.
+		atomic def remoteDescription() ?SessionDescription {
+			return remote unless remote is none
+			return pendingRemote
+		}
+
+		// ---- Tracks ----
+
+		// addTrack puts a track on the connection: the next offer carries
+		// a media section for it, or the answer to an offer with a section
+		// of its kind takes it; `sendOnly` offers the section without
+		// taking a track of the peer back. Frames are sent once the
+		// connection is up and the peer's description takes the track. Fails with
+		// WebRtcError when the connection is closed, as the system does
+		// when it gives no random bytes.
+		atomic def addTrack(track LocalTrack, sendOnly bool = false) !LocalTrack {
+			fail WebRtcError{message: "webrtc: the connection is closed", code: "webrtc.invalid-state"} when signaling == SignalingState.Closed
+			media.name(try rand(8))
+			if !tracks.includes(track) {
+				tracks.push(track)
+				layered.push([])
+			}
+			oneWay.push(track) when sendOnly && !oneWay.includes(track)
+			return track
+		}
+
+		// addSimulcast puts several encodings of one picture on the
+		// connection as the layers of one media section (simulcast, RFC
+		// 8853), best first: each is a track of its own, written by its
+		// own encoder at its own bitrate, and is named in the description
+		// by its `rid` (its place in `layers` when it has none). A peer
+		// that takes simulcast (a relay) receives every layer and picks;
+		// one that does not (a browser receiving) gets the first layer as
+		// a plain track. `sendOnly` as for `addTrack`. Fails with
+		// WebRtcError for fewer than two layers, layers that are not
+		// video of one format, a name that is not 1 to 16 letters and
+		// digits or is used twice, a track already on the connection, or
+		// a closed connection.
+		atomic def addSimulcast(layers LocalTrack[], sendOnly bool = false) !none {
+			fail WebRtcError{message: "webrtc: the connection is closed", code: "webrtc.invalid-state"} when signaling == SignalingState.Closed
+			fail WebRtcError{message: "webrtc: simulcast takes two layers or more, not {layers.len()}", code: "webrtc.invalid-argument"} when layers.len() < 2
+			let names = namesOf(layers)
+			for let (place, layer) in layers {
+				fail WebRtcError{message: "webrtc: simulcast layers are video tracks of one format", code: "webrtc.invalid-argument"} when layer.kind != TrackKind.Video || layer.format != layers[0].format
+				fail WebRtcError{message: "webrtc: a simulcast layer is already on the connection", code: "webrtc.invalid-argument"} when tracks.includes(layer) || layers.indexOf(layer) != place
+				let name = names[place]
+				let plain = name.len() >= 1 && name.len() <= 16
+				for let c in name.bytes() {
+					plain = false unless (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+				}
+				fail WebRtcError{message: "webrtc: '{name}' does not name a simulcast layer: 1 to 16 letters and digits, each name once", code: "webrtc.invalid-argument"} when !plain || names.indexOf(name) != place
+			}
+			media.name(try rand(8))
+			for let (place, layer) in layers {
+				layer.rid = names[place]
+			}
+			tracks.push(layers[0])
+			layered.push(layers.clone())
+			oneWay.push(layers[0]) when sendOnly
+			return none
+		}
+
+		// namesOf is the names of simulcast layers: each track's `rid`,
+		// or its place when it has none.
+		internal def namesOf(layers LocalTrack[]) string[] {
+			let names string[]
+			for let (place, layer) in layers {
+				names.push(layer.rid == "" ?? ("{place}", layer.rid))
+			}
+			return names
+		}
+
+		// expectTrack has the next offer carry a media section that only
+		// receives a track of the format (what a viewer asks a server
+		// for); the track comes out of `acceptTrack` once the answer sends
+		// on it. Fails with WebRtcError when the connection is closed.
+		atomic def expectTrack(format rtp.PayloadFormat) !none {
+			fail WebRtcError{message: "webrtc: the connection is closed", code: "webrtc.invalid-state"} when signaling == SignalingState.Closed
+			media.name(try rand(8))
+			expected.push(format)
+			return none
+		}
+
+		// acceptTrack waits for a track the peer sends, known once its
+		// description is in force; 0s or less waits without end. Fails
+		// with NetError (TimedOut), WebRtcError once the connection is
+		// closed.
+		def acceptTrack(timeout duration = 30s) !RemoteTrack {
+			return new RemoteTrack(media, try media.accept(timeout))
+		}
+
+		// ---- Data channels ----
+
+		// createDataChannel makes a data channel. One made before the
+		// connection is up waits in `Connecting`; the next offer then
+		// carries the data section. Fails as the options are refused:
+		// WebRtcError for both limits at once, a negotiated channel
+		// without a stream, a stream in use.
+		def createDataChannel(label string, options DataChannelOptions = DataChannelOptions{}) !DataChannel {
+			return new DataChannel(channels, try channels.open(label, options))
+		}
+
+		// acceptDataChannel waits for a data channel the peer opened; 0s
+		// or less waits without end. Fails with NetError (TimedOut),
+		// WebRtcError once the connection is closed.
+		def acceptDataChannel(timeout duration = 30s) !DataChannel {
+			return new DataChannel(channels, try channels.accept(timeout))
+		}
+
+		// ---- State ----
+
+		// state is where the connection stands; a connected one whose ICE
+		// path stopped answering is Disconnected, then Failed.
+		atomic def state() PeerConnectionState {
+			let agent = ice
+			return connection when agent is none || connection != PeerConnectionState.Connected
+			let found = agent.currentState()
+			return PeerConnectionState.Disconnected when found == IceConnectionState.Disconnected
+			return PeerConnectionState.Failed when found == IceConnectionState.Failed
+			return connection
+		}
+
+		// stats is the connection at this moment.
+		def stats() Stats {
+			let (sent, got) = media.statistics()
+			let out = Stats{state: state(), iceState: iceState(), sending: sent, receiving: got}
+			let agent = theAgent()
+			return out when agent is none
+			let pair = agent.selectedPair()
+			return out when pair is none
+			let (near, far) = pair
+			out.localCandidate = near
+			out.remoteCandidate = far
+			return out
+		}
+
+		internal atomic def theAgent() ?Agent {
+			return ice
+		}
+
+		// iceState is where the search for a path stands.
+		atomic def iceState() IceConnectionState {
+			let agent = ice
+			return IceConnectionState.New when agent is none
+			return agent.currentState()
+		}
+
+		// iceGatheringState is where the collection of candidates stands.
+		atomic def iceGatheringState() IceGatheringState {
+			let agent = ice
+			return IceGatheringState.New when agent is none
+			return agent.gatheringState()
+		}
+
+		// signalingState is where the offer/answer exchange stands.
+		atomic def signalingState() SignalingState {
+			return signaling
+		}
+
+		// waitConnected waits until the connection is up: the path found,
+		// the DTLS handshake done and, with data channels, the SCTP
+		// association open. Fails with what failed the connection,
+		// WebRtcError when it was closed, NetError (TimedOut) after the
+		// timeout.
+		def waitConnected(timeout duration = 30s) !none {
+			let deadline = int(time.monoNs()) + int(timeout)
+			for {
+				let (now, cause) = outcome()
+				return none when now == PeerConnectionState.Connected
+				fail cause unless cause is none
+				fail WebRtcError{message: "webrtc: the connection is closed"} when now == PeerConnectionState.Closed
+				fail net.errorOf(net.ErrorCode.TimedOut, "connect", "", "the connection did not come up in time") unless awaitSignal(changed, deadline)
+			}
+			fail WebRtcError{message: "webrtc: unreachable"}
+		}
+
+		internal atomic def outcome() (PeerConnectionState, ?error) {
+			return (connection, failure)
+		}
+
+		// close ends the connection: data channels close, the peer is
+		// told (SCTP and DTLS), sockets are released. Never fails.
+		def close() !none {
+			media.farewell()
+			let (association, transport, agent) = shut()
+			association.abort() unless (association is none)
+			if !(transport is none) {
+				transport.close() onerror recover none
+			}
+			if !(agent is none) {
+				agent.close() onerror recover none
+			}
+			return none
+		}
+
+		internal atomic def shut() (?sctp.Association, ?Transport, ?Agent) {
+			signaling = SignalingState.Closed
+			media.shut()
+			moveTo(PeerConnectionState.Closed)
+			connection = PeerConnectionState.Closed
+			return (link, path, ice)
+		}
+	}
+}

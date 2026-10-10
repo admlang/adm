@@ -1,0 +1,440 @@
+// QUIC (RFC 9000, RFC 9001, RFC 9002): connections of independent,
+// ordered, flow-controlled streams over UDP, encrypted with TLS 1.3.
+//
+//     let conn = try quic.dial("example.com:443", quic.Config{tls: tls.Config{alpn: ["echo"]}})
+//     let stream = try conn.openStream()
+//     try stream.write("hello".bytes())
+//     try stream.closeWrite()
+//
+// A server needs a certificate and the same application protocol:
+//
+//     let listener = try quic.listen("0.0.0.0:4433", quic.Config{tls: serverTLS})
+//     let conn = try listener.accept()
+//     let stream = try conn.acceptStream()
+partial module std.net.quic {
+	use (
+		std.net
+		std.net.quic.core::*
+		std.net.quic.wire
+		std.net.tls
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// Config is what both ends of a connection settle before it starts.
+	struct Config {
+		// The TLS settings; `alpn` must name at least one application
+		// protocol, and a server needs `certificates`. QUIC always runs
+		// TLS 1.3.
+		tls              tls.Config
+		// The connection ends when nothing arrives for this long; the
+		// peer's shorter timeout wins. 0s turns it off on this side.
+		idleTimeout      duration   = 30s
+		// Sends a PING when nothing was sent for this long, to keep the
+		// connection and its NAT binding alive; 0s sends none.
+		keepAlive        duration   = 0s
+		handshakeTimeout duration   = 10s
+		// Bytes the peer may have outstanding on the whole connection
+		// and on one stream before the application reads them.
+		maxData          int        = 1048576
+		maxStreamData    int        = 262144
+		// Streams the peer may have open at once, of each kind.
+		maxStreams       int        = 100
+		maxUniStreams    int        = 100
+		// Accept unreliable datagrams (RFC 9221) of up to this many
+		// bytes; 0 accepts none.
+		maxDatagramSize  int        = 0
+		// Server: answer every first packet with a Retry, so a
+		// connection is only set up for a client that proved its address.
+		retry            bool       = false
+	}
+
+	// dial opens a connection to "host:port" and runs the handshake.
+	// When the TLS config names no server, the host is verified and sent
+	// as SNI.
+	// Fails with PolicyDenied when the policy denies the endpoint,
+	// NetError when the name does not resolve or the socket fails,
+	// TransportError (a TLS alert shows as `Crypto`) when the handshake
+	// fails, ClosedError when it does not finish in `handshakeTimeout`.
+	def dial(address string, config Config) !Connection {
+		try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "quic://" + address)
+		let target = try net.parseAddress(address)
+		let host = target.host
+		let ip = net.parseIPText(host)
+		if ip is none {
+			let found = try net.resolve(host)
+			fail net.errorOf(net.ErrorCode.Resolve, "dial", address, "the name resolves to no address") when found.len() == 0
+			host = found[0]
+			ip = net.parseIPText(host)
+		}
+		let v6 = !(ip is none) && ip.len() == 16
+		let peer = v6 ?? ("[{host}]:{target.port}", "{host}:{target.port}")
+		let socket = try net.socket(v6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+		try socket.bind(v6 ?? ("[::]:0", "0.0.0.0:0"))
+		let settings = settingsOf(config)
+		settings.tlsConfig = tls.withServerName(config.tls, target.host) when config.tls.serverName == "" && net.parseIPText(target.host) is none
+		let endpoint = new Endpoint(socket, false, settings)
+		let conn = new Conn(true, settings, endpoint, peer)
+		let failure ?error = none
+		conn.startClient() onerror (err error) {
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			endpoint.stop()
+			fail failure
+		}
+		let receiver = async endpoint.receiveLoop()
+		receiver.keepAlive()
+		let driver = async endpoint.drive(conn)
+		driver.keepAlive()
+		let handshake = async conn.runHandshake()
+		handshake.keepAlive()
+		conn.wakeDriver()
+		let made = new Connection(conn)
+		try waitReady(conn)
+		return made
+	}
+
+	// listen binds a UDP address and accepts connections on it.
+	// Fails with PolicyDenied when the policy denies listening, NetError
+	// when the address cannot be bound, ClosedError when the TLS config
+	// has no certificate or names no application protocol.
+	def listen(address string, config Config) !Listener {
+		fail ClosedError{message: "quic: a server needs a certificate in its TLS config", reason: "config"} when config.tls.certificates.len() == 0 && config.tls.getCertificate is none
+		fail ClosedError{message: "quic: a server needs an application protocol in its TLS config", reason: "config"} when config.tls.alpn.len() == 0
+		try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "quic://" + address)
+		let at = try net.parseAddress(address)
+		let socket = try net.socket(at.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+		try socket.bind(address)
+		let endpoint = new Endpoint(socket, true, settingsOf(config))
+		endpoint.requireRetry = config.retry
+		let receiver = async endpoint.receiveLoop()
+		receiver.keepAlive()
+		return new Listener(endpoint)
+	}
+
+	// appendVarint appends a variable-length integer (RFC 9000 §16), the
+	// encoding the protocols over QUIC use for their own framing; value
+	// is at most 2^62 - 1.
+	def appendVarint(out byte[], value int) {
+		wire.putVarint(out, value)
+	}
+
+	// varintLength is the bytes a variable-length integer takes, read
+	// from its first byte: 1, 2, 4 or 8.
+	def varintLength(first byte) int {
+		return 1 << (int(first) >> 6)
+	}
+
+	// parseVarint reads the variable-length integer that fills data.
+	def parseVarint(data byte[]) int {
+		return (new wire.Cursor(data)).varint()
+	}
+
+	internal def settingsOf(config Config) Settings {
+		return Settings{tlsConfig: config.tls, idleTimeout: int(config.idleTimeout) / 1000, keepAlive: int(config.keepAlive) / 1000, handshakeTimeout: int(config.handshakeTimeout) / 1000, maxData: config.maxData, maxStreamData: config.maxStreamData, maxStreamsBidi: config.maxStreams, maxStreamsUni: config.maxUniStreams, maxDatagramFrame: config.maxDatagramSize}
+	}
+
+	// waitFor blocks until the signal fires or the deadline (monotonic
+	// microseconds, -1 for none) passes; false when it passed.
+	internal def waitFor(signal channel<none>, deadline int) bool {
+		if deadline < 0 {
+			select {
+				case signal:
+					signal.flush()
+			}
+			return true
+		}
+		let left = deadline - nowMicros()
+		return false when left <= 0
+		let sleep = time.sleepChan(duration(left * 1000))
+		select {
+			case signal:
+				signal.flush()
+			case sleep:
+				return nowMicros() < deadline
+		}
+		return true
+	}
+
+	// waitReady waits for a connection's handshake to finish.
+	internal def waitReady(conn Conn) !none {
+		for {
+			return none when conn.handshakeComplete
+			let ended = conn.closeError
+			fail ended unless ended is none
+			fail ClosedError{message: "quic: the connection closed during the handshake"} when conn.state >= 2
+			waitFor(conn.readySignal, nowMicros() + 50000)
+		}
+		fail "unreachable"
+	}
+
+	internal def deadlineOf(timeout duration) int {
+		return timeout <= 0s ?? (-1, nowMicros() + int(timeout) / 1000)
+	}
+
+	// Listener accepts the connections clients open to a UDP address.
+	type Listener {
+		internal endpoint Endpoint
+
+		def new(endpoint Endpoint) {
+			self.endpoint = endpoint
+		}
+
+		// accept waits for the next connection whose handshake finished.
+		// Fails with ClosedError once the listener is closed, NetError
+		// (TimedOut) when a timeout is given and passes.
+		def accept(timeout duration = 0s) !Connection {
+			let deadline = deadlineOf(timeout)
+			for {
+				let conn = endpoint.takeReady()
+				return new Connection(conn) unless conn is none
+				fail ClosedError{message: "quic: the listener is closed"} unless endpoint.running
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no connection arrived in time") unless waitFor(endpoint.readySignal, deadline)
+			}
+			fail "unreachable"
+		}
+
+		// The bound address, with the port the system picked for port 0.
+		def address() net.Address {
+			return endpoint.socket.localAddr()
+		}
+
+		// close stops accepting and closes every connection of the
+		// listener with an application error code and reason. A second
+		// close does nothing; it never fails.
+		def close(code int = 0, reason string = "") !none {
+			return none unless endpoint.running
+			for let conn in endpoint.connections() {
+				conn.closeWith(code, reason)
+				conn.wakeDriver()
+			}
+			// Let the close frames leave before the socket goes.
+			time.sleep(20ms)
+			endpoint.stop()
+			return none
+		}
+	}
+
+	// Connection is one QUIC connection, from `dial` or `Listener.accept`.
+	// Safe from many tasks.
+	type Connection {
+		internal conn Conn
+
+		def new(conn Conn) {
+			self.conn = conn
+		}
+
+		// openStream opens a bidirectional stream, waiting while the
+		// peer's stream limit is reached.
+		// Fails with the error that ended the connection, NetError
+		// (TimedOut) when the limit does not lift in time.
+		def openStream(timeout duration = 30s) !Stream {
+			return new Stream(conn, try opened(false, timeout))
+		}
+
+		// openSendStream opens a stream only this side writes on.
+		// Fails as `openStream` does.
+		def openSendStream(timeout duration = 30s) !Stream {
+			return new Stream(conn, try opened(true, timeout))
+		}
+
+		internal def opened(uni bool, timeout duration) !StreamState {
+			let deadline = deadlineOf(timeout)
+			for {
+				let s = try conn.openStream(uni)
+				return s unless s is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "open", "", "the peer's stream limit did not lift in time") unless waitFor(conn.readySignal, deadline)
+			}
+			fail "unreachable"
+		}
+
+		// acceptStream waits for the next bidirectional stream the peer
+		// opens.
+		// Fails with the error that ended the connection, NetError
+		// (TimedOut) when a timeout is given and passes.
+		def acceptStream(timeout duration = 0s) !Stream {
+			return new Stream(conn, try taken(false, timeout))
+		}
+
+		// acceptReceiveStream waits for the next stream only the peer
+		// writes on. Fails as `acceptStream` does.
+		def acceptReceiveStream(timeout duration = 0s) !Stream {
+			return new Stream(conn, try taken(true, timeout))
+		}
+
+		internal def taken(uni bool, timeout duration) !StreamState {
+			let deadline = deadlineOf(timeout)
+			for {
+				let s = try conn.acceptStream(uni)
+				return s unless s is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no stream arrived in time") unless waitFor(conn.acceptSignal, deadline)
+				// Another waiter may be after the other kind of stream.
+				conn.acceptSignal.offer(none)
+				time.sleep(100us)
+			}
+			fail "unreachable"
+		}
+
+		// sendDatagram sends one unreliable datagram (RFC 9221).
+		// Fails with ClosedError when the peer accepts none or none this
+		// large, else with the error that ended the connection.
+		def sendDatagram(data byte[]) !none {
+			try conn.queueDatagram(data)
+			conn.wakeDriver()
+			return none
+		}
+
+		// receiveDatagram waits for the next unreliable datagram.
+		// Fails with the error that ended the connection, NetError
+		// (TimedOut) when a timeout is given and passes.
+		def receiveDatagram(timeout duration = 0s) !byte[] {
+			let deadline = deadlineOf(timeout)
+			for {
+				let data = try conn.takeDatagram()
+				return data unless data is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "no datagram arrived in time") unless waitFor(conn.datagramSignal, deadline)
+			}
+			fail "unreachable"
+		}
+
+		// The application protocol both sides agreed on.
+		def protocol() string {
+			return conn.alpn
+		}
+
+		// What TLS negotiated: the cipher suite, the peer's certificates.
+		def tlsState() tls.ConnectionState {
+			return conn.tlsState
+		}
+
+		// The peer's address, "host:port".
+		def remoteAddr() string {
+			return conn.peer
+		}
+
+		// Whether the connection still carries streams.
+		def isOpen() bool {
+			return conn.state == 1
+		}
+
+		// The error that ended the connection, none while it is open.
+		def closeReason() ?error {
+			return conn.closeError
+		}
+
+		// updateKeys moves the connection to fresh packet protection keys
+		// (RFC 9001 §6); the peer follows.
+		// Fails with ClosedError before the handshake is confirmed or
+		// while the previous update is not acknowledged.
+		def updateKeys() !none {
+			try conn.initiateKeyUpdate()
+			conn.wakeDriver()
+			return none
+		}
+
+		// close ends the connection with an application error code and a
+		// reason the peer can read; streams still open fail from now on.
+		// A second close does nothing; it never fails.
+		def close(code int = 0, reason string = "") !none {
+			conn.closeWith(code, reason)
+			conn.wakeDriver()
+			return none
+		}
+	}
+
+	// Stream is one stream of a connection: an ordered, reliable byte
+	// stream in one or both directions. One task reads and one writes at
+	// a time. Implements net.Stream.
+	type Stream {
+		internal engine Conn
+		internal state  StreamState
+
+		def new(engine Conn, state StreamState) {
+			self.engine = engine
+			self.state = state
+		}
+
+		// The stream ID (RFC 9000 §2.1).
+		def id() int {
+			return state.id
+		}
+
+		// read copies received bytes into data and returns the count; 0
+		// is the end of the stream.
+		// Fails with ApplicationError when the peer reset the stream,
+		// NetError (TimedOut) when nothing arrives in time, else with the
+		// error that ended the connection.
+		def read(data byte[], timeout duration = 30s) !int {
+			let deadline = deadlineOf(timeout)
+			for {
+				let n = try engine.streamRead(state, data)
+				if n >= 0 {
+					engine.wakeDriver()
+					return n
+				}
+				fail net.errorOf(net.ErrorCode.TimedOut, "read", "", "no stream data arrived in time") unless waitFor(state.readSignal, deadline)
+			}
+			fail "unreachable"
+		}
+
+		// write queues every byte of data and returns its length, waiting
+		// while the stream's buffer is full.
+		// Fails with ApplicationError when the peer asked to stop,
+		// ClosedError after `closeWrite` or `reset`, NetError (TimedOut)
+		// when the buffer does not drain in time, else with the error
+		// that ended the connection.
+		def write(data byte[], timeout duration = 30s) !int {
+			let deadline = deadlineOf(timeout)
+			let off = 0
+			for off < data.len() {
+				let n = try engine.streamWrite(state, data[off:])
+				if n > 0 {
+					off += n
+					engine.wakeDriver()
+					continue
+				}
+				fail net.errorOf(net.ErrorCode.TimedOut, "write", "", "the stream did not drain in time") unless waitFor(state.writeSignal, deadline)
+			}
+			return data.len()
+		}
+
+		// closeWrite ends the sending half: the peer reads everything
+		// written, then the end of the stream. It never fails.
+		def closeWrite() !none {
+			engine.streamCloseWrite(state)
+			engine.wakeDriver()
+			return none
+		}
+
+		// reset abandons the sending half with an application error code:
+		// what was not delivered yet may never be.
+		def reset(code int) {
+			engine.streamReset(state, code)
+			engine.wakeDriver()
+		}
+
+		// stopReading tells the peer to stop sending, with an application
+		// error code; what still arrives is discarded.
+		def stopReading(code int) {
+			engine.streamStop(state, code)
+			engine.wakeDriver()
+		}
+
+		// close ends the sending half as `closeWrite` does and, when the
+		// peer has not finished its own, tells it to stop with code 0.
+		// It never fails.
+		def close() !none {
+			engine.streamCloseWrite(state)
+			engine.streamStop(state, 0)
+			engine.wakeDriver()
+			return none
+		}
+
+		// Whether either half can still carry data.
+		def isOpen() bool {
+			return engine.state == 1 && !(state.sendDone() && state.recvDone())
+		}
+	}
+}

@@ -1,0 +1,774 @@
+partial module std.net.proxy {
+	use (
+		std.net
+		std.net.proxy.wire::*
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// Command is what a SOCKS client asks its proxy to do.
+	enum Command {
+		// Open a connection to the target.
+		Connect,
+		// Accept one connection from the target on the client's behalf.
+		Bind,
+		// Relay UDP datagrams for the client (SOCKS5 only).
+		Associate,
+	}
+
+	// Request is what a client asked a `SocksServer` for, as its
+	// `allow` hook sees it.
+	struct Request {
+		// The protocol version the client speaks: 4 or 5.
+		version int
+		command Command
+		// The target as the client named it: a host name or an IP.
+		host    string
+		port    int
+		// The SOCKS5 user name that authenticated, or the SOCKS4 user id.
+		user    string      = ""
+		client  net.Address
+	}
+
+	// SocksServer is a SOCKS proxy: versions 4, 4a and 5 on one port,
+	// with `CONNECT`, `BIND` and, for SOCKS5, `UDP ASSOCIATE`. A zero
+	// server accepts every client and reaches every target directly.
+	//
+	//     let server = new proxy.SocksServer("127.0.0.1:1080")
+	//     server.authenticate(def (user string, password string) bool { return user == "ana" && password == "secret" })
+	//     try server.start()
+	type SocksServer {
+		// "host:port" to listen on; port 0 picks a free one, read back
+		// from `address()`.
+		addr                 string
+		backlog              int           = 128
+		// Reaches targets through another proxy; none dials them directly.
+		upstream             ?Dialer       = none
+		// The time a client has for each step of its handshake.
+		handshakeTimeout     duration      = 30s
+		// The time a connection to a target, or a `BIND` wait, may take.
+		dialTimeout          duration      = 30s
+		// A relay with nothing moving in either direction this long ends.
+		idleTimeout          duration      = 300s
+		internal listener    ?net.Listener = none
+		internal running     bool          = false
+		internal authHook    ?AuthHook     = none
+		internal allowHook   ?AllowHook    = none
+		internal errorHooks  ErrorHook[]   = []
+		internal atomic open Session[]     = []
+
+		def new(addr string = "127.0.0.1:1080") {
+			self.addr = addr
+		}
+
+		// authenticate makes SOCKS5 clients present a username and
+		// password that fn accepts; SOCKS4 has no passwords, so its
+		// clients are then refused.
+		def authenticate(fn def (string, string) bool) {
+			authHook = new AuthHook(fn)
+		}
+
+		// allow lets fn decide each request after authentication; a
+		// refused client reads "connection not allowed by ruleset".
+		def allow(fn def (Request) bool) {
+			allowHook = new AllowHook(fn)
+		}
+
+		// onError registers fn to receive what the server swallows: a
+		// failed accept, a client that broke the protocol, a target that
+		// could not be reached.
+		def onError(fn def (error)) {
+			errorHooks.push(new ErrorHook(fn))
+		}
+
+		// Implements net.Server: binds and serves in the background.
+		// Fails with PolicyDenied when the policy denies listening on
+		// `socks://addr`, NetError when the address cannot be bound.
+		def start() !none {
+			return none when running
+			try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "socks://" + addr)
+			let a = net.parseAddress(addr) onerror recover new net.Address()
+			let sock = try net.socket(a.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			try sock.bind(addr)
+			let ln = try sock.listen(backlog)
+			listener = ln
+			running = true
+			let task = async acceptLoop(ln)
+			task.keepAlive()
+			return none
+		}
+
+		// Implements net.Server: stops accepting and closes every
+		// session. A second close does nothing. Never fails: what
+		// refuses to close is dropped.
+		def close() !none {
+			return none unless running
+			running = false
+			let ln = listener
+			listener = none
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			let sessions = open
+			open = []
+			for let s in sessions {
+				s.close()
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address, with the port the
+		// system picked for port 0.
+		def address() net.Address {
+			let ln = listener
+			return ln.address() unless ln is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// Sessions being served right now.
+		def sessionCount() int {
+			return open.len()
+		}
+
+		internal def acceptLoop(ln net.Listener) {
+			for {
+				return unless running
+				let failure ?error = none
+				let accepted = tryAccept(ln) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					return unless running
+					report(failure)
+					return when failure is net.NetError && failure.kind == net.ErrorCode.Closed
+					time.sleep(5ms)
+					continue
+				}
+				continue when accepted is none
+				let session = new Session(accepted, authHook, allowHook)
+				track(session)
+				let task = async serveSession(session)
+				task.keepAlive()
+			}
+		}
+
+		internal def tryAccept(ln net.Listener) !?net.Connection {
+			return try ln.accept()
+		}
+
+		// Serves one client to the end; what fails goes to `onError`.
+		internal def serveSession(session Session) {
+			session.serve(self) onerror (err error) {
+				report(err)
+				recover none
+			}
+			session.close()
+			untrack(session)
+		}
+
+		internal atomic def track(session Session) {
+			open.push(session)
+		}
+
+		internal atomic def untrack(session Session) {
+			let kept Session[] = []
+			for let s in open {
+				kept.push(s) unless s == session
+			}
+			open = kept
+		}
+
+		// Hands an error the server swallowed to the `onError` hooks.
+		internal def report(err error) {
+			for let hook in errorHooks {
+				hook.fn(err)
+			}
+		}
+	}
+
+	internal type AuthHook {
+		fn def (string, string) bool
+
+		def new(fn def (string, string) bool) {
+			self.fn = fn
+		}
+	}
+
+	internal type AllowHook {
+		fn def (Request) bool
+
+		def new(fn def (Request) bool) {
+			self.fn = fn
+		}
+	}
+
+	internal type ErrorHook {
+		fn def (error)
+
+		def new(fn def (error)) {
+			self.fn = fn
+		}
+	}
+
+	// Session serves one client of a SocksServer from its first byte to
+	// the end of its relay.
+	internal type Session {
+		client    net.Connection
+		authHook  ?AuthHook
+		allowHook ?AllowHook
+		// The other end of the relay once there is one.
+		target    ?net.Stream    = none
+		// The listener of a pending BIND and the socket of a UDP relay.
+		waiting   ?net.Listener  = none
+		datagrams ?net.Socket    = none
+		closed    bool           = false
+
+		def new(client net.Connection, authHook ?AuthHook, allowHook ?AllowHook) {
+			self.client = client
+			self.authHook = authHook
+			self.allowHook = allowHook
+		}
+
+		// Whether clients must authenticate.
+		internal def wantsAuth() bool {
+			return !(authHook is none)
+		}
+
+		// Whether the credentials pass; true without an `authenticate`
+		// hook.
+		internal def accepts(user string, password string) bool {
+			let hook = authHook
+			return true when hook is none
+			return hook.fn(user, password)
+		}
+
+		// Whether the request may proceed; true without an `allow` hook.
+		internal def allows(req Request) bool {
+			let hook = allowHook
+			return true when hook is none
+			return hook.fn(req)
+		}
+
+		// close ends the session from either side; closing twice does
+		// nothing.
+		def close() {
+			return when closed
+			closed = true
+			client.close() onerror recover none
+			let other = target
+			if !(other is none) {
+				other.close() onerror recover none
+			}
+			let ln = waiting
+			if !(ln is none) {
+				ln.close() onerror recover none
+			}
+			let socket = datagrams
+			if !(socket is none) {
+				socket.close() onerror recover none
+			}
+		}
+
+		// serve runs the session: the handshake, then the relay.
+		// Fails with ProxyError when the client breaks the protocol or
+		// is refused, NetError when a socket fails.
+		def serve(owner SocksServer) !none {
+			let limit = owner.handshakeTimeout
+			let version = try readExact(client, 1, limit)
+			return try serve5(owner) when version[0] == 0x05
+			return try serve4(owner) when version[0] == 0x04
+			fail ProxyError{message: "a client of {client.remoteAddr().str()} spoke neither SOCKS4 nor SOCKS5", kind: ErrorKind.Protocol, reply: int(version[0])}
+		}
+
+		// SOCKS5 (RFC 1928): method selection, RFC 1929 authentication
+		// when the server wants it, then one request.
+		internal def serve5(owner SocksServer) !none {
+			let limit = owner.handshakeTimeout
+			let count = try readExact(client, 1, limit)
+			let methods = try readExact(client, int(count[0]), limit)
+			let wanted = wantsAuth() ?? (0x02, 0x00)
+			if !methods.includes(byte(wanted)) {
+				try net.writeAll(client, [0x05, 0xFF], limit)
+				fail ProxyError{message: "a SOCKS5 client offered no acceptable authentication method", kind: ErrorKind.Auth}
+			}
+			try net.writeAll(client, [0x05, byte(wanted)], limit)
+			let user = ""
+			if wanted == 0x02 {
+				let head = try readExact(client, 2, limit)
+				user = string(try readExact(client, int(head[1]), limit))
+				let size = try readExact(client, 1, limit)
+				let password = string(try readExact(client, int(size[0]), limit))
+				let ok = head[0] == 0x01 && accepts(user, password)
+				try net.writeAll(client, [0x01, ok ?? (0x00, 0x01)], limit)
+				fail ProxyError{message: "a SOCKS5 client failed authentication as {user}", kind: ErrorKind.Auth} unless ok
+			}
+			let head = try readExact(client, 3, limit)
+			fail ProxyError{message: "a SOCKS5 request carries version {head[0]}", kind: ErrorKind.Protocol} when head[0] != 0x05
+			let addressFailure ?error = none
+			let (host, port) = readAddress(client, limit) onerror (err error) {
+				addressFailure = err
+				recover ("", 0)
+			}
+			if !(addressFailure is none) {
+				refuse5(0x08) when addressFailure is ProxyError
+				fail addressFailure
+			}
+			let req = Request{version: 5, command: Command.Connect, host: host, port: port, user: user, client: client.remoteAddr()}
+			match int(head[1]) {
+				case 1:
+					req.command = Command.Connect
+				case 2:
+					req.command = Command.Bind
+				case 3:
+					req.command = Command.Associate
+				default:
+					refuse5(0x07)
+					fail ProxyError{message: "a SOCKS5 client sent the unknown command {head[1]}", kind: ErrorKind.Protocol, reply: int(head[1])}
+			}
+			if !allows(req) {
+				refuse5(0x02)
+				return none
+			}
+			return try connect5(owner, req) when req.command == Command.Connect
+			return try bind5(owner, req) when req.command == Command.Bind
+			return try associate5(req)
+		}
+
+		internal def connect5(owner SocksServer, req Request) !none {
+			let failure ?error = none
+			let out = outbound(owner, req.host, req.port) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				refuse5(replyFor(failure))
+				fail failure
+			}
+			return none when out is none
+			target = out
+			try reply5(0x00, localOf(out))
+			relay(client, out, owner.idleTimeout)
+			return none
+		}
+
+		// BIND: listen, tell the client where, accept the one peer the
+		// request named, tell the client who came, relay.
+		internal def bind5(owner SocksServer, req Request) !none {
+			let failure ?error = none
+			let ln = listenFor(owner) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				refuse5(replyFor(failure))
+				fail failure
+			}
+			return none when ln is none
+			waiting = ln
+			let here = ln.address()
+			try reply5(0x00, net.Address{host: client.localAddr().host, port: here.port, isIPv6: client.localAddr().isIPv6})
+			let peer = acceptFrom(owner, ln, req.host) onerror (err error) {
+				failure = err
+				recover none
+			}
+			ln.close() onerror recover none
+			waiting = none
+			if !(failure is none) {
+				refuse5(replyFor(failure))
+				fail failure
+			}
+			return none when peer is none
+			target = peer
+			try reply5(0x00, peer.remoteAddr())
+			relay(client, peer, owner.idleTimeout)
+			return none
+		}
+
+		// UDP ASSOCIATE: a relay socket for the client's datagrams, alive
+		// while the control connection is.
+		internal def associate5(req Request) !none {
+			let local = client.localAddr()
+			let failure ?error = none
+			let socket = datagramSocket(local) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				refuse5(replyFor(failure))
+				fail failure
+			}
+			return none when socket is none
+			datagrams = socket
+			let bound = socket.localAddr()
+			try reply5(0x00, net.Address{host: local.host, port: bound.port, isIPv6: local.isIPv6})
+			let pump = new DatagramRelay(socket, client.remoteAddr().host, req.port)
+			let task = async pump.run()
+			task.keepAlive()
+			// The association lasts as long as this connection: wait for
+			// the client to close it.
+			let sink byte[] = []
+			sink.len(256)
+			for {
+				break when closed
+				let failed = false
+				let got = client.read(sink, 1s) onerror (err error) {
+					failed = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover -1
+				}
+				break when failed || got == 0
+			}
+			pump.stop()
+			return none
+		}
+
+		// SOCKS4 and 4a: one request, a user id, and for 4a a host name
+		// after it when the address is 0.0.0.x.
+		internal def serve4(owner SocksServer) !none {
+			let limit = owner.handshakeTimeout
+			let head = try readExact(client, 7, limit)
+			let port = (int(head[1]) << 8) | int(head[2])
+			let host = net.ipText(head[3:7])
+			let user = try readText(limit)
+			host = try readText(limit) when head[3] == 0 && head[4] == 0 && head[5] == 0 && head[6] != 0
+			let req = Request{version: 4, command: Command.Connect, host: host, port: port, user: user, client: client.remoteAddr()}
+			req.command = Command.Bind when head[0] == 2
+			if head[0] != 1 && head[0] != 2 {
+				reply4(91, new net.Address()) onerror recover none
+				fail ProxyError{message: "a SOCKS4 client sent the unknown command {head[0]}", kind: ErrorKind.Protocol, reply: int(head[0])}
+			}
+			// Version 4 has no passwords: a server that wants them
+			// cannot serve it.
+			if wantsAuth() || !allows(req) {
+				reply4(91, new net.Address()) onerror recover none
+				return none
+			}
+			let failure ?error = none
+			if req.command == Command.Connect {
+				let out = outbound(owner, host, port) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					reply4(91, new net.Address()) onerror recover none
+					fail failure
+				}
+				return none when out is none
+				target = out
+				try reply4(90, localOf(out))
+				relay(client, out, owner.idleTimeout)
+				return none
+			}
+			let ln = listenFor(owner) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				reply4(91, new net.Address()) onerror recover none
+				fail failure
+			}
+			return none when ln is none
+			waiting = ln
+			try reply4(90, net.Address{host: client.localAddr().host, port: ln.address().port})
+			let peer = acceptFrom(owner, ln, host) onerror (err error) {
+				failure = err
+				recover none
+			}
+			ln.close() onerror recover none
+			waiting = none
+			if !(failure is none) {
+				reply4(91, new net.Address()) onerror recover none
+				fail failure
+			}
+			return none when peer is none
+			target = peer
+			try reply4(90, peer.remoteAddr())
+			relay(client, peer, owner.idleTimeout)
+			return none
+		}
+
+		// readText reads a NUL-terminated field of a SOCKS4 request, at
+		// most 255 bytes.
+		internal def readText(limit duration) !string {
+			let out byte[] = []
+			for {
+				let one = try readExact(client, 1, limit)
+				return string(out) when one[0] == 0x00
+				out.push(one[0])
+				fail ProxyError{message: "a SOCKS4 field passes 255 bytes", kind: ErrorKind.Protocol} when out.len() > 255
+			}
+			fail "unreachable"
+		}
+
+		// reply5 writes a SOCKS5 reply with the bound address.
+		internal def reply5(code int, bound net.Address) !none {
+			let out byte[] = [0x05, byte(code), 0x00]
+			let host = bound.host
+			host = "0.0.0.0" when net.parseIPText(host) is none
+			try encodeAddress(out, host, bound.port)
+			return try net.writeAll(client, out, 30s)
+		}
+
+		// refuse5 tells the client why its request failed; the write is
+		// best effort, the connection closes next.
+		internal def refuse5(code int) {
+			reply5(code, new net.Address()) onerror recover none
+		}
+
+		// reply4 writes a SOCKS4 reply.
+		internal def reply4(code int, bound net.Address) !none {
+			let out byte[] = [0x00, byte(code), byte((bound.port >> 8) & 0xFF), byte(bound.port & 0xFF)]
+			let ip = net.parseIPText(bound.host)
+			if ip is none {
+				out.push(0, 0, 0, 0)
+			} else if ip.len() == 4 {
+				out.push(...ip)
+			} else {
+				out.push(0, 0, 0, 0)
+			}
+			return try net.writeAll(client, out, 30s)
+		}
+	}
+
+	// outbound opens the connection a client asked for: through the
+	// server's upstream proxy, or directly once the policy allows it.
+	internal def outbound(owner SocksServer, host string, port int) !?net.Stream {
+		let address = joinTarget(host, port)
+		let via = owner.upstream
+		return try via.dial(address, owner.dialTimeout) unless via is none
+		try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "tcp://" + address)
+		return try net.dialStream(address, owner.dialTimeout)
+	}
+
+	// localOf is the local address of a stream that is a socket, an
+	// empty address otherwise.
+	internal def localOf(stream net.Stream) net.Address {
+		return stream.localAddr() when stream is net.Connection
+		return new net.Address()
+	}
+
+	// listenFor opens the listener of a BIND on the interface the client
+	// reached the server on, at a free port.
+	internal def listenFor(owner SocksServer) !?net.Listener {
+		let local = owner.address()
+		let host = local.isIPv6 ?? ("[{local.host}]", local.host)
+		try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "tcp://{host}:0")
+		let sock = try net.socket(local.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+		try sock.bind("{host}:0")
+		return try sock.listen(1)
+	}
+
+	// acceptFrom waits for the peer of a BIND. A connection from another
+	// host than the one the request named is closed and the wait goes on
+	// (RFC 1928 §6); a request naming no host accepts the first.
+	// Fails with NetError (TimedOut) when the peer does not come within
+	// the server's dial timeout.
+	internal def acceptFrom(owner SocksServer, ln net.Listener, expected string) !?net.Connection {
+		let wanted string[] = []
+		if net.parseIPText(expected) is none {
+			wanted = net.resolve(expected) onerror recover []
+		} else if expected != "0.0.0.0" && expected != "::" {
+			wanted = [expected]
+		}
+		let waiter = new BindWait(ln, owner.dialTimeout)
+		let task = async waiter.expire()
+		task.keepAlive()
+		for {
+			let failure ?error = none
+			let conn = acceptOne(ln) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", expected, "the peer did not connect in time") when waiter.expired
+				fail failure
+			}
+			continue when conn is none
+			if wanted.len() == 0 || wanted.includes(conn.remoteAddr().host) {
+				waiter.done = true
+				return conn
+			}
+			conn.close() onerror recover none
+		}
+		fail "unreachable"
+	}
+
+	internal def acceptOne(ln net.Listener) !?net.Connection {
+		return try ln.accept()
+	}
+
+	// BindWait closes a BIND listener that nobody connected to in time,
+	// which ends the accept waiting on it.
+	internal type BindWait {
+		ln      net.Listener
+		limit   duration
+		done    bool         = false
+		expired bool         = false
+
+		def new(ln net.Listener, limit duration) {
+			self.ln = ln
+			self.limit = limit
+		}
+
+		def expire() {
+			let started = time.now()
+			for time.since(started) < limit {
+				return when done
+				time.sleep(20ms)
+			}
+			return when done
+			expired = true
+			ln.close() onerror recover none
+		}
+	}
+
+	// datagramSocket binds the relay socket of a UDP association on the
+	// interface the client reached the server on.
+	internal def datagramSocket(local net.Address) !?net.Socket {
+		let host = local.isIPv6 ?? ("[{local.host}]", local.host)
+		try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "udp://{host}:0")
+		let socket = try net.socket(local.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+		try socket.bind("{host}:0")
+		return socket
+	}
+
+	// DatagramRelay moves the datagrams of one UDP association: what the
+	// client sends is unwrapped and sent on, what anyone else sends is
+	// wrapped and sent to the client (RFC 1928 §7).
+	internal type DatagramRelay {
+		socket     net.Socket
+		// The client: its host is the control connection's peer, its port
+		// the one it announced, or that of its first datagram.
+		clientHost string
+		clientPort int
+		running    bool       = true
+
+		def new(socket net.Socket, clientHost string, clientPort int) {
+			self.socket = socket
+			self.clientHost = clientHost
+			self.clientPort = clientPort
+		}
+
+		def stop() {
+			running = false
+		}
+
+		def run() {
+			let buf byte[] = []
+			buf.len(65536)
+			for running {
+				let timedOut = false
+				let failed = false
+				let (n, from) = socket.readFrom(buf, 1s) onerror (err error) {
+					timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					failed   = !timedOut
+					recover (0, new net.Address())
+				}
+				return when failed
+				continue when timedOut
+				if from.host == clientHost && (clientPort == 0 || from.port == clientPort) {
+					clientPort = from.port
+					outward(buf, n)
+					continue
+				}
+				// Nothing to wrap for until the client has sent once.
+				continue when clientPort == 0
+				let packet byte[] = [0x00, 0x00, 0x00]
+				encodeAddress(packet, from.host, from.port) onerror recover none
+				packet.push(...buf[:n])
+				socket.writeTo(packet, joinTarget(clientHost, clientPort), 5s) onerror recover 0
+			}
+		}
+
+		// outward sends a client datagram to the target in its header;
+		// fragments and targets that do not resolve are dropped.
+		internal def outward(buf byte[], n int) {
+			return when n < 4 || buf[2] != 0x00
+			let (host, port, start) = decodeAddress(buf[:n], 3)
+			return when start < 0
+			if net.parseIPText(host) is none {
+				let found = net.resolve(host) onerror recover []
+				return when found.len() == 0
+				host = found[0]
+			}
+			let allowed = true
+			Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "udp://" + joinTarget(host, port)) onerror (err error) {
+				allowed = false
+				recover none
+			}
+			return unless allowed
+			socket.writeTo(buf[start:n], joinTarget(host, port), 5s) onerror recover 0
+		}
+	}
+
+	// relay copies bytes both ways between two streams until both
+	// directions ended or nothing moved in either for the idle time, then
+	// closes both: what a proxy does once its tunnel is open. It returns
+	// when the relay is over.
+	def relay(a net.Stream, b net.Stream, idle duration = 300s) {
+		let state = new RelayState(idle)
+		let back = async pump(b, a, state)
+		pump(a, b, state)
+		await back
+		a.close() onerror recover none
+		b.close() onerror recover none
+	}
+
+	// RelayState is what the two directions of a relay share: when a byte
+	// last moved, and whether one of them gave up.
+	internal type RelayState {
+		idle       duration
+		lastActive time.Time
+		stopped    bool      = false
+
+		def new(idle duration) {
+			self.idle = idle
+			lastActive = time.now()
+		}
+	}
+
+	// pump copies from one stream to the other until the source ends,
+	// then ends the other's sending side so its peer sees the end too.
+	internal def pump(from net.Stream, to net.Stream, state RelayState) {
+		let buf byte[] = []
+		buf.len(32768)
+		for {
+			break when state.stopped
+			let timedOut = false
+			let failed = false
+			let n = from.read(buf, state.idle) onerror (err error) {
+				timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+				failed = !timedOut
+				recover 0
+			}
+			if timedOut {
+				// The other direction may still be moving.
+				continue when time.since(state.lastActive) < state.idle
+				state.stopped = true
+				break
+			}
+			break when failed || n <= 0
+			state.lastActive = time.now()
+			let off = 0
+			let broken = false
+			for off < n {
+				let wrote = to.write(buf[off:n], state.idle) onerror (err error) {
+					broken = true
+					recover 0
+				}
+				break when broken || wrote <= 0
+				off += wrote
+			}
+			if off < n {
+				state.stopped = true
+				break
+			}
+		}
+		if to is net.Connection {
+			to.shutdownWrite() onerror recover none
+		} else {
+			to.close() onerror recover none
+		}
+	}
+}

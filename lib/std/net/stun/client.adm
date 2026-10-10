@@ -1,0 +1,913 @@
+partial module std.net.stun {
+	use (
+		std.net.stun.wire::*
+		std.net.sequence::(RoundTrip)
+		std.net.waiting::(awaitSignal)
+		std.net
+		std.net.udp
+		std.net.tls
+		std.time
+	)
+
+	// The most transactions in flight to one server (RFC 8489 §6.2).
+	internal const maxOutstanding = 10
+	// How long a redirect target stays barred from a second redirect
+	// (RFC 8489 §10), in nanoseconds.
+	internal const redirectMemory = 300000000000
+	// How long an RTO estimate stays good without a transaction (RFC 8489
+	// §6.2.1), in nanoseconds.
+	internal const rtoMemory = 600000000000
+	// Retries of a request a server answered with 5xx (RFC 8489 §6.3.4),
+	// and of one it answered with 438.
+	internal const serverErrorRetries = 4
+	internal const staleNonceRetries = 3
+	// Challenges (401) one request answers before it gives up.
+	internal const challengeRounds = 3
+	// Connection attempts of peers (RFC 6062) kept until `accept` takes
+	// them, and datagrams a peer's queue holds; more are dropped.
+	internal const attemptBacklog = 64
+	internal const relayBacklog = 256
+
+	// ClientConfig steers a client: long-term credentials (TURN, or a STUN
+	// server that asks), or short-term ones (ICE style, every request
+	// signed), the SOFTWARE it names itself with, whether its messages
+	// carry FINGERPRINT, the TLS settings of a "stuns" or "turns" server, the
+	// timers of RFC 8489 §6.2 and the local address of a UDP or DTLS socket.
+	struct ClientConfig {
+		username      string     = ""
+		password      string     = ""
+		// Sign every request with the password as a short-term credential
+		// (RFC 8489 §9.1) instead of answering a long-term challenge.
+		shortTerm     bool       = false
+		software      string     = "adm"
+		fingerprint   bool       = false
+		tls           tls.Config
+		// The first retransmission timeout (RTO) over UDP and DTLS; later
+		// ones follow the measured round trips.
+		rto           duration   = 500ms
+		// Rc: how many times a request is sent over UDP or DTLS.
+		requests      int        = 7
+		// Rm: how many RTOs after the last one the answer may take.
+		lastWait      int        = 16
+		// Ti: how long a request waits over TCP or TLS.
+		streamTimeout duration   = 39500ms
+		// The local address a UDP or DTLS socket binds; "" for any.
+		local         string     = ""
+	}
+
+	// Waiter is a transaction in flight: the integrity key its response
+	// must carry (empty when the request carried none), and what came back.
+	internal type Waiter {
+		key                 byte[]
+		signal              channel<none>
+		atomic response     ?Message      = none
+		atomic failure      ?error        = none
+		atomic badIntegrity bool          = false
+
+		def new(key byte[]) {
+			self.key = key
+			signal = new channel<none>(1)
+		}
+
+		def wake() {
+			signal.offer(none)
+		}
+	}
+
+	// Delivery is application data the server relayed: from a Data
+	// indication (with the peer, or the ICMP type and code of an error the
+	// peer's network reported) or a ChannelData message (with the channel).
+	internal struct Delivery {
+		peer     ?net.Address
+		data     byte[]
+		channel  int          = 0
+		icmpType int          = -1
+		icmpCode int          = -1
+	}
+
+	// Session is the transport to one server: it reads what the server
+	// sends on a task of its own and hands responses to their waiters,
+	// relayed data to the allocation and connection attempts to a queue.
+	internal type Session {
+		transport          Transport
+		datagram           ?net.DatagramTransport = none
+		stream             ?net.Stream            = none
+		server             string
+		config             ClientConfig
+		atomic waiters     map<string, Waiter>
+		atomic pending     Message[]              = []
+		attemptSignal      channel<none>
+		slots              channel<none>
+		atomic running     bool                   = true
+		atomic closedError ?error                 = none
+		// The allocation relayed data goes to, none for a plain client.
+		weak router        ?Relaying
+		// The RTO estimate (RFC 6298, without the one-second floor,
+		// RFC 8489 §6.2.1) and when it was last used, in monotonic ns.
+		roundTrip          RoundTrip
+		rtoUsedAt          int                    = 0
+
+		def new(transport Transport, server string, config ClientConfig) {
+			self.transport = transport
+			self.server = server
+			self.config = config
+			attemptSignal = new channel<none>(1)
+			slots = new channel<none>(maxOutstanding)
+			for let i = 0; i < maxOutstanding; i++ {
+				slots <- none
+			}
+			roundTrip = new RoundTrip(int(config.rto), 0, 3600000000000)
+			roundTrip.granularity = 10000000
+		}
+
+		// reliable reports whether the transport is a stream, where STUN
+		// does not retransmit.
+		def reliable() bool {
+			return transport := Transport.TCP || Transport.TLS
+		}
+
+		// start runs the reader.
+		def start() {
+			let task = async readLoop()
+			task.keepAlive()
+		}
+
+		// send writes one message or ChannelData message. Fails as the
+		// transport does.
+		def send(data byte[]) !none {
+			let d = datagram
+			return try d.send(data, 5s) unless d is none
+			let s = stream
+			fail stunError("session has no transport") when s is none
+			return try net.writeAll(s, data, config.streamTimeout)
+		}
+
+		// close stops the reader and closes the transport.
+		def close() {
+			running = false
+			let d = datagram
+			if !(d is none) {
+				d.close() onerror recover none
+			}
+			let s = stream
+			if !(s is none) {
+				s.close() onerror recover none
+			}
+			failAll(stunError("the client was closed"))
+		}
+
+		// transact sends a request and waits for its response: over UDP and
+		// DTLS retransmitting at RTO, 2 RTO, 4 RTO... up to `requests`
+		// sends and then `lastWait` RTOs (RFC 8489 §6.2.1), over TCP and TLS
+		// once for `streamTimeout`. A response whose integrity does not
+		// verify under `key` is dropped over a datagram transport and ends
+		// the transaction over a stream (RFC 8489 §9.2.5). Fails with
+		// StunError (timeout, integrity, closed) or the transport's error.
+		def transact(bytes byte[], transactionID byte[], key byte[]) !Message {
+			<-slots
+			let waiter = new Waiter(key)
+			let id = transactionID.hex()
+			register(id, waiter)
+			let failure ?error = none
+			let answer = exchange(bytes, waiter) onerror (err error) {
+				failure = err
+				recover none
+			}
+			unregister(id)
+			slots <- none
+			fail failure unless failure is none
+			fail stunError("the transaction ended without a response") when answer is none
+			return answer
+		}
+
+		internal def exchange(bytes byte[], waiter Waiter) !?Message {
+			if reliable() {
+				try send(bytes)
+				try waitFor(waiter, int(time.monoNs()) + int(config.streamTimeout))
+				return try outcome(waiter)
+			}
+			let sentAt = int(time.monoNs())
+			let interval = timeout(sentAt)
+			for let i = 0; i < config.requests; i++ {
+				try send(bytes)
+				let wait = (i == config.requests - 1) ?? (interval * config.lastWait, interval)
+				let done = try waitFor(waiter, int(time.monoNs()) + wait)
+				if done {
+					measure(int(time.monoNs()) - sentAt) when i == 0
+					return try outcome(waiter)
+				}
+				interval = interval * 2
+			}
+			fail stunError("the response failed the integrity check") when waiter.badIntegrity
+			fail StunError{message: "stun: no response from {server}", timedOut: true}
+		}
+
+		// outcome is what a woken waiter got.
+		internal def outcome(waiter Waiter) !?Message {
+			let failure = waiter.failure
+			fail failure unless failure is none
+			return waiter.response
+		}
+
+		// timeout is the RTO a transaction starting now begins with: the
+		// estimate, or the configured one when the estimate is older than
+		// ten minutes (RFC 8489 §6.2.1).
+		internal atomic def timeout(now int) int {
+			roundTrip.reset() when rtoUsedAt > 0 && now - rtoUsedAt > rtoMemory
+			rtoUsedAt = now
+			return roundTrip.rto
+		}
+
+		// measure folds a round trip into the RTO.
+		internal atomic def measure(rtt int) {
+			roundTrip.measure(rtt)
+		}
+
+		// waitFor waits until the waiter is woken or the deadline
+		// (monotonic ns) passes; false when it passed. Fails with the
+		// session's error once it is closed.
+		internal def waitFor(waiter Waiter, deadline int) !bool {
+			for {
+				return true unless waiter.response is none && waiter.failure is none
+				let failure = closedError
+				fail failure unless failure is none
+				return false unless awaitSignal(waiter.signal, deadline)
+			}
+			return false
+		}
+
+		internal atomic def register(id string, waiter Waiter) {
+			waiters[id] = waiter
+		}
+
+		internal atomic def unregister(id string) {
+			waiters.delete(id)
+		}
+
+		internal atomic def waiterOf(id string) ?Waiter {
+			return waiters.get(id)
+		}
+
+		internal atomic def allWaiters() Waiter[] {
+			let out Waiter[]
+			for let (_, w) in waiters {
+				out.push(w)
+			}
+			return out
+		}
+
+		// failAll ends every transaction in flight.
+		def failAll(err error) {
+			closedError = err when closedError is none
+			for let (_, w) in allWaiters() {
+				w.failure = err when w.failure is none
+				w.wake()
+			}
+			attemptSignal.offer(none)
+		}
+
+		// readLoop reads until the session closes.
+		def readLoop() {
+			let failure ?error = none
+			if datagram is none {
+				readStream() onerror (err error) {
+					failure = err
+					recover none
+				}
+			} else {
+				readDatagrams() onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			running = false
+			if failure is none {
+				failAll(stunError("the connection closed"))
+			} else {
+				failAll(failure)
+			}
+		}
+
+		internal def readDatagrams() !none {
+			let d = datagram
+			fail stunError("no datagram transport") when d is none
+			let buf byte[]
+			buf.len(65536)
+			for running {
+				let timedOut = false
+				let n = d.receive(buf, 500ms) onerror (err error) {
+					timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					fail err unless timedOut
+					recover 0
+				}
+				continue when timedOut
+				// The buffer is read into again: the message gets its own bytes.
+				handle(buf[0:n].clone())
+			}
+			return none
+		}
+
+		// readStream reads STUN messages and padded ChannelData messages off
+		// TCP or TLS (RFC 8656 §12.5).
+		internal def readStream() !none {
+			let s = stream
+			fail stunError("no stream") when s is none
+			let inbox byte[] = []
+			let buf byte[]
+			buf.len(65536)
+			for running {
+				let timedOut = false
+				let n = s.read(buf, 500ms) onerror (err error) {
+					timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					fail err unless timedOut
+					recover 0
+				}
+				continue when timedOut
+				fail stunError("the server closed the connection") when n == 0
+				inbox = inbox + buf[0:n]
+				for inbox.len() >= 4 {
+					let size = frameSize(inbox)
+					fail stunError("the server sent bytes that are neither STUN nor ChannelData") when size < 0
+					break when inbox.len() < size
+					handle(inbox[0:size])
+					inbox = inbox[size:]
+				}
+			}
+			return none
+		}
+
+		// handle dispatches one message from the server.
+		def handle(data byte[]) {
+			if data.len() >= 4 && int(data[0]) >= 0x40 && int(data[0]) <= 0x4F {
+				let channel = int(data[0]) << 8 | int(data[1])
+				let length = int(data[2]) << 8 | int(data[3])
+				return when data.len() < 4 + length
+				deliver(Delivery{peer: none, data: data[4:4 + length], channel: channel})
+				return
+			}
+			return unless isMessage(data)
+			let m = optionalMessage(data) onerror recover none
+			return when m is none
+			return when config.fingerprint && m.has(AttributeType.Fingerprint) && !m.checkFingerprint()
+			if m.class := MessageClass.SuccessResponse || MessageClass.ErrorResponse {
+				let waiter = waiterOf(m.transactionID.hex())
+				return when waiter is none
+				accept(waiter, m)
+				return
+			}
+			return unless m.class == MessageClass.Indication
+			if m.method == Method.Data {
+				let peer = m.xorAddress(AttributeType.XorPeerAddress)
+				return when peer is none
+				let icmp = m.get(AttributeType.ICMP)
+				if !(icmp is none) && icmp.len() >= 4 {
+					deliver(Delivery{peer: peer, data: [], icmpType: int(icmp[2]) & 0x7F, icmpCode: int(icmp[3])})
+					return
+				}
+				let payload = m.get(AttributeType.Data)
+				return when payload is none
+				deliver(Delivery{peer: peer, data: payload})
+				return
+			}
+			addAttempt(m) when m.method == Method.ConnectionAttempt
+		}
+
+		// accept takes a response for its waiter under the integrity rules
+		// of RFC 8489 §9.1.4 and §9.2.5.
+		internal def accept(waiter Waiter, m Message) {
+			return unless waiter.response is none
+			if waiter.key.len() > 0 {
+				if m.integrityUsed() == Integrity.None {
+					let code = m.refusal()
+					let challenge = !(code is none) && (code.code := int(ErrorCode.Unauthenticated) || int(ErrorCode.StaleNonce))
+					if !challenge {
+						// A 400 without integrity is as if it never came.
+						return when !(code is none) && code.code == int(ErrorCode.BadRequest)
+						waiter.badIntegrity = true
+						if reliable() {
+							waiter.failure = stunError("the response carries no message integrity")
+							waiter.wake()
+						}
+						return
+					}
+				} else if !m.checkIntegrity(waiter.key) {
+					waiter.badIntegrity = true
+					if reliable() {
+						waiter.failure = stunError("the response failed the integrity check")
+						waiter.wake()
+					}
+					return
+				}
+			}
+			waiter.response = m
+			waiter.wake()
+		}
+
+		// deliver hands relayed data to the allocation; a client without
+		// one has asked for none and drops it.
+		internal def deliver(d Delivery) {
+			let target = router
+			target.route(d) unless target is none
+		}
+
+		internal atomic def addAttempt(m Message) {
+			return when pending.len() >= attemptBacklog
+			pending.push(m)
+			attemptSignal.offer(none)
+		}
+
+		atomic def takeAttempt() ?Message {
+			return none when pending.len() == 0
+			return pending.shift()
+		}
+	}
+
+	// frameSize is the size of the first frame of a stream's bytes: a STUN
+	// message, or a ChannelData message padded to four bytes; -1 for bytes
+	// that are neither.
+	internal def frameSize(data byte[]) int {
+		let first = int(data[0])
+		// Channel numbers start with the bits 01: 0x4000 to 0x4FFF since
+		// RFC 8656, up to 0x7FFF before it.
+		if (first & 0xC0) == 0x40 {
+			let length = int(data[2]) << 8 | int(data[3])
+			return 4 + (length + 3) / 4 * 4
+		}
+		return -1 unless (first & 0xC0) == 0
+		return messageSize(data)
+	}
+
+	// Client talks to one STUN or TURN server: Binding requests, the
+	// credential mechanisms, redirects, and TURN allocations.
+	type Client {
+		// The server's URI, none for a client over a transport of the
+		// caller's.
+		uri  ?ServerURI = none
+		core Requester
+
+		def new(core Requester) {
+			self.core = core
+		}
+
+		// binding asks the server for this side's address as it sees it:
+		// the XOR-MAPPED-ADDRESS of a Binding response (MAPPED-ADDRESS from
+		// a server of RFC 3489). Fails with StunError when the server does
+		// not answer or answers without an address, or as `transact` does.
+		def binding() !net.Address {
+			let answer = try core.transact(try request(Method.Binding))
+			let mapped = answer.xorAddress(AttributeType.XorMappedAddress)
+			return mapped unless mapped is none
+			let plain = answer.address(AttributeType.MappedAddress)
+			fail stunError("the Binding response carries no address") when plain is none
+			return plain
+		}
+
+		// transact sends a request and returns the success response,
+		// signing it as the credentials say: with short-term credentials
+		// always; with long-term ones after the first challenge, answering
+		// 401 and 438 with the realm, nonce and password algorithm the
+		// server named (RFC 8489 §9.2.5). Redirects (300), retries after
+		// 5xx and the next resolved server after a timeout are followed.
+		// Fails with StunError carrying the error code of an error
+		// response, or when the server does not answer.
+		def transact(message Message) !Message {
+			return try core.transact(message)
+		}
+
+		// allocate creates a TURN allocation (RFC 8656 §7, RFC 6062 §4.1)
+		// on this client's transport, which carries it from then on: one
+		// allocation per client. A 437 (the 5-tuple is in use) is retried
+		// from a new local port, up to three times (§7.4). Fails with
+		// StunError carrying the server's error code, or for a TCP relay
+		// over UDP or DTLS.
+		def allocate(options AllocateOptions = AllocateOptions{}) !Allocation {
+			fail stunError("a TCP relay needs a TCP or TLS connection to the server") when options.protocol == RelayProtocol.TCP && !core.session.reliable()
+			fail stunError("REQUESTED-ADDRESS-FAMILY and ADDITIONAL-ADDRESS-FAMILY exclude each other") when options.dualStack && !(options.family is none)
+			let response = new Message(MessageClass.ErrorResponse, Method.Allocate, [])
+			let done = false
+			for let attempt = 0; !done; attempt++ {
+				let failure ?error = none
+				let request = try allocateRequest(options)
+				let got = core.transact(request) onerror (err error) {
+					failure = err
+					recover response
+				}
+				if failure is none {
+					response = got
+					done = true
+				} else {
+					let mismatch = failure is StunError && failure.errorCode == int(ErrorCode.AllocationMismatch)
+					fail failure unless mismatch && attempt < 3 && !core.session.reliable()
+					try core.reconnect(core.session.server, "")
+				}
+			}
+			let relayed string[]
+			for let (_, a) in response.xorAddresses(AttributeType.XorRelayedAddress) {
+				relayed.push(a.str())
+			}
+			fail stunError("the Allocate response carries no XOR-RELAYED-ADDRESS") when relayed.len() == 0
+			let allocation = new Relaying(core, options.protocol)
+			allocation.relayed = relayed
+			let mapped = response.xorAddress(AttributeType.XorMappedAddress)
+			allocation.mapped = mapped is none ?? ("", mapped.str())
+			let seconds = response.uint32(AttributeType.Lifetime)
+			allocation.takeLifetime(seconds is none ?? (600, seconds))
+			let token = response.get(AttributeType.ReservationToken)
+			allocation.reservationToken = token unless token is none
+			let familyError = response.get(AttributeType.AddressErrorCode)
+			allocation.familyError = (int(familyError[2]) & 0x07) * 100 + int(familyError[3]) when !(familyError is none) && familyError.len() >= 4
+			core.session.router = allocation
+			let keeper = async allocation.keep()
+			keeper.keepAlive()
+			return new Allocation(allocation)
+		}
+
+		// localAddress is the address of this side of a UDP transport,
+		// empty for others.
+		def localAddress() net.Address {
+			let d = core.session.datagram
+			if !(d is none) {
+				if d is udp.Peer {
+					let peer udp.Peer = d
+					return peer.localAddr()
+				}
+			}
+			return new net.Address()
+		}
+
+		// close closes the transport; allocations on it go with it. Never
+		// fails.
+		def close() !none {
+			core.close()
+			return none
+		}
+	}
+
+	// Requester sends requests to one server for a client and its
+	// allocations: the session, the credential state, the server addresses
+	// and the redirects followed.
+	internal type Requester {
+		config         ClientConfig
+		uri            ?ServerURI         = none
+		atomic session Session
+		// The server addresses the URI resolved to, the one in use first.
+		servers        string[]           = []
+		// The username and the short-term key after OpaqueString, made at
+		// the first request.
+		username       string             = ""
+		shortKey       byte[]             = []
+		// Long-term state, from the last challenge (RFC 8489 §9.2).
+		realm          string             = ""
+		nonce          string             = ""
+		key            byte[]             = []
+		algorithms     byte[]             = []
+		algorithm      ?PasswordAlgorithm = none
+		useHash        bool               = false
+		// The integrity attribute the server answered with, None before
+		// it answered.
+		integrity      Integrity          = Integrity.None
+		// Redirect targets and when they were used, in monotonic ns.
+		redirects      map<string, int>
+
+		def new(session Session, config ClientConfig) {
+			self.session = session
+			self.config = config
+		}
+
+		// close closes the session.
+		def close() {
+			session.close()
+		}
+
+		// Closes the transport once neither the client nor an allocation
+		// holds it.
+		def dispose() {
+			session.close()
+		}
+
+		// transact sends a request and returns the success response,
+		// signing it as the credentials say: with short-term credentials
+		// always; with long-term ones after the first challenge, answering
+		// 401 and 438 with the realm, nonce and password algorithm the
+		// server named (RFC 8489 §9.2.5). Redirects (300), retries after
+		// 5xx and the next resolved server after a timeout are followed.
+		// Fails with StunError carrying the error code of an error
+		// response, or when the server does not answer.
+		def transact(message Message) !Message {
+			let challenges = 0
+			let stale = 0
+			let serverErrors = 0
+			let triedRealm = ""
+			for {
+				let m = new Message(message.class, message.method, try newTransactionID())
+				m.attributes = message.attributes.clone()
+				let (bytes, signedWith) = try sign(m)
+				let answer = try attempt(bytes, m.transactionID, signedWith)
+				continue when answer is none
+				noteIntegrity(answer.integrityUsed()) when signedWith.len() > 0
+				return answer when answer.class == MessageClass.SuccessResponse
+				let code = answer.refusal()
+				fail stunError("an error response without ERROR-CODE") when code is none
+				switch {
+					case code.code == int(ErrorCode.Unauthenticated) && !config.shortTerm && config.username != "":
+						let realmNow = textOr(answer, AttributeType.Realm)
+						// A new challenge for the same realm means the
+						// credentials were refused (RFC 8489 §9.2.5).
+						fail errorOf(code, answer) when challenges > 0 && realmNow == triedRealm && key.len() > 0
+						fail errorOf(code, answer) when challenges >= challengeRounds
+						challenges++
+						try takeChallenge(answer)
+						triedRealm = realm
+					case code.code == int(ErrorCode.StaleNonce) && stale < staleNonceRetries:
+						stale++
+						try takeChallenge(answer)
+					case code.code == int(ErrorCode.TryAlternate):
+						try redirect(answer, signedWith)
+					case code.code >= 500 && code.code <= 599 && serverErrors < serverErrorRetries:
+						serverErrors++
+					default:
+						fail errorOf(code, answer)
+				}
+			}
+			fail stunError("unreachable")
+		}
+
+		// attempt is one exchange with the server in use: its response, or
+		// none when it did not answer and the next address the URI resolved
+		// to took over (RFC 8489 §8.1). Fails as `Session.transact` does.
+		internal def attempt(bytes byte[], transactionID byte[], signedWith byte[]) !?Message {
+			let moved = false
+			let answer = session.transact(bytes, transactionID, signedWith) onerror (err error) {
+				fail err unless timedOut(err) && nextServer()
+				moved = true
+				recover new Message(MessageClass.ErrorResponse, Method.Binding, [])
+			}
+			return none when moved
+			return answer
+		}
+
+		// sign adds the credential attributes a request needs now and
+		// encodes it; returns the bytes and the key the response must be
+		// signed with (empty when the request is not signed). Fails with
+		// PrecisError when the username or password is no OpaqueString.
+		atomic def sign(m Message) !(byte[], byte[]) {
+			let fingerprint = config.fingerprint
+			m.add(AttributeType.Software, config.software) when config.software != "" && m.class == MessageClass.Request && !m.has(AttributeType.Software)
+			if config.username != "" && username == "" {
+				username = try opaque(config.username)
+				shortKey = try shortTermKey(config.password) when config.shortTerm
+			}
+			if config.shortTerm && username != "" {
+				m.add(AttributeType.Username, username)
+				// Both until the server showed which it takes (RFC 8489 §9.1.2).
+				let which = integrity == Integrity.None ?? (Integrity.Both, integrity)
+				return (m.encode(shortKey, which, fingerprint), shortKey)
+			}
+			if key.len() > 0 && m.class == MessageClass.Request {
+				if useHash {
+					m.add(AttributeType.UserHash, try userHash(config.username, realm))
+				} else {
+					m.add(AttributeType.Username, username)
+				}
+				m.add(AttributeType.Realm, realm)
+				m.add(AttributeType.Nonce, nonce)
+				if algorithms.len() > 0 {
+					m.add(AttributeType.PasswordAlgorithms, algorithms)
+					let chosen = algorithm
+					m.add(AttributeType.PasswordAlgorithm, encodePasswordAlgorithm(chosen)) unless chosen is none
+				}
+				// A server that listed PASSWORD-ALGORITHMS takes only
+				// MESSAGE-INTEGRITY-SHA256 from then on (RFC 8489 §9.2.5).
+				let which = algorithms.len() > 0 ?? (Integrity.SHA256, Integrity.SHA1)
+				which = integrity when integrity != Integrity.None && algorithms.len() == 0
+				return (m.encode(key, which, fingerprint), key)
+			}
+			return (m.encode([], Integrity.None, fingerprint), byte[])
+		}
+
+		// noteIntegrity keeps the integrity attribute the server answers
+		// with.
+		internal atomic def noteIntegrity(used Integrity) {
+			integrity = used unless used == Integrity.None
+		}
+
+		// takeChallenge keeps the realm and nonce of a 401 or 438 and derives
+		// the key: with the first algorithm of PASSWORD-ALGORITHMS this
+		// module implements, SHA-256 when both are listed (RFC 8656 §6), and
+		// USERHASH when the nonce announces username anonymity. Fails with
+		// StunError when the nonce announces password algorithms the
+		// response does not list, or lists none this module implements.
+		atomic def takeChallenge(answer Message) !none {
+			let realmNow = answer.text(AttributeType.Realm)
+			let nonceNow = answer.text(AttributeType.Nonce)
+			fail stunError("the challenge carries no NONCE") when nonceNow is none
+			realm = realmNow unless realmNow is none
+			nonce = nonceNow
+			let announced = nonceFeatures(nonce)
+			let features = 0
+			features = announced unless announced is none
+			let listed = answer.get(AttributeType.PasswordAlgorithms)
+			fail stunError("the nonce announces password algorithms the response does not list") when (features & featurePasswordAlgorithms) != 0 && listed is none
+			algorithms = []
+			algorithm = none
+			if !(listed is none) {
+				let codes = try decodePasswordAlgorithms(listed)
+				for let (_, c) in codes {
+					let known = passwordAlgorithmOf(c)
+					continue when known is none
+					algorithm = known when algorithm is none
+				}
+				algorithm = PasswordAlgorithm.SHA256 when codes.includes(int(PasswordAlgorithm.SHA256))
+				fail stunError("the server lists no password algorithm this client implements") when algorithm is none
+				algorithms = listed
+			}
+			useHash = (features & featureUsernameAnonymity) != 0
+			let chosen = algorithm
+			let derive = PasswordAlgorithm.MD5
+			derive = chosen unless chosen is none
+			key = try longTermKey(config.username, realm, config.password, derive)
+			return none
+		}
+
+		// redirect follows a 300 to the ALTERNATE-SERVER it names, over the
+		// same transport and with the same credentials, unless the response
+		// was not authenticated or the target was used within five minutes
+		// (RFC 8489 §10). Fails with StunError when it is not followed.
+		def redirect(answer Message, signedWith byte[]) !none {
+			fail stunError("a 300 that is not authenticated is not followed") when signedWith.len() == 0
+			let target = answer.address(AttributeType.AlternateServer)
+			fail stunError("a 300 without ALTERNATE-SERVER") when target is none
+			let now = int(time.monoNs())
+			let seen = redirects.get(target.str())
+			fail stunError("redirected to {target.str()} again within five minutes") when !(seen is none) && now - seen < redirectMemory
+			redirects[target.str()] = now
+			try reconnect(target.str(), textOr(answer, AttributeType.AlternateDomain))
+			return none
+		}
+
+		// bindConnection opens a new connection to the server and binds it
+		// to a peer connection with ConnectionBind (RFC 6062 §4.3-4.4),
+		// signed as the control connection's requests are; afterwards it
+		// carries the peer's bytes and nothing else. Fails with StunError
+		// when the server refuses, NetError when the connection cannot be
+		// opened.
+		def bindConnection(id byte[]) !net.Stream {
+			let target = uri
+			let host = target is none ?? ("", target.host)
+			let data = try openSession(session.transport, session.server, host, config)
+			let stream = data.stream
+			fail stunError("the data connection is not a stream") when stream is none
+			let stale = 0
+			for {
+				let m = try request(Method.ConnectionBind)
+				m.add(AttributeType.ConnectionID, id)
+				let (bytes, signedWith) = try sign(m)
+				try net.writeAll(stream, bytes, config.streamTimeout)
+				let answer = try readMessage(stream, config.streamTimeout)
+				if signedWith.len() > 0 && answer.integrityUsed() != Integrity.None && !answer.checkIntegrity(signedWith) {
+					stream.close() onerror recover none
+					fail stunError("the ConnectionBind response failed the integrity check")
+				}
+				return stream when answer.class == MessageClass.SuccessResponse
+				let code = answer.refusal()
+				fail stunError("an error response without ERROR-CODE") when code is none
+				if (code.code := int(ErrorCode.StaleNonce) || int(ErrorCode.Unauthenticated)) && stale < staleNonceRetries {
+					stale++
+					try takeChallenge(answer)
+					continue
+				}
+				stream.close() onerror recover none
+				fail errorOf(code, answer)
+			}
+			fail stunError("unreachable")
+		}
+
+		// nextServer moves to the next address the URI resolved to after a
+		// timeout (RFC 8489 §8.1); false when there is none.
+		def nextServer() bool {
+			return false when servers.len() < 2
+			servers = servers[1:]
+			reconnect(servers[0], "") onerror recover none
+			return true
+		}
+
+		// reconnect opens the transport to another server address; a TLS or
+		// DTLS one verifies `domain` when given.
+		def reconnect(address string, domain string) !none {
+			let target = uri
+			let transport = session.transport
+			let host = target is none ?? ("", target.host)
+			host = domain when domain != ""
+			let fresh = try openSession(transport, address, host, config)
+			session.close()
+			session = fresh
+			session.start()
+			return none
+		}
+	}
+
+	// allocateRequest is an Allocate request with the attributes the
+	// options ask for (RFC 8656 §7.1, §18). Fails when the random source
+	// does.
+	internal def allocateRequest(options AllocateOptions) !Message {
+		let m = try request(Method.Allocate)
+		m.add(AttributeType.RequestedTransport, byte[byte(int(options.protocol)), 0, 0, 0])
+		let family = options.family
+		m.add(AttributeType.RequestedAddressFamily, byte[byte(int(family)), 0, 0, 0]) unless family is none
+		m.add(AttributeType.AdditionalAddressFamily, byte[byte(familyIPv6), 0, 0, 0]) when options.dualStack
+		m.add(AttributeType.Lifetime, uint32(int(options.lifetime) / 1000000000)) when options.lifetime > 0s
+		m.add(AttributeType.EvenPort, byte[options.reserveNext ?? (0x80, 0)]) when options.evenPort || options.reserveNext
+		m.add(AttributeType.ReservationToken, options.reservationToken) when options.reservationToken.len() > 0
+		m.add(AttributeType.DontFragment, []) when options.dontFragment
+		return m
+	}
+
+	internal def optionalMessage(data byte[]) !?Message {
+		return try parseMessage(data)
+	}
+
+	// readMessage reads exactly one STUN message off a stream, nothing
+	// past it: on a TURN data connection the peer's bytes follow. Fails
+	// with StunError when the bytes are no STUN message, NetError as the
+	// stream does or when it ends inside the message.
+	internal def readMessage(stream net.Stream, timeout duration) !Message {
+		let data byte[]
+		data.len(headerSize)
+		try net.readFull(stream, data, timeout)
+		fail stunError("the server sent no STUN message") unless (int(data[0]) & 0xC0) == 0
+		let size = messageSize(data)
+		let message byte[]
+		message.len(size)
+		data.copy(message)
+		try net.readFull(stream, message[headerSize:], timeout)
+		return try parseMessage(message)
+	}
+
+	// textOr is a text attribute, "" when absent.
+	internal def textOr(m Message, kind AttributeType) string {
+		let value = m.text(kind)
+		return "" when value is none
+		return value
+	}
+
+	// timedOut reports whether a failure is a STUN timeout.
+	internal def timedOut(err error) bool {
+		return err is StunError && err.timedOut
+	}
+
+	// errorOf is the failure of an error response.
+	internal def errorOf(code Refusal, answer Message) StunError {
+		return StunError{message: "stun: {answer.method} failed with {code.code} {code.reason}", kind: errorCodeOf(code.code), errorCode: code.code, reason: code.reason, unknown: answer.unknownAttributes()}
+	}
+
+	// dial resolves a STUN or TURN URI and opens the transport to the first
+	// server it names. Fails with StunError for a malformed URI, NetError
+	// when the name does not resolve or the transport cannot be opened,
+	// TLSError when a TLS or DTLS handshake fails.
+	def dial(text string, config ClientConfig = ClientConfig{}) !Client {
+		let uri = try parseURI(text)
+		let addresses = try resolveURI(uri)
+		let session = try openSession(uri.transport, addresses[0], uri.host, config)
+		let core = new Requester(session, config)
+		core.uri = uri
+		core.servers = addresses
+		session.start()
+		let c = new Client(core)
+		c.uri = uri
+		return c
+	}
+
+	// client runs a client over a datagram transport of the caller's (an
+	// ICE path, a socket shared with other traffic is not one: the client
+	// reads every datagram). Requests are retransmitted as over UDP.
+	def client(transport net.DatagramTransport, config ClientConfig = ClientConfig{}) Client {
+		let session = new Session(Transport.UDP, "", config)
+		session.datagram = transport
+		session.start()
+		return new Client(new Requester(session, config))
+	}
+
+	// openSession opens a transport to a server address; TLS and DTLS verify
+	// `host` (the URI's name) unless the config names a server.
+	internal def openSession(transport Transport, address string, host string, config ClientConfig) !Session {
+		let session = new Session(transport, address, config)
+		let secure = tls.withServerName(config.tls, config.tls.serverName == "" ?? (host, config.tls.serverName))
+		switch {
+			case transport == Transport.UDP:
+				session.datagram = try udp.dial(address, config.local)
+			case transport == Transport.DTLS:
+				let peer = try udp.dial(address, config.local)
+				let conn = tls.dtlsClient(peer, tls.DTLSConfig{tls: secure})
+				conn.handshake() onerror (err error) {
+					peer.close() onerror recover none
+					fail err
+				}
+				session.datagram = conn
+			case transport == Transport.TCP:
+				session.stream = try net.dialStream(address, 10s)
+			case transport == Transport.TLS:
+				session.stream = try tls.dial(address, secure, 10s)
+		}
+		return session
+	}
+}

@@ -1,0 +1,1810 @@
+// One QUIC connection (RFC 9000, RFC 9001, RFC 9002): the engine both
+// the client and the server side run. Every change of its state goes
+// through an `atomic` method; a driver task sends what `assemble`
+// builds and sleeps until `nextDeadline`.
+internal partial module std.net.quic.core {
+	use (
+		std.crypto::(rand)
+		std.net.quic.wire::*
+		std.net.quic::*
+		std.net.tls
+		std.time
+	)
+
+	const stateHandshaking = 0
+	const stateEstablished = 1
+	// This side sent CONNECTION_CLOSE and answers packets with it.
+	const stateClosing = 2
+	// The peer closed: nothing is sent any more.
+	const stateDraining = 3
+	const stateClosed = 4
+
+	// The bytes of connection IDs this endpoint issues.
+	const localIDLength = 8
+	// The largest datagram sent while the path is not probed for more
+	// (RFC 9000 §14).
+	const baseDatagram = 1200
+	// The most a stream holds unacknowledged before a writer waits.
+	const sendBufferLimit = 262144
+	// The most CRYPTO data held out of order (RFC 9000 §7.5).
+	const cryptoBufferLimit = 65536
+
+	// Settings is a connection's configuration after defaults.
+	struct Settings {
+		tlsConfig        tls.Config
+		// Microseconds; 0 turns the idle timeout off on this side.
+		idleTimeout      int        = 30000000
+		// Microseconds between keep-alive PINGs; 0 sends none.
+		keepAlive        int        = 0
+		handshakeTimeout int        = 10000000
+		maxData          int        = 1048576
+		maxStreamData    int        = 262144
+		maxStreamsBidi   int        = 100
+		maxStreamsUni    int        = 100
+		// The largest DATAGRAM frame accepted; 0 turns datagrams off.
+		maxDatagramFrame int        = 0
+	}
+
+	// NullIO stands where the TLS record layer wants a reader and a
+	// writer; with a carrier set it never touches them.
+	type NullIO {
+		def read(data byte[]) !int {
+			return 0
+		}
+
+		def write(data byte[]) !int {
+			return data.len()
+		}
+	}
+
+	type Conn {
+		isClient           bool
+		settings           Settings
+		sink               PacketSink
+		// Where datagrams go.
+		peer               string
+		state              int                   = stateHandshaking
+		// Why the connection ended; none while it runs.
+		closeError         ?error                = none
+		// CONNECTION_CLOSE to send while closing.
+		closeCode          int                   = 0
+		closeIsApp         bool                  = false
+		closeFrameType     int                   = 0
+		closeReason        string                = ""
+		closeSends         int                   = 0
+		closeReceived      int                   = 0
+		closeDeadline      int                   = -1
+		spaces             Space[]               = []
+		recovery           Recovery
+		// Connection IDs.
+		localIDs           LocalID[]             = []
+		nextLocalSequence  int                   = 0
+		peerIDs            PeerID[]              = []
+		// The destination connection ID in use and its sequence number.
+		dcid               byte[]                = []
+		dcidSequence       int                   = 0
+		// Sequence numbers of peer IDs to retire with a frame.
+		retiring           int[]                 = []
+		retirePriorTo      int                   = 0
+		// The client's first destination ID, and what a Retry changed.
+		originalDCID       byte[]                = []
+		retrySCID          byte[]                = []
+		retried            bool                  = false
+		retryToken         byte[]                = []
+		// The source ID of the peer's first Initial packet.
+		peerInitialSCID    byte[]                = []
+		sawPeerInitial     bool                  = false
+		// Transport parameters.
+		localParams        Parameters
+		peerParams         Parameters
+		// The handshake.
+		handshakeComplete  bool                  = false
+		handshakeConfirmed bool                  = false
+		handshakeDoneOwed  bool                  = false
+		alpn               string                = ""
+		tlsState           tls.ConnectionState
+		handshakeSignal    channel<none>
+		// Packets that arrived before their keys.
+		deferred           byte[][]              = []
+		// Address validation (RFC 9000 §8): a server sends at most three
+		// times what it received until the client's address is proven.
+		addressValidated   bool                  = false
+		// Client: the server showed it validated this address, by
+		// acknowledging a Handshake packet (RFC 9002 §6.2.2.1).
+		peerValidated      bool                  = false
+		bytesReceived      int                   = 0
+		bytesSent          int                   = 0
+		// Connection flow control: what the peer allows, what was sent;
+		// what this side allows, what arrived, what readers took.
+		sendMax            int                   = 0
+		sentData           int                   = 0
+		recvMax            int                   = 0
+		recvData           int                   = 0
+		recvConsumed       int                   = 0
+		owesMaxData        bool                  = false
+		// Streams.
+		streams            map<int, StreamState>
+		// How many streams of each kind this side opened, and may open.
+		openedBidi         int                   = 0
+		openedUni          int                   = 0
+		peerMaxBidi        int                   = 0
+		peerMaxUni         int                   = 0
+		// How many the peer opened (highest index + 1), and may open.
+		peerOpenedBidi     int                   = 0
+		peerOpenedUni      int                   = 0
+		localMaxBidi       int                   = 0
+		localMaxUni        int                   = 0
+		owesMaxStreamsBidi bool                  = false
+		owesMaxStreamsUni  bool                  = false
+		accepted           StreamState[]         = []
+		acceptedUni        StreamState[]         = []
+		// Streams with frames owed (RESET_STREAM, STOP_SENDING,
+		// MAX_STREAM_DATA) or data to send.
+		acceptSignal       channel<none>
+		// Wakes tasks waiting to open a stream or for the handshake.
+		readySignal        channel<none>
+		// Path validation.
+		pathResponses      byte[][]              = []
+		pathChallenge      byte[]                = []
+		pathCandidate      string                = ""
+		pingOwed           bool                  = false
+		// Key update (RFC 9001 §6).
+		keyPhase           int                   = 0
+		nextRecvKeys       ?Keys                 = none
+		updateAckedAt      int                   = -1
+		sentInPhase        int                   = 0
+		// Datagrams (RFC 9221).
+		datagramsIn        byte[][]              = []
+		datagramsOut       byte[][]              = []
+		datagramSignal     channel<none>
+		// Timers, microseconds.
+		lastActivity       int                   = 0
+		lastSent           int                   = 0
+		idleTimeout        int                   = 0
+		createdAt          int                   = 0
+		// Wakes the driver task.
+		driverSignal       channel<none>
+
+		def new(isClient bool, settings Settings, sink PacketSink, peer string) {
+			self.isClient = isClient
+			self.settings = settings
+			self.sink = sink
+			self.peer = peer
+			spaces = [new Space(spaceInitial), new Space(spaceHandshake), new Space(spaceApplication)]
+			recovery = new Recovery(baseDatagram)
+			handshakeSignal = new channel<none>(1)
+			acceptSignal = new channel<none>(1)
+			readySignal = new channel<none>(1)
+			datagramSignal = new channel<none>(1)
+			driverSignal = new channel<none>(1)
+			createdAt = nowMicros()
+			lastActivity = createdAt
+			lastSent = createdAt
+			idleTimeout = settings.idleTimeout
+			recvMax = settings.maxData
+			localMaxBidi = settings.maxStreamsBidi
+			localMaxUni = settings.maxStreamsUni
+			localParams = Parameters{maxIdleTimeout: settings.idleTimeout / 1000, initialMaxData: settings.maxData, initialMaxStreamBidiLocal: settings.maxStreamData, initialMaxStreamBidiRemote: settings.maxStreamData, initialMaxStreamUni: settings.maxStreamData, initialMaxStreamsBidi: settings.maxStreamsBidi, initialMaxStreamsUni: settings.maxStreamsUni, maxUDPPayloadSize: 65527, activeConnectionIDLimit: 4, maxDatagramFrameSize: settings.maxDatagramFrame}
+			peerParams = Parameters{}
+			addressValidated = isClient
+		}
+
+		// ---- Setup -----------------------------------------------------
+
+		// startClient picks the connection IDs of a new client connection
+		// and keys the Initial space. Fails when the random source does.
+		def startClient() !none {
+			originalDCID = try rand(localIDLength)
+			dcid = originalDCID
+			try issueLocalID()
+			localParams.initialSCID = localIDs[0].id
+			localParams.hasInitialSCID = true
+			return try keyInitial(originalDCID)
+		}
+
+		// startServer keys a server connection from the client's first
+		// Initial: `original` is the destination ID the handshake keys
+		// come from, `first` the one before a Retry (they are equal when
+		// there was none). Fails when the random source does.
+		def startServer(original byte[], first byte[], clientSCID byte[], retriedWith byte[]) !none {
+			originalDCID = original
+			dcid = clientSCID
+			peerInitialSCID = clientSCID
+			sawPeerInitial = true
+			peerIDs.push(PeerID{sequence: 0, id: clientSCID})
+			try issueLocalID()
+			localParams.initialSCID = localIDs[0].id
+			localParams.hasInitialSCID = true
+			localParams.originalDCID = first
+			localParams.hasOriginalDCID = true
+			localParams.statelessResetToken = localIDs[0].resetToken
+			if retriedWith.len() > 0 {
+				localParams.retrySCID = retriedWith
+				localParams.hasRetrySCID = true
+				// The token proved the address.
+				addressValidated = true
+			}
+			return try keyInitial(original)
+		}
+
+		def keyInitial(id byte[]) !none {
+			let (client, server) = try initialKeys(id)
+			spaces[spaceInitial].sendKeys = isClient ?? (client, server)
+			spaces[spaceInitial].recvKeys = isClient ?? (server, client)
+			return none
+		}
+
+		// issueLocalID makes a new connection ID for the peer to use and
+		// routes it to this connection.
+		def issueLocalID() !none {
+			let id = try rand(localIDLength)
+			let entry = LocalID{sequence: nextLocalSequence, id: id, resetToken: sink.resetTokenFor(id), announce: nextLocalSequence > 0}
+			nextLocalSequence++
+			localIDs.push(entry)
+			sink.bindID(id, self)
+			return none
+		}
+
+		// ---- Signals ---------------------------------------------------
+
+		def wakeDriver() {
+			driverSignal.offer(none)
+		}
+
+		def wakeAll() {
+			handshakeSignal.offer(none)
+			acceptSignal.offer(none)
+			readySignal.offer(none)
+			datagramSignal.offer(none)
+			for let (_, s) in streams {
+				s.wake()
+			}
+		}
+
+		// ---- TLS carrier (tls.HandshakeCarrier) ------------------------
+
+		// Implements tls.HandshakeCarrier: queues handshake bytes on the
+		// CRYPTO stream of the level.
+		def sendHandshake(level int, data byte[]) !none {
+			queueCrypto(level, data)
+			wakeDriver()
+			return none
+		}
+
+		atomic def queueCrypto(level int, data byte[]) {
+			spaces[level].cryptoSend.write(data)
+		}
+
+		// Implements tls.HandshakeCarrier: waits for CRYPTO bytes of the
+		// level. Fails with the connection's error once it is closed.
+		def receiveHandshake(level int) !byte[] {
+			let buf byte[] = []
+			buf.len(4096)
+			for {
+				let n = takeCrypto(level, buf)
+				return buf[:n].clone() when n > 0
+				let ended = closeError
+				fail ended unless ended is none
+				fail ClosedError{message: "quic: the connection closed during the handshake"} when state >= stateClosing
+				select {
+					case handshakeSignal:
+						handshakeSignal.flush()
+				}
+			}
+			fail "unreachable"
+		}
+
+		atomic def takeCrypto(level int, buf byte[]) int {
+			return spaces[level].cryptoRecv.read(buf)
+		}
+
+		// Implements tls.HandshakeCarrier: keys one direction of a level.
+		// Fails when the keys cannot be derived.
+		def installSecret(level int, forWriting bool, suite tls.CipherSuite, secret byte[]) !none {
+			let keys = try deriveKeys(suite, secret)
+			setKeys(level, forWriting, keys)
+			if !forWriting {
+				// Packets of this level that came before its keys.
+				for let packet in takeDeferred() {
+					receive(packet, peer)
+				}
+			}
+			wakeDriver()
+			return none
+		}
+
+		atomic def setKeys(level int, forWriting bool, keys Keys) {
+			if forWriting {
+				spaces[level].sendKeys = keys
+			} else {
+				spaces[level].recvKeys = keys
+			}
+		}
+
+		// runHandshake drives TLS to the end on the caller's task and
+		// applies what it negotiated; a failure closes the connection
+		// with the matching CRYPTO_ERROR.
+		def runHandshake() {
+			let failure ?error = none
+			handshakeSteps() onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				abort(failure)
+			} else {
+				sink.established(self)
+			}
+			wakeDriver()
+		}
+
+		def handshakeSteps() !none {
+			let io = new NullIO()
+			let records = new tls.RecordLayer(io, io)
+			records.carrier = self
+			let cfg = tls.withServerName(settings.tlsConfig, settings.tlsConfig.serverName)
+			cfg.minVersion = tls.Version.TLS13
+			cfg.maxVersion = tls.Version.TLS13
+			let own = encodeParameters(localParams)
+			if isClient {
+				let hs = new tls.ClientHandshake(cfg, records)
+				hs.quicParameters = own
+				try hs.run()
+				return try completeHandshake(hs.peerQuicParameters, hs.state)
+			}
+			let hs = new tls.ServerHandshake(cfg, records)
+			hs.quicParameters = own
+			try hs.run()
+			return try completeHandshake(hs.peerQuicParameters, hs.state)
+		}
+
+		// completeHandshake checks the peer's transport parameters
+		// against the connection IDs seen (RFC 9000 §7.3) and opens the
+		// connection for streams.
+		atomic def completeHandshake(encoded byte[], negotiated tls.ConnectionState) !none {
+			let p = try decodeParameters(encoded, isClient)
+			fail transportError(TransportCode.TransportParameter, "the peer's initial_source_connection_id does not match its packets") unless p.hasInitialSCID && p.initialSCID.equals(peerInitialSCID)
+			if isClient {
+				fail transportError(TransportCode.TransportParameter, "original_destination_connection_id does not match") unless p.hasOriginalDCID && p.originalDCID.equals(originalDCID)
+				fail transportError(TransportCode.TransportParameter, "retry_source_connection_id does not match") unless p.hasRetrySCID == retried && (!retried || p.retrySCID.equals(retrySCID))
+				for let entry in peerIDs {
+					entry.resetToken = p.statelessResetToken when entry.sequence == 0
+				}
+			}
+			peerParams = p
+			sendMax = p.initialMaxData
+			peerMaxBidi = p.initialMaxStreamsBidi
+			peerMaxUni = p.initialMaxStreamsUni
+			recovery.maxAckDelay = p.maxAckDelay * 1000
+			let theirs = p.maxIdleTimeout * 1000
+			idleTimeout = theirs when theirs > 0 && (idleTimeout == 0 || theirs < idleTimeout)
+			alpn = negotiated.alpn
+			tlsState = negotiated
+			handshakeComplete = true
+			state = stateEstablished when state == stateHandshaking
+			if !isClient {
+				// The server confirms the handshake at once and tells the
+				// client (RFC 9001 §4.1.2).
+				handshakeConfirmed = true
+				handshakeDoneOwed = true
+				dropSpace(spaceHandshake)
+			}
+			// More connection IDs for the peer, up to its limit.
+			let want = p.activeConnectionIDLimit
+			want = 4 when want > 4
+			for localIDs.len() < want {
+				issueLocalID() onerror recover none
+			}
+			for let (_, s) in streams {
+				s.sendMax = sendLimitFor(s.id)
+			}
+			wakeAll()
+			return none
+		}
+
+		// dropSpace discards the keys and state of a packet number space
+		// (RFC 9001 §4.9).
+		def dropSpace(index int) {
+			let space = spaces[index]
+			return when space.discarded
+			space.discarded = true
+			space.sendKeys = none
+			space.recvKeys = none
+			recovery.discard(space.sent)
+			space.sent = []
+			space.lossTime = -1
+			space.lastElicitingSent = -1
+			space.ackOwed = false
+			space.probes = 0
+			recovery.ptoCount = 0
+		}
+
+		// ---- Closing ---------------------------------------------------
+
+		// abort closes the connection for an error of this side: a
+		// TransportError goes out with its code, a TLS alert as
+		// CRYPTO_ERROR, anything else as INTERNAL_ERROR.
+		atomic def abort(err error) {
+			return when state >= stateClosing
+			let code = TransportCode.InternalError.value
+			let frameType = 0
+			if err is TransportError {
+				code = err.wireCode
+				frameType = err.frameType
+			} else if err is tls.TLSError {
+				code = 0x100 + int(err.alert)
+			}
+			beginClose(err, code, false, frameType, err.message)
+		}
+
+		// closeWith closes the connection for the application with its
+		// code and reason.
+		atomic def closeWith(code int, reason string) {
+			return when state >= stateClosing
+			beginClose(ClosedError{message: "quic: the connection was closed", reason: "closed"}, code, true, 0, reason)
+		}
+
+		def beginClose(err error, code int, app bool, frameType int, reason string) {
+			closeError = err
+			closeCode = code
+			closeIsApp = app
+			closeFrameType = frameType
+			closeReason = reason.len() > 200 ?? (reason[:200], reason)
+			state = stateClosing
+			closeSends = 1
+			closeDeadline = nowMicros() + 3 * recovery.ptoInterval(true)
+			wakeAll()
+			wakeDriver()
+		}
+
+		// drain ends the connection without sending: the peer closed it,
+		// reset it, or it idled out.
+		def drain(err error) {
+			return when state >= stateDraining
+			closeError = err when closeError is none || state < stateClosing
+			state = stateDraining
+			closeDeadline = nowMicros() + 3 * recovery.ptoInterval(true)
+			wakeAll()
+			wakeDriver()
+		}
+
+		// ---- Receiving -------------------------------------------------
+
+		// receive processes one datagram from `from`.
+		atomic def receive(datagram byte[], from string) {
+			return when state >= stateDraining
+			if state == stateClosing {
+				// Packets that still arrive are answered with the close
+				// again, for the first and then every time their count
+				// doubles (RFC 9000 §10.2.1).
+				closeReceived++
+				closeSends = 1 when (closeReceived & (closeReceived - 1)) == 0
+			}
+			let now = nowMicros()
+			bytesReceived += datagram.len()
+			let offset = 0
+			for offset < datagram.len() {
+				let h = parseHeader(datagram, offset, localIDLength)
+				break unless h.ok
+				let next = h.end
+				let failure ?error = none
+				receivePacket(datagram, offset, h, from, now) onerror (err error) {
+					failure = err
+					recover none
+				}
+				if !(failure is none) {
+					abortLocked(failure)
+					return
+				}
+				break when h.kind == packetShort || h.kind == packetRetry || h.kind == packetVersionNegotiation
+				offset = next
+			}
+		}
+
+		// abortLocked is `abort` for code already inside an atomic method.
+		def abortLocked(err error) {
+			return when state >= stateClosing
+			let code = TransportCode.InternalError.value
+			let frameType = 0
+			if err is TransportError {
+				code = err.wireCode
+				frameType = err.frameType
+			} else if err is tls.TLSError {
+				code = 0x100 + int(err.alert)
+			}
+			beginClose(err, code, false, frameType, err.message)
+		}
+
+		def receivePacket(datagram byte[], start int, h Header, from string, now int) !none {
+			if h.kind == packetVersionNegotiation {
+				// Only before any packet of the server was read, and only
+				// when it does not list the version in use (RFC 9000 §6.2).
+				return none unless isClient && !sawPeerInitial && !h.versions.includes(version1)
+				drain(ClosedError{message: "quic: the server speaks none of this endpoint's versions", reason: "version"})
+				return none
+			}
+			return none when h.version != version1 && h.kind != packetShort
+			return try receiveRetry(datagram, start, h) when h.kind == packetRetry
+			return none when h.kind == packetZeroRTT
+			let index = spaceApplication
+			index = spaceInitial when h.kind == packetInitial
+			index = spaceHandshake when h.kind == packetHandshake
+			let space = spaces[index]
+			return none when space.discarded
+			let keys = space.recvKeys
+			if keys is none {
+				// The keys are not there yet: keep the packet for when
+				// they are.
+				deferred.push(datagram[start:h.end].clone()) when deferred.len() < 16
+				return none
+			}
+			let opened = try unprotect(keys, datagram, start, h, space.largestReceived)
+			return none unless opened.ok
+			let payload byte[] = []
+			let decrypted = false
+			if h.kind == packetShort {
+				let (plain, ok) = try openShort(space, keys, opened)
+				payload = plain
+				decrypted = ok
+			} else {
+				payload = open(keys, opened) onerror (err error) {
+					recover []
+				}
+				decrypted = payload.len() > 0
+			}
+			if !decrypted {
+				checkStatelessReset(datagram) when h.kind == packetShort
+				return none
+			}
+			// Reserved bits must be zero once the packet authenticated.
+			let reserved = h.kind == packetShort ?? (opened.first & 0x18, opened.first & 0x0c)
+			fail transportError(TransportCode.ProtocolViolation, "reserved header bits are set") when reserved != 0
+			return none when space.received.contains(opened.pn)
+			if h.kind == packetInitial && !sawPeerInitial {
+				// The server's first Initial names the ID to send to from
+				// now on (RFC 9000 §7.2).
+				sawPeerInitial = true
+				peerInitialSCID = h.scid.clone()
+				dcid = peerInitialSCID
+				peerIDs.push(PeerID{sequence: 0, id: peerInitialSCID})
+			}
+			if h.kind == packetHandshake && !isClient {
+				// A Handshake packet proves the client's address and ends
+				// the Initial space (RFC 9001 §4.9.1).
+				addressValidated = true
+				dropSpace(spaceInitial)
+			}
+			let frames = try parseFrames(payload)
+			if state == stateClosing {
+				// Only the peer's own close matters now: it ends the
+				// exchange of close frames.
+				for let f in frames {
+					continue unless f.kind := frameConnectionClose || frameApplicationClose
+					state = stateDraining
+					closeSends = 0
+				}
+				return none
+			}
+			lastActivity = now
+			let eliciting = false
+			for let f in frames {
+				eliciting = true unless f.kind := frameAck || frameConnectionClose || frameApplicationClose
+				try checkFrameAllowed(index, f)
+				try handleFrame(space, f, now)
+			}
+			noteReceived(space, opened.pn, eliciting, now)
+			if index == spaceApplication && from != peer && from != pathCandidate && state == stateEstablished && !isClient {
+				// The client's address changed: prove the new one before
+				// moving to it (RFC 9000 §9.3).
+				pathCandidate = from
+				pathChallenge = rand(8) onerror recover [1, 2, 3, 4, 5, 6, 7, 8]
+			}
+			return none
+		}
+
+		// openShort decrypts a 1-RTT packet, following the peer through a
+		// key update when the key phase bit flipped (RFC 9001 §6.3).
+		def openShort(space Space, keys Keys, opened Opened) !(byte[], bool) {
+			let phase = int(opened.first >> 2) & 0x01
+			if phase == keyPhase {
+				let failed = false
+				let plain = open(keys, opened) onerror (err error) {
+					failed = true
+					recover []
+				}
+				return (plain, !failed)
+			}
+			// A flipped bit on an old packet number is a late packet of
+			// the previous phase: nothing to open it with any more.
+			return ([], false) when opened.pn <= space.largestReceived
+			let held = nextRecvKeys
+			let upcoming = held is none ?? (try nextKeys(keys), held)
+			nextRecvKeys = upcoming
+			let failed = false
+			let plain = open(upcoming, opened) onerror (err error) {
+				failed = true
+				recover []
+			}
+			return ([], false) when failed
+			// The peer updated: follow with both directions.
+			space.recvKeys = upcoming
+			nextRecvKeys = none
+			let sending = space.sendKeys
+			space.sendKeys = try nextKeys(sending) unless sending is none
+			keyPhase = phase
+			sentInPhase = 0
+			updateAckedAt = -1
+			return (plain, true)
+		}
+
+		// checkStatelessReset ends the connection when an unreadable
+		// datagram ends in a reset token the peer issued (RFC 9000 §10.3).
+		def checkStatelessReset(datagram byte[]) {
+			return when datagram.len() < 21
+			let tail = datagram[datagram.len() - 16:]
+			for let entry in peerIDs {
+				continue unless entry.resetToken.len() == 16 && entry.resetToken.equals(tail)
+				drain(ClosedError{message: "quic: the peer reset the connection", reason: "reset"})
+				state = stateClosed
+				return
+			}
+		}
+
+		// receiveRetry restarts the handshake with the server's token
+		// (RFC 9000 §17.2.5): once, before any other packet of the server,
+		// and only when the integrity tag proves it saw the first Initial.
+		def receiveRetry(datagram byte[], start int, h Header) !none {
+			return none unless isClient && !retried && !sawPeerInitial && h.token.len() > 0
+			let tag = try retryTag(originalDCID, datagram[start:datagram.len() - 16])
+			return none unless tag.equals(datagram[datagram.len() - 16:])
+			retried = true
+			retrySCID = h.scid.clone()
+			retryToken = h.token.clone()
+			dcid = retrySCID
+			try keyInitial(retrySCID)
+			// Everything sent so far goes again under the new keys.
+			let space = spaces[spaceInitial]
+			for let p in space.sent {
+				requeue(space, p)
+			}
+			recovery.discard(space.sent)
+			space.sent = []
+			space.lastElicitingSent = -1
+			return none
+		}
+
+		def checkFrameAllowed(index int, f Frame) !none {
+			return none when index == spaceApplication
+			return none when f.kind := frameAck || frameCrypto || framePing || frameConnectionClose
+			fail transportError(TransportCode.ProtocolViolation, "frame type {f.kind} in an Initial or Handshake packet", f.kind)
+		}
+
+		def noteReceived(space Space, pn int, eliciting bool, now int) {
+			space.received.add(pn, pn + 1)
+			space.received.keepLast(32)
+			let outOfOrder = pn != space.largestReceived + 1
+			if pn > space.largestReceived {
+				space.largestReceived = pn
+				space.largestReceivedAt = now
+			}
+			return unless eliciting
+			space.ackOwed = true
+			space.elicitingUnacked++
+			// Handshake packets and gaps are acknowledged at once, 1-RTT
+			// packets after two or the peer-visible delay (RFC 9000 §13.2).
+			if space.index != spaceApplication || outOfOrder || space.elicitingUnacked >= 2 {
+				space.ackDeadline = now
+			} else if space.ackDeadline < 0 {
+				space.ackDeadline = now + 20000
+			}
+		}
+
+		// ---- Frames ----------------------------------------------------
+
+		def handleFrame(space Space, f Frame, now int) !none {
+			let kind = f.kind
+			return try handleAck(space, f, now) when kind == frameAck
+			if kind == frameCrypto {
+				fail transportError(TransportCode.CryptoBufferExceeded, "CRYPTO data arrives too far ahead", kind) when f.offset + f.data.len() > space.cryptoRecv.delivered + cryptoBufferLimit
+				return none when handshakeComplete && space.index == spaceApplication
+				space.cryptoRecv.insert(f.offset, f.data)
+				handshakeSignal.offer(none)
+				return none
+			}
+			return none when kind == framePing
+			if kind := frameConnectionClose || frameApplicationClose {
+				if kind == frameApplicationClose {
+					drain(ApplicationError{message: "quic: the peer closed the connection: {f.reason} (code {f.value})", appCode: f.value})
+				} else if f.value == 0 {
+					drain(ClosedError{message: "quic: the peer closed the connection", reason: "closed"})
+				} else {
+					drain(TransportError{message: "quic: the peer closed the connection: {f.reason} ({transportCodeOf(f.value)})", kind: transportCodeOf(f.value), wireCode: f.value, frameType: f.frameType, remote: true})
+				}
+				return none
+			}
+			return try handleStream(f) when kind == frameStream
+			if kind == frameMaxData {
+				if f.value > sendMax {
+					sendMax = f.value
+					wakeWriters()
+				}
+				return none
+			}
+			if kind == frameMaxStreamData {
+				let s = try streamFor(f.streamID, kind, true)
+				return none when s is none
+				if f.value > s.sendMax {
+					s.sendMax = f.value
+					s.wake()
+				}
+				return none
+			}
+			if kind := frameMaxStreamsBidi || frameMaxStreamsUni {
+				fail transportError(TransportCode.FrameEncoding, "MAX_STREAMS passes 2^60", kind) when f.value > 1152921504606846976
+				if kind == frameMaxStreamsBidi {
+					peerMaxBidi = f.value when f.value > peerMaxBidi
+				} else {
+					peerMaxUni = f.value when f.value > peerMaxUni
+				}
+				readySignal.offer(none)
+				return none
+			}
+			if kind == frameResetStream {
+				let s = try streamFor(f.streamID, kind, false)
+				return none when s is none
+				return try handleReset(s, f)
+			}
+			if kind == frameStopSending {
+				let s = try streamFor(f.streamID, kind, true)
+				return none when s is none
+				if s.stoppedCode < 0 {
+					s.stoppedCode = f.value
+					// The answer is a reset with the same code (RFC 9000
+					// §3.5).
+					resetLocked(s, f.value)
+					s.wake()
+				}
+				return none
+			}
+			if kind := frameDataBlocked || frameStreamDataBlocked || frameStreamsBlockedBidi || frameStreamsBlockedUni {
+				return none
+			}
+			return try handleNewConnectionID(f) when kind == frameNewConnectionID
+			return try handleRetireConnectionID(f) when kind == frameRetireConnectionID
+			if kind == framePathChallenge {
+				pathResponses.push(f.data.clone()) when pathResponses.len() < 8
+				return none
+			}
+			if kind == framePathResponse {
+				if pathChallenge.len() == 8 && f.data.equals(pathChallenge) {
+					// The new address answered: move to it and start its
+					// congestion state over (RFC 9000 §9.4).
+					peer = pathCandidate
+					pathCandidate = ""
+					pathChallenge = []
+					recovery = new Recovery(recovery.maxDatagram)
+					recovery.maxAckDelay = peerParams.maxAckDelay * 1000
+				}
+				return none
+			}
+			if kind == frameHandshakeDone {
+				fail transportError(TransportCode.ProtocolViolation, "a client sent HANDSHAKE_DONE", kind) unless isClient
+				if !handshakeConfirmed {
+					handshakeConfirmed = true
+					dropSpace(spaceHandshake)
+				}
+				return none
+			}
+			if kind == frameNewToken {
+				fail transportError(TransportCode.ProtocolViolation, "a client sent NEW_TOKEN", kind) unless isClient
+				return none
+			}
+			if kind == frameDatagram {
+				fail transportError(TransportCode.ProtocolViolation, "DATAGRAM frames were not negotiated", kind) when settings.maxDatagramFrame == 0
+				fail transportError(TransportCode.ProtocolViolation, "a DATAGRAM frame is larger than this endpoint accepts", kind) when f.data.len() > settings.maxDatagramFrame
+				if datagramsIn.len() < 256 {
+					datagramsIn.push(f.data.clone())
+					datagramSignal.offer(none)
+				}
+				return none
+			}
+			return none
+		}
+
+		def wakeWriters() {
+			for let (_, s) in streams {
+				s.wake() when s.canSend
+			}
+		}
+
+		// handleAck settles the packets an ACK frame covers, samples the
+		// round-trip time and looks for losses (RFC 9002 §5, §6, §7).
+		def handleAck(space Space, f Frame, now int) !none {
+			let largest = f.ranges[0].largest
+			fail transportError(TransportCode.ProtocolViolation, "an ACK covers a packet that was never sent", frameAck) when largest >= space.nextPN
+			let acked SentPacket[] = []
+			let kept SentPacket[] = []
+			for let p in space.sent {
+				let covered = false
+				for let r in f.ranges {
+					break when p.pn > r.largest
+					if p.pn >= r.smallest {
+						covered = true
+						break
+					}
+				}
+				if covered {
+					acked.push(p)
+				} else {
+					kept.push(p)
+				}
+			}
+			return none when acked.len() == 0
+			space.sent = kept
+			let newest = acked[acked.len() - 1]
+			space.largestAcked = largest when largest > space.largestAcked
+			peerValidated = true when space.index == spaceHandshake
+			if newest.pn == largest && anyEliciting(acked) {
+				let exponent = handshakeComplete ?? (peerParams.ackDelayExponent, 3)
+				recovery.updateRTT(now - newest.sentAt, f.ackDelay << exponent, handshakeConfirmed)
+			}
+			for let p in acked {
+				recovery.onAcked(p)
+				for let frame in p.frames {
+					settle(space, frame)
+				}
+			}
+			// An acknowledgment resets the probe backoff, unless a client
+			// cannot yet know its address was validated (RFC 9002 §6.2.1).
+			recovery.ptoCount = 0 when !isClient || handshakeConfirmed || peerValidated
+			updateAckedAt = now when space.index == spaceApplication && updateAckedAt < 0 && sentInPhase > 0
+			detectLost(space, now)
+			wakeWriters()
+			return none
+		}
+
+		def anyEliciting(packets SentPacket[]) bool {
+			for let p in packets {
+				return true when p.ackEliciting
+			}
+			return false
+		}
+
+		// settle records that a sent frame arrived.
+		def settle(space Space, frame SentFrame) {
+			let kind = frame.kind
+			if kind == sentCrypto {
+				space.cryptoSend.ack(frame.offset, frame.size, false)
+				return
+			}
+			if kind == sentAck {
+				// The peer saw this ACK: ranges under what it covered need
+				// no further acknowledgment (RFC 9000 §13.2.4).
+				space.received.removeBelow(frame.value)
+				return
+			}
+			if kind := sentStream || sentResetStream {
+				let s = streams.get(frame.streamID)
+				return when s is none
+				if kind == sentStream {
+					s.send.ack(frame.offset, frame.size, frame.fin)
+				} else {
+					s.resetAcked = true
+				}
+				s.wake()
+				retireStream(s)
+			}
+		}
+
+		// detectLost declares packets lost that a later acknowledged one
+		// passed by three, or that were sent long enough before it (RFC
+		// 9002 §6.1), and queues what they carried again.
+		def detectLost(space Space, now int) {
+			space.lossTime = -1
+			return when space.largestAcked < 0
+			let delay = recovery.lossDelay()
+			let lost SentPacket[] = []
+			let kept SentPacket[] = []
+			for let p in space.sent {
+				if p.pn > space.largestAcked {
+					kept.push(p)
+					continue
+				}
+				if p.sentAt <= now - delay || space.largestAcked >= p.pn + packetThreshold {
+					lost.push(p)
+					continue
+				}
+				let at = p.sentAt + delay
+				space.lossTime = at when space.lossTime < 0 || at < space.lossTime
+				kept.push(p)
+			}
+			return when lost.len() == 0
+			space.sent = kept
+			// Losses that span more than three probe timeouts, with
+			// nothing acknowledged between, are persistent congestion.
+			let persistent = recovery.hasRTT && lost.len() >= 2 && lost[lost.len() - 1].sentAt - lost[0].sentAt > recovery.persistentDuration()
+			recovery.onLost(lost, now, persistent)
+			for let p in lost {
+				requeue(space, p)
+			}
+		}
+
+		// requeue marks what a packet carried for sending again.
+		def requeue(space Space, p SentPacket) {
+			for let frame in p.frames {
+				let kind = frame.kind
+				if kind == sentCrypto {
+					space.cryptoSend.lose(frame.offset, frame.size, false)
+				} else if kind == sentStream {
+					let s = streams.get(frame.streamID)
+					continue when s is none
+					s.send.lose(frame.offset, frame.size, frame.fin) when s.resetCode < 0
+				} else if kind == sentResetStream {
+					let s = streams.get(frame.streamID)
+					continue when s is none
+					s.resetSent = false unless s.resetAcked
+				} else if kind == sentStopSending {
+					let s = streams.get(frame.streamID)
+					continue when s is none
+					s.stopSent = false
+				} else if kind == sentMaxStreamData {
+					let s = streams.get(frame.streamID)
+					continue when s is none
+					s.owesMaxData = true
+				} else if kind == sentMaxData {
+					owesMaxData = true
+				} else if kind == sentMaxStreamsBidi {
+					owesMaxStreamsBidi = true
+				} else if kind == sentMaxStreamsUni {
+					owesMaxStreamsUni = true
+				} else if kind == sentHandshakeDone {
+					handshakeDoneOwed = true
+				} else if kind == sentNewConnectionID {
+					for let entry in localIDs {
+						entry.announce = true when entry.sequence == frame.value
+					}
+				} else if kind == sentRetireConnectionID {
+					retiring.push(frame.value) unless retiring.includes(frame.value)
+				}
+			}
+		}
+
+		// ---- Streams, receiving side ------------------------------------
+
+		// streamFor finds the stream a frame names, creating a stream the
+		// peer opens with it. `sending` says whether the frame concerns
+		// this side's sending half. It returns none for a stream that is
+		// already closed and forgotten.
+		// Fails with TransportError: StreamState for a frame on the wrong
+		// direction or on a stream this side has not opened, StreamLimit
+		// when the peer passes its stream limit.
+		def streamFor(id int, kind int, sending bool) !?StreamState {
+			let uni = streamIsUni(id)
+			let mine = streamByClient(id) == isClient
+			if uni {
+				fail transportError(TransportCode.StreamState, "a frame for the sending half of a stream this endpoint only receives on", kind) when sending && !mine
+				fail transportError(TransportCode.StreamState, "a frame for the receiving half of a stream this endpoint only sends on", kind) when !sending && mine
+			}
+			let existing = streams.get(id)
+			return existing unless existing is none
+			let ordinal = id >> 2
+			if mine {
+				let opened = uni ?? (openedUni, openedBidi)
+				fail transportError(TransportCode.StreamState, "a frame for stream {id}, which this endpoint has not opened", kind) when ordinal >= opened
+				return none
+			}
+			let limit = uni ?? (localMaxUni, localMaxBidi)
+			fail transportError(TransportCode.StreamLimit, "the peer opened stream {id} past its limit", kind) when ordinal >= limit
+			let seen = uni ?? (peerOpenedUni, peerOpenedBidi)
+			return none when ordinal < seen
+			// Opening a stream opens every lower one of its kind (RFC
+			// 9000 §3.2).
+			let made ?StreamState = none
+			for let i = seen; i <= ordinal; i++ {
+				let s = newStream((i << 2) | (id & 0x03))
+				s.announced = true
+				if uni {
+					acceptedUni.push(s)
+				} else {
+					accepted.push(s)
+				}
+				made = s
+			}
+			if uni {
+				peerOpenedUni = ordinal + 1
+			} else {
+				peerOpenedBidi = ordinal + 1
+			}
+			acceptSignal.offer(none)
+			return made
+		}
+
+		def newStream(id int) StreamState {
+			let s = new StreamState(id)
+			let uni = streamIsUni(id)
+			let mine = streamByClient(id) == isClient
+			s.canSend = !uni || mine
+			s.canReceive = !uni || !mine
+			s.sendMax = sendLimitFor(id)
+			s.recvWindow = settings.maxStreamData
+			s.recvMax = s.canReceive ?? (settings.maxStreamData, 0)
+			streams[id] = s
+			return s
+		}
+
+		// sendLimitFor is the peer's initial flow control limit for this
+		// side's sending on a stream (RFC 9000 §18.2).
+		def sendLimitFor(id int) int {
+			return peerParams.initialMaxStreamUni when streamIsUni(id)
+			return peerParams.initialMaxStreamBidiRemote when streamByClient(id) == isClient
+			return peerParams.initialMaxStreamBidiLocal
+		}
+
+		def handleStream(f Frame) !none {
+			let s = try streamFor(f.streamID, frameStream, false)
+			return none when s is none
+			let end = f.offset + f.data.len()
+			fail transportError(TransportCode.FinalSize, "data past the final size of stream {s.id}", frameStream) when s.recv.finalSize >= 0 && (end > s.recv.finalSize || (f.fin && end != s.recv.finalSize))
+			fail transportError(TransportCode.FinalSize, "stream {s.id} ends below data already received", frameStream) when f.fin && end < s.recv.highest
+			if end > s.recv.highest {
+				let grown = end - s.recv.highest
+				fail transportError(TransportCode.FlowControl, "stream {s.id} passes its flow control limit", frameStream) when end > s.recvMax
+				recvData += grown
+				fail transportError(TransportCode.FlowControl, "the connection passes its flow control limit", frameStream) when recvData > recvMax
+			}
+			return none when s.peerResetCode >= 0
+			s.recv.finalSize = end when f.fin
+			if s.stopCode >= 0 {
+				// Nobody reads this stream any more: count the bytes as
+				// consumed so the connection window keeps moving.
+				s.recv.highest = end when end > s.recv.highest
+				creditConnection(s, s.recv.highest - s.consumed)
+				return none
+			}
+			s.recv.insert(f.offset, f.data)
+			s.wake()
+			return none
+		}
+
+		def handleReset(s StreamState, f Frame) !none {
+			let size = f.offset
+			fail transportError(TransportCode.FinalSize, "RESET_STREAM changes the final size of stream {s.id}", frameResetStream) when s.recv.finalSize >= 0 && size != s.recv.finalSize
+			fail transportError(TransportCode.FinalSize, "RESET_STREAM ends stream {s.id} below data already received", frameResetStream) when size < s.recv.highest
+			if size > s.recv.highest {
+				recvData += size - s.recv.highest
+				fail transportError(TransportCode.FlowControl, "the connection passes its flow control limit", frameResetStream) when recvData > recvMax
+				s.recv.highest = size
+			}
+			return none when s.peerResetCode >= 0
+			s.recv.finalSize = size
+			s.peerResetCode = f.value
+			// What was not read will not be: release its share of the
+			// connection window.
+			creditConnection(s, size - s.consumed)
+			s.wake()
+			retireStream(s)
+			return none
+		}
+
+		// creditConnection counts bytes of a stream as consumed and opens
+		// the connection window when half of it is used.
+		def creditConnection(s StreamState, n int) {
+			return when n <= 0
+			s.consumed += n
+			recvConsumed += n
+			if recvMax - recvConsumed < settings.maxData / 2 {
+				recvMax = recvConsumed + settings.maxData
+				owesMaxData = true
+			}
+		}
+
+		// retireStream forgets a stream once both halves are over, and
+		// lets the peer open another in its place.
+		def retireStream(s StreamState) {
+			return when s.released || !s.sendDone() || !s.recvDone()
+			s.released = true
+			streams.delete(s.id)
+			return when streamByClient(s.id) == isClient
+			if streamIsUni(s.id) {
+				localMaxUni++
+				owesMaxStreamsUni = true
+			} else {
+				localMaxBidi++
+				owesMaxStreamsBidi = true
+			}
+		}
+
+		// ---- Connection IDs --------------------------------------------
+
+		def handleNewConnectionID(f Frame) !none {
+			fail transportError(TransportCode.ProtocolViolation, "NEW_CONNECTION_ID for a peer that uses no connection ID", frameNewConnectionID) when dcid.len() == 0
+			for let entry in peerIDs {
+				if entry.sequence == f.value {
+					fail transportError(TransportCode.ProtocolViolation, "a sequence number names two connection IDs", frameNewConnectionID) unless entry.id.equals(f.connectionID)
+					return none
+				}
+			}
+			retirePriorTo = f.retirePriorTo when f.retirePriorTo > retirePriorTo
+			if f.value < retirePriorTo {
+				// Already asked to be retired: answer and keep nothing.
+				retiring.push(f.value) unless retiring.includes(f.value)
+				return none
+			}
+			peerIDs.push(PeerID{sequence: f.value, id: f.connectionID.clone(), resetToken: f.resetToken.clone()})
+			let kept PeerID[] = []
+			for let entry in peerIDs {
+				if entry.sequence < retirePriorTo {
+					retiring.push(entry.sequence) unless retiring.includes(entry.sequence)
+					continue
+				}
+				kept.push(entry)
+			}
+			peerIDs = kept
+			fail transportError(TransportCode.ConnectionIDLimit, "the peer issued more connection IDs than this endpoint takes", frameNewConnectionID) when peerIDs.len() > localParams.activeConnectionIDLimit
+			if dcidSequence < retirePriorTo && peerIDs.len() > 0 {
+				dcid = peerIDs[0].id
+				dcidSequence = peerIDs[0].sequence
+			}
+			return none
+		}
+
+		def handleRetireConnectionID(f Frame) !none {
+			fail transportError(TransportCode.ProtocolViolation, "RETIRE_CONNECTION_ID for a sequence number never issued", frameRetireConnectionID) when f.value >= nextLocalSequence
+			let kept LocalID[] = []
+			let removed = false
+			for let entry in localIDs {
+				if entry.sequence == f.value {
+					sink.unbindID(entry.id)
+					removed = true
+					continue
+				}
+				kept.push(entry)
+			}
+			localIDs = kept
+			if removed {
+				issueLocalID() onerror recover none
+			}
+			return none
+		}
+
+		// ---- Timers ----------------------------------------------------
+
+		// nextDeadline is when the driver must call `onTimeout` at the
+		// latest, in microseconds of the monotonic clock; -1 for never.
+		atomic def nextDeadline() int {
+			return closeDeadline when state >= stateClosing
+			let at = -1
+			at = lastActivity + idleTimeout when idleTimeout > 0
+			if !handshakeComplete {
+				let limit = createdAt + settings.handshakeTimeout
+				at = limit when at < 0 || limit < at
+			}
+			if settings.keepAlive > 0 && state == stateEstablished {
+				let ping = lastSent + settings.keepAlive
+				at = ping when at < 0 || ping < at
+			}
+			for let space in spaces {
+				continue when space.discarded
+				at = space.lossTime when space.lossTime >= 0 && (at < 0 || space.lossTime < at)
+				at = space.ackDeadline when space.ackOwed && space.ackDeadline >= 0 && (at < 0 || space.ackDeadline < at)
+			}
+			let pto = ptoDeadline()
+			at = pto when pto >= 0 && (at < 0 || pto < at)
+			return at
+		}
+
+		// ptoDeadline is when the probe timeout fires (RFC 9002 §6.2):
+		// for the earliest space with an ack-eliciting packet in flight,
+		// or for a client that must keep the server unblocked while the
+		// handshake is not confirmed.
+		def ptoDeadline() int {
+			let backoff = 1 << (recovery.ptoCount > 16 ?? (16, recovery.ptoCount))
+			let at = -1
+			for let space in spaces {
+				continue when space.discarded || space.sendKeys is none
+				continue when space.index == spaceApplication && !handshakeComplete
+				continue unless space.elicitingInFlight()
+				let fire = space.lastElicitingSent + recovery.ptoInterval(space.index == spaceApplication) * backoff
+				at = fire when at < 0 || fire < at
+			}
+			return at when at >= 0
+			return -1 unless isClient && !handshakeConfirmed && !peerValidated && state == stateHandshaking
+			// Nothing in flight, but the server may be waiting for more
+			// from this address before it may send (RFC 9002 §6.2.2.1).
+			return lastSent + recovery.ptoInterval(false) * backoff
+		}
+
+		// onTimeout runs what is due at `now`.
+		atomic def onTimeout(now int) {
+			if state >= stateClosing {
+				state = stateClosed when closeDeadline >= 0 && now >= closeDeadline
+				return
+			}
+			if idleTimeout > 0 && now >= lastActivity + idleTimeout {
+				drain(ClosedError{message: "quic: the connection idled out", reason: "idle"})
+				state = stateClosed
+				return
+			}
+			if !handshakeComplete && now >= createdAt + settings.handshakeTimeout {
+				drain(ClosedError{message: "quic: the handshake did not finish in time", reason: "timeout"})
+				state = stateClosed
+				return
+			}
+			for let space in spaces {
+				continue when space.discarded
+				detectLost(space, now) when space.lossTime >= 0 && now >= space.lossTime
+				space.ackDeadline = now when space.ackOwed && space.ackDeadline >= 0 && now >= space.ackDeadline
+			}
+			let pto = ptoDeadline()
+			if pto >= 0 && now >= pto {
+				recovery.ptoCount++
+				// Probe in the space whose packets wait longest; with
+				// nothing in flight (a client keeping the server
+				// unblocked) in the Handshake space when it has keys,
+				// else the Initial one (RFC 9002 §6.2.4).
+				let pick = -1
+				for let space in spaces {
+					continue when space.discarded || space.sendKeys is none
+					continue when space.index == spaceApplication && !handshakeComplete
+					continue unless space.elicitingInFlight()
+					pick = space.index when pick < 0 || space.lastElicitingSent < spaces[pick].lastElicitingSent
+				}
+				if pick < 0 {
+					let handshake = spaces[spaceHandshake]
+					pick = handshake.discarded || handshake.sendKeys is none ?? (spaceInitial, spaceHandshake)
+				}
+				let chosen = spaces[pick]
+				chosen.probes = 2
+				// A probe carries the oldest data again when there is any.
+				for let p in chosen.sent {
+					continue unless p.ackEliciting
+					requeue(chosen, p)
+					break
+				}
+			}
+			pingOwed = true when settings.keepAlive > 0 && state == stateEstablished && now >= lastSent + settings.keepAlive
+		}
+
+		// ---- Sending ---------------------------------------------------
+
+		// assemble builds the datagrams that are due, each with the
+		// address it goes to.
+		atomic def assemble() (byte[][], string[]) {
+			let out byte[][] = []
+			let to string[] = []
+			return (out, to) when state >= stateDraining
+			let now = nowMicros()
+			if state == stateClosing {
+				// One CONNECTION_CLOSE now, and again for packets that
+				// still arrive (RFC 9000 §10.2.1).
+				return (out, to) when closeSends <= 0
+				closeSends = 0
+				let datagram = closeDatagram(now)
+				if datagram.len() > 0 {
+					out.push(datagram)
+					to.push(peer)
+				}
+				return (out, to)
+			}
+			if pathChallenge.len() == 8 && pathCandidate != "" {
+				let probe = pathProbe(now)
+				if probe.len() > 0 {
+					out.push(probe)
+					to.push(pathCandidate)
+				}
+			}
+			for let round = 0; round < 64; round++ {
+				let datagram = nextDatagram(now)
+				break when datagram.len() == 0
+				out.push(datagram)
+				to.push(peer)
+				bytesSent += datagram.len()
+			}
+			return (out, to)
+		}
+
+		// sendRoom is how many bytes this side may still send to an
+		// address it has not validated; a large number once it has.
+		def sendRoom() int {
+			return 1 << 40 when addressValidated
+			return 3 * bytesReceived - bytesSent
+		}
+
+		// nextDatagram builds one datagram with a packet of every space
+		// that has something to send; empty when nothing is due.
+		def nextDatagram(now int) byte[] {
+			let limit = recovery.maxDatagram
+			let room = sendRoom()
+			return [] when room <= 0
+			limit = room when room < limit
+			let datagram byte[] = []
+			// The spaces that put a packet in, and their payloads.
+			let indexes int[] = []
+			let payloads byte[][] = []
+			let records SentFrame[][] = []
+			let elicits bool[] = []
+			let used = 0
+			for let space in spaces {
+				continue when space.discarded || space.sendKeys is none
+				continue when space.index == spaceApplication && !handshakeComplete
+				let overhead = headerSize(space) + 16
+				let budget = limit - used - overhead
+				continue when budget < 32
+				let frames SentFrame[] = []
+				let payload byte[] = []
+				let eliciting = fillPayload(space, payload, frames, budget, now)
+				continue when payload.len() == 0
+				indexes.push(space.index)
+				payloads.push(payload)
+				records.push(frames)
+				elicits.push(eliciting)
+				used += overhead + payload.len()
+			}
+			return [] when indexes.len() == 0
+			// A datagram with an Initial packet is at least 1200 bytes
+			// (RFC 9000 §14.1): pad the last packet's payload.
+			let pad = 0
+			pad = baseDatagram - used when indexes.includes(spaceInitial) && used < baseDatagram && (isClient || elicits[0])
+			for let i = 0; i < indexes.len(); i++ {
+				let space = spaces[indexes[i]]
+				let payload = payloads[i]
+				if i == indexes.len() - 1 {
+					for let k = 0; k < pad; k++ {
+						payload.push(0)
+					}
+				}
+				sealPacket(space, datagram, payload, records[i], elicits[i], now)
+			}
+			return datagram
+		}
+
+		// headerSize is the bytes of the header the next packet of the
+		// space gets, packet number included.
+		def headerSize(space Space) int {
+			let pnLength = packetNumberLength(space.nextPN, space.largestAcked)
+			return 1 + dcid.len() + pnLength when space.index == spaceApplication
+			let size = 1 + 4 + 1 + dcid.len() + 1 + localIDs[0].id.len() + 2 + pnLength
+			size += varintSize(retryToken.len()) + retryToken.len() when space.index == spaceInitial
+			return size
+		}
+
+		// sealPacket writes the header of one packet behind what the
+		// datagram holds, protects it, and records it as sent.
+		def sealPacket(space Space, datagram byte[], payload byte[], frames SentFrame[], eliciting bool, now int) {
+			let keys = space.sendKeys
+			return when keys is none
+			let pn = space.nextPN
+			space.nextPN++
+			let pnLength = packetNumberLength(pn, space.largestAcked)
+			// The header protection sample starts four bytes behind the
+			// packet number.
+			for payload.len() + pnLength < 4 {
+				payload.push(0)
+			}
+			let start = datagram.len()
+			if space.index == spaceApplication {
+				shortHeader(datagram, dcid, keyPhase, false, pnLength)
+				sentInPhase++
+			} else {
+				let kind = space.index == spaceInitial ?? (packetInitial, packetHandshake)
+				let at = longHeader(datagram, kind, version1, dcid, localIDs[0].id, isClient ?? (retryToken, []), pnLength)
+				setLength(datagram, at, pnLength + payload.len() + 16)
+			}
+			putPacketNumber(datagram, pn, pnLength)
+			seal(keys, datagram, start, pnLength, pn, payload) onerror recover none
+			let size = datagram.len() - start
+			let packet = SentPacket{pn: pn, sentAt: now, size: size, ackEliciting: eliciting, inFlight: eliciting, frames: frames}
+			lastSent = now
+			if eliciting {
+				space.sent.push(packet)
+				space.lastElicitingSent = now
+				recovery.onSent(packet)
+			} else if frames.len() > 0 {
+				// An ACK-only packet is tracked so its own acknowledgment
+				// can trim the ranges, but never counts as in flight.
+				space.sent.push(packet)
+			}
+			dropSpace(spaceInitial) when space.index == spaceHandshake && isClient
+		}
+
+		// fillPayload writes the frames of the next packet of a space
+		// into `payload`, at most `budget` bytes, and records them. It
+		// returns whether the packet is ack-eliciting.
+		def fillPayload(space Space, payload byte[], frames SentFrame[], budget int, now int) bool {
+			let eliciting = false
+			let probing = space.probes > 0
+			// Data waits for the congestion window; acknowledgments and
+			// probes do not (RFC 9002 §7).
+			let open = recovery.canSend() || probing
+			let hasData = open && wantsToSend(space)
+			let ackDue = space.ackOwed && (space.ackDeadline >= 0 && now >= space.ackDeadline || hasData || probing)
+			if ackDue && !space.received.isEmpty() {
+				let ranges AckRange[] = []
+				for let i = space.received.count() - 1; i >= 0; i-- {
+					ranges.push(AckRange{smallest: space.received.starts[i], largest: space.received.ends[i] - 1})
+				}
+				let delay = now - space.largestReceivedAt
+				delay = 0 when delay < 0
+				putAck(payload, ranges, delay >> localParams.ackDelayExponent)
+				frames.push(SentFrame{kind: sentAck, value: ranges[ranges.len() - 1].smallest})
+				space.ackOwed = false
+				space.ackDeadline = -1
+				space.elicitingUnacked = 0
+			}
+			if open {
+				// CRYPTO first.
+				for space.cryptoSend.pending() && budget - payload.len() > 24 {
+					let (offset, chunk, _) = space.cryptoSend.take(budget - payload.len() - 16, 1 << 30)
+					break when offset < 0 || chunk.len() == 0
+					putCrypto(payload, offset, chunk)
+					frames.push(SentFrame{kind: sentCrypto, offset: offset, size: chunk.len()})
+					eliciting = true
+				}
+				if space.index == spaceApplication {
+					eliciting = true when fillControl(payload, frames, budget)
+					eliciting = true when fillStreams(payload, frames, budget)
+				}
+			}
+			if probing {
+				if !eliciting && budget - payload.len() >= 1 {
+					putVarint(payload, framePing)
+					eliciting = true
+				}
+				space.probes--
+			}
+			if pingOwed && space.index == spaceApplication && !eliciting && budget - payload.len() >= 1 {
+				putVarint(payload, framePing)
+				eliciting = true
+			}
+			pingOwed = false when space.index == spaceApplication && eliciting
+			return eliciting
+		}
+
+		// wantsToSend is whether a space has ack-eliciting frames waiting.
+		def wantsToSend(space Space) bool {
+			return true when space.cryptoSend.pending()
+			return false unless space.index == spaceApplication
+			return true when handshakeDoneOwed || owesMaxData || owesMaxStreamsBidi || owesMaxStreamsUni || pingOwed || retiring.len() > 0 || pathResponses.len() > 0 || datagramsOut.len() > 0
+			for let entry in localIDs {
+				return true when entry.announce
+			}
+			for let (_, s) in streams {
+				return true when streamWants(s)
+			}
+			return false
+		}
+
+		// streamWants is whether a stream has a frame to send now.
+		def streamWants(s StreamState) bool {
+			return true when s.owesMaxData || (s.stopCode >= 0 && !s.stopSent) || (s.resetCode >= 0 && !s.resetSent)
+			return false unless s.canSend && s.resetCode < 0
+			return true when !s.send.lost.isEmpty() || (s.send.finAt >= 0 && !s.send.finSent && s.send.next == s.send.finAt)
+			return s.send.hasNew() && s.send.next < s.sendMax && sentData < sendMax
+		}
+
+		// fillControl writes the connection-level frames that are owed.
+		def fillControl(payload byte[], frames SentFrame[], budget int) bool {
+			let any = false
+			if handshakeDoneOwed && budget - payload.len() >= 1 {
+				putVarint(payload, frameHandshakeDone)
+				frames.push(SentFrame{kind: sentHandshakeDone})
+				handshakeDoneOwed = false
+				any = true
+			}
+			for pathResponses.len() > 0 && budget - payload.len() >= 9 {
+				putVarint(payload, framePathResponse)
+				payload.push(...pathResponses[0])
+				pathResponses = pathResponses[1:].clone()
+				any = true
+			}
+			if owesMaxData && budget - payload.len() >= 9 {
+				putValue(payload, frameMaxData, recvMax)
+				frames.push(SentFrame{kind: sentMaxData})
+				owesMaxData = false
+				any = true
+			}
+			if owesMaxStreamsBidi && budget - payload.len() >= 9 {
+				putValue(payload, frameMaxStreamsBidi, localMaxBidi)
+				frames.push(SentFrame{kind: sentMaxStreamsBidi})
+				owesMaxStreamsBidi = false
+				any = true
+			}
+			if owesMaxStreamsUni && budget - payload.len() >= 9 {
+				putValue(payload, frameMaxStreamsUni, localMaxUni)
+				frames.push(SentFrame{kind: sentMaxStreamsUni})
+				owesMaxStreamsUni = false
+				any = true
+			}
+			for let entry in localIDs {
+				continue unless entry.announce && budget - payload.len() >= 4 + entry.id.len() + 16 + 8
+				putNewConnectionID(payload, entry.sequence, 0, entry.id, entry.resetToken)
+				frames.push(SentFrame{kind: sentNewConnectionID, value: entry.sequence})
+				entry.announce = false
+				any = true
+			}
+			for retiring.len() > 0 && budget - payload.len() >= 9 {
+				putValue(payload, frameRetireConnectionID, retiring[0])
+				frames.push(SentFrame{kind: sentRetireConnectionID, value: retiring[0]})
+				retiring = retiring[1:].clone()
+				any = true
+			}
+			for datagramsOut.len() > 0 && budget - payload.len() >= datagramsOut[0].len() + 3 {
+				putVarint(payload, frameDatagramLength)
+				putVarint(payload, datagramsOut[0].len())
+				payload.push(...datagramsOut[0])
+				datagramsOut = datagramsOut[1:].clone()
+				any = true
+			}
+			return any
+		}
+
+		// fillStreams writes the stream-level frames and as much stream
+		// data as the packet, the stream limits and the connection limit
+		// allow.
+		def fillStreams(payload byte[], frames SentFrame[], budget int) bool {
+			let any = false
+			for let (_, s) in streams {
+				break when budget - payload.len() < 24
+				if s.resetCode >= 0 && !s.resetSent {
+					putResetStream(payload, s.id, s.resetCode, s.send.next)
+					frames.push(SentFrame{kind: sentResetStream, streamID: s.id})
+					s.resetSent = true
+					any = true
+				}
+				if s.stopCode >= 0 && !s.stopSent {
+					putStreamValue(payload, frameStopSending, s.id, s.stopCode)
+					frames.push(SentFrame{kind: sentStopSending, streamID: s.id})
+					s.stopSent = true
+					any = true
+				}
+				if s.owesMaxData {
+					putStreamValue(payload, frameMaxStreamData, s.id, s.recvMax)
+					frames.push(SentFrame{kind: sentMaxStreamData, streamID: s.id})
+					s.owesMaxData = false
+					any = true
+				}
+				continue unless s.canSend && s.resetCode < 0
+				for s.send.pending() {
+					let space = budget - payload.len() - 20
+					break when space < 1 && !(s.send.finAt >= 0 && s.send.next == s.send.finAt)
+					space = 0 when space < 0
+					let fresh = s.sendMax - s.send.next
+					let shared = sendMax - sentData
+					fresh = shared when shared < fresh
+					fresh = 0 when fresh < 0
+					let before = s.send.next
+					let (offset, chunk, fin) = s.send.take(space, fresh)
+					break when offset < 0
+					sentData += s.send.next - before
+					putStream(payload, s.id, offset, chunk, fin)
+					frames.push(SentFrame{kind: sentStream, streamID: s.id, offset: offset, size: chunk.len(), fin: fin})
+					any = true
+					break when budget - payload.len() < 24
+				}
+			}
+			return any
+		}
+
+		// closeDatagram builds the datagram that carries CONNECTION_CLOSE
+		// in the highest space with keys. Before the handshake is over an
+		// application close goes as APPLICATION_ERROR, so nothing of the
+		// application leaks in a packet the peer might not have keys for
+		// (RFC 9000 §10.2.3).
+		def closeDatagram(now int) byte[] {
+			let datagram byte[] = []
+			for let i = 2; i >= 0; i-- {
+				let space = spaces[i]
+				continue when space.discarded || space.sendKeys is none
+				continue when i == spaceApplication && !handshakeComplete
+				let payload byte[] = []
+				if closeIsApp && i != spaceApplication {
+					putClose(payload, false, TransportCode.Application.value, 0, "")
+				} else {
+					putClose(payload, closeIsApp, closeCode, closeFrameType, closeReason)
+				}
+				let pad = i == spaceInitial ?? (baseDatagram - headerSize(space) - 16 - payload.len(), 0)
+				for let k = 0; k < pad; k++ {
+					payload.push(0)
+				}
+				sealPacket(space, datagram, payload, [], false, now)
+				return datagram
+			}
+			return datagram
+		}
+
+		// pathProbe builds the padded datagram that challenges a new peer
+		// address (RFC 9000 §8.2.1).
+		def pathProbe(now int) byte[] {
+			let space = spaces[spaceApplication]
+			let datagram byte[] = []
+			return datagram when space.sendKeys is none
+			let payload byte[] = []
+			putVarint(payload, framePathChallenge)
+			payload.push(...pathChallenge)
+			let pad = baseDatagram - headerSize(space) - 16 - payload.len()
+			for let k = 0; k < pad; k++ {
+				payload.push(0)
+			}
+			sealPacket(space, datagram, payload, [], true, now)
+			return datagram
+		}
+
+		// retryDeferred hands packets that waited for keys back in.
+		atomic def takeDeferred() byte[][] {
+			let held = deferred
+			deferred = []
+			return held
+		}
+
+		// answerClosing asks for another CONNECTION_CLOSE when packets
+		// keep arriving after this side closed.
+		atomic def answerClosing() {
+			closeSends = 1 when state == stateClosing
+		}
+
+		// ---- Streams, application side ---------------------------------
+
+		// openStream makes the next stream of this side, bidirectional or
+		// not; none when the peer's limit is reached.
+		// Fails with the connection's error once it is closed.
+		atomic def openStream(uni bool) !?StreamState {
+			let ended = closeError
+			fail ended unless ended is none
+			fail ClosedError{message: "quic: the connection is not established"} unless state == stateEstablished
+			let opened = uni ?? (openedUni, openedBidi)
+			let limit = uni ?? (peerMaxUni, peerMaxBidi)
+			return none when opened >= limit
+			let id = (opened << 2) | (uni ?? (0x02, 0x00)) | (isClient ?? (0x00, 0x01))
+			if uni {
+				openedUni++
+			} else {
+				openedBidi++
+			}
+			let s = newStream(id)
+			s.announced = true
+			return s
+		}
+
+		// acceptStream takes the next stream the peer opened; none when
+		// none waits. Fails with the connection's error once it is closed.
+		atomic def acceptStream(uni bool) !?StreamState {
+			if uni && acceptedUni.len() > 0 {
+				let s = acceptedUni[0]
+				acceptedUni = acceptedUni[1:].clone()
+				return s
+			}
+			if !uni && accepted.len() > 0 {
+				let s = accepted[0]
+				accepted = accepted[1:].clone()
+				return s
+			}
+			let ended = closeError
+			fail ended unless ended is none
+			fail ClosedError{message: "quic: the connection is closed"} when state >= stateClosing
+			return none
+		}
+
+		// streamWrite queues bytes on a stream and returns how many it
+		// took; 0 when the buffer is full and the writer must wait.
+		// Fails with the connection's error, ApplicationError when the
+		// peer asked to stop, ClosedError after `closeWrite` or `reset`.
+		atomic def streamWrite(s StreamState, data byte[]) !int {
+			let ended = closeError
+			fail ended unless ended is none
+			fail ApplicationError{message: "quic: the peer stopped reading stream {s.id} (code {s.stoppedCode})", appCode: s.stoppedCode, streamID: s.id} when s.stoppedCode >= 0
+			fail ClosedError{message: "quic: stream {s.id} is closed for writing"} when !s.canSend || s.resetCode >= 0 || s.send.finAt >= 0
+			let room = sendBufferLimit - s.send.buffered()
+			return 0 when room <= 0
+			let n = data.len() < room ?? (data.len(), room)
+			s.send.write(data[:n])
+			return n
+		}
+
+		// streamRead copies received bytes into buf: the count, 0 at the
+		// end of the stream, -1 when the reader must wait.
+		// Fails with ApplicationError when the peer reset the stream, the
+		// connection's error once it is closed.
+		atomic def streamRead(s StreamState, buf byte[]) !int {
+			fail ApplicationError{message: "quic: the peer reset stream {s.id} (code {s.peerResetCode})", appCode: s.peerResetCode, streamID: s.id} when s.peerResetCode >= 0
+			fail ClosedError{message: "quic: stream {s.id} is closed for reading"} when !s.canReceive || s.stopCode >= 0
+			let n = s.recv.read(buf)
+			if n > 0 {
+				s.consumed += n
+				recvConsumed += n
+				if s.recv.finalSize < 0 && s.recvMax - s.consumed < s.recvWindow / 2 {
+					s.recvMax = s.consumed + s.recvWindow
+					s.owesMaxData = true
+				}
+				if recvMax - recvConsumed < settings.maxData / 2 {
+					recvMax = recvConsumed + settings.maxData
+					owesMaxData = true
+				}
+				retireStream(s) when s.recv.finished()
+				return n
+			}
+			if s.recv.finished() {
+				retireStream(s)
+				return 0
+			}
+			let ended = closeError
+			fail ended unless ended is none
+			return -1
+		}
+
+		// streamCloseWrite ends the sending half: what was written goes
+		// out, then the end of the stream.
+		atomic def streamCloseWrite(s StreamState) {
+			return unless s.canSend && s.resetCode < 0
+			s.send.closeWrite()
+		}
+
+		// streamReset abandons the sending half with an application code.
+		atomic def streamReset(s StreamState, code int) {
+			resetLocked(s, code)
+		}
+
+		def resetLocked(s StreamState, code int) {
+			return unless s.canSend && s.resetCode < 0 && !s.send.settled()
+			s.resetCode = code
+			// The bytes never sent stay unsent: give the connection window
+			// back what was counted only when sent, which is nothing.
+			s.wake()
+		}
+
+		// streamStop asks the peer to stop sending, with an application
+		// code; what arrives from now on is discarded.
+		atomic def streamStop(s StreamState, code int) {
+			return unless s.canReceive && s.stopCode < 0 && s.peerResetCode < 0 && !s.recv.finished()
+			s.stopCode = code
+			creditConnection(s, s.recv.highest - s.consumed)
+		}
+
+		// Whether every byte written was acknowledged.
+		atomic def streamFlushed(s StreamState) bool {
+			return s.send.buffered() == 0
+		}
+
+		// queueDatagram queues an unreliable datagram (RFC 9221).
+		// Fails when the peer accepts none, or none this large.
+		atomic def queueDatagram(data byte[]) !none {
+			let ended = closeError
+			fail ended unless ended is none
+			let limit = peerParams.maxDatagramFrameSize
+			fail ClosedError{message: "quic: the peer accepts no datagrams", reason: "unsupported"} when limit == 0
+			fail ClosedError{message: "quic: a datagram of {data.len()} bytes passes what the peer or a packet takes", reason: "size"} when data.len() + 3 > limit || data.len() > recovery.maxDatagram - 64
+			datagramsOut.push(data.clone())
+			return none
+		}
+
+		atomic def takeDatagram() !?byte[] {
+			if datagramsIn.len() > 0 {
+				let first = datagramsIn[0]
+				datagramsIn = datagramsIn[1:].clone()
+				return first
+			}
+			let ended = closeError
+			fail ended unless ended is none
+			return none
+		}
+
+		// initiateKeyUpdate moves both directions to the next keys (RFC
+		// 9001 §6.1); the peer follows when it sees the flipped bit.
+		// Fails before the handshake is confirmed, while an update is not
+		// acknowledged yet, or when HKDF does.
+		atomic def initiateKeyUpdate() !none {
+			let space = spaces[spaceApplication]
+			let sending = space.sendKeys
+			let receiving = space.recvKeys
+			fail ClosedError{message: "quic: keys are updated only once the handshake is confirmed"} when !handshakeConfirmed || sending is none || receiving is none
+			fail ClosedError{message: "quic: the previous key update is not acknowledged yet"} when sentInPhase == 0 || updateAckedAt < 0
+			space.sendKeys = try nextKeys(sending)
+			let upcoming = nextRecvKeys
+			space.recvKeys = upcoming is none ?? (try nextKeys(receiving), upcoming)
+			nextRecvKeys = none
+			keyPhase = keyPhase ^ 1
+			sentInPhase = 0
+			updateAckedAt = -1
+			return none
+		}
+	}
+}

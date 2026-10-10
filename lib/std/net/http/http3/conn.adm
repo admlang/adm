@@ -1,0 +1,698 @@
+partial module std.net.http.http3 {
+	use (
+		std.net
+		std.net.http.http2::(HeaderField)
+		std.net.quic
+		std.time
+	)
+
+	// Frame types (RFC 9114 §7.2).
+	internal const frameData = 0x00
+	internal const frameHeaders = 0x01
+	internal const frameCancelPush = 0x03
+	internal const frameSettings = 0x04
+	internal const framePushPromise = 0x05
+	internal const frameGoAway = 0x07
+	internal const frameMaxPushID = 0x0d
+
+	// Unidirectional stream types (RFC 9114 §6.2, RFC 9204 §4.2).
+	internal const streamControl = 0x00
+	internal const streamPush = 0x01
+	internal const streamQpackEncoder = 0x02
+	internal const streamQpackDecoder = 0x03
+
+	// Settings identifiers (RFC 9114 §7.2.4.1, RFC 9204 §5, RFC 9220).
+	internal const settingQpackCapacity = 0x01
+	internal const settingMaxFieldSectionSize = 0x06
+	internal const settingQpackBlocked = 0x07
+	internal const settingConnectProtocol = 0x08
+
+	// Settings is what one end of an HTTP/3 connection announces.
+	struct Settings {
+		// The largest field section accepted, in the size RFC 9114
+		// §4.2.2 counts: names, values and 32 bytes a field. 0 is no
+		// limit.
+		maxFieldSectionSize int  = 1048576
+		// The QPACK dynamic table this end's decoder keeps, and the
+		// streams that may wait for it.
+		qpackCapacity       int  = 4096
+		qpackBlocked        int  = 16
+		// A server takes extended CONNECT requests (RFC 9220).
+		connectProtocol     bool = false
+	}
+
+	// StreamReader buffers the receiving half of a QUIC stream.
+	internal type StreamReader {
+		raw    quic.Stream
+		buffer byte[]      = []
+		pos    int         = 0
+		filled int         = 0
+		ended  bool        = false
+
+		def new(raw quic.Stream) {
+			self.raw = raw
+			buffer.len(16384)
+		}
+
+		// fill reads more of the stream; false at its end.
+		def fill(timeout duration) !bool {
+			return false when ended
+			let n = try raw.read(buffer, timeout)
+			if n == 0 {
+				ended = true
+				return false
+			}
+			pos = 0
+			filled = n
+			return true
+		}
+
+		// nextByte is the next byte, -1 at the end of the stream.
+		def nextByte(timeout duration) !int {
+			if pos >= filled {
+				return -1 unless try fill(timeout)
+			}
+			pos++
+			return int(buffer[pos - 1])
+		}
+
+		// varint is the next variable-length integer, -1 when the stream
+		// ends before its first byte.
+		// Fails with Http3Error (FrameError) when it ends inside one.
+		def varint(timeout duration) !int {
+			let first = try nextByte(timeout)
+			return -1 when first < 0
+			let size = 1 << (first >> 6)
+			let value = first & 0x3F
+			for let i = 1; i < size; i++ {
+				let next = try nextByte(timeout)
+				fail connError(ErrorCode.FrameError, "the stream ends inside an integer") when next < 0
+				value = (value << 8) | next
+			}
+			return value
+		}
+
+		// read copies up to buf.len() buffered or new bytes; 0 at the end.
+		def read(buf byte[], timeout duration) !int {
+			if pos >= filled {
+				return 0 unless try fill(timeout)
+			}
+			let n = filled - pos
+			n = buf.len() when buf.len() < n
+			for let i = 0; i < n; i++ {
+				buf[i] = buffer[pos + i]
+			}
+			pos += n
+			return n
+		}
+
+		// exactly reads n bytes.
+		// Fails with Http3Error (FrameError) when the stream ends first.
+		def exactly(n int, timeout duration) !byte[] {
+			let out byte[] = []
+			out.len(n)
+			let have = 0
+			for have < n {
+				let got = try read(out[have:], timeout)
+				fail connError(ErrorCode.FrameError, "the stream ends inside a frame") when got == 0
+				have += got
+			}
+			return out
+		}
+
+		// skip discards n bytes; false when the stream ends first.
+		def skip(n int, timeout duration) !bool {
+			let left = n
+			let sink byte[] = []
+			sink.len(4096)
+			for left > 0 {
+				let got = try read(left < sink.len() ?? (sink[:left], sink), timeout)
+				return false when got == 0
+				left -= got
+			}
+			return true
+		}
+	}
+
+	// Conn is an HTTP/3 connection over a QUIC connection, client or
+	// server side. `start` opens the control and QPACK streams and sends
+	// SETTINGS; a client then opens request streams with `newStream`, a
+	// server takes them with `acceptStream`. Safe from many tasks.
+	type Conn {
+		transport              quic.Connection
+		isClient               bool
+		local                  Settings
+		// What the peer announced; the defaults until its SETTINGS came.
+		peer                   Settings
+		peerSettingsSeen       bool            = false
+		// A server told this client to send no request past this stream
+		// ID (GOAWAY); -1 while it has not.
+		goAwayID               int             = -1
+		// The error that ended the connection, none while it runs.
+		failure                ?error          = none
+		internal control       ?quic.Stream    = none
+		internal encoderStream ?quic.Stream    = none
+		internal decoderStream ?quic.Stream    = none
+		internal encoder       Encoder
+		internal decoder       Decoder
+		internal sawControl    bool            = false
+		internal sawEncoder    bool            = false
+		internal sawDecoder    bool            = false
+		// Wakes sections that wait for the dynamic table.
+		internal tableSignal   channel<none>
+		internal blocked       int             = 0
+		// The highest request stream a server took, for GOAWAY.
+		internal lastAccepted  int             = -1
+		internal sentGoAway    bool            = false
+
+		def new(transport quic.Connection, isClient bool, settings Settings = Settings{}) {
+			self.transport = transport
+			self.isClient = isClient
+			local = settings
+			peer = Settings{maxFieldSectionSize: 0, qpackCapacity: 0, qpackBlocked: 0}
+			encoder = new Encoder()
+			decoder = new Decoder(settings.qpackCapacity, settings.qpackBlocked)
+			tableSignal = new channel<none>(1)
+		}
+
+		// start opens this end's control, QPACK encoder and QPACK decoder
+		// streams, sends SETTINGS, and begins reading the peer's.
+		// Fails with the error that ended the QUIC connection.
+		def start() !none {
+			let c = try transport.openSendStream()
+			let settings byte[] = [byte(streamControl)]
+			let payload byte[] = []
+			quic.appendVarint(payload, settingQpackCapacity)
+			quic.appendVarint(payload, local.qpackCapacity)
+			quic.appendVarint(payload, settingQpackBlocked)
+			quic.appendVarint(payload, local.qpackBlocked)
+			if local.maxFieldSectionSize > 0 {
+				quic.appendVarint(payload, settingMaxFieldSectionSize)
+				quic.appendVarint(payload, local.maxFieldSectionSize)
+			}
+			if local.connectProtocol && !isClient {
+				quic.appendVarint(payload, settingConnectProtocol)
+				quic.appendVarint(payload, 1)
+			}
+			quic.appendVarint(settings, frameSettings)
+			quic.appendVarint(settings, payload.len())
+			settings.push(...payload)
+			try c.write(settings)
+			control = c
+			let e = try transport.openSendStream()
+			try e.write([byte(streamQpackEncoder)])
+			encoderStream = e
+			let d = try transport.openSendStream()
+			try d.write([byte(streamQpackDecoder)])
+			decoderStream = d
+			let task = async acceptPeerStreams()
+			task.keepAlive()
+			return none
+		}
+
+		// Whether new requests may start: the connection is open and no
+		// GOAWAY was received.
+		def accepting() bool {
+			return failure is none && goAwayID < 0 && transport.isOpen()
+		}
+
+		// newStream opens a request stream.
+		// Fails with Http3Error (RequestRejected) after a GOAWAY, else
+		// with the error that ended the connection.
+		def newStream(timeout duration = 30s) !Stream {
+			let ended = failure
+			fail ended unless ended is none
+			fail streamError(-1, ErrorCode.RequestRejected, "the server is going away") when goAwayID >= 0
+			return new Stream(self, try transport.openStream(timeout))
+		}
+
+		// acceptStream waits for the next request stream of a client.
+		// Fails with the error that ended the connection, NetError
+		// (TimedOut) when a timeout is given and passes.
+		def acceptStream(timeout duration = 0s) !Stream {
+			let raw = try transport.acceptStream(timeout)
+			lastAccepted = raw.id() when raw.id() > lastAccepted
+			return new Stream(self, raw)
+		}
+
+		// goAway tells the client to open no more requests (RFC 9114
+		// §5.2); those up to the last one accepted still finish. It never
+		// fails: a connection that is gone needs no notice.
+		def goAway() !none {
+			return none when isClient || sentGoAway
+			let c = control
+			return none when c is none
+			sentGoAway = true
+			let frame byte[] = []
+			quic.appendVarint(frame, frameGoAway)
+			let id byte[] = []
+			quic.appendVarint(id, lastAccepted + 4)
+			quic.appendVarint(frame, id.len())
+			frame.push(...id)
+			c.write(frame) onerror recover 0
+			return none
+		}
+
+		// close ends the connection with H3_NO_ERROR. It never fails.
+		def close() !none {
+			return try transport.close(ErrorCode.NoError.value, "")
+		}
+
+		// abort ends the connection for a protocol error of the peer.
+		def abort(err error) {
+			return unless failure is none
+			failure = err
+			let code = ErrorCode.InternalError
+			code = err.errorCode when err is Http3Error
+			transport.close(code.value, err.message) onerror recover none
+			tableSignal.offer(none)
+		}
+
+		// acceptPeerStreams reads the peer's unidirectional streams, one
+		// task each, to the end of the connection.
+		internal def acceptPeerStreams() {
+			for {
+				let raw = nextPeerStream() onerror recover none
+				if raw is none {
+					noteClosed()
+					return
+				}
+				let task = async servePeerStream(raw)
+				task.keepAlive()
+			}
+		}
+
+		internal def nextPeerStream() !?quic.Stream {
+			return try transport.acceptReceiveStream()
+		}
+
+		// noteClosed records why the QUIC connection ended.
+		internal def noteClosed() {
+			return unless failure is none
+			let reason = transport.closeReason()
+			if reason is none {
+				failure = quic.ClosedError{message: "http3: the connection is closed"}
+			} else if reason is quic.ApplicationError {
+				failure = Http3Error{message: "http3: the peer closed the connection ({errorCodeOf(reason.appCode)})", errorCode: errorCodeOf(reason.appCode), remote: true, cause: reason}
+			} else {
+				failure = reason
+			}
+			tableSignal.offer(none)
+		}
+
+		internal def servePeerStream(raw quic.Stream) {
+			readPeerStream(raw) onerror (err error) {
+				// A failure after the connection ended is its echo.
+				abort(err) when transport.isOpen()
+				recover none
+			}
+		}
+
+		internal def readPeerStream(raw quic.Stream) !none {
+			let r = new StreamReader(raw)
+			let kind = try r.varint(0s)
+			return none when kind < 0
+			if kind == streamControl {
+				fail connError(ErrorCode.StreamCreationError, "a second control stream") when sawControl
+				sawControl = true
+				try readControl(r)
+				fail connError(ErrorCode.ClosedCriticalStream, "the control stream closed")
+			}
+			if kind == streamQpackEncoder {
+				fail connError(ErrorCode.StreamCreationError, "a second QPACK encoder stream") when sawEncoder
+				sawEncoder = true
+				let buf byte[] = []
+				buf.len(4096)
+				for {
+					let n = try r.read(buf, 0s)
+					break when n == 0
+					try feedDecoder(buf[:n])
+				}
+				fail connError(ErrorCode.ClosedCriticalStream, "the QPACK encoder stream closed")
+			}
+			if kind == streamQpackDecoder {
+				fail connError(ErrorCode.StreamCreationError, "a second QPACK decoder stream") when sawDecoder
+				sawDecoder = true
+				let buf byte[] = []
+				buf.len(4096)
+				for {
+					let n = try r.read(buf, 0s)
+					break when n == 0
+					try feedEncoder(buf[:n])
+				}
+				fail connError(ErrorCode.ClosedCriticalStream, "the QPACK decoder stream closed")
+			}
+			fail connError(isClient ?? (ErrorCode.IdError, ErrorCode.StreamCreationError), "a push stream nobody allowed") when kind == streamPush
+			// A stream type this end does not know is refused, not an
+			// error (RFC 9114 §6.2).
+			raw.stopReading(ErrorCode.StreamCreationError.value)
+			return none
+		}
+
+		// readControl reads the peer's control stream: SETTINGS first,
+		// then GOAWAY, MAX_PUSH_ID and CANCEL_PUSH as they come.
+		internal def readControl(r StreamReader) !none {
+			let first = true
+			for {
+				let kind = try r.varint(0s)
+				return none when kind < 0
+				let size = try r.varint(0s)
+				fail connError(ErrorCode.FrameError, "the control stream ends inside a frame") when size < 0
+				if first {
+					fail connError(ErrorCode.MissingSettings, "the control stream does not start with SETTINGS") when kind != frameSettings
+					first = false
+					try applySettings(try r.exactly(size, 0s))
+					continue
+				}
+				fail connError(ErrorCode.FrameUnexpected, "a second SETTINGS frame") when kind == frameSettings
+				fail connError(ErrorCode.FrameUnexpected, "frame type {kind} on the control stream") when kind := frameData || frameHeaders || framePushPromise || 0x02 || 0x06 || 0x08 || 0x09
+				fail connError(ErrorCode.ExcessiveLoad, "a control frame of {size} bytes") when size > 65536
+				let payload = try r.exactly(size, 0s)
+				if kind == frameGoAway {
+					let id = quic.parseVarint(payload)
+					fail connError(ErrorCode.IdError, "GOAWAY raises its stream ID") when goAwayID >= 0 && id > goAwayID
+					goAwayID = id
+				} else if kind == frameMaxPushID {
+					fail connError(ErrorCode.FrameUnexpected, "a server sent MAX_PUSH_ID") when isClient
+				}
+				// CANCEL_PUSH and unknown types: nothing to do.
+			}
+			return none
+		}
+
+		internal def applySettings(payload byte[]) !none {
+			let seen int[] = []
+			let at = 0
+			let made = Settings{maxFieldSectionSize: 0, qpackCapacity: 0, qpackBlocked: 0}
+			for at < payload.len() {
+				let idSize = quic.varintLength(payload[at])
+				fail connError(ErrorCode.FrameError, "SETTINGS is cut short") when at + idSize >= payload.len()
+				let id = quic.parseVarint(payload[at:at + idSize])
+				at += idSize
+				let valueSize = quic.varintLength(payload[at])
+				fail connError(ErrorCode.FrameError, "SETTINGS is cut short") when at + valueSize > payload.len()
+				let value = quic.parseVarint(payload[at:at + valueSize])
+				at += valueSize
+				fail connError(ErrorCode.SettingsError, "setting {id} is sent twice") when seen.includes(id)
+				seen.push(id)
+				// The HTTP/2 settings without a meaning here (RFC 9114
+				// §7.2.4.1).
+				fail connError(ErrorCode.SettingsError, "the HTTP/2 setting {id} has no place in HTTP/3") when id := 0x00 || 0x02 || 0x03 || 0x04 || 0x05
+				if id == settingQpackCapacity {
+					made.qpackCapacity = value
+				} else if id == settingQpackBlocked {
+					made.qpackBlocked = value
+				} else if id == settingMaxFieldSectionSize {
+					made.maxFieldSectionSize = value
+				} else if id == settingConnectProtocol {
+					fail connError(ErrorCode.SettingsError, "SETTINGS_ENABLE_CONNECT_PROTOCOL is 0 or 1") when value > 1
+					made.connectProtocol = value == 1
+				}
+			}
+			peer = made
+			peerSettingsSeen = true
+			try openEncoderTable(made.qpackCapacity)
+			return none
+		}
+
+		// The calls below serialize the QPACK state and keep the bytes of
+		// each QPACK stream in the order they were produced.
+
+		internal atomic def openEncoderTable(capacity int) !none {
+			encoder.applySettings(capacity)
+			return try flushEncoder()
+		}
+
+		internal def flushEncoder() !none {
+			let bytes = encoder.takeOutput()
+			return none when bytes.len() == 0
+			let out = encoderStream
+			return none when out is none
+			try out.write(bytes)
+			return none
+		}
+
+		internal def flushDecoder() !none {
+			let bytes = decoder.takeOutput()
+			return none when bytes.len() == 0
+			let out = decoderStream
+			return none when out is none
+			try out.write(bytes)
+			return none
+		}
+
+		internal atomic def feedDecoder(data byte[]) !none {
+			try decoder.feedEncoderStream(data)
+			try flushDecoder()
+			tableSignal.offer(none)
+			return none
+		}
+
+		internal atomic def feedEncoder(data byte[]) !none {
+			return try encoder.feedDecoderStream(data)
+		}
+
+		// encodeSection renders a field section for a stream.
+		// Fails when the QPACK encoder stream cannot be written.
+		atomic def encodeSection(fields HeaderField[]) !byte[] {
+			let section = encoder.encode(fields)
+			try flushEncoder()
+			return section
+		}
+
+		internal atomic def tryDecode(streamID int, block byte[]) !?HeaderField[] {
+			let fields = try decoder.decode(streamID, block)
+			try flushDecoder()
+			return fields
+		}
+
+		internal atomic def countBlocked(change int) int {
+			blocked += change
+			return blocked
+		}
+
+		// decodeSection reads the field section of a stream, waiting for
+		// the peer's QPACK encoder stream when the section needs it.
+		// Fails with Http3Error: QpackDecompression for a malformed
+		// section or more blocked streams than announced, else with the
+		// error that ended the connection.
+		def decodeSection(streamID int, block byte[], timeout duration) !HeaderField[] {
+			let first = try tryDecode(streamID, block)
+			return first unless first is none
+			fail connError(ErrorCode.QpackDecompression, "more streams wait for the dynamic table than this end allows") when countBlocked(1) > local.qpackBlocked
+			let until = time.now() + timeout
+			for {
+				let ended = failure
+				if !(ended is none) {
+					countBlocked(-1)
+					fail ended
+				}
+				let fields = tryDecode(streamID, block) onerror (err error) {
+					countBlocked(-1)
+					fail err
+				}
+				if !(fields is none) {
+					countBlocked(-1)
+					// Another section may wait for the same inserts.
+					tableSignal.offer(none)
+					return fields
+				}
+				if timeout > 0s && time.now() >= until {
+					countBlocked(-1)
+					fail net.errorOf(net.ErrorCode.TimedOut, "read", "", "the QPACK encoder stream did not deliver in time")
+				}
+				let sleep = time.sleepChan(50ms)
+				select {
+					case tableSignal:
+						tableSignal.flush()
+					case sleep:
+				}
+			}
+			fail "unreachable"
+		}
+	}
+
+	// Stream is one request and its response (RFC 9114 §4.1): field
+	// sections and data in HTTP/3 frames on a bidirectional QUIC stream.
+	// One task writes and one reads at a time.
+	type Stream {
+		session          Conn
+		raw              quic.Stream
+		// Reads and writes fail with a timeout past this time; none sets
+		// no limit.
+		deadline         ?time.Time    = none
+		// The trailing field section, once `read` reached the end.
+		trailers         HeaderField[] = []
+		internal reader  StreamReader
+		// Bytes left of the DATA frame being read.
+		internal left    int           = 0
+		internal ended   bool          = false
+		// DATA arrived: a later field section is the trailers.
+		internal sawData bool          = false
+
+		def new(session Conn, raw quic.Stream) {
+			self.session = session
+			self.raw = raw
+			reader = new StreamReader(raw)
+		}
+
+		// The QUIC stream ID.
+		def id() int {
+			return raw.id()
+		}
+
+		// The time left until the deadline; 0s for no limit.
+		// Fails with NetError (TimedOut) once it passed.
+		internal def timeLeft() !duration {
+			let until = deadline
+			return 0s when until is none
+			let remaining = until - time.now()
+			fail net.errorOf(net.ErrorCode.TimedOut, "stream", "", "the stream's deadline passed") when remaining <= 0s
+			return remaining
+		}
+
+		// writeHeaders sends a field section; `last` ends the stream with
+		// it.
+		// Fails when the stream or the connection does.
+		def writeHeaders(fields HeaderField[], last bool = false) !none {
+			let section = try session.encodeSection(fields)
+			let frame byte[] = []
+			quic.appendVarint(frame, frameHeaders)
+			quic.appendVarint(frame, section.len())
+			frame.push(...section)
+			try raw.write(frame, try writeTimeout())
+			try raw.closeWrite() when last
+			return none
+		}
+
+		internal def writeTimeout() !duration {
+			let remaining = try timeLeft()
+			return remaining == 0s ?? (60s, remaining)
+		}
+
+		// write sends buf as one DATA frame and returns its length.
+		// Implements std.io.Writer.
+		// Fails when the stream or the connection does.
+		def write(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			let frame byte[] = []
+			quic.appendVarint(frame, frameData)
+			quic.appendVarint(frame, buf.len())
+			frame.push(...buf)
+			try raw.write(frame, try writeTimeout())
+			return buf.len()
+		}
+
+		// end finishes this side: the trailers when there are any, then
+		// the end of the stream.
+		// Fails when the stream or the connection does.
+		def end(trailing HeaderField[] = []) !none {
+			try writeHeaders(trailing) when trailing.len() > 0
+			return try raw.closeWrite()
+		}
+
+		// nextFrame reads the type and length of the next frame the
+		// caller handles, skipping unknown types; (-1, 0) at the end of
+		// the stream.
+		internal def nextFrame() !(int, int) {
+			for {
+				let kind = try reader.varint(try timeLeft())
+				return (-1, 0) when kind < 0
+				let size = try reader.varint(try timeLeft())
+				fail streamError(id(), ErrorCode.FrameError, "the stream ends inside a frame header") when size < 0
+				return (kind, size) when kind := frameData || frameHeaders
+				// Frames of the control stream and of HTTP/2 have no place
+				// on a request stream (RFC 9114 §7.2).
+				fail connError(ErrorCode.FrameUnexpected, "frame type {kind} on a request stream") when kind := frameCancelPush || frameSettings || frameGoAway || frameMaxPushID || 0x02 || 0x06 || 0x08 || 0x09
+				fail connError(ErrorCode.IdError, "PUSH_PROMISE without MAX_PUSH_ID") when kind == framePushPromise
+				fail streamError(id(), ErrorCode.FrameError, "the stream ends inside a frame") unless try reader.skip(size, try timeLeft())
+			}
+			fail "unreachable"
+		}
+
+		// readHeaders reads the next field section: the request or the
+		// response head, an interim response, or the trailers.
+		// Fails with Http3Error: FrameUnexpected when data comes where a
+		// field section must, RequestIncomplete when the stream ends
+		// first, ExcessiveLoad for a section past this end's limit;
+		// ApplicationError when the peer reset the stream; NetError
+		// (TimedOut) past the deadline.
+		def readHeaders() !HeaderField[] {
+			let (kind, size) = try nextFrame()
+			fail streamError(id(), ErrorCode.RequestIncomplete, "the stream ended before its field section") when kind < 0
+			fail connError(ErrorCode.FrameUnexpected, "DATA before the field section") when kind == frameData
+			return try section(size)
+		}
+
+		internal def section(size int) !HeaderField[] {
+			let limit = session.local.maxFieldSectionSize
+			fail streamError(id(), ErrorCode.ExcessiveLoad, "a field section of {size} bytes passes the limit") when limit > 0 && size > limit
+			let block = try reader.exactly(size, try timeLeft())
+			let wait = try timeLeft()
+			let fields = try session.decodeSection(id(), block, wait == 0s ?? (60s, wait))
+			if limit > 0 {
+				let total = 0
+				for let f in fields {
+					total += f.name.len() + f.value.len() + 32
+				}
+				fail streamError(id(), ErrorCode.ExcessiveLoad, "a field section of {total} bytes passes the limit") when total > limit
+			}
+			return fields
+		}
+
+		// read copies body bytes into buf; 0 is the end of the message,
+		// with `trailers` set when a trailing section came.
+		// Implements std.io.Reader.
+		// Fails as `readHeaders` does.
+		def read(buf byte[]) !int {
+			return 0 when ended || buf.len() == 0
+			for left == 0 {
+				let (kind, size) = try nextFrame()
+				if kind < 0 {
+					ended = true
+					return 0
+				}
+				if kind == frameHeaders {
+					fail connError(ErrorCode.FrameUnexpected, "a second trailing field section") when trailers.len() > 0
+					trailers = try section(size)
+					continue
+				}
+				fail connError(ErrorCode.FrameUnexpected, "DATA after the trailers") when trailers.len() > 0
+				sawData = true
+				left = size
+			}
+			let want = buf.len() < left ?? (buf.len(), left)
+			let n = try reader.read(buf[:want], try timeLeft())
+			fail streamError(id(), ErrorCode.FrameError, "the stream ends inside a DATA frame") when n == 0
+			left -= n
+			return n
+		}
+
+		// reset abandons the sending half with an HTTP/3 error code.
+		def reset(code ErrorCode) {
+			raw.reset(code.value)
+		}
+
+		// stopReading tells the peer to stop sending, with an HTTP/3
+		// error code.
+		def stopReading(code ErrorCode) {
+			raw.stopReading(code.value)
+		}
+
+		// cancel abandons both halves with a code: a request the client
+		// gives up, or one the server rejects.
+		def cancel(code ErrorCode) {
+			raw.reset(code.value)
+			raw.stopReading(code.value)
+		}
+	}
+
+	// valueOf is the value of the first field with the name, "" when
+	// there is none.
+	def valueOf(fields HeaderField[], name string) string {
+		for let f in fields {
+			return f.value when f.name == name
+		}
+		return ""
+	}
+}

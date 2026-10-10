@@ -1,0 +1,505 @@
+// QPACK field compression for HTTP/3 (RFC 9204).
+partial module std.net.http.http3 {
+	use std.net.http.http2::(HeaderField, huffmanEncode, huffmanEncodedLen, huffmanDecode)
+
+	// The static table of RFC 9204 Appendix A, indexes 0 to 98.
+	internal const staticNames = string[":authority", ":path", "age", "content-disposition", "content-length", "cookie", "date", "etag", "if-modified-since", "if-none-match", "last-modified", "link", "location", "referer", "set-cookie", ":method", ":method", ":method", ":method", ":method", ":method", ":method", ":scheme", ":scheme", ":status", ":status", ":status", ":status", ":status", "accept", "accept", "accept-encoding", "accept-ranges", "access-control-allow-headers", "access-control-allow-headers", "access-control-allow-origin", "cache-control", "cache-control", "cache-control", "cache-control", "cache-control", "cache-control", "content-encoding", "content-encoding", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "content-type", "range", "strict-transport-security", "strict-transport-security", "strict-transport-security", "vary", "vary", "x-content-type-options", "x-xss-protection", ":status", ":status", ":status", ":status", ":status", ":status", ":status", ":status", ":status", "accept-language", "access-control-allow-credentials", "access-control-allow-credentials", "access-control-allow-headers", "access-control-allow-methods", "access-control-allow-methods", "access-control-allow-methods", "access-control-expose-headers", "access-control-request-headers", "access-control-request-method", "access-control-request-method", "alt-svc", "authorization", "content-security-policy", "early-data", "expect-ct", "forwarded", "if-range", "origin", "purpose", "server", "timing-allow-origin", "upgrade-insecure-requests", "user-agent", "x-forwarded-for", "x-frame-options", "x-frame-options"]
+	internal const staticValues = string["", "/", "0", "", "0", "", "", "", "", "", "", "", "", "", "", "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT", "http", "https", "103", "200", "304", "404", "503", "*/*", "application/dns-message", "gzip, deflate, br", "bytes", "cache-control", "content-type", "*", "max-age=0", "max-age=2592000", "max-age=604800", "no-cache", "no-store", "public, max-age=31536000", "br", "gzip", "application/dns-message", "application/javascript", "application/json", "application/x-www-form-urlencoded", "image/gif", "image/jpeg", "image/png", "text/css", "text/html; charset=utf-8", "text/plain", "text/plain;charset=utf-8", "bytes=0-", "max-age=31536000", "max-age=31536000; includesubdomains", "max-age=31536000; includesubdomains; preload", "accept-encoding", "origin", "nosniff", "1; mode=block", "100", "204", "206", "302", "400", "403", "421", "425", "500", "", "FALSE", "TRUE", "*", "get", "get, post, options", "options", "content-length", "content-type", "get", "post", "clear", "", "script-src 'none'; object-src 'none'; base-uri 'none'", "1", "", "", "", "", "prefetch", "", "*", "1", "", "", "deny", "sameorigin"]
+
+	// The bytes an entry counts for in the dynamic table (RFC 9204 §3.2.1).
+	internal def entrySize(f HeaderField) int {
+		return f.name.len() + f.value.len() + 32
+	}
+
+	// Table is a QPACK dynamic table: entries in insertion order, each
+	// with an absolute index that never changes.
+	type Table {
+		entries  HeaderField[] = []
+		// Entries evicted so far: the absolute index of entries[0].
+		dropped  int           = 0
+		size     int           = 0
+		capacity int           = 0
+
+		// The number of entries ever inserted.
+		def inserted() int {
+			return dropped + entries.len()
+		}
+
+		// The entry at an absolute index; none once evicted or not there.
+		def get(absolute int) ?HeaderField {
+			let at = absolute - dropped
+			return none when at < 0 || at >= entries.len()
+			return entries[at]
+		}
+
+		// Whether the entry fits after evicting what must go.
+		def fits(f HeaderField) bool {
+			return entrySize(f) <= capacity
+		}
+
+		// insert adds an entry, evicting the oldest ones for room.
+		def insert(f HeaderField) {
+			let need = entrySize(f)
+			let drop = 0
+			for size + need > capacity && drop < entries.len() {
+				size -= entrySize(entries[drop])
+				drop++
+			}
+			if drop > 0 {
+				entries = entries[drop:].clone()
+				dropped += drop
+			}
+			entries.push(f)
+			size += need
+		}
+
+		// resize changes the capacity, evicting what no longer fits.
+		def resize(n int) {
+			capacity = n
+			let drop = 0
+			for size > capacity && drop < entries.len() {
+				size -= entrySize(entries[drop])
+				drop++
+			}
+			if drop > 0 {
+				entries = entries[drop:].clone()
+				dropped += drop
+			}
+		}
+	}
+
+	// putInteger appends a prefixed integer (RFC 7541 §5.1) with the
+	// high bits of its first byte given.
+	internal def putInteger(out byte[], prefixBits int, first int, value int) {
+		let limit = (1 << prefixBits) - 1
+		if value < limit {
+			out.push(byte(first | value))
+			return
+		}
+		out.push(byte(first | limit))
+		let rest = value - limit
+		for rest >= 128 {
+			out.push(byte((rest & 0x7f) | 0x80))
+			rest >>= 7
+		}
+		out.push(byte(rest))
+	}
+
+	// putString appends a string literal whose length has the given
+	// prefix, Huffman coded when that is shorter; `first` holds the bits
+	// above the Huffman flag, which sits right above the prefix.
+	internal def putString(out byte[], prefixBits int, first int, text string) {
+		let raw = text.bytes()
+		let coded = huffmanEncodedLen(raw)
+		if coded < raw.len() {
+			putInteger(out, prefixBits, first | (1 << prefixBits), coded)
+			out.push(...huffmanEncode(raw))
+			return
+		}
+		putInteger(out, prefixBits, first, raw.len())
+		out.push(...raw)
+	}
+
+	// Reader walks QPACK bytes. A read past the end sets `short`, so a
+	// stream of instructions can wait for the rest; a malformed value
+	// sets `bad`.
+	internal type Reader {
+		data  byte[]
+		pos   int    = 0
+		short bool   = false
+		bad   bool   = false
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def left() int {
+			return data.len() - pos
+		}
+
+		// The byte at the read position, without consuming it.
+		def peek() int {
+			if pos >= data.len() {
+				short = true
+				return 0
+			}
+			return int(data[pos])
+		}
+
+		def integer(prefixBits int) int {
+			if pos >= data.len() {
+				short = true
+				return 0
+			}
+			let limit = (1 << prefixBits) - 1
+			let value = int(data[pos]) & limit
+			pos++
+			return value when value < limit
+			let shift = 0
+			for {
+				if pos >= data.len() {
+					short = true
+					return 0
+				}
+				let b = int(data[pos])
+				pos++
+				value += (b & 0x7f) << shift
+				shift += 7
+				break when (b & 0x80) == 0
+				if shift > 56 {
+					bad = true
+					return 0
+				}
+			}
+			return value
+		}
+
+		// A string literal whose length has the given prefix, the Huffman
+		// flag right above it.
+		def text(prefixBits int) string {
+			let coded = (peek() & (1 << prefixBits)) != 0
+			let size = integer(prefixBits)
+			return "" when short || bad
+			if size > data.len() - pos {
+				short = true
+				return ""
+			}
+			let raw = data[pos:pos + size]
+			pos += size
+			return string(raw.clone()) unless coded
+			let plain = huffmanDecode(raw) onerror (err error) {
+				bad = true
+				recover []
+			}
+			return string(plain)
+		}
+	}
+
+	// Decoder reads field sections with the dynamic table the peer's
+	// encoder stream builds (RFC 9204 §4). `maxCapacity` and `maxBlocked`
+	// are what this side announced in SETTINGS. One decoder serves a
+	// connection; the connection serializes its calls.
+	type Decoder {
+		table        Table
+		maxCapacity  int
+		maxBlocked   int
+		// Encoder stream bytes of an instruction not complete yet.
+		pending      byte[] = []
+		// Decoder stream bytes to send.
+		outbox       byte[] = []
+		// The insert count the peer's encoder knows this side reached.
+		acknowledged int    = 0
+
+		def new(maxCapacity int = 4096, maxBlocked int = 16) {
+			self.maxCapacity = maxCapacity
+			self.maxBlocked = maxBlocked
+			table = new Table()
+		}
+
+		// feedEncoderStream applies the instructions in bytes read from
+		// the peer's encoder stream; a cut instruction waits for more.
+		// Fails with Http3Error (QpackEncoderStream) for an instruction
+		// that is malformed or refers to what the table does not hold.
+		def feedEncoderStream(data byte[]) !none {
+			pending.push(...data)
+			let r = new Reader(pending)
+			let done = 0
+			for r.left() > 0 {
+				let first = r.peek()
+				if (first & 0x80) != 0 {
+					// Insert with name reference.
+					let fromStatic = (first & 0x40) != 0
+					let index = r.integer(6)
+					let value = r.text(7)
+					break when r.short
+					fail connError(ErrorCode.QpackEncoderStream, "malformed insert") when r.bad
+					let name = ""
+					if fromStatic {
+						fail connError(ErrorCode.QpackEncoderStream, "static index {index} does not exist") when index >= staticNames.len()
+						name = staticNames[index]
+					} else {
+						let entry = table.get(table.inserted() - 1 - index)
+						fail connError(ErrorCode.QpackEncoderStream, "an insert names an entry the table does not hold") when entry is none
+						name = entry.name
+					}
+					try insert(HeaderField{name: name, value: value})
+				} else if (first & 0x40) != 0 {
+					// Insert with literal name.
+					let name = r.text(5)
+					let value = r.text(7)
+					break when r.short
+					fail connError(ErrorCode.QpackEncoderStream, "malformed insert") when r.bad
+					try insert(HeaderField{name: name, value: value})
+				} else if (first & 0x20) != 0 {
+					let capacity = r.integer(5)
+					break when r.short
+					fail connError(ErrorCode.QpackEncoderStream, "the encoder asks for a table of {capacity} bytes, past the limit of {maxCapacity}") when r.bad || capacity > maxCapacity
+					table.resize(capacity)
+				} else {
+					// Duplicate.
+					let index = r.integer(5)
+					break when r.short
+					let entry = table.get(table.inserted() - 1 - index)
+					fail connError(ErrorCode.QpackEncoderStream, "a duplicate names an entry the table does not hold") when r.bad || entry is none
+					try insert(HeaderField{name: entry.name, value: entry.value})
+				}
+				done = r.pos
+			}
+			pending = pending[done:].clone()
+			// Tell the encoder how far this side got (RFC 9204 §4.4.3).
+			if table.inserted() > acknowledged {
+				putInteger(outbox, 6, 0x00, table.inserted() - acknowledged)
+				acknowledged = table.inserted()
+			}
+			return none
+		}
+
+		internal def insert(f HeaderField) !none {
+			fail connError(ErrorCode.QpackEncoderStream, "an entry does not fit the dynamic table") unless table.fits(f)
+			table.insert(f)
+			return none
+		}
+
+		// decode reads the field section of a stream; none when the
+		// section needs entries the encoder stream has not delivered yet
+		// (the caller tries again after more of it arrived).
+		// Fails with Http3Error (QpackDecompression) for a malformed
+		// section or a reference to what the table does not hold.
+		def decode(streamID int, block byte[]) !?HeaderField[] {
+			let r = new Reader(block)
+			let encoded = r.integer(8)
+			let sign = (r.peek() & 0x80) != 0
+			let delta = r.integer(7)
+			fail connError(ErrorCode.QpackDecompression, "field section prefix is cut short") when r.short || r.bad
+			let required = try requiredInserts(encoded)
+			return none when required > table.inserted()
+			let base = sign ?? (required - delta - 1, required + delta)
+			fail connError(ErrorCode.QpackDecompression, "field section base is negative") when base < 0
+			let out HeaderField[] = []
+			for r.left() > 0 {
+				let first = r.peek()
+				if (first & 0x80) != 0 {
+					let fromStatic = (first & 0x40) != 0
+					let index = r.integer(6)
+					out.push(try entryAt(fromStatic, fromStatic ?? (index, base - 1 - index), required))
+				} else if (first & 0x40) != 0 {
+					let fromStatic = (first & 0x10) != 0
+					let index = r.integer(4)
+					let value = r.text(7)
+					let named = try entryAt(fromStatic, fromStatic ?? (index, base - 1 - index), required)
+					out.push(HeaderField{name: named.name, value: value})
+				} else if (first & 0x20) != 0 {
+					let name = r.text(3)
+					let value = r.text(7)
+					out.push(HeaderField{name: name, value: value})
+				} else if (first & 0x10) != 0 {
+					let index = r.integer(4)
+					out.push(try entryAt(false, base + index, required))
+				} else {
+					let index = r.integer(3)
+					let value = r.text(7)
+					let named = try entryAt(false, base + index, required)
+					out.push(HeaderField{name: named.name, value: value})
+				}
+				fail connError(ErrorCode.QpackDecompression, "field section is cut short or malformed") when r.short || r.bad
+			}
+			// A section that used the dynamic table is acknowledged (RFC
+			// 9204 §4.4.1).
+			if required > 0 {
+				putInteger(outbox, 7, 0x80, streamID)
+				acknowledged = required when required > acknowledged
+			}
+			return out
+		}
+
+		// requiredInserts recovers the Required Insert Count from its
+		// wrapped encoding (RFC 9204 §4.5.1.1).
+		internal def requiredInserts(encoded int) !int {
+			return 0 when encoded == 0
+			let maxEntries = maxCapacity / 32
+			let fullRange = 2 * maxEntries
+			fail connError(ErrorCode.QpackDecompression, "required insert count is out of range") when maxEntries == 0 || encoded > fullRange
+			let maxValue = table.inserted() + maxEntries
+			let maxWrapped = (maxValue / fullRange) * fullRange
+			let required = maxWrapped + encoded - 1
+			if required > maxValue {
+				fail connError(ErrorCode.QpackDecompression, "required insert count is out of range") when required <= fullRange
+				required -= fullRange
+			}
+			fail connError(ErrorCode.QpackDecompression, "required insert count is zero after decoding") when required == 0
+			return required
+		}
+
+		internal def entryAt(fromStatic bool, index int, required int) !HeaderField {
+			if fromStatic {
+				fail connError(ErrorCode.QpackDecompression, "static index {index} does not exist") when index < 0 || index >= staticNames.len()
+				return HeaderField{name: staticNames[index], value: staticValues[index]}
+			}
+			fail connError(ErrorCode.QpackDecompression, "a field refers to an entry past the required insert count") when index < 0 || index >= required
+			let entry = table.get(index)
+			fail connError(ErrorCode.QpackDecompression, "a field refers to an evicted entry") when entry is none
+			return entry
+		}
+
+		// cancel tells the encoder a stream's sections will not be read
+		// (RFC 9204 §4.4.2).
+		def cancel(streamID int) {
+			putInteger(outbox, 6, 0x40, streamID) when table.capacity > 0
+		}
+
+		// takeOutput hands over the decoder stream bytes waiting to go.
+		def takeOutput() byte[] {
+			let out = outbox
+			outbox = []
+			return out
+		}
+	}
+
+	// Encoder writes field sections (RFC 9204 §4.5). It inserts fields
+	// into its dynamic table until the table is full and refers only to
+	// entries the peer acknowledged, so a section never waits on the
+	// encoder stream. One encoder serves a connection; the connection
+	// serializes its calls.
+	type Encoder {
+		table         Table
+		// What the peer's decoder allows.
+		peerCapacity  int              = 0
+		// The insert count the peer acknowledged.
+		knownReceived int              = 0
+		// Encoder stream bytes to send.
+		outbox        byte[]           = []
+		// Where each entry of the dynamic table is: name, a line feed and
+		// the value, to its absolute index.
+		positions     map<string, int>
+		// The upper limit of the dynamic table this side fills.
+		limit         int              = 4096
+
+		def new() {
+			table = new Table()
+		}
+
+		// applySettings takes the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY:
+		// the dynamic table opens at the smaller of it and `limit`.
+		def applySettings(maxCapacity int) {
+			peerCapacity = maxCapacity
+			let capacity = maxCapacity < limit ?? (maxCapacity, limit)
+			return when capacity <= 0 || table.capacity == capacity
+			table.resize(capacity)
+			putInteger(outbox, 5, 0x20, capacity)
+		}
+
+		// encode renders a field section and queues inserts for fields
+		// worth remembering.
+		def encode(fields HeaderField[]) byte[] {
+			let body byte[] = []
+			let required = 0
+			let plan int[] = []
+			// First pass: which acknowledged entry each field can use.
+			for let f in fields {
+				let at = -1
+				if table.capacity > 0 && !sensitive(f.name) {
+					let found = positions.get(f.name + "\n" + f.value)
+					if found is none {
+						remember(f)
+					} else if found < knownReceived && found >= table.dropped {
+						at = found
+						required = at + 1 when at + 1 > required
+					}
+				}
+				plan.push(at)
+			}
+			let base = required
+			for let i = 0; i < fields.len(); i++ {
+				let f = fields[i]
+				if plan[i] >= 0 {
+					putInteger(body, 6, 0x80, base - 1 - plan[i])
+					continue
+				}
+				let (index, exact) = staticIndex(f.name, f.value)
+				if exact {
+					putInteger(body, 6, 0xC0, index)
+				} else if index >= 0 {
+					putInteger(body, 4, sensitive(f.name) ?? (0x70, 0x50), index)
+					putString(body, 7, 0x00, f.value)
+				} else {
+					putString(body, 3, sensitive(f.name) ?? (0x30, 0x20), f.name)
+					putString(body, 7, 0x00, f.value)
+				}
+			}
+			let out byte[] = []
+			if required == 0 {
+				out.push(0x00, 0x00)
+			} else {
+				let maxEntries = peerCapacity / 32
+				putInteger(out, 8, 0x00, required % (2 * maxEntries) + 1)
+				putInteger(out, 7, 0x00, 0)
+			}
+			out.push(...body)
+			return out
+		}
+
+		// remember inserts a field into the dynamic table when it fits
+		// without evicting anything.
+		internal def remember(f HeaderField) {
+			return when table.size + entrySize(f) > table.capacity || entrySize(f) > 512
+			let (index, _) = staticIndex(f.name, "\n")
+			if index >= 0 {
+				putInteger(outbox, 6, 0xC0, index)
+			} else {
+				putString(outbox, 5, 0x40, f.name)
+			}
+			putString(outbox, 7, 0x00, f.value)
+			positions[f.name + "\n" + f.value] = table.inserted()
+			table.insert(f)
+		}
+
+		// feedDecoderStream applies the peer's decoder stream.
+		// Fails with Http3Error (QpackDecoderStream) for an instruction
+		// that is malformed or acknowledges more than was inserted.
+		def feedDecoderStream(data byte[]) !none {
+			let r = new Reader(data)
+			for r.left() > 0 {
+				let first = r.peek()
+				if (first & 0x80) != 0 {
+					// Section acknowledgment: this encoder's sections never
+					// pass what is already acknowledged.
+					r.integer(7)
+				} else if (first & 0x40) != 0 {
+					r.integer(6)
+				} else {
+					let increment = r.integer(6)
+					fail connError(ErrorCode.QpackDecoderStream, "the decoder acknowledges inserts that were not made") when increment == 0 || knownReceived + increment > table.inserted()
+					knownReceived += increment
+				}
+				fail connError(ErrorCode.QpackDecoderStream, "malformed decoder instruction") when r.short || r.bad
+			}
+			return none
+		}
+
+		// takeOutput hands over the encoder stream bytes waiting to go.
+		def takeOutput() byte[] {
+			let out = outbox
+			outbox = []
+			return out
+		}
+	}
+
+	// sensitive reports whether a field's value is kept out of the
+	// dynamic table and marked never-indexed.
+	internal def sensitive(name string) bool {
+		return name := "authorization" || "proxy-authorization" || "cookie" || "set-cookie"
+	}
+
+	// staticIndex finds a field in the static table: the index of an
+	// entry with the name and value and true, else the first entry with
+	// the name and false, else -1.
+	internal def staticIndex(name string, value string) (int, bool) {
+		let byName = -1
+		for let i = 0; i < staticNames.len(); i++ {
+			continue unless staticNames[i] == name
+			return (i, true) when staticValues[i] == value
+			byName = i when byName < 0
+		}
+		return (byName, false)
+	}
+}

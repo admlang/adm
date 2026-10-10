@@ -1,0 +1,1913 @@
+// The association itself: the handshake, data transfer, acknowledgments,
+// retransmission and congestion control of RFC 9260.
+internal partial module std.net.sctp.wire {
+	use (
+		std.crypto::(rand, constantTimeEqual)
+		std.crypto.hash::(Hash, hmac)
+		std.net
+		std.net.sctp::*
+		std.net.sequence::(Ranges, RoundTrip, expand)
+		std.net.waiting::(awaitSignal)
+		std.time
+	)
+
+	// Flags of a DATA chunk (RFC 9260 §3.3.1): the last and the first
+	// fragment of a message, and unordered delivery.
+	const flagEnd = 0x01
+	const flagBegin = 0x02
+	const flagUnordered = 0x04
+	// How long a SACK may wait for a second packet (RFC 9260 §6.2).
+	const sackDelay = 200000000
+	// How long a state cookie stays good, in nanoseconds of the clock that
+	// minted it.
+	const cookieLife = 60000000000
+	// Error causes (RFC 9260 §3.3.10) this module sends.
+	const causeUnrecognizedChunk = 6
+	const causeUserAbort = 12
+	const causeProtocolViolation = 13
+	// How long a finished search for the path MTU rests (RFC 8899 §5.1.1).
+	const probeRaise = 600000000000
+	// The most bytes of messages queued for sending before `send` waits.
+	const sendBufferSize = 1048576
+
+	// OutChunk is a DATA chunk this side sent or will send: its TSN (not
+	// wrapped), the packet that carries it alone (common header, chunk
+	// header, payload and padding, written once), how many payload bytes
+	// it holds, when it was last sent and how often, and what the peer
+	// said about it.
+	type OutChunk {
+		tsn        int
+		wire       byte[]
+		size       int
+		// Its stream, stream sequence number and message (a count of this
+		// association), for giving the message up.
+		// The sequence number (DATA) or message identifier (I-DATA) is
+		// given when the first chunk of the message is scheduled.
+		stream     int    = 0
+		key        int    = 0
+		ordered    bool   = true
+		first      bool   = false
+		last       bool   = false
+		message    int    = 0
+		// Partial reliability (RFC 3758, RFC 7496): the most times it is
+		// sent again (-1 without limit), when it expires (0 never), and
+		// whether its message was given up.
+		limit      int    = -1
+		expires    int    = 0
+		abandoned  bool   = false
+		sentAt     int    = 0
+		sends      int    = 0
+		// The packet's checksum is written.
+		summed     bool   = false
+		// Counted in the bytes outstanding.
+		inFlight   bool   = false
+		// A gap block of a SACK covers it.
+		acked      bool   = false
+		retransmit bool   = false
+		misses     int    = 0
+
+		def new(tsn int, wire byte[], size int) {
+			self.tsn = tsn
+			self.wire = wire
+			self.size = size
+		}
+	}
+
+	// InChunk is a DATA or I-DATA chunk received and not delivered yet:
+	// its message's stream sequence number or message identifier, and its
+	// rank, which grows by one from a fragment of a message to the next
+	// (the TSN for DATA; unordered bit, message identifier and fragment
+	// sequence number for I-DATA).
+	struct InChunk {
+		tsn      int
+		key      int
+		rank     int
+		protocol int
+		flags    int
+		data     byte[]
+	}
+
+	// StreamState is one stream: the next sequence numbers each way, the
+	// chunks received and not yet whole messages (by TSN), and the
+	// messages ready for the application.
+	type StreamState {
+		id        int
+		// The next sequence number or message identifier to give out, for
+		// ordered and (I-DATA) unordered messages, the one of the message
+		// being sent, and the next ordered one to deliver.
+		sendKey   int           = 0
+		unordered int           = 0
+		sending   int           = 0
+		wantKey   int           = 0
+		// Chunks not scheduled yet, in the order queued.
+		pending   OutChunk[]    = []
+		parts     InChunk[]     = []
+		ready     Message[]     = []
+		// Signalled when a message becomes ready or the association ends.
+		arrived   channel<none>
+		// The application used the stream or was told of it.
+		announced bool          = false
+		// Resets by the peer the application was not told of yet: for
+		// each, how many messages of `ready` it is told behind, counted
+		// from the reset before it. Their sum never passes `ready.len()`.
+		resets    int[]         = []
+		// This side asked to reset the stream and has no answer yet.
+		resetting bool          = false
+
+		def new(id int) {
+			self.id = id
+			arrived = new channel<none>(1)
+		}
+	}
+
+	// Core is the state of one association and everything that changes
+	// it. Its state changes under its lock; the packets it decides to send
+	// are queued and sent outside it (`drain`), so the reader task and the
+	// application's senders do not wait on the transport for each other.
+	type Core {
+		transport      net.DatagramTransport
+		options        Options
+		state          AssociationState      = AssociationState.Closed
+		// Why the association ended, none while it runs or after a clean
+		// shutdown.
+		failure        ?error                = none
+		// The association ran and ended; Closed before that means it has
+		// not opened yet.
+		over           bool                  = false
+		// Tags and TSNs (RFC 9260 §5.1): this side's verification tag and
+		// first TSN, the peer's once known.
+		localTag       int                   = 0
+		initialTSN     int                   = 0
+		peerTag        int                   = 0
+		cookieSecret   byte[]                = []
+		cookie         byte[]                = []
+		// Sending: the next TSN, the streams with chunks not scheduled yet
+		// and whose turn it is, chunks sent and not acknowledged
+		// cumulatively, in TSN order.
+		nextTSN        int                   = 0
+		active         int[]                 = []
+		turn           int                   = 0
+		sent           OutChunk[]            = []
+		queuedBytes    int                   = 0
+		outstanding    int                   = 0
+		// How many sent chunks are marked for retransmission, how many a
+		// gap block covers, and whether the next retransmission goes out
+		// whatever the congestion window says (RFC 9260 §6.3.3, §7.2.4).
+		marked         int                   = 0
+		// What the peer supports (RFC 3758, RFC 6525), messages counted,
+		// and the TSN the last FORWARD-TSN moved the peer to.
+		peerForward    bool                  = false
+		// The largest packet sent now, and the search for a larger one
+		// (RFC 8899): the largest size confirmed and the largest still
+		// possible, the probe in flight (0 none), its timer and sends.
+		pathMtu        int                   = 0
+		probeLow       int                   = 0
+		probeHigh      int                   = 0
+		probeSize      int                   = 0
+		probeDue       int                   = 0
+		probeSends     int                   = 0
+		// Both sides announced I-DATA (RFC 8260): messages interleave,
+		// and their keys are 32-bit message identifiers.
+		interleaved    bool                  = false
+		keyMask        int                   = 0xFFFF
+		peerReconfig   bool                  = false
+		messages       int                   = 0
+		forwardPoint   int                   = 0
+		// Stream resets (RFC 6525): streams waiting for a request, the
+		// request in flight (its parameter, streams, timer and sends), this
+		// side's and the peer's next request numbers, and the last answer
+		// given.
+		resetQueue     int[]                 = []
+		request        byte[]                = []
+		requestStreams int[]                 = []
+		requestDue     int                   = 0
+		requestSends   int                   = 0
+		requestSeq     int                   = 0
+		peerRequestSeq int                   = 0
+		lastResponse   byte[]                = []
+		// The streams of the messages ready, in the order they became so.
+		arrivedOrder   int[]                 = []
+		gapAcked       int                   = 0
+		burst          bool                  = false
+		cumulativeAck  int                   = 0
+		// Congestion control (RFC 9260 §7.2) and the peer's window.
+		cwnd           int                   = 0
+		ssthresh       int                   = 0
+		partialAcked   int                   = 0
+		peerWindow     int                   = 0
+		recoveryExit   int                   = -1
+		roundTrip      RoundTrip
+		measuring      int                   = -1
+		measureFrom    int                   = 0
+		// Timers, as monotonic ns, 0 when not running: T1 or T2
+		// (handshake and shutdown), T3 (data), the delayed SACK, the next
+		// heartbeat.
+		handshakeDue   int                   = 0
+		handshakeSends int                   = 0
+		dataDue        int                   = 0
+		// The tail probe (see `tailExpired`): when it is due (0 when not
+		// armed) and whether one went out since the peer last
+		// acknowledged anything new.
+		tailDue        int                   = 0
+		tailProbed     bool                  = false
+		// The latest send time among the chunks a SACK newly
+		// acknowledges, while it is taken.
+		ackedSendTime  int                   = 0
+		sackDue        int                   = 0
+		heartbeatDue   int                   = 0
+		errors         int                   = 0
+		// Receiving: the cumulative TSN (not wrapped), the TSNs above it,
+		// what to acknowledge.
+		cumulative     int                   = 0
+		above          Ranges
+		duplicates     int[]                 = []
+		packetsUnacked int                   = 0
+		sackNow        bool                  = false
+		buffered       int                   = 0
+		streams        map<int, StreamState>
+		incoming       int[]                 = []
+		// Packets to send, and whether each came from the pool; the batch
+		// one task is sending; buffers to build packets in; the packet of
+		// small chunks being filled.
+		outbox         byte[][]              = []
+		outboxPooled   bool[]                = []
+		batch          byte[][]              = []
+		batchPooled    bool[]                = []
+		draining       bool                  = false
+		pool           byte[][]              = []
+		bundle         byte[]                = []
+		bundleUsed     int                   = 0
+		// Signalled on a change of state or a new stream, and when the
+		// send buffer has room again.
+		changed        channel<none>
+		writable       channel<none>
+		anyArrived     channel<none>
+		buffer         byte[]
+
+		def new(transport net.DatagramTransport, options Options) {
+			self.transport = transport
+			self.options = options
+			pathMtu = options.mtu
+			above = new Ranges()
+			roundTrip = new RoundTrip(int(options.rtoInitial), int(options.rtoMin), int(options.rtoMax))
+			changed = new channel<none>(1)
+			writable = new channel<none>(1)
+			anyArrived = new channel<none>(1)
+		}
+
+		// ---- The application's side ----
+
+		// start opens the association: actively with an INIT, or waiting
+		// for the peer's; then a task reads the transport until the
+		// association ends. Fails with SctpError when it is not established
+		// within the connect timeout.
+		def start(active bool) !none {
+			let seed = try rand(40)
+			try prepare(seed, active)
+			try drain()
+			let reader = async run()
+			reader.keepAlive()
+			let deadline = int(time.monoNs()) + int(options.connectTimeout)
+			for currentState() != AssociationState.Established {
+				let ended = ending()
+				fail ended unless ended is none
+				if int(time.monoNs()) >= deadline {
+					abort("the association was not established in time")
+					fail sctpError("the peer did not answer within {options.connectTimeout}")
+				}
+				pause(20ms)
+			}
+			return none
+		}
+
+		internal atomic def prepare(seed byte[], active bool) !none {
+			localTag = get32(seed, 0) | 1
+			nextTSN = (1 << 32) + get32(seed, 4)
+			initialTSN = nextTSN & 0xFFFFFFFF
+			requestSeq = initialTSN
+			cumulativeAck = nextTSN - 1
+			cookieSecret = seed[8:40].clone()
+			cwnd = (4 * options.mtu).min((2 * options.mtu).max(4380))
+			ssthresh = options.receiveBuffer
+			return none unless active
+			state = AssociationState.CookieWait
+			queueInit()
+			handshakeDue = int(time.monoNs()) + roundTrip.rto
+			return none
+		}
+
+		// pause waits for a change of state, at most `longest`.
+		internal def pause(longest duration) {
+			awaitSignal(changed, int(time.monoNs()) + int(longest))
+		}
+
+		internal def notify() {
+			changed.offer(none)
+		}
+
+		atomic def currentMtu() int {
+			return pathMtu
+		}
+
+		atomic def currentState() AssociationState {
+			return state
+		}
+
+		// isOver reports whether the association ran and ended.
+		atomic def isOver() bool {
+			return over
+		}
+
+		// ending is what the association ended with, none while it runs.
+		internal atomic def ending() ?error {
+			return none unless over
+			return closedError()
+		}
+
+		// send queues a message as DATA chunks and sends what the windows
+		// allow. Fails with SctpError when the association is not open or
+		// the message is too long, as the transport does otherwise.
+		def send(stream int, data byte[], protocol int, ordered bool, maxRetransmits int, lifetime duration) !none {
+			fail sctpError("SCTP carries no empty message") when data.len() == 0
+			fail sctpError("a message of {data.len()} bytes is longer than the {options.maxMessageSize} the association sends") when data.len() > options.maxMessageSize
+			for {
+				let queued = try enqueue(stream, data, protocol, ordered, maxRetransmits, lifetime)
+				break when queued
+				awaitSignal(writable, 0)
+			}
+			return try drain()
+		}
+
+		// enqueue cuts a message into chunks and queues them on its stream;
+		// false when the send buffer has no room yet. Fails with SctpError
+		// when the association cannot send.
+		internal atomic def enqueue(stream int, data byte[], protocol int, ordered bool, maxRetransmits int, lifetime duration) !bool {
+			fail closedError() unless state == AssociationState.Established
+			return false when queuedBytes > 0 && queuedBytes + data.len() > sendBufferSize
+			let own = streamOf(stream)
+			own.announced = true
+			fail sctpError("stream {stream} is being reset") when own.resetting
+			messages++
+			let expires = lifetime > 0s ?? (int(time.monoNs()) + int(lifetime), 0)
+			let header = interleaved ?? (iDataHeaderSize, dataHeaderSize)
+			// A chunk's length is a multiple of four, so its packet never
+			// passes the MTU through padding.
+			let room = (pathMtu - packetHeaderSize - header) / 4 * 4
+			let at = 0
+			let fragment = 0
+			active.push(stream) when own.pending.len() == 0
+			for {
+				let n = (data.len() - at).min(room)
+				let flags = (ordered ?? (0, flagUnordered)) | (at == 0 ?? (flagBegin, 0)) | (at + n >= data.len() ?? (flagEnd, 0))
+				// The message's bytes are copied once, into the packets that
+				// carry them: the caller may reuse its array. The TSN and the
+				// message's number are written when the chunk is scheduled.
+				let padded = (n + 3) / 4 * 4
+				let wire byte[]
+				wire.len(packetHeaderSize + header + padded)
+				put16(wire, 0, options.port)
+				put16(wire, 2, options.remotePort)
+				put32(wire, 4, peerTag)
+				wire[12] = byte(interleaved ?? (chunkIData, chunkData))
+				wire[13] = byte(flags)
+				put16(wire, 14, header + n)
+				put16(wire, 20, stream)
+				put16(wire, 22, 0)
+				// DATA carries the payload protocol in every chunk, I-DATA in
+				// the first and the fragment's number in the others.
+				put32(wire, header + 8, interleaved && at > 0 ?? (fragment, protocol))
+				let body = packetHeaderSize + header
+				if n == data.len() {
+					data.copy(wire[body:])
+				} else {
+					data[at:at + n].copy(wire[body:])
+				}
+				for let i = n; i < padded; i++ {
+					wire[body + i] = 0
+				}
+				let chunk = new OutChunk(0, wire, n)
+				chunk.stream = stream
+				chunk.ordered = ordered
+				chunk.first = at == 0
+				chunk.last = at + n >= data.len()
+				chunk.message = messages
+				chunk.limit = maxRetransmits
+				chunk.expires = expires
+				own.pending.push(chunk)
+				queuedBytes += n
+				at += n
+				fragment++
+				break when at >= data.len()
+			}
+			queueData(int(time.monoNs()))
+			return true
+		}
+
+		// receive waits for the next message of a stream. Fails with
+		// NetError (TimedOut), or the association's end once nothing is
+		// left.
+		def receive(stream int, timeout duration) !Message {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			let arrived = arrivals(stream)
+			for {
+				let message = try take(stream)
+				if !(message is none) {
+					try drain()
+					return message
+				}
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "no message before the timeout") unless awaitSignal(arrived, deadline)
+			}
+			fail sctpError("unreachable")
+		}
+
+		internal atomic def arrivals(stream int) channel<none> {
+			let own = streamOf(stream)
+			own.announced = true
+			return own.arrived
+		}
+
+		// receiveAny waits for the next message of any stream, in the
+		// order they became ready. Fails as `receive` does.
+		def receiveAny(timeout duration) !Message {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let message = try takeAny()
+				if !(message is none) {
+					try drain()
+					return message
+				}
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "no message before the timeout") unless awaitSignal(anyArrived, deadline)
+			}
+			fail sctpError("unreachable")
+		}
+
+		internal atomic def takeAny() !?Message {
+			for arrivedOrder.len() > 0 {
+				let own = streamOf(arrivedOrder[0])
+				if own.ready.len() == 0 && own.resets.len() == 0 {
+					arrivedOrder.shift()
+					continue
+				}
+				return try take(own.id)
+			}
+			fail closedError() when over
+			return none
+		}
+
+		internal atomic def take(stream int) !?Message {
+			let own = streamOf(stream)
+			own.announced = true
+			let place = arrivedOrder.indexOf(stream)
+			if own.resets.len() > 0 && own.resets[0] == 0 {
+				// The messages that came before the reset were read: the
+				// reset is told before those that came after it.
+				own.resets.shift()
+				arrivedOrder.remove(place) when place >= 0
+				fail SctpError{message: "sctp: the peer reset stream {stream}", streamReset: true, stream: stream}
+			}
+			if own.ready.len() == 0 {
+				fail closedError() when over
+				return none
+			}
+			arrivedOrder.remove(place) when place >= 0
+			own.resets[0] = own.resets[0] - 1 when own.resets.len() > 0
+			let message = own.ready.shift()
+			// The window opens again: tell the peer when it was nearly shut.
+			let shut = options.receiveBuffer - buffered < options.mtu
+			buffered -= message.data.len()
+			sackNow = true when shut
+			queueAck(int(time.monoNs())) when shut
+			return message
+		}
+
+		// nextStream waits for a stream the peer started. Fails with
+		// NetError (TimedOut) or the association's end.
+		def nextStream(timeout duration) !int {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let id = try takeIncoming()
+				return id unless id < 0
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no stream before the timeout") when deadline > 0 && int(time.monoNs()) >= deadline
+				pause(50ms)
+			}
+			fail sctpError("unreachable")
+		}
+
+		internal atomic def takeIncoming() !int {
+			return incoming.shift() when incoming.len() > 0
+			fail closedError() when over
+			return -1
+		}
+
+		internal def closedError() error {
+			let ended = failure
+			return ended unless ended is none
+			return sctpError("the association is closed")
+		}
+
+		// shutdown ends the association once its data is acknowledged, and
+		// waits for that up to the connect timeout.
+		def shutdown() {
+			beginShutdown()
+			drain() onerror recover none
+			let deadline = int(time.monoNs()) + int(options.connectTimeout)
+			for !isOver() && int(time.monoNs()) < deadline {
+				pause(20ms)
+			}
+			if !isOver() {
+				abort("")
+				return
+			}
+			drain() onerror recover none
+			transport.close() onerror recover none
+		}
+
+		internal atomic def beginShutdown() {
+			return unless state == AssociationState.Established
+			state = AssociationState.ShutdownPending
+			advanceShutdown(int(time.monoNs()))
+		}
+
+		// abort ends the association now and tells the peer.
+		def abort(reason string) {
+			endWith(reason)
+			drain() onerror recover none
+			transport.close() onerror recover none
+		}
+
+		internal atomic def endWith(reason string) {
+			return when over
+			if peerTag != 0 {
+				let text = reason.bytes()
+				control(peerTag, chunkBytes(chunkAbort, 0, parameter(causeUserAbort, text)))
+			}
+			conclude(reason == "" ?? (none, sctpError(reason)))
+		}
+
+		// conclude closes the association with what ended it.
+		internal def conclude(cause ?error) {
+			failure = cause when failure is none
+			state = AssociationState.Closed
+			over = true
+			handshakeDue = 0
+			dataDue = 0
+			sackDue = 0
+			heartbeatDue = 0
+			requestDue = 0
+			probeDue = 0
+			notify()
+			writable.offer(none)
+			anyArrived.offer(none)
+			for let (_, own) in streams {
+				own.arrived.offer(none)
+			}
+		}
+
+		// drain sends the packets queued, one task at a time: a task that
+		// finds another sending leaves its packets to it. Fails as the
+		// transport does once it is closed.
+		def drain() !none {
+			return none unless beginDrain()
+			let failed ?error = none
+			for nextBatch() {
+				for let packet in batch {
+					transport.send(packet, 5s) onerror (err error) {
+						failed = err when failed is none
+						recover none
+					}
+				}
+				recycle()
+			}
+			// A send that failed on an open transport is a lost datagram.
+			fail failed unless failed is none || transport.isOpen()
+			return none
+		}
+
+		internal atomic def beginDrain() bool {
+			return false when draining
+			draining = true
+			return true
+		}
+
+		// nextBatch moves the queued packets to the batch; false, ending
+		// the drain, when none are queued.
+		internal atomic def nextBatch() bool {
+			if outbox.len() == 0 {
+				draining = false
+				return false
+			}
+			let packets = outbox
+			outbox = batch
+			batch = packets
+			let flags = outboxPooled
+			outboxPooled = batchPooled
+			batchPooled = flags
+			return true
+		}
+
+		// recycle returns the batch's pooled buffers.
+		internal atomic def recycle() {
+			for let i = 0; i < batch.len(); i++ {
+				pool.push(batch[i]) when batchPooled[i] && pool.len() < 64
+			}
+			batch.flush()
+			batchPooled.flush()
+		}
+
+		// post queues a packet built for this one send.
+		internal def post(packet byte[]) {
+			outbox.push(packet)
+			outboxPooled.push(false)
+		}
+
+		// control queues a packet of chunks under a verification tag.
+		internal def control(tag int, chunks byte[]) {
+			post(packetBytes(options.port, options.remotePort, tag, chunks))
+		}
+
+		// packetBuffer is a buffer of `size` bytes from the pool, with the
+		// common header for the peer written; what else it holds is old.
+		internal def packetBuffer(size int) byte[] {
+			if pool.len() > 0 && size <= pool[pool.len() - 1].cap() {
+				let reused = pool.pop()
+				reused.len(size)
+				writeHeader(reused)
+				return reused
+			}
+			let made byte[]
+			made.cap(options.mtu.max(options.maxMtu).max(size))
+			made.len(size)
+			writeHeader(made)
+			return made
+		}
+
+		internal def writeHeader(packet byte[]) {
+			put16(packet, 0, options.port)
+			put16(packet, 2, options.remotePort)
+			put32(packet, 4, peerTag)
+		}
+
+		// ---- The reader task ----
+
+		// run reads the transport and serves the timers until the
+		// association is closed.
+		def run() {
+			buffer.len(65536)
+			for !isOver() || pendingOutput() {
+				let wait = serve(int(time.monoNs()))
+				drainOrEnd()
+				break when isOver()
+				let failed = false
+				let timedOut = false
+				let n = transport.receive(buffer, duration(wait)) onerror (err error) {
+					timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					failed = !timedOut
+					recover 0
+				}
+				if failed {
+					if !transport.isOpen() {
+						failWith(sctpError("the transport closed"))
+						break
+					}
+					// A transport that is still open lost a datagram (a UDP
+					// socket reports the peer's closed port this way); the
+					// timers send again.
+					time.sleep(10ms)
+					continue
+				}
+				continue when timedOut || n < packetHeaderSize + 4
+				arrived(n, int(time.monoNs()))
+			}
+			drain() onerror recover none
+		}
+
+		// drainOrEnd sends what is queued; a transport that fails ends
+		// the association.
+		internal def drainOrEnd() {
+			drain() onerror (err error) {
+				failWith(err)
+				recover none
+			}
+		}
+
+		// arrived takes the packet in the first `size` bytes of the buffer.
+		internal atomic def arrived(size int, now int) {
+			buffer.len(size)
+			handle(now)
+			buffer.len(65536)
+		}
+
+		internal atomic def pendingOutput() bool {
+			return outbox.len() > 0
+		}
+
+		internal atomic def failWith(err error) {
+			conclude(err)
+		}
+
+		// serve runs the timers that are due and answers how long the
+		// reader may wait for a packet, in nanoseconds.
+		internal atomic def serve(now int) int {
+			handshakeExpired(now) when handshakeDue > 0 && now >= handshakeDue
+			tailExpired(now) when tailDue > 0 && now >= tailDue && (dataDue == 0 || now < dataDue)
+			dataExpired(now) when dataDue > 0 && now >= dataDue
+			if sackDue > 0 && now >= sackDue {
+				sackNow = true
+				queueAck(now)
+			}
+			if heartbeatDue > 0 && now >= heartbeatDue && state == AssociationState.Established {
+				control(peerTag, chunkBytes(chunkHeartbeat, 0, parameter(1, word(now >> 32) + word(now & 0xFFFFFFFF))))
+				heartbeatDue = now + int(options.heartbeat)
+			}
+			requestExpired(now) when requestDue > 0 && now >= requestDue
+			probeExpired(now) when probeDue > 0 && now >= probeDue
+			let wake = now + 500000000
+			wake = probeDue when probeDue > 0 && probeDue < wake
+			wake = requestDue when requestDue > 0 && requestDue < wake
+			wake = handshakeDue when handshakeDue > 0 && handshakeDue < wake
+			wake = dataDue when dataDue > 0 && dataDue < wake
+			wake = tailDue when tailDue > 0 && tailDue < wake
+			wake = sackDue when sackDue > 0 && sackDue < wake
+			wake = heartbeatDue when heartbeatDue > 0 && heartbeatDue < wake
+			return (wake - now).max(1000000)
+		}
+
+		// handshakeExpired sends the INIT, COOKIE ECHO, SHUTDOWN or
+		// SHUTDOWN ACK again, or gives up (RFC 9260 §5.1, §9.2).
+		internal def handshakeExpired(now int) {
+			handshakeSends++
+			let opening = state := AssociationState.CookieWait || AssociationState.CookieEchoed
+			let limit = opening ?? (options.maxInitRetransmits, options.maxRetransmits)
+			if handshakeSends > limit {
+				conclude(sctpError("the peer stopped answering"))
+				return
+			}
+			roundTrip.backoff()
+			switch {
+				case state == AssociationState.CookieWait:
+					queueInit()
+				case state == AssociationState.CookieEchoed:
+					control(peerTag, chunkBytes(chunkCookieEcho, 0, cookie))
+				case state == AssociationState.ShutdownSent:
+					control(peerTag, chunkBytes(chunkShutdown, 0, word(cumulative)))
+				case state == AssociationState.ShutdownAckSent:
+					control(peerTag, chunkBytes(chunkShutdownAck, 0, []))
+				default:
+					handshakeDue = 0
+					return
+			}
+			handshakeDue = now + roundTrip.rto
+		}
+
+		// tailWait is how long after the last chunk went out a tail probe
+		// waits: two round trips and their variation, and, when what is
+		// outstanding fits one packet, the time the peer may hold its
+		// acknowledgment of a single packet back (it answers a second
+		// packet at once, RFC 9260 §6.2). 0 before a round trip was
+		// measured: no probe then.
+		internal def tailWait() int {
+			return 0 when roundTrip.srtt == 0
+			let wait = 2 * roundTrip.srtt + (4 * roundTrip.rttvar).max(1000000)
+			return outstanding > pathMtu ?? (wait, wait + sackDelay)
+		}
+
+		// tailExpired sends the last outstanding chunk once more when the
+		// peer has been silent for `tailWait`, before T3 runs out. The
+		// last chunks of a burst have nothing behind them to make the
+		// peer report them missing, so without this their loss waits for
+		// the retransmission timer, a second at least and doubling. The
+		// acknowledgment of the probe shows by its time what was lost
+		// before it (`takeSack`). Neither the window nor the timeout
+		// changes: nothing is known to be lost yet (the tail loss probe
+		// of RFC 8985, which RFC 9260 does not define).
+		internal def tailExpired(now int) {
+			tailDue = 0
+			return when tailProbed || marked > 0
+			// What the peer skipped over long enough ago is lost; else the
+			// last chunk is the probe.
+			let window = (roundTrip.srtt / 4).max(1000000)
+			let highest = -1
+			for let chunk in sent {
+				highest = chunk.tsn when chunk.acked && chunk.tsn > highest
+			}
+			let lost = false
+			for let chunk in sent {
+				continue when chunk.acked || chunk.abandoned || chunk.retransmit || !chunk.inFlight
+				continue unless chunk.tsn < highest && now - chunk.sentAt >= roundTrip.srtt + window
+				mark(chunk)
+				lost = true
+			}
+			if lost {
+				burst = true
+				if cumulativeAck > recoveryExit {
+					ssthresh = (cwnd / 2).max(4 * options.mtu)
+					cwnd = ssthresh
+					partialAcked = 0
+					recoveryExit = nextTSN - 1
+				}
+				queueData(now)
+				return
+			}
+			for let i = sent.len() - 1; i >= 0; i-- {
+				let chunk = sent[i]
+				continue when chunk.acked || chunk.abandoned
+				tailProbed = true
+				mark(chunk)
+				burst = true
+				queueData(now)
+				return
+			}
+		}
+
+		// dataExpired is the T3 timer running out (RFC 9260 §6.3.3): the
+		// window collapses and everything outstanding is sent again.
+		internal def dataExpired(now int) {
+			errors++
+			if errors > options.maxRetransmits {
+				conclude(sctpError("the peer stopped acknowledging"))
+				return
+			}
+			roundTrip.backoff()
+			ssthresh = (cwnd / 2).max(4 * options.mtu)
+			cwnd = options.mtu
+			if pathMtu > options.mtu && errors >= 2 {
+				// Nothing passes any more: the path may have narrowed
+				// (RFC 8899 §4.3). New messages are cut for the base size
+				// and the search starts over later.
+				pathMtu = options.mtu
+				probeSize = 0
+				probeDue = now + probeRaise
+			}
+			partialAcked = 0
+			recoveryExit = -1
+			measuring = -1
+			for let chunk in sent {
+				continue when chunk.acked || chunk.abandoned
+				mark(chunk)
+			}
+			burst = true
+			dataDue = 0
+			tailDue = 0
+			// The FORWARD-TSN goes again when the peer did not move.
+			forwardPoint = cumulativeAck
+			queueData(now)
+		}
+
+		// mark sets a sent chunk to be sent again and takes it out of the
+		// bytes outstanding.
+		internal def mark(chunk OutChunk) {
+			if !chunk.retransmit {
+				chunk.retransmit = true
+				marked++
+			}
+			if chunk.inFlight {
+				chunk.inFlight = false
+				outstanding -= chunk.size
+			}
+		}
+
+		// ---- Packets in ----
+
+		// handle takes the packet the buffer holds, chunk by chunk.
+		internal def handle(now int) {
+			let size = buffer.len()
+			return unless checksumHolds(buffer)
+			let tag = get32(buffer, 4)
+			let firstKind = int(buffer[12])
+			// An INIT comes with tag 0; an ABORT or SHUTDOWN COMPLETE with
+			// the T bit comes with the tag this side sends (RFC 9260 §8.5).
+			let reflected = (firstKind := chunkAbort || chunkShutdownComplete) && (int(buffer[13]) & 0x01) != 0 && tag == peerTag
+			return unless (firstKind == chunkInit && tag == 0) || tag == localTag || reflected
+			let hadData = false
+			let at = packetHeaderSize
+			for at + 4 <= size {
+				let kind = int(buffer[at])
+				let flags = int(buffer[at + 1])
+				let length = get16(buffer, at + 2)
+				break when length < 4 || at + length > size
+				if kind := chunkData || chunkIData {
+					// One kind of data chunk on an association (RFC 8260 §2.2).
+					if (kind == chunkIData) != interleaved {
+						control(peerTag, chunkBytes(chunkAbort, 0, parameter(causeProtocolViolation, [])))
+						conclude(sctpError("the peer sent the kind of data chunk that was not agreed"))
+						return
+					}
+					hadData = true
+					takeData(at, length, flags)
+				} else if kind == chunkSack {
+					takeSack(at + 4, length - 4, now)
+				} else {
+					let goOn = takeControl(kind, flags, buffer[at + 4:at + length], now)
+					break unless goOn
+					return when over
+				}
+				at += (length + 3) / 4 * 4
+			}
+			packetsUnacked++ when hadData
+			queueAck(now) when hadData || sackNow
+			advanceShutdown(now)
+			queueData(now)
+		}
+
+		// takeControl takes a chunk that is neither DATA nor SACK; false
+		// when the rest of the packet is to be left unread.
+		internal def takeControl(kind int, flags int, value byte[], now int) bool {
+			switch {
+				case kind == chunkInit:
+					takeInit(value)
+				case kind == chunkInitAck:
+					takeInitAck(value, now)
+				case kind == chunkCookieEcho:
+					takeCookieEcho(value, now)
+				case kind == chunkCookieAck:
+					establish(now) when state == AssociationState.CookieEchoed
+				case kind == chunkHeartbeat:
+					control(peerTag, chunkBytes(chunkHeartbeatAck, 0, value))
+				case kind == chunkHeartbeatAck:
+					errors = 0
+					// A probe came back: packets of its size pass.
+					if probeSize > 0 && value.len() == 16 && get32(value, 12) == probeSize {
+						pathMtu = probeSize
+						probeLow = probeSize
+						probe(now)
+					}
+				case kind == chunkAbort:
+					conclude(sctpError("the peer aborted the association"))
+				case kind == chunkShutdown:
+					takeShutdown(value, now)
+				case kind == chunkShutdownAck:
+					if state := AssociationState.ShutdownSent || AssociationState.ShutdownAckSent {
+						control(peerTag, chunkBytes(chunkShutdownComplete, 0, []))
+						conclude(none)
+					}
+				case kind == chunkShutdownComplete:
+					conclude(none) when state == AssociationState.ShutdownAckSent
+				case kind := chunkForwardTSN || chunkIForwardTSN:
+					takeForward(value, kind == chunkIForwardTSN) when (kind == chunkIForwardTSN) == interleaved
+				case kind == chunkReconfig:
+					takeReconfig(value, now)
+				case kind == chunkError:
+				// The causes are the peer's complaint about a chunk of
+				// ours; the association goes on.
+				default:
+					// The two highest bits of an unknown type say what to do
+					// (RFC 9260 §3.2): stop or skip, report or not.
+					control(peerTag, chunkBytes(chunkError, 0, parameter(causeUnrecognizedChunk, chunkBytes(kind, flags, value)))) when (kind & 0x40) != 0 && peerTag != 0
+					return (kind & 0x80) != 0
+			}
+			return true
+		}
+
+		// ---- The handshake (RFC 9260 §5) ----
+
+		// initValue is the value of this side's INIT or INIT ACK: the
+		// fixed part, then what it supports (RFC 3758 §3.1, RFC 5061
+		// §4.2.7): FORWARD-TSN, RE-CONFIG and, unless turned off, I-DATA.
+		internal def initValue() byte[] {
+			return word(localTag) + word(options.receiveBuffer) + half(options.streams) + half(options.streams) + word(initialTSN) + parameter(paramForwardTSN, []) + parameter(paramSupportedExtensions, options.interleaving ?? (byte[chunkForwardTSN, chunkReconfig, chunkIData, chunkIForwardTSN], byte[chunkForwardTSN, chunkReconfig]))
+		}
+
+		internal def queueInit() {
+			control(0, chunkBytes(chunkInit, 0, initValue()))
+		}
+
+		// supported is what the parameters of an INIT or INIT ACK say the
+		// peer supports: bit 0 FORWARD-TSN, bit 1 RE-CONFIG, bit 2 I-DATA.
+		internal def supported(value byte[]) int {
+			let bits = 0
+			for let p in parametersOf(value, 16) {
+				bits = bits | 1 when p.kind == paramForwardTSN
+				continue unless p.kind == paramSupportedExtensions
+				for let kind in p.value {
+					bits = bits | 1 when int(kind) == chunkForwardTSN
+					bits = bits | 2 when int(kind) == chunkReconfig
+					bits = bits | 4 when int(kind) == chunkIData
+				}
+			}
+			return bits
+		}
+
+		// takeInit answers an INIT with an INIT ACK that carries everything
+		// about the peer in a signed cookie, and keeps nothing (§5.1). The
+		// tag is this side's own in every state, so two sides that open at
+		// once meet (§5.2.1).
+		internal def takeInit(value byte[]) {
+			return when value.len() < 16 || get32(value, 0) == 0
+			let theirTag = get32(value, 0)
+			let body = word(int(time.monoNs()) >> 32) + word(int(time.monoNs()) & 0xFFFFFFFF) + word(localTag) + value[0:16] + word(supported(value))
+			let minted = body + hmac(Hash.SHA256, cookieSecret, body)
+			control(theirTag, chunkBytes(chunkInitAck, 0, initValue() + parameter(paramStateCookie, minted)))
+		}
+
+		internal def takeInitAck(value byte[], now int) {
+			return unless state == AssociationState.CookieWait && value.len() >= 16
+			let echoed byte[] = []
+			for let p in parametersOf(value, 16) {
+				echoed = p.value when p.kind == paramStateCookie
+			}
+			return when echoed.len() == 0
+			adoptPeer(value, supported(value))
+			cookie = echoed.clone()
+			state = AssociationState.CookieEchoed
+			handshakeSends = 0
+			control(peerTag, chunkBytes(chunkCookieEcho, 0, cookie))
+			handshakeDue = now + roundTrip.rto
+		}
+
+		// adoptPeer takes the peer's tag, window and first TSN from the
+		// fixed part of its INIT or INIT ACK, and what it supports.
+		internal def adoptPeer(value byte[], bits int) {
+			peerTag = get32(value, 0)
+			peerWindow = get32(value, 4)
+			cumulative = (1 << 32) + get32(value, 12) - 1
+			peerRequestSeq = get32(value, 12)
+			peerForward = (bits & 1) != 0
+			peerReconfig = (bits & 2) != 0
+			interleaved = options.interleaving && (bits & 4) != 0
+			keyMask = interleaved ?? (0xFFFFFFFF, 0xFFFF)
+		}
+
+		// takeCookieEcho checks a cookie this side minted and, when it is
+		// for this association, establishes it (§5.1, §5.2.4): for the side
+		// that waited, and for both sides when they opened at once.
+		internal def takeCookieEcho(value byte[], now int) {
+			return when value.len() != 32 + 32
+			let body = value[0:32]
+			return unless constantTimeEqual(value[32:], hmac(Hash.SHA256, cookieSecret, body))
+			let minted = get32(body, 0) << 32 | get32(body, 4)
+			return when now - minted > cookieLife || get32(body, 8) != localTag
+			let theirs = body[12:28]
+			if state := AssociationState.Closed || AssociationState.CookieWait || AssociationState.CookieEchoed {
+				adoptPeer(theirs, get32(body, 28)) when peerTag == 0 || state != AssociationState.CookieEchoed
+				return unless get32(theirs, 0) == peerTag
+				establish(now)
+			}
+			// An established association answers a repeated COOKIE ECHO
+			// with another COOKIE ACK.
+			control(peerTag, chunkBytes(chunkCookieAck, 0, [])) when get32(theirs, 0) == peerTag
+		}
+
+		internal def establish(now int) {
+			state = AssociationState.Established
+			handshakeDue = 0
+			handshakeSends = 0
+			roundTrip.reset()
+			heartbeatDue = now + int(options.heartbeat)
+			if options.maxMtu > options.mtu {
+				probeLow = options.mtu
+				probeHigh = options.maxMtu
+				probe(now)
+			}
+			notify()
+		}
+
+		// ---- Shutdown (RFC 9260 §9.2) ----
+
+		internal def takeShutdown(value byte[], now int) {
+			return when value.len() < 4
+			takeCumulativeAck(expand(cumulativeAck, get32(value, 0), 32), now, 0)
+			state = AssociationState.ShutdownReceived when state := AssociationState.Established || AssociationState.ShutdownPending
+		}
+
+		// advanceShutdown moves a closing association on once nothing is
+		// left to deliver to the peer.
+		internal def advanceShutdown(now int) {
+			return when active.len() > 0 || sent.len() > 0
+			if state == AssociationState.ShutdownPending {
+				state = AssociationState.ShutdownSent
+				control(peerTag, chunkBytes(chunkShutdown, 0, word(cumulative)))
+				handshakeSends = 0
+				handshakeDue = now + roundTrip.rto
+			} else if state == AssociationState.ShutdownReceived {
+				state = AssociationState.ShutdownAckSent
+				control(peerTag, chunkBytes(chunkShutdownAck, 0, []))
+				handshakeSends = 0
+				handshakeDue = now + roundTrip.rto
+			}
+		}
+
+		// ---- Data in (RFC 9260 §6.2) ----
+
+		internal def streamOf(id int) StreamState {
+			let known = streams.get(id)
+			return known unless known is none
+			let fresh = new StreamState(id)
+			streams[id] = fresh
+			return fresh
+		}
+
+		// takeData takes the DATA or I-DATA chunk at an offset of the
+		// buffer: a new TSN goes to its stream, a repeated one is reported
+		// in the next SACK.
+		internal def takeData(at int, length int, flags int) {
+			let header = interleaved ?? (iDataHeaderSize, dataHeaderSize)
+			let size = length - header
+			return when size <= 0 || !(state := AssociationState.Established || AssociationState.ShutdownPending || AssociationState.ShutdownSent)
+			let tsn = expand(cumulative + 1, get32(buffer, at + 4), 32)
+			if tsn <= cumulative || above.holds(tsn) {
+				duplicates.push(tsn & 0xFFFFFFFF) when duplicates.len() < 16
+				sackNow = true
+				return
+			}
+			// A chunk the window has no room for is dropped unless it is the
+			// one that fills the gap at the front (RFC 9260 §6.2).
+			return when buffered + size > options.receiveBuffer && tsn != cumulative + 1
+			let unordered = (flags & flagUnordered) != 0
+			let key = interleaved ?? (get32(buffer, at + 12), get16(buffer, at + 10))
+			let rank = tsn
+			let protocol = get32(buffer, at + header - 4)
+			if interleaved {
+				// The first fragment carries the protocol, the others their
+				// number; a message has far fewer than 2^30 of them.
+				let fragment = (flags & flagBegin) != 0 ?? (0, protocol)
+				return when fragment >= 1 << 30
+				rank = (unordered ?? (1 << 62, 0)) | key << 30 | fragment
+			}
+			if tsn == cumulative + 1 {
+				cumulative = tsn
+				if !above.isEmpty() {
+					// The TSNs right above join in.
+					cumulative = above.bounds[1] - 1 when above.bounds[0] == cumulative + 1
+					above.dropBelow(cumulative + 1)
+				}
+			} else {
+				above.add(tsn, tsn + 1)
+				sackNow = true
+			}
+			let own = streamOf(get16(buffer, at + 8))
+			if !own.announced {
+				own.announced = true
+				incoming.push(own.id)
+				notify()
+			}
+			// An ordered message already delivered or skipped comes too
+			// late (a fragment behind an I-FORWARD-TSN).
+			return when interleaved && !unordered && serialBefore(key, own.wantKey, keyMask)
+			let payload byte[]
+			payload.len(size)
+			buffer[at + header:at + length].copy(payload)
+			buffered += size
+			let part = InChunk{tsn: tsn, key: key, rank: rank, protocol: protocol, flags: flags, data: payload}
+			// By rank: a message's fragments lie side by side.
+			let slot = own.parts.len()
+			for slot > 0 && own.parts[slot - 1].rank > rank {
+				slot--
+			}
+			return when slot > 0 && own.parts[slot - 1].rank == rank
+			own.parts.push(part)
+			for let i = own.parts.len() - 1; i > slot; i-- {
+				own.parts[i] = own.parts[i - 1]
+			}
+			own.parts[slot] = part
+			deliver(own)
+		}
+
+		// deliver moves the messages of a stream that are whole, and next
+		// in order when ordered, to its ready queue.
+		internal def deliver(own StreamState) {
+			let moved = true
+			for moved {
+				moved = false
+				for let start = 0; start < own.parts.len(); start++ {
+					let head = own.parts[start]
+					continue unless (head.flags & flagBegin) != 0
+					let ordered = (head.flags & flagUnordered) == 0
+					continue when ordered && head.key != own.wantKey
+					let end = start
+					let whole = (head.flags & flagEnd) != 0
+					for !whole && end + 1 < own.parts.len() && own.parts[end + 1].rank == own.parts[end].rank + 1 {
+						end++
+						whole = (own.parts[end].flags & flagEnd) != 0
+					}
+					continue unless whole
+					let size = 0
+					for let i = start; i <= end; i++ {
+						size += own.parts[i].data.len()
+					}
+					let data = head.data
+					if end > start {
+						data = []
+						data.len(size)
+						let to = 0
+						for let i = start; i <= end; i++ {
+							let piece = own.parts[i].data
+							piece.copy(data[to:])
+							to += piece.len()
+						}
+					}
+					for let i = start; i <= end; i++ {
+						own.parts.remove(start)
+					}
+					own.ready.push(Message{stream: own.id, data: data, protocol: head.protocol})
+					own.wantKey = (own.wantKey + 1) & keyMask when ordered
+					moved = true
+					arrivedOrder.push(own.id)
+					own.arrived.offer(none)
+					anyArrived.offer(none)
+					break
+				}
+			}
+		}
+
+		// queueAck queues a SACK (RFC 9260 §3.3.4) when one is owed: at
+		// once for a gap, a duplicate or a second packet, else after the
+		// delay.
+		internal def queueAck(now int) {
+			return when peerTag == 0
+			if !sackNow && packetsUnacked < 2 && above.isEmpty() {
+				sackDue = now + sackDelay when packetsUnacked > 0 && sackDue == 0
+				return
+			}
+			let repeats = duplicates.len()
+			let blocks = (above.bounds.len() / 2).min((options.mtu - packetHeaderSize - 16 - 4 * repeats) / 4)
+			let packet = packetBuffer(packetHeaderSize + 16 + 4 * blocks + 4 * repeats)
+			packet[12] = byte(chunkSack)
+			packet[13] = 0
+			put16(packet, 14, 16 + 4 * blocks + 4 * repeats)
+			put32(packet, 16, cumulative & 0xFFFFFFFF)
+			put32(packet, 20, (options.receiveBuffer - buffered).max(0))
+			put16(packet, 24, blocks)
+			put16(packet, 26, repeats)
+			let at = 28
+			for let i = 0; i < blocks; i++ {
+				put16(packet, at, above.bounds[2 * i] - cumulative)
+				put16(packet, at + 2, above.bounds[2 * i + 1] - 1 - cumulative)
+				at += 4
+			}
+			for let tsn in duplicates {
+				put32(packet, at, tsn)
+				at += 4
+			}
+			writeChecksum(packet)
+			outbox.push(packet)
+			outboxPooled.push(true)
+			packetsUnacked = 0
+			sackNow = false
+			sackDue = 0
+			duplicates.len(0)
+		}
+
+		// ---- Data out (RFC 9260 §6.1, §6.3, §7.2) ----
+
+		// queueData queues packets of DATA chunks: first what is marked
+		// for retransmission, then new chunks, while the congestion window
+		// and the peer's window have room.
+		internal def queueData(now int) {
+			return unless state := AssociationState.Established || AssociationState.ShutdownPending || AssociationState.ShutdownReceived
+			if marked > 0 {
+				// After a timeout or a fast retransmission one packet goes
+				// out whatever the window says (RFC 9260 §6.3.3, §7.2.4).
+				let free = burst ?? (pathMtu - packetHeaderSize, 0)
+				burst = false
+				for let chunk in sent {
+					continue unless chunk.retransmit
+					if peerForward && ((chunk.limit >= 0 && chunk.sends > chunk.limit) || (chunk.expires > 0 && now >= chunk.expires)) {
+						abandon(chunk)
+						break when marked == 0
+						continue
+					}
+					let length = chunk.wire.len() - packetHeaderSize
+					if length <= free {
+						free -= length
+					} else {
+						free = 0
+						break when outstanding > 0 && outstanding + chunk.size > cwnd
+					}
+					emit(chunk)
+					chunk.retransmit = false
+					marked--
+					chunk.sends++
+					chunk.sentAt = now
+					chunk.misses = 0
+					chunk.inFlight = true
+					outstanding += chunk.size
+					break when marked == 0
+				}
+			}
+			let fresh = false
+			for marked == 0 && active.len() > 0 {
+				turn = 0 when turn >= active.len()
+				let own = streamOf(active[turn])
+				let chunk = own.pending[0]
+				let size = chunk.size
+				// A message that expired before all of it was scheduled is
+				// given up; what was not sent takes no TSN.
+				if peerForward && chunk.expires > 0 && now >= chunk.expires {
+					abandon(chunk)
+					continue
+				}
+				// A window that is shut still lets one chunk through as a
+				// probe when nothing is outstanding (RFC 9260 §6.1 A).
+				break when outstanding > 0 && (outstanding + size > cwnd || size > peerWindow)
+				own.pending.shift()
+				// Round robin over the streams: by chunk when messages
+				// interleave (RFC 8260 §3.2), else by message.
+				if own.pending.len() == 0 {
+					active.remove(turn)
+				} else if interleaved || chunk.last {
+					turn++
+				}
+				schedule(own, chunk)
+				emit(chunk)
+				chunk.sends = 1
+				chunk.sentAt = now
+				chunk.inFlight = true
+				sent.push(chunk)
+				fresh = true
+				outstanding += size
+				queuedBytes -= size
+				peerWindow = (peerWindow - size).max(0)
+				if measuring < 0 {
+					measuring = chunk.tsn
+					measureFrom = now
+				}
+			}
+			closeBundle()
+			advanceForward()
+			launchReset(now) when resetQueue.len() > 0
+			dataDue = now + roundTrip.rto when dataDue == 0 && sent.len() > 0
+			if fresh {
+				// The probe waits from the last new chunk.
+				let wait = tailWait()
+				tailDue = wait > 0 ?? (now + wait, 0)
+				tailProbed = false
+			}
+			writable.offer(none) when queuedBytes < sendBufferSize / 2
+		}
+
+		// schedule gives a chunk its TSN and its message's number: the
+		// stream sequence number of DATA, or the message identifier of
+		// I-DATA, counted apart for ordered and unordered messages.
+		internal def schedule(own StreamState, chunk OutChunk) {
+			chunk.tsn = nextTSN
+			nextTSN++
+			if chunk.first {
+				if chunk.ordered {
+					own.sending = own.sendKey
+					own.sendKey = (own.sendKey + 1) & keyMask
+				} else if interleaved {
+					own.sending = own.unordered
+					own.unordered = (own.unordered + 1) & keyMask
+				} else {
+					own.sending = 0
+				}
+			}
+			chunk.key = own.sending
+			put32(chunk.wire, 16, chunk.tsn & 0xFFFFFFFF)
+			if interleaved {
+				put32(chunk.wire, 24, chunk.key)
+			} else {
+				put16(chunk.wire, 22, chunk.key)
+			}
+		}
+
+		// emit queues a chunk for sending: a chunk that fills more than
+		// half a packet goes as the packet it was written into, smaller
+		// ones are copied into one packet together.
+		internal def emit(chunk OutChunk) {
+			let length = chunk.wire.len() - packetHeaderSize
+			if 2 * length > pathMtu - packetHeaderSize {
+				closeBundle()
+				if !chunk.summed {
+					writeChecksum(chunk.wire)
+					chunk.summed = true
+				}
+				outbox.push(chunk.wire)
+				outboxPooled.push(false)
+				return
+			}
+			closeBundle() when bundleUsed + length > pathMtu
+			if bundleUsed == 0 {
+				bundle = packetBuffer(pathMtu)
+				bundleUsed = packetHeaderSize
+			}
+			chunk.wire[packetHeaderSize:].copy(bundle[bundleUsed:])
+			bundleUsed += length
+		}
+
+		// closeBundle queues the packet of small chunks being filled.
+		internal def closeBundle() {
+			return when bundleUsed == 0
+			bundle.len(bundleUsed)
+			writeChecksum(bundle)
+			outbox.push(bundle)
+			outboxPooled.push(true)
+			bundleUsed = 0
+		}
+
+		// takeSack takes the SACK whose value is at an offset of the
+		// buffer: the cumulative acknowledgment, the gap blocks above it,
+		// and the peer's window.
+		internal def takeSack(at int, size int, now int) {
+			return when size < 12
+			let cumulativeTSN = expand(cumulativeAck, get32(buffer, at), 32)
+			return when cumulativeTSN < cumulativeAck || cumulativeTSN >= nextTSN
+			let blocks = get16(buffer, at + 8)
+			return when size < 12 + 4 * blocks
+			let newlyAcked = 0
+			let highestNew = 0
+			ackedSendTime = 0
+			if blocks > 0 || gapAcked > 0 {
+				// What the gap blocks cover the peer holds; what they covered
+				// before and do not now it gave up again (RFC 9260 §6.2.1).
+				for let chunk in sent {
+					continue when chunk.tsn <= cumulativeTSN || chunk.abandoned
+					let offset = chunk.tsn - cumulativeTSN
+					let covered = false
+					for let i = 0; i < blocks && !covered; i++ {
+						covered = offset >= get16(buffer, at + 12 + 4 * i) && offset <= get16(buffer, at + 14 + 4 * i)
+					}
+					if covered && !chunk.acked {
+						chunk.acked = true
+						gapAcked++
+						if chunk.retransmit {
+							chunk.retransmit = false
+							marked--
+						}
+						if chunk.inFlight {
+							chunk.inFlight = false
+							outstanding -= chunk.size
+						}
+						newlyAcked += chunk.size
+						highestNew = chunk.tsn
+						ackedSendTime = chunk.sentAt when chunk.sentAt > ackedSendTime
+					} else if !covered && chunk.acked {
+						chunk.acked = false
+						gapAcked--
+					}
+				}
+			}
+			takeCumulativeAck(cumulativeTSN, now, newlyAcked)
+			// A chunk below the highest TSN newly acknowledged that is still
+			// missing counts a miss; three make a fast retransmission
+			// (RFC 9260 §7.2.4).
+			let cut = false
+			if highestNew > 0 {
+				for let chunk in sent {
+					break when chunk.tsn >= highestNew
+					continue when chunk.acked || chunk.retransmit || chunk.abandoned
+					chunk.misses++
+					continue unless chunk.misses == 3
+					mark(chunk)
+					cut = true
+				}
+			}
+			// By time as well (the idea of RFC 8985): a chunk that went out
+			// a reordering window before one the peer now acknowledges, and
+			// is not acknowledged itself, is lost. This finds what three
+			// reports cannot: a retransmission lost again, and the chunks in
+			// front of a tail probe. Chunks of one burst carry one time and
+			// are left to the count above.
+			if ackedSendTime > 0 && roundTrip.srtt > 0 {
+				let window = (roundTrip.srtt / 4).max(1000000)
+				let before = ackedSendTime - window
+				for let chunk in sent {
+					continue when chunk.acked || chunk.retransmit || chunk.abandoned || !chunk.inFlight
+					// Sent a window before an acknowledged one; or in one
+					// burst with a later one that is acknowledged, a round
+					// trip and a window ago.
+					let overtaken = chunk.sentAt < before
+					let passed = highestNew > chunk.tsn && chunk.sentAt <= ackedSendTime
+					if overtaken || (passed && now - chunk.sentAt >= roundTrip.srtt + window) {
+						mark(chunk)
+						cut = true
+					} else if passed {
+						// Not long enough ago yet: looked at again when it
+						// is, by the probe timer.
+						let again = chunk.sentAt + roundTrip.srtt + window + 1000000
+						if tailDue == 0 || again < tailDue {
+							tailDue = again
+							tailProbed = false
+						}
+					}
+				}
+			}
+			if cut {
+				burst = true
+				if cumulativeTSN > recoveryExit {
+					ssthresh = (cwnd / 2).max(4 * options.mtu)
+					cwnd = ssthresh
+					partialAcked = 0
+					recoveryExit = nextTSN - 1
+				}
+			}
+			peerWindow = (get32(buffer, at + 4) - outstanding).max(0)
+		}
+
+		// takeCumulativeAck drops the chunks up to a cumulative TSN and
+		// opens the congestion window (RFC 9260 §7.2.1-7.2.2).
+		internal def takeCumulativeAck(cumulativeTSN int, now int, alsoAcked int) {
+			let acked = alsoAcked
+			let advanced = false
+			for sent.len() > 0 && sent[0].tsn <= cumulativeTSN {
+				let chunk = sent.shift()
+				advanced = true
+				if chunk.inFlight {
+					outstanding -= chunk.size
+					acked += chunk.size
+				}
+				ackedSendTime = chunk.sentAt when !chunk.acked && chunk.sentAt > ackedSendTime
+				gapAcked-- when chunk.acked
+				marked-- when chunk.retransmit
+				// A round trip is measured from a chunk sent once (Karn).
+				if chunk.tsn == measuring {
+					roundTrip.measure(now - measureFrom) when chunk.sends == 1
+					measuring = -1
+				}
+			}
+			measuring = -1 when measuring >= 0 && measuring <= cumulativeTSN
+			cumulativeAck = cumulativeTSN when cumulativeTSN > cumulativeAck
+			if advanced {
+				errors = 0
+				// The peer answers: the doubling of a timeout is over, and
+				// a tail probe may go again.
+				roundTrip.settle()
+				tailProbed = false
+				let wait = tailWait()
+				tailDue = sent.len() > 0 && wait > 0 ?? (now + wait, 0)
+				if cumulativeTSN > recoveryExit {
+					if cwnd <= ssthresh {
+						cwnd += acked.min(options.mtu)
+					} else {
+						partialAcked += acked
+						if partialAcked >= cwnd {
+							partialAcked -= cwnd
+							cwnd += options.mtu
+						}
+					}
+				}
+				dataDue = sent.len() > 0 ?? (now + roundTrip.rto, 0)
+			}
+			if sent.len() == 0 {
+				dataDue = 0
+				tailDue = 0
+			}
+		}
+
+		// ---- Path MTU (RFC 8899) ----
+
+		// probe sends the next probe of the search: a HEARTBEAT padded to
+		// a size between the largest confirmed and the largest possible
+		// (RFC 8899 §6.2.1, PAD of RFC 4820). The search ends when they
+		// are close, and starts over after ten minutes.
+		internal def probe(now int) {
+			if probeHigh - probeLow < 16 {
+				probeSize = 0
+				probeDue = now + probeRaise
+				return
+			}
+			probeSize = (probeLow + probeHigh + 1) / 2 / 4 * 4
+			probeSends = 0
+			sendProbe(now)
+		}
+
+		internal def sendProbe(now int) {
+			let beat = chunkBytes(chunkHeartbeat, 0, parameter(1, word(now >> 32) + word(now & 0xFFFFFFFF) + word(probeSize)))
+			let padding byte[]
+			padding.len(probeSize - packetHeaderSize - beat.len() - 4)
+			control(peerTag, beat + chunkBytes(chunkPad, 0, padding))
+			probeDue = now + roundTrip.rto
+		}
+
+		// probeExpired sends a probe again; one that got no answer three
+		// times is too large. With no probe in flight the search starts
+		// over.
+		internal def probeExpired(now int) {
+			if probeSize == 0 {
+				probeLow = pathMtu
+				probeHigh = options.maxMtu
+				probe(now)
+				return
+			}
+			probeSends++
+			if probeSends < 3 {
+				sendProbe(now)
+				return
+			}
+			probeHigh = probeSize - 4
+			probe(now)
+		}
+
+		// ---- Partial reliability (RFC 3758) ----
+
+		// abandon gives up the message a chunk belongs to: its chunks that
+		// were sent are not sent again and leave the bytes outstanding,
+		// those not scheduled yet are dropped.
+		internal def abandon(of OutChunk) {
+			for let chunk in sent {
+				continue unless chunk.message == of.message
+				chunk.abandoned = true
+				if chunk.retransmit {
+					chunk.retransmit = false
+					marked--
+				}
+				if chunk.inFlight {
+					chunk.inFlight = false
+					outstanding -= chunk.size
+				}
+			}
+			let own = streamOf(of.stream)
+			for own.pending.len() > 0 && own.pending[0].message == of.message {
+				queuedBytes -= own.pending.shift().size
+			}
+			if own.pending.len() == 0 {
+				let place = active.indexOf(own.id)
+				active.remove(place) when place >= 0
+			}
+		}
+
+		// advanceForward sends a FORWARD-TSN, or an I-FORWARD-TSN when
+		// messages interleave (RFC 8260 §2.3), when the chunks next to be
+		// acknowledged were given up: the peer moves its cumulative TSN
+		// over them, and its streams past the messages among them.
+		internal def advanceForward() {
+			return unless sent.len() > 0 && sent[0].abandoned
+			let point = cumulativeAck
+			// Stream (with the unordered bit above it) and the last
+			// message skipped, in pairs.
+			let skipped int[]
+			for let chunk in sent {
+				break unless chunk.abandoned
+				point = chunk.tsn
+				continue unless chunk.ordered || interleaved
+				let stream = chunk.ordered ?? (chunk.stream, chunk.stream | 0x10000)
+				let place = -1
+				for let i = 0; i < skipped.len(); i += 2 {
+					place = i when skipped[i] == stream
+				}
+				if place < 0 {
+					skipped.push(stream, chunk.key)
+				} else {
+					skipped[place + 1] = chunk.key
+				}
+			}
+			return when point <= forwardPoint
+			forwardPoint = point
+			let value = word(point & 0xFFFFFFFF)
+			for let i = 0; i < skipped.len(); i += 2 {
+				if interleaved {
+					value = value + half(skipped[i] & 0xFFFF) + half(skipped[i] >> 16) + word(skipped[i + 1])
+				} else {
+					value = value + half(skipped[i]) + half(skipped[i + 1])
+				}
+			}
+			control(peerTag, chunkBytes(interleaved ?? (chunkIForwardTSN, chunkForwardTSN), 0, value))
+		}
+
+		// takeForward takes a FORWARD-TSN (RFC 3758 §3.6) or an
+		// I-FORWARD-TSN (RFC 8260 §2.3.1): the cumulative TSN moves, the
+		// streams named move past the messages skipped, and what cannot
+		// become a message any more is dropped.
+		internal def takeForward(value byte[], withIdentifiers bool) {
+			return when value.len() < 4
+			let point = expand(cumulative, get32(value, 0), 32)
+			if point > cumulative {
+				cumulative = point
+				above.dropBelow(cumulative + 1)
+				if !above.isEmpty() && above.bounds[0] == cumulative + 1 {
+					cumulative = above.bounds[1] - 1
+					above.dropBelow(cumulative + 1)
+				}
+			}
+			let entry = withIdentifiers ?? (8, 4)
+			for let at = 4; at + entry <= value.len(); at += entry {
+				let own = streamOf(get16(value, at))
+				let last = withIdentifiers ?? (get32(value, at + 4), get16(value, at + 2))
+				if withIdentifiers && (get16(value, at + 2) & 1) != 0 {
+					dropParts(own, last, false)
+					continue
+				}
+				// Whole messages up to the one named are delivered in
+				// order, the fragments of the others dropped.
+				for own.wantKey == last || serialBefore(own.wantKey, last, keyMask) {
+					if own.parts.len() == 0 {
+						own.wantKey = (last + 1) & keyMask
+						break
+					}
+					let before = own.wantKey
+					deliver(own)
+					continue unless own.wantKey == before
+					dropParts(own, before, true)
+					own.wantKey = (before + 1) & keyMask
+				}
+				deliver(own)
+			}
+			if !withIdentifiers {
+				// Fragments of unordered messages below the point never
+				// complete: a message's TSNs follow each other.
+				for let (_, own) in streams {
+					deliver(own)
+					dropParts(own, cumulative, false)
+				}
+			}
+			sackNow = true
+		}
+
+		// dropParts drops the fragments of the ordered message with a
+		// number; or the unordered fragments up to a TSN (DATA) or up to a
+		// message identifier (I-DATA).
+		internal def dropParts(own StreamState, key int, ordered bool) {
+			for let i = own.parts.len() - 1; i >= 0; i-- {
+				let part = own.parts[i]
+				let unordered = (part.flags & flagUnordered) != 0
+				let gone = false
+				if ordered {
+					gone = !unordered && part.key == key
+				} else if interleaved {
+					gone = unordered && (part.key == key || serialBefore(part.key, key, keyMask))
+				} else {
+					gone = unordered && part.tsn <= key
+				}
+				continue unless gone
+				buffered -= part.data.len()
+				own.parts.remove(i)
+			}
+		}
+
+		// ---- Stream reset (RFC 6525) ----
+
+		// reset asks the peer to reset a stream this side sends on. Fails
+		// with SctpError when the association is not open or the peer does
+		// not reset streams.
+		def reset(stream int) !none {
+			try queueReset(stream)
+			return try drain()
+		}
+
+		internal atomic def queueReset(stream int) !none {
+			fail closedError() unless state == AssociationState.Established
+			fail sctpError("the peer does not reset streams") unless peerReconfig
+			let own = streamOf(stream)
+			own.announced = true
+			return none when own.resetting
+			own.resetting = true
+			resetQueue.push(stream)
+			launchReset(int(time.monoNs()))
+			return none
+		}
+
+		// launchReset sends an Outgoing SSN Reset Request for the streams
+		// waiting whose messages were all scheduled, one request at a time
+		// (RFC 6525 §5.1.2). The peer acts on it once it holds everything
+		// up to the last TSN assigned.
+		internal def launchReset(now int) {
+			return when request.len() > 0 || resetQueue.len() == 0
+			let ready int[]
+			let later int[]
+			for let id in resetQueue {
+				if streamOf(id).pending.len() == 0 {
+					ready.push(id)
+				} else {
+					later.push(id)
+				}
+			}
+			return when ready.len() == 0
+			let value = word(requestSeq) + word((peerRequestSeq - 1) & 0xFFFFFFFF) + word((nextTSN - 1) & 0xFFFFFFFF)
+			for let id in ready {
+				value = value + half(id)
+			}
+			requestStreams = ready
+			resetQueue = later
+			request = parameter(paramOutgoingReset, value)
+			requestSends = 0
+			requestDue = now + roundTrip.rto
+			control(peerTag, chunkBytes(chunkReconfig, 0, request))
+		}
+
+		// requestExpired sends the request again, or gives the association
+		// up as any chunk without an answer does.
+		internal def requestExpired(now int) {
+			requestSends++
+			if requestSends > options.maxRetransmits {
+				conclude(sctpError("the peer stopped answering"))
+				return
+			}
+			control(peerTag, chunkBytes(chunkReconfig, 0, request))
+			requestDue = now + roundTrip.rto
+		}
+
+		// takeReconfig takes the parameters of a RE-CONFIG chunk.
+		internal def takeReconfig(value byte[], now int) {
+			for let p in parametersOf(value, 0) {
+				switch {
+					case p.kind == paramOutgoingReset:
+						takeOutgoingReset(p.value)
+					case p.kind == paramIncomingReset:
+						takeIncomingReset(p.value, now)
+					case p.kind == paramReconfigResponse:
+						takeResponse(p.value, now)
+					case p.kind := paramTSNReset || paramAddOutgoing || paramAddIncoming:
+						// Not offered by this side: refused (RFC 6525 §5.2.1).
+						answer(get32(p.value, 0), resultDenied, sequenced(get32(p.value, 0))) when p.value.len() >= 4
+				}
+			}
+		}
+
+		// sequenced checks a request's number against the next one
+		// expected: true, moving on, for the next; false for any other,
+		// after the last answer was given again for a repeated request or
+		// a bad sequence reported.
+		internal def sequenced(seq int) bool {
+			if seq == peerRequestSeq {
+				peerRequestSeq = (peerRequestSeq + 1) & 0xFFFFFFFF
+				return true
+			}
+			if seq == ((peerRequestSeq - 1) & 0xFFFFFFFF) && lastResponse.len() > 0 {
+				control(peerTag, chunkBytes(chunkReconfig, 0, lastResponse))
+				return false
+			}
+			control(peerTag, chunkBytes(chunkReconfig, 0, parameter(paramReconfigResponse, word(seq) + word(resultBadSequence))))
+			return false
+		}
+
+		// answer sends the result of a request when it was the one
+		// expected, and keeps it for a repeated request.
+		internal def answer(seq int, result int, expected bool) {
+			return unless expected
+			lastResponse = parameter(paramReconfigResponse, word(seq) + word(result))
+			control(peerTag, chunkBytes(chunkReconfig, 0, lastResponse))
+		}
+
+		// takeOutgoingReset takes the peer's request to reset streams it
+		// sends on (RFC 6525 §5.2.2): once everything it sent before has
+		// arrived, the streams start over and the application is told.
+		internal def takeOutgoingReset(value byte[]) {
+			return when value.len() < 12
+			let seq = get32(value, 0)
+			if seq == peerRequestSeq && expand(cumulative, get32(value, 8), 32) > cumulative {
+				// Not yet: the peer asks again.
+				control(peerTag, chunkBytes(chunkReconfig, 0, parameter(paramReconfigResponse, word(seq) + word(resultInProgress))))
+				return
+			}
+			return unless sequenced(seq)
+			if value.len() == 12 {
+				for let (_, own) in streams {
+					restart(own)
+				}
+			}
+			for let at = 12; at + 2 <= value.len(); at += 2 {
+				restart(streamOf(get16(value, at)))
+			}
+			answer(seq, resultPerformed, true)
+		}
+
+		// restart starts a stream's incoming numbering over and tells the
+		// application behind the messages it has not read.
+		internal def restart(own StreamState) {
+			own.wantKey = 0
+			let before = own.ready.len()
+			for let n in own.resets {
+				before -= n
+			}
+			own.resets.push(before)
+			arrivedOrder.push(own.id)
+			if !own.announced {
+				own.announced = true
+				incoming.push(own.id)
+				notify()
+			}
+			own.arrived.offer(none)
+			anyArrived.offer(none)
+		}
+
+		// takeIncomingReset takes the peer's request that this side reset
+		// streams it sends on (RFC 6525 §5.2.3).
+		internal def takeIncomingReset(value byte[], now int) {
+			return when value.len() < 4
+			let seq = get32(value, 0)
+			return unless sequenced(seq)
+			for let at = 4; at + 2 <= value.len(); at += 2 {
+				let own = streamOf(get16(value, at))
+				continue when own.resetting
+				own.resetting = true
+				resetQueue.push(own.id)
+			}
+			answer(seq, resultPerformed, true)
+			launchReset(now)
+		}
+
+		// takeResponse takes the answer to this side's request: performed,
+		// the streams number from zero again; refused, they go on as they
+		// were; in progress, the request stays and is sent again.
+		internal def takeResponse(value byte[], now int) {
+			return when value.len() < 8 || request.len() == 0 || get32(value, 0) != requestSeq
+			let result = get32(value, 4)
+			if result == resultInProgress {
+				requestDue = now + roundTrip.rto
+				return
+			}
+			for let id in requestStreams {
+				let own = streamOf(id)
+				own.resetting = false
+				continue unless result <= resultPerformed
+				own.sendKey = 0
+				own.unordered = 0
+			}
+			request = []
+			requestStreams = []
+			requestDue = 0
+			requestSeq = (requestSeq + 1) & 0xFFFFFFFF
+			launchReset(now)
+		}
+	}
+}

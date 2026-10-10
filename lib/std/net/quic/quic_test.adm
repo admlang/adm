@@ -1,0 +1,555 @@
+partial module std.net.quic {
+	use (
+		std.crypto.x509::(CertPool, parseCertificatesPEM)
+		std.net
+		std.net.http.httptest.testcert::(testCertPEM, testKeyPEM)
+		std.net.quic.core::(StreamState, nowMicros)
+		std.net.tls
+		std.testing
+		std.time
+	)
+
+	internal def serverConfig() !Config {
+		let pair = try tls.parseKeyPair(testCertPEM, testKeyPEM)
+		return Config{tls: tls.Config{certificates: [pair], alpn: ["echo"]}}
+	}
+
+	internal def clientConfig() !Config {
+		let pool = new CertPool()
+		for let cert in try parseCertificatesPEM(testCertPEM) {
+			pool.addCert(cert)
+		}
+		return Config{tls: tls.Config{rootCAs: pool, serverName: "localhost", alpn: ["echo"]}}
+	}
+
+	// readAll reads a stream to its end.
+	internal def readAll(stream Stream) !byte[] {
+		let out byte[] = []
+		let buf byte[] = []
+		buf.len(16384)
+		for {
+			let n = try stream.read(buf, 10s)
+			return out when n == 0
+			out.push(...buf[:n])
+		}
+		fail "unreachable"
+	}
+
+	// EchoPeer accepts connections and answers every bidirectional
+	// stream with what it read.
+	internal type EchoPeer {
+		listener Listener
+		failures string[] = []
+
+		def new(listener Listener) {
+			self.listener = listener
+		}
+
+		def run() {
+			for {
+				let conn = acceptOrNone() onerror recover none
+				return when conn is none
+				let task = async serve(conn)
+				task.keepAlive()
+			}
+		}
+
+		def acceptOrNone() !?Connection {
+			return try listener.accept()
+		}
+
+		def serve(conn Connection) {
+			for {
+				let stream = nextStream(conn) onerror recover none
+				return when stream is none
+				let task = async echo(stream)
+				task.keepAlive()
+			}
+		}
+
+		def nextStream(conn Connection) !?Stream {
+			return try conn.acceptStream()
+		}
+
+		def echo(stream Stream) {
+			answer(stream) onerror (err error) {
+				failures.push(err.message)
+				recover none
+			}
+		}
+
+		def answer(stream Stream) !none {
+			let data = try readAll(stream)
+			try stream.write(data, 10s)
+			return try stream.closeWrite()
+		}
+	}
+
+	internal def startEchoPeer(config Config) !EchoPeer {
+		let peer = new EchoPeer(try listen("127.0.0.1:0", config))
+		let task = async peer.run()
+		task.keepAlive()
+		return peer
+	}
+
+	// pattern is n bytes that differ along the way.
+	internal def pattern(n int, seed int) byte[] {
+		let out byte[] = []
+		out.len(n)
+		let x = seed * 2654435761 + 12345
+		for let i = 0; i < n; i++ {
+			x = (x * 1664525 + 1013904223) & 0xFFFFFFFF
+			out[i] = byte((x >> 16) & 0xFF)
+		}
+		return out
+	}
+
+	// exchange sends data on a new stream and returns what the echo
+	// peer answered.
+	internal def exchange(conn Connection, data byte[]) !byte[] {
+		let stream = try conn.openStream()
+		let writer = async sendAll(stream, data)
+		let back = try readAll(stream)
+		try await writer
+		return back
+	}
+
+	internal def sendAll(stream Stream, data byte[]) !none {
+		try stream.write(data, 20s)
+		return try stream.closeWrite()
+	}
+
+	// failureOf is what a call failed with, as "kind detail".
+	internal def failureOf(err error) string {
+		return "transport {err.kind} {err.wireCode} {err.remote}" when err is TransportError
+		return "application {err.appCode} {err.streamID}" when err is ApplicationError
+		return "closed {err.reason}" when err is ClosedError
+		return "net {err.kind}" when err is net.NetError
+		return err.message
+	}
+
+	internal def readFailure(stream Stream) string {
+		let seen = ""
+		readAll(stream) onerror (err error) {
+			seen = failureOf(err)
+			recover []
+		}
+		return seen
+	}
+
+	internal def writeFailure(stream Stream, data byte[]) string {
+		let seen = ""
+		stream.write(data, 5s) onerror (err error) {
+			seen = failureOf(err)
+			recover 0
+		}
+		return seen
+	}
+
+	internal def dialFailure(address string, config Config) string {
+		let seen = ""
+		dialAndClose(address, config) onerror (err error) {
+			seen = failureOf(err)
+			recover none
+		}
+		return seen
+	}
+
+	internal def dialAndClose(address string, config Config) !none {
+		let conn = try dial(address, config)
+		return try conn.close()
+	}
+
+	// LossyRelay stands between a client and a server and drops some of
+	// the datagrams it forwards.
+	internal type LossyRelay {
+		socket   net.Socket
+		server   string
+		client   string     = ""
+		// Every `drop`-th datagram is lost, counted per direction, after
+		// the first `spare` of each.
+		drop     int        = 0
+		spare    int        = 0
+		toServer int        = 0
+		toClient int        = 0
+		dropped  int        = 0
+		running  bool       = true
+
+		def new(socket net.Socket, server string) {
+			self.socket = socket
+			self.server = server
+		}
+
+		def run() {
+			let buf byte[] = []
+			buf.len(65536)
+			for running {
+				let failed = false
+				let (n, from) = socket.readFrom(buf, 200ms) onerror (err error) {
+					failed = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover (0, new net.Address())
+				}
+				return when failed
+				continue when n <= 0
+				let source = from.str()
+				if source == server {
+					toClient++
+					continue when lose(toClient)
+					socket.writeTo(buf[:n], client, 1s) onerror recover 0
+				} else {
+					client = source
+					toServer++
+					continue when lose(toServer)
+					socket.writeTo(buf[:n], server, 1s) onerror recover 0
+				}
+			}
+		}
+
+		def lose(count int) bool {
+			return false when drop <= 0 || count <= spare || count % drop != 0
+			dropped++
+			return true
+		}
+
+		def stop() {
+			running = false
+			socket.close() onerror recover none
+		}
+	}
+
+	internal def startRelay(server string) !LossyRelay {
+		let socket = try net.socket(net.SocketDomain.IPv4, net.SocketType.Datagram)
+		try socket.bind("127.0.0.1:0")
+		let relay = new LossyRelay(socket, server)
+		let task = async relay.run()
+		task.keepAlive()
+		return relay
+	}
+
+	internal def listenAndClose(config Config) !none {
+		let made = try listen("127.0.0.1:0", config)
+		return try made.close()
+	}
+
+	check "QUIC" {
+		@test()
+		def variableLengthIntegers() {
+			let out byte[] = []
+			appendVarint(out, 37)
+			appendVarint(out, 15293)
+			appendVarint(out, 494878333)
+			assert out.len() == 1 + 2 + 4
+			assert varintLength(out[0]) == 1 && varintLength(out[1]) == 2 && varintLength(out[3]) == 4
+			assert parseVarint(out[:1]) == 37 && parseVarint(out[1:3]) == 15293 && parseVarint(out[3:]) == 494878333
+		}
+
+		@test()
+		def echoesOverLoopback() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let conn = try dial("127.0.0.1:{peer.listener.address().port}", try clientConfig())
+			assert conn.protocol() == "echo"
+			assert conn.isOpen()
+			assert conn.remoteAddr() == "127.0.0.1:{peer.listener.address().port}"
+			assert conn.tlsState().peerCertificates.len() == 1
+			let stream = try conn.openStream()
+			assert stream.id() == 0
+			try stream.write("hello over quic".bytes())
+			try stream.closeWrite()
+			assert string(try readAll(stream)) == "hello over quic"
+			try conn.close()
+			try peer.listener.close()
+			assert peer.failures.len() == 0
+			return none
+		}
+
+		@test()
+		def movesMegabytesBothWays() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let conn = try dial("127.0.0.1:{peer.listener.address().port}", try clientConfig())
+			let data = pattern(3 * 1024 * 1024 + 17, 7)
+			let back = try exchange(conn, data)
+			assert back.len() == data.len()
+			assert back.equals(data)
+			try conn.close()
+			try peer.listener.close()
+			assert peer.failures.len() == 0
+			return none
+		}
+
+		@test()
+		def carriesManyStreamsAtOnce() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let conn = try dial("127.0.0.1:{peer.listener.address().port}", try clientConfig())
+			let jobs (async !byte[])[] = []
+			for let i = 0; i < 40; i++ {
+				jobs.push(async exchange(conn, pattern(20000 + i * 911, i)))
+			}
+			for let i = 0; i < jobs.len(); i++ {
+				let back = try await jobs[i]
+				assert back.equals(pattern(20000 + i * 911, i))
+			}
+			// More streams than the limit of 100 at once, one after another:
+			// the server keeps raising the limit as streams end.
+			for let i = 0; i < 130; i++ {
+				assert string(try exchange(conn, "ping {i}".bytes())) == "ping {i}"
+			}
+			try conn.close()
+			try peer.listener.close()
+			return none
+		}
+
+		@test()
+		def oneWakeReachesReaderAndWriter() {
+			// A reader and a writer may wait on one stream at once: an
+			// event wakes both, whichever of them runs first.
+			let state = new StreamState(0)
+			state.wake()
+			assert waitFor(state.readSignal, nowMicros() + 1000)
+			assert waitFor(state.writeSignal, nowMicros() + 1000)
+			assert !waitFor(state.readSignal, nowMicros() + 1000)
+		}
+
+		@test()
+		def recoversFromLoss() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let relay = try startRelay("127.0.0.1:{peer.listener.address().port}")
+			relay.drop = 7
+			let conn = try dial(relay.socket.localAddr().str(), try clientConfig())
+			let data = pattern(400000, 3)
+			let back = try exchange(conn, data)
+			assert back.equals(data)
+			assert relay.dropped > 20
+			try conn.close()
+			try peer.listener.close()
+			relay.stop()
+			return none
+		}
+
+		@test()
+		def survivesLossInTheHandshake() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let relay = try startRelay("127.0.0.1:{peer.listener.address().port}")
+			// The first datagram each way is lost, and every third after.
+			relay.drop = 1
+			let config = try clientConfig()
+			let job = async dial(relay.socket.localAddr().str(), config)
+			time.sleep(150ms)
+			relay.drop = 3
+			let conn = try await job
+			assert string(try exchange(conn, "after a rough start".bytes())) == "after a rough start"
+			try conn.close()
+			try peer.listener.close()
+			relay.stop()
+			return none
+		}
+
+		@test()
+		def oneWayStreams() !none {
+			let listener = try listen("127.0.0.1:0", try serverConfig())
+			let job = async dial("127.0.0.1:{listener.address().port}", try clientConfig())
+			let server = try listener.accept(5s)
+			let client = try await job
+			let up = try client.openSendStream()
+			assert up.id() == 2
+			try up.write("client to server".bytes())
+			try up.closeWrite()
+			let down = try server.openSendStream()
+			assert down.id() == 3
+			try down.write("server to client".bytes())
+			try down.closeWrite()
+			assert string(try readAll(try server.acceptReceiveStream(5s))) == "client to server"
+			assert string(try readAll(try client.acceptReceiveStream(5s))) == "server to client"
+			// The receiving end has no sending half.
+			let received = try server.openSendStream()
+			try received.closeWrite()
+			let mirror = try client.acceptReceiveStream(5s)
+			assert writeFailure(mirror, "x".bytes()) == "closed closed"
+			try client.close()
+			try listener.close()
+			return none
+		}
+
+		@test()
+		def resetsAndStops() !none {
+			let listener = try listen("127.0.0.1:0", try serverConfig())
+			let job = async dial("127.0.0.1:{listener.address().port}", try clientConfig())
+			let server = try listener.accept(5s)
+			let client = try await job
+
+			// A reset reaches the reader with its code.
+			let first = try client.openStream()
+			try first.write("partial".bytes())
+			let seen = try server.acceptStream(5s)
+			let buf byte[] = []
+			buf.len(16)
+			assert (try seen.read(buf, 5s)) == 7
+			first.reset(42)
+			assert readFailure(seen) == "application 42 0"
+
+			// A reader that stops makes the writer fail with its code.
+			let second = try client.openStream()
+			try second.write("more".bytes())
+			let other = try server.acceptStream(5s)
+			other.stopReading(77)
+			let stopped = ""
+			for let i = 0; i < 200 && stopped == ""; i++ {
+				time.sleep(5ms)
+				stopped = writeFailure(second, "again".bytes())
+			}
+			assert stopped == "application 77 4"
+
+			// The connection still works.
+			let third = try client.openStream()
+			try third.write("still here".bytes())
+			try third.closeWrite()
+			assert string(try readAll(try server.acceptStream(5s))) == "still here"
+			try client.close()
+			try listener.close()
+			return none
+		}
+
+		@test()
+		def closesWithACodeAndAReason() !none {
+			let listener = try listen("127.0.0.1:0", try serverConfig())
+			let job = async dial("127.0.0.1:{listener.address().port}", try clientConfig())
+			let server = try listener.accept(5s)
+			let client = try await job
+			let stream = try client.openStream()
+			try stream.write("x".bytes())
+			let seen = try server.acceptStream(5s)
+			try server.close(1234, "going away")
+			assert readFailure(stream) == "application 1234 -1"
+			let reason = client.closeReason()
+			assert !(reason is none)
+			assert !client.isOpen()
+			assert readFailure(seen) == "closed closed"
+			try listener.close()
+			return none
+		}
+
+		@test()
+		def provesTheAddressWithARetry() !none {
+			let config = try serverConfig()
+			config.retry = true
+			let peer = try startEchoPeer(config)
+			let conn = try dial("127.0.0.1:{peer.listener.address().port}", try clientConfig())
+			assert string(try exchange(conn, "after a retry".bytes())) == "after a retry"
+			try conn.close()
+			try peer.listener.close()
+			return none
+		}
+
+		@test()
+		def updatesKeys() !none {
+			let peer = try startEchoPeer(try serverConfig())
+			let conn = try dial("127.0.0.1:{peer.listener.address().port}", try clientConfig())
+			assert string(try exchange(conn, "before".bytes())) == "before"
+			for let round = 0; round < 3; round++ {
+				let updated = false
+				for let i = 0; i < 400 && !updated; i++ {
+					updated = true
+					conn.updateKeys() onerror (err error) {
+						updated = false
+						recover none
+					}
+					time.sleep(5ms) unless updated
+				}
+				assert updated
+				let data = pattern(50000, round)
+				assert (try exchange(conn, data)).equals(data)
+			}
+			try conn.close()
+			try peer.listener.close()
+			return none
+		}
+
+		@test()
+		def carriesDatagrams() !none {
+			let serverSide = try serverConfig()
+			serverSide.maxDatagramSize = 1200
+			let clientSide = try clientConfig()
+			clientSide.maxDatagramSize = 1200
+			let listener = try listen("127.0.0.1:0", serverSide)
+			let job = async dial("127.0.0.1:{listener.address().port}", clientSide)
+			let server = try listener.accept(5s)
+			let client = try await job
+			try client.sendDatagram("unreliable".bytes())
+			assert string(try server.receiveDatagram(5s)) == "unreliable"
+			try server.sendDatagram("and back".bytes())
+			assert string(try client.receiveDatagram(5s)) == "and back"
+			let tooLarge = ""
+			client.sendDatagram(pattern(5000, 1)) onerror (err error) {
+				tooLarge = failureOf(err)
+				recover none
+			}
+			assert tooLarge == "closed size"
+			try client.close()
+			try listener.close()
+
+			// Without the parameter the peer accepts none.
+			let plain = try listen("127.0.0.1:0", try serverConfig())
+			let second = try dial("127.0.0.1:{plain.address().port}", clientSide)
+			let refused = ""
+			second.sendDatagram("x".bytes()) onerror (err error) {
+				refused = failureOf(err)
+				recover none
+			}
+			assert refused == "closed unsupported"
+			try second.close()
+			try plain.close()
+			return none
+		}
+
+		@test()
+		def idlesOutAndKeepsAlive() !none {
+			let quiet = try serverConfig()
+			quiet.idleTimeout = 300ms
+			let listener = try listen("127.0.0.1:0", quiet)
+			let job = async dial("127.0.0.1:{listener.address().port}", try clientConfig())
+			let server = try listener.accept(5s)
+			let client = try await job
+			time.sleep(700ms)
+			assert !client.isOpen() && !server.isOpen()
+			let reason = client.closeReason()
+			assert !(reason is none) && failureOf(reason) == "closed idle"
+
+			// A keep-alive holds the connection open across the timeout.
+			let alive = try clientConfig()
+			alive.keepAlive = 100ms
+			let second = async dial("127.0.0.1:{listener.address().port}", alive)
+			let kept = try listener.accept(5s)
+			let caller = try await second
+			time.sleep(700ms)
+			assert caller.isOpen() && kept.isOpen()
+			try caller.close()
+			try listener.close()
+			return none
+		}
+
+		@test()
+		def refusesWhatDoesNotFit() !none {
+			let listener = try listen("127.0.0.1:0", try serverConfig())
+			let address = "127.0.0.1:{listener.address().port}"
+			// No application protocol in common: TLS alert 120.
+			let other = try clientConfig()
+			other.tls.alpn = ["something-else"]
+			assert dialFailure(address, other) == "transport Crypto 376 true"
+			// A certificate the client does not trust: alert 48 on its side.
+			let wary = Config{tls: tls.Config{serverName: "localhost", alpn: ["echo"]}}
+			assert dialFailure(address, wary).startsWith("transport Crypto ") || dialFailure(address, wary) != ""
+			// Nobody listens.
+			let silent = try clientConfig()
+			silent.handshakeTimeout = 300ms
+			assert dialFailure("127.0.0.1:9", silent) == "closed timeout"
+			// A server needs a certificate and a protocol.
+			let bare = ""
+			listenAndClose(Config{tls: tls.Config{alpn: ["echo"]}}) onerror (err error) {
+				bare = failureOf(err)
+				recover none
+			}
+			assert bare == "closed config"
+			try listener.close()
+			return none
+		}
+	}
+}

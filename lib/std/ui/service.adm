@@ -1,24 +1,36 @@
 partial module std.ui {
 	use (
 		std.time
+		std.gfx.canvas
 		std.gfx.color
 		std.formats.image
 		std.services::(Dependencies, Lifecycle, StartMode, RestartMode, ServiceStatus)
 		std.services.runtime::(Runtime)
+		std.services.clipboard::(Clipboard, ClipboardRequest)
 		std.ui.renderer.opengl as _
 		std.ui.renderer.cpu as _
 		std.ui.renderer.vulkan as _
 		std.ui.renderer.directx as _
 		std.ui.renderer as r
 		std.ui.renderer::(PlatformEventKind, getRenderer)
+		std.ui.host.sdl::SDLHost
 		std.ui.platform::*
+		std.ui.styles::Cursor
+		std.ui.runtime::(Scene, iconNamed, keep, keepable, restored, shelveIcons, wakeDue, wakeIn, writeKept, writeKeptDue)
+		std.ui.frames
+		std.math.geom::(Point, Rect, Size)
+		std.units::Pixels
 	)
 
 	// UIConfig controls how the UI service initializes and which renderer backend it uses.
 	type UIConfig {
-		// renderer provides platform windows, per-frame surfaces, and low-level input events.
-		// If it is `none`, `UI.start()` fails.
+		// renderer draws each frame into the host's windows.
+		// If it is `none`, `rendererName` picks one.
 		renderer ?r.Renderer = none
+
+		// host provides the platform's windows, input events, clipboard, displays and tray.
+		// `none`: the platform's own (SDL3 on Linux, macOS and Windows).
+		host ?r.Host = none
 
 		// rendererName selects a renderer annotated with `@renderer(name=...)`.
 		// It is only used when `renderer` is not provided.
@@ -33,7 +45,75 @@ partial module std.ui {
 
 		// show FPS information
 		showFPS bool = false
+
+		// Renders every frame. Off, a window is drawn only after something happened in it (a
+		// platform event, `UI.redraw()`, a component's `redraw()`, a change of the desktop's
+		// look) and for the few frames that follow.
+		forceRedraw bool = false
 	}
+
+	// The frames a window is owed after something happened in it: the one that shows it,
+	// and two more for what settles a frame late (a floating component is measured on its
+	// first frame and placed on the next; a style set in `render` shows on the following).
+	// What a click-through window's last frame showed, for telling where it is there for
+	// the pointer: `width` by `height` device pixels of red, green, blue and alpha.
+	internal struct WindowShape {
+		width, height int
+		pixels        byte[]
+	}
+
+	// Copies the box `fresh` (`width` by `height` pixels of four bytes) into `into`, a
+	// picture `wide` pixels across, at (`left`, `top`). True when a pixel there went from
+	// no alpha to some or back: when what the picture covers changed.
+	internal def patchCover(into byte[], wide int, fresh byte[], left int, top int, width int, height int) bool {
+		let changed = false
+		for let row = 0; row < height; row++ {
+			let to = ((top + row) * wide + left) * 4
+			let from = row * width * 4
+			for let i = 0; i < width * 4; i += 4 {
+				changed = true when (into[to + i + 3] == 0) != (fresh[from + i + 3] == 0)
+				into[to + i] = fresh[from + i]
+				into[to + i + 1] = fresh[from + i + 1]
+				into[to + i + 2] = fresh[from + i + 2]
+				into[to + i + 3] = fresh[from + i + 3]
+			}
+		}
+		return changed
+	}
+
+	// Whether two windows' bounds are the same place and size.
+	internal def sameBounds(a Rect<Pixels>, b Rect<Pixels>) bool {
+		return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+	}
+
+	// What is kept of a window opened with `WindowConfig.persist`: where it is when it is
+	// neither maximized nor fullscreen, in logical pixels, and its state.
+	internal struct KeptWindow {
+		left, top, width, height float
+		state                    WindowState
+	}
+
+	// Whether a window of that size at that place shows a part of itself a pointer can
+	// take, on one of the displays. A host that does not say where its displays are
+	// leaves every place good.
+	internal def onDisplays(kept KeptWindow, displays Display[]) bool {
+		let known = false
+		for let display in displays {
+			let area = display.workArea
+			continue when area.right <= area.left || area.bottom <= area.top
+			known = true
+			let wide = float(area.right).min(kept.left + kept.width) - float(area.left).max(kept.left)
+			let high = float(area.bottom).min(kept.top + kept.height) - float(area.top).max(kept.top)
+			return true when wide >= 64.0 && high >= 32.0
+		}
+		return !known
+	}
+
+	internal const settleFrames = 3
+
+	// The longest a pass that drew nothing waits for an event or a wake: after it the loop
+	// looks at what arrives without either (the displays, a reload of a hot build).
+	internal const idlePause = 250ms
 
 	internal type FPSState {
 		last     time.Time
@@ -51,15 +131,47 @@ partial module std.ui {
 		lifecycle                 = Lifecycle{start: StartMode.Manual, restart: RestartMode.Always}
 		permissions  Permission[]
 
-		internal cfg            UIConfig                     = new UIConfig()
+		internal cfg            UIConfig                = new UIConfig()
 		internal hasConfig      bool
 		internal running        bool
 		internal wins           r.Window[]
-		internal roots          map<uint, ComponentRenderer>
+		// The mounted tree of each window opened with a root component.
+		internal scenes         map<uint, Scene>
+		// Device pixels per logical pixel of each window's last frame.
+		internal scales         map<uint, float>
+		// How many frames each window is still owed: set when something happened in it, so
+		// that a frame runs for it and a few more for what follows a frame late.
+		internal owed           map<uint, int>
+		// The reload objects loaded when the windows were last drawn (hot builds).
+		internal generation     int64
+		// A `run` loop is serving the windows, and `stop` asked it to end.
+		internal looping        bool
+		internal stopAsked      bool
+		// Whether the host shows a tray icon for this service.
+		internal trayShown      bool
 		internal baseTitles     map<uint, string>
+		// What the host was last told of each window: on screen or not, and its state.
+		internal shownAs        map<uint, bool>
+		// What each click-through window's last frame showed, and the windows that
+		// could not be shaped.
+		internal shapes         map<uint, WindowShape>
+		internal unshaped       map<uint, bool>
+		internal stateAs        map<uint, WindowState>
+		// The bounds each window had when the host was last asked or told.
+		internal boundsAs       map<uint, Rect<Pixels>>
+		// The name each window opened with `WindowConfig.persist` is kept under, and
+		// what was last kept of it.
+		internal keptAs         map<uint, string>
+		internal placedAs       map<uint, KeptWindow>
+		// The pointer shape the host was last given.
+		internal cursorAs       ?Cursor                 = none
+		// The text input on for each window: the kind and caret last given to the host.
+		internal typingAs       map<uint, string>
+		// Events read from the host and not yet handed out.
+		internal waiting        r.PlatformEvent[]
 		internal fps            map<uint, FPSState>
 		internal frameTimes     map<uint, time.Time>
-		internal look           AppearanceState              = new AppearanceState()
+		internal look           AppearanceState         = new AppearanceState()
 		// The displays as last seen, one line each, and each window's display.
 		internal seenDisplays   string
 		internal seenWindows    map<uint, string>
@@ -78,10 +190,11 @@ partial module std.ui {
 			return none
 		}
 
-		// Resolves the renderer named by the configuration and marks the service running.
+		// Resolves the renderer named by the configuration, hands it the host and marks the
+		// service running.
 		//
-		// Fails when the service is not configured, no renderer is configured, or the named
-		// renderer is not registered.
+		// Fails when the service is not configured, no renderer is configured, the named
+		// renderer is not registered, or the renderer cannot draw in the host's windows.
 		async def start() !none {
 			status = ServiceStatus.Starting
 			defer def () {
@@ -101,10 +214,32 @@ partial module std.ui {
 			}
 
 			fail "UI renderer must be configured (renderer or rendererName)" when resolved is none
+			let windows = cfg.host
+			if windows is none {
+				windows = new SDLHost()
+			}
+			fail "UI host is not configured" when windows is none
+			try resolved.attach(windows)
 			cfg.renderer = resolved
+			cfg.host = windows
+			frames.onFrameAsked(def () {
+				windows.wake()
+			})
+			shownAs = map<uint, bool>{}
+			shapes = map<uint, WindowShape>{}
+			unshaped = map<uint, bool>{}
+			owed = map<uint, int>{}
+			stateAs = map<uint, WindowState>{}
+			boundsAs = map<uint, Rect<Pixels>>{}
+			keptAs = map<uint, string>{}
+			placedAs = map<uint, KeptWindow>{}
+			typingAs = map<uint, string>{}
+			waiting = []
 			hasConfig = true
 			running = true
-			roots = map<uint, ComponentRenderer>{}
+			stopAsked = false
+			scenes = map<uint, Scene>{}
+			scales = map<uint, float>{}
 			baseTitles = map<uint, string>{}
 			fps = map<uint, FPSState>{}
 			frameTimes = map<uint, time.Time>{}
@@ -121,8 +256,18 @@ partial module std.ui {
 		// Closes every open window and marks the service stopped. Does not fail today.
 		async def stop() !none {
 			return none unless running
-			// Close every window the renderer still holds; the renderer itself
-			// has no shutdown call, its windows are its only resources.
+			// A `run` loop closes its windows itself, between two frames and on the task the
+			// window system knows: closing them here would take them from under the frame
+			// being drawn. The wait is bounded for a `stop` called from inside that loop.
+			if looping {
+				stopAsked = true
+				let resting = cfg.host
+				resting.wake() unless resting is none
+				for let waited = 0; looping && waited < 500; waited++ {
+					time.sleep(1ms)
+				}
+			}
+			// The host has no shutdown call: its windows and its tray icon are all it holds.
 			let open r.Window[] = []
 			for let (_, w) in wins {
 				open.push(w)
@@ -130,11 +275,18 @@ partial module std.ui {
 			for let (_, w) in open {
 				closeWindow(w) onerror recover none
 			}
+			let host = cfg.host
+			if trayShown && !(host is none) {
+				host.hideTray() onerror recover none
+			}
+			trayShown = false
 			let watch = look.watch
 			if !(watch is none) {
 				let active SettingsWatch = watch
 				active.close()
 			}
+			frames.onFrameAsked(none)
+			writeKept()
 			running = false
 			status = ServiceStatus.Stopped
 			return none
@@ -147,47 +299,89 @@ partial module std.ui {
 			return none
 		}
 
-		// Opens a window on the configured renderer. The handle stays valid until the window
-		// closes.
+		// The host while the service runs.
 		//
-		// Fails when the service is not running, no renderer is configured, or the renderer cannot open the window.
-		@commit()
-		def openWindow(cfg r.WindowConfig) !r.Window {
+		// Fails when the service is not running.
+		internal def windowHost() !r.Host {
 			fail "UI service is not running" unless running
-			fail "UI renderer is not configured" when self.cfg.renderer is none
-
-			let ren = self.cfg.renderer
-			fail "UI renderer is not configured" when ren is none
-
-			let win = try ren.openWindow(cfg)
-			wins.push(win)
-			baseTitles = baseTitles.set(win.id(), cfg.title)
-			return win
+			let host = cfg.host
+			fail "UI host is not configured" when host is none
+			return host
 		}
 
-		// Opens a window with root as the component it renders.
+		// The window with that id among the open ones.
+		internal def windowOf(id uint) ?r.Window {
+			for let (_, win) in wins {
+				return win when win.id() == id
+			}
+			return none
+		}
+
+		// Opens a window that shows `root`: the component that stands for the window, laid out
+		// in it, drawn in it, and the target of what happens in it when no other component is.
+		// Call it again for each further window; `run` serves them all.
 		//
-		// Fails when the service is not running, no renderer is configured, or the renderer cannot open the window.
+		// Fails when the service is not running, the host cannot open the window, or
+		// `cfg.persist` is not a name.
 		@commit()
 		def openWindow<T: component>(root T, cfg r.WindowConfig) !r.Window {
-			let win = try openWindow(cfg)
-			let renderable ComponentRenderer = root
-			roots = roots.set(win.id(), renderable)
+			let host = try windowHost()
+			fail "UI: a window cannot be kept as \"{cfg.persist}\": a name is letters, digits, '.', '_' and '-'" unless cfg.persist == "" || keepable(cfg.persist)
+			// A kept window opens as it was last, on a display that is still there. One
+			// that was never kept has no size.
+			let kept = KeptWindow{}
+			kept = restored<KeptWindow>(cfg.persist, kept) when cfg.persist != ""
+			let known = kept.width > 0.0 && kept.height > 0.0
+			let (size, position, state) = (cfg.size, cfg.position, cfg.state)
+			defer def () {
+				cfg.size = size
+				cfg.position = position
+				cfg.state = state
+			}()
+			if known {
+				cfg.size = new Size(kept.width, kept.height)
+				cfg.position = new Point<Pixels>(kept.left * 1(px), kept.top * 1(px)) when onDisplays(kept, displays())
+				cfg.state = kept.state
+			}
+			let win = try host.openWindow(cfg)
+			win.transparent = cfg.transparent
+			// The shape of what is drawn needs a window that shows what is behind it.
+			win.clickThrough = cfg.clickThrough
+			win.clickThrough = r.ClickThrough.None when cfg.clickThrough == r.ClickThrough.Empty && !cfg.transparent
+			if win.clickThrough == r.ClickThrough.All {
+				// A shape with nothing in it: no point of the window is there for the
+				// pointer. A desktop that cannot shape a window leaves it taking presses.
+				host.setWindowShape(win, 1, 1, [byte(0), byte(0), byte(0), byte(0)]) onerror recover none
+			}
+			shownAs = shownAs.set(win.id(), true)
+			owed = owed.set(win.id(), settleFrames)
+			stateAs = stateAs.set(win.id(), WindowState.Normal)
+			// The state it opens in is asked for with its first frame.
+			win.state = cfg.state
+			// Where the desktop put it; a host that cannot say leaves it unknown.
+			let at = host.windowBounds(win) onerror recover Rect<Pixels>{}
+			win.bounds = at
+			boundsAs = boundsAs.set(win.id(), at)
+			if cfg.persist != "" {
+				keptAs = keptAs.set(win.id(), cfg.persist)
+				placedAs = placedAs.set(win.id(), kept) when known
+			}
+			wins.push(win)
+			baseTitles = baseTitles.set(win.id(), cfg.title)
+			let mounted component = root
+			let scene = new Scene(mounted)
+			scenes = scenes.set(win.id(), scene)
+			// A host that cannot move a window by a place in it leaves it where it is.
+			host.setWindowDragTest(win, def (at Point<Pixels>) bool {
+				return scene.dragsWindow(at)
+			}) onerror recover none
 			return win
-		}
-
-		// Opens a window with the `UIConfig.defaultWindow` settings.
-		//
-		// Fails when the service is not running, no renderer is configured, or the renderer cannot open the window.
-		@commit()
-		def openDefaultWindow() !r.Window {
-			return openWindow(cfg.defaultWindow)
 		}
 
 		// Opens a window with the `UIConfig.defaultWindow` settings and root as the component it
 		// renders.
 		//
-		// Fails when the service is not running, no renderer is configured, or the renderer cannot open the window.
+		// Fails when the service is not running or the host cannot open the window.
 		@commit()
 		def openDefaultWindow<T: component>(root T) !r.Window {
 			return openWindow(root, cfg.defaultWindow)
@@ -195,64 +389,179 @@ partial module std.ui {
 
 		// Closes the window.
 		//
-		// Fails when the service is not running, no renderer is configured, or the window is unknown.
+		// Fails when the service is not running or the window is unknown.
 		@commit()
 		def closeWindow(win r.Window) !none {
-			fail "UI service is not running" unless running
-			fail "UI renderer is not configured" when cfg.renderer is none
-
+			let host = try windowHost()
 			let ren = cfg.renderer
-			fail "UI renderer is not configured" when ren is none
-
-			try ren.closeWindow(win)
+			try ren.release(win) unless ren is none
+			try host.closeWindow(win)
 
 			let out r.Window[]
 			for let (_, w) in wins {
 				out.push(w) unless w.id() == win.id()
 			}
 			wins = out
-			roots = roots.delete(win.id()) when roots.hasKey(win.id())
+			if scenes.hasKey(win.id()) {
+				scenes[win.id()].close()
+				scenes = scenes.delete(win.id())
+				scales = scales.delete(win.id()) when scales.hasKey(win.id())
+			}
 			baseTitles = baseTitles.delete(win.id()) when baseTitles.hasKey(win.id())
 			fps = fps.delete(win.id()) when fps.hasKey(win.id())
 			frameTimes = frameTimes.delete(win.id()) when frameTimes.hasKey(win.id())
 			seenWindows = seenWindows.delete(win.id()) when seenWindows.hasKey(win.id())
+			shownAs = shownAs.delete(win.id()) when shownAs.hasKey(win.id())
+			shapes = shapes.delete(win.id()) when shapes.hasKey(win.id())
+			unshaped = unshaped.delete(win.id()) when unshaped.hasKey(win.id())
+			owed = owed.delete(win.id()) when owed.hasKey(win.id())
+			stateAs = stateAs.delete(win.id()) when stateAs.hasKey(win.id())
+			boundsAs = boundsAs.delete(win.id()) when boundsAs.hasKey(win.id())
+			typingAs = typingAs.delete(win.id()) when typingAs.hasKey(win.id())
+			placedAs = placedAs.delete(win.id()) when placedAs.hasKey(win.id())
+			if keptAs.hasKey(win.id()) {
+				keptAs = keptAs.delete(win.id())
+				// Where it was when it closed is on disk before the application ends.
+				writeKept()
+			}
 			return none
+		}
+
+		// Keeps where a window opened with `WindowConfig.persist` is, when that changed:
+		// its bounds while it is neither maximized nor fullscreen, and its state, a
+		// minimized window as what it was before.
+		internal def keepPlacement(win r.Window) {
+			let id = win.id()
+			let name = keptAs.get(id)
+			return when name is none
+			let last = placedAs.get(id)
+			let now = KeptWindow{state: WindowState.Normal}
+			now = KeptWindow{left: last.left, top: last.top, width: last.width, height: last.height, state: last.state} unless last is none
+			let at = win.bounds
+			if win.state == WindowState.Normal && at.right > at.left && at.bottom > at.top {
+				now.left = float(at.left)
+				now.top = float(at.top)
+				now.width = float(at.right - at.left)
+				now.height = float(at.bottom - at.top)
+			}
+			now.state = win.state unless win.state == WindowState.Minimized
+			return when now.width <= 0.0 || now.height <= 0.0
+			return when !(last is none) && last.left == now.left && last.top == now.top && last.width == now.width && last.height == now.height && last.state == now.state
+			placedAs = placedAs.set(id, now)
+			keep<KeptWindow>(name, now)
+		}
+
+		// Draws every window again on its next frame, whether or not anything changed. For
+		// code outside any component; a component calls its own `redraw()`.
+		//
+		// Fails when the service is not running.
+		@commit()
+		def redraw() !none {
+			fail "UI service is not running" unless running
+			oweAll()
+			let host = cfg.host
+			host.wake() unless host is none
+			return none
+		}
+
+		// Owes every window its frames: something changed that all of them may show.
+		internal def oweAll(frames int = settleFrames) {
+			for let (_, win) in wins {
+				let left = owed.get(win.id())
+				continue when !(left is none) && left >= frames
+				owed = owed.set(win.id(), frames)
+			}
+		}
+
+		// Whether the window is drawn on this pass: always under `forceRedraw`; else when
+		// frames are owed to it (an event that changed something, `UI.redraw()`, a
+		// component's `redraw()`, a change of theme).
+		internal def frameDue(win r.Window) bool {
+			return true when cfg.forceRedraw
+			let id = win.id()
+			let left = owed.get(id)
+			if !(left is none) && left > 0 {
+				owed = owed.set(id, left - 1)
+				return true
+			}
+			return false
+		}
+
+		// Puts a window above the others.
+		//
+		// Fails when the service is not running, the window is unknown or the desktop refuses.
+		@commit()
+		def raiseWindow(win r.Window) !none {
+			let host = try windowHost()
+			return host.raiseWindow(win)
 		}
 
 		// Sets a window's title.
 		//
-		// Fails when the service is not running, no renderer is configured, or the window is unknown.
+		// Fails when the service is not running or the window is unknown.
 		@commit()
 		def setWindowTitle(win r.Window, title string) !none {
-			fail "UI service is not running" unless running
-			fail "UI renderer is not configured" when cfg.renderer is none
-
-			let ren = cfg.renderer
-			fail "UI renderer is not configured" when ren is none
-
+			let host = try windowHost()
 			let id = win.id()
 			baseTitles = baseTitles.set(id, title)
 			if cfg.showFPS && fps.hasKey(id) {
 				let state = fps[id]
 				if state.lastText.len() != 0 {
-					return ren.setWindowTitle(win, sprintf("%s (%s)", title, state.lastText))
+					return host.setWindowTitle(win, sprintf("%s (%s)", title, state.lastText))
 				}
 			}
-			return ren.setWindowTitle(win, title)
+			return host.setWindowTitle(win, title)
+		}
+
+		// Makes the icons of `set` known by name; a set added later is looked in first, and
+		// one with the name of a set already there replaces it.
+		@commit()
+		def addIcons(set IconSet) {
+			shelveIcons(set)
+			frames.askFrame()
+		}
+
+		// The picture of the icon called `name` (`set/name` for the one of that set); none
+		// when no set holds it. Std's own set has "chevron-down", "chevron-up",
+		// "chevron-left", "chevron-right", "close", "check", "search", "menu", "plus" and
+		// "minus".
+		@query()
+		def icon(name string) ?canvas.Picture {
+			let found = iconNamed(name)
+			return none when found is none
+			return found.picture
 		}
 
 		// Sets a window's icon.
 		//
-		// Fails when the service is not running, no renderer is configured, or the window is unknown.
+		// Fails when the service is not running or the window is unknown.
 		@commit()
 		def setWindowIcon(win r.Window, icon image.Image) !none {
-			fail "UI service is not running" unless running
-			fail "UI renderer is not configured" when cfg.renderer is none
+			let host = try windowHost()
+			return host.setWindowIcon(win, icon)
+		}
 
-			let ren = cfg.renderer
-			fail "UI renderer is not configured" when ren is none
+		// Shows the application's icon in the system tray, or replaces what the tray shows.
+		// `menu` opens from the icon; clicking the icon itself emits `trayActivated` where the
+		// host reports it.
+		//
+		// Fails when the service is not running, the icon is empty, or the desktop has no tray.
+		@commit()
+		def showTray(icon image.Image, tooltip string = "", menu MenuEntry[] = []) !none {
+			let host = try windowHost()
+			try host.showTray(icon, tooltip, menu)
+			trayShown = true
+			return none
+		}
 
-			return ren.setWindowIcon(win, icon)
+		// Removes the tray icon.
+		//
+		// Fails when the service is not running.
+		@commit()
+		def hideTray() !none {
+			let host = try windowHost()
+			trayShown = false
+			return host.hideTray()
 		}
 
 		// The open windows.
@@ -261,33 +570,95 @@ partial module std.ui {
 			return wins
 		}
 
-		// Reads the raw platform events waiting on the window. Nothing is emitted; pumpEvents turns
-		// them into `std.ui` events.
-		//
-		// Fails when the service is not running, no renderer is configured, or the window is unknown.
-		@query()
-		def pollPlatformEvents(win r.Window) !r.PlatformEvent[] {
-			fail "UI service is not running" unless running
-			fail "UI renderer is not configured" when cfg.renderer is none
-
-			let ren = cfg.renderer
-			fail "UI renderer is not configured" when ren is none
-
-			return ren.pollEvents(win)
+		// The host while a window is open: the window system's clipboard is used through it
+		// only then.
+		internal def windowClipboard() ?r.Host {
+			return none when wins.len() == 0 || !running
+			return cfg.host
 		}
 
-		internal def renderOne(win r.Window) !none {
-			fail "UI renderer is not configured" when cfg.renderer is none
+		// Serves a clipboard read from the window system. A read the host refuses (a
+		// call from another task than the one that runs the windows) is left to the
+		// clipboard program.
+		@on(Clipboard.reading)
+		def answerClipboardRead(evt Event<ClipboardRequest>) {
+			let access = windowClipboard()
+			return when access is none
+			let failed = false
+			let text = access.clipboardText() onerror (err error) {
+				failed = true
+				recover ""
+			}
+			evt.result.answer(text) unless failed
+		}
+
+		// Serves a clipboard write through the window system, as `answerClipboardRead` does a read.
+		@on(Clipboard.writing)
+		def answerClipboardWrite(evt Event<ClipboardRequest>) {
+			let access = windowClipboard()
+			return when access is none
+			let failed = false
+			access.setClipboardText(evt.result.text) onerror (err error) {
+				failed = true
+				recover none
+			}
+			evt.result.done() unless failed
+		}
+
+		// Reads what the host has waiting, for every window, into `waiting`.
+		//
+		// Fails when the service is not running or the host cannot be read.
+		internal def readHost() !none {
+			let host = try windowHost()
+			let fresh = try host.poll()
+			return none when fresh.len() == 0
+			let all = waiting
+			for let event in fresh {
+				all.push(event)
+			}
+			waiting = all
+			return none
+		}
+
+		// Takes the window's events out of `waiting`.
+		internal def takeEvents(id uint) r.PlatformEvent[] {
+			let taken r.PlatformEvent[]
+			let left r.PlatformEvent[]
+			for let event in waiting {
+				if event.window == id {
+					taken.push(event)
+				} else {
+					left.push(event)
+				}
+			}
+			waiting = left
+			return taken
+		}
+
+		// Reads the raw platform events waiting on the window. Nothing is emitted; pumpEvents turns
+		// them into `std.ui` events. Events of other windows stay waiting for their own call.
+		//
+		// Fails when the service is not running or the host cannot be read.
+		@commit()
+		def pollPlatformEvents(win r.Window) !r.PlatformEvent[] {
+			try readHost()
+			return takeEvents(win.id())
+		}
+
+		// Draws the window. With `part`, when the renderer still holds the last frame and
+		// the scene can draw alone the components that asked to be drawn again, only
+		// their part of the window is drawn; else all of it, after the views, the styles
+		// and the layout ran.
+		internal def renderOne(win r.Window, part bool = false) !none {
+			let host = try windowHost()
 			let ren = cfg.renderer
 			fail "UI renderer is not configured" when ren is none
 
-			return none unless roots.hasKey(win.id())
-			let renderable = roots[win.id()]
+			return none unless scenes.hasKey(win.id())
+			let scene = scenes[win.id()]
 
 			let frame r.Frame = try ren.nextFrame(win)
 			let ctx = frame.ctx
-			// TODO: theme/background comes from style; default to dark gray for now.
-			ctx.clear(new color.Color(color.RGBA{r: 50, g: 50, b: 50, a: 255}))
 			let now = time.now()
 			let delta = 0s
 			if frameTimes.hasKey(win.id()) {
@@ -295,15 +666,82 @@ partial module std.ui {
 			}
 			frameTimes = frameTimes.set(win.id(), now)
 			ctx.setFrameTiming(delta, now)
-			renderable.render(ctx)
+			scene.draw.setFrameTiming(delta, now)
+			// The frame is in device pixels; the window's bounds give the logical size.
+			let device = ctx.size()
+			let scale = 1.0
+			let bounds = host.windowBounds(win) onerror recover Rect<Pixels>{}
+			scale = device.width / float(bounds.width) when float(bounds.width) > 0.0 && device.width > 0.0
+			let before = scales.get(win.id())
+			scales = scales.set(win.id(), scale)
+			// A transparent window starts from nothing; any other from the theme's colour.
+			let ground color.Color = theme().palette.window
+			ground = new color.Color(color.RGBA{r: 0, g: 0, b: 0, a: 0}) when win.transparent
+			if part && frame.kept && !(before is none) && before == scale && scene.repaint(ctx, scale, ground) {
+				frame.over = true
+				try ren.commit(win, frame)
+				let drawn = scene.drawnPart
+				reshape(win, int(drawn.left), int(drawn.top), int(drawn.right - drawn.left), int(drawn.bottom - drawn.top), int(device.width), int(device.height)) when win.clickThrough == r.ClickThrough.Empty
+				try updateFpsTitle(win, host) when cfg.showFPS
+				return none
+			}
+			ctx.clear(ground)
+			scene.reduceMotion = appearance().reduceMotion
+			scene.arrange(new Size<Pixels>(device.width / scale * 1(px), device.height / scale * 1(px)))
+			scene.paint(ctx, scale)
 
 			try ren.commit(win, frame)
+			reshape(win, 0, 0, int(device.width), int(device.height), int(device.width), int(device.height)) when win.clickThrough == r.ClickThrough.Empty
 
-			try updateFpsTitle(win, ren) when cfg.showFPS
+			try updateFpsTitle(win, host) when cfg.showFPS
 			return none
 		}
 
-		internal def updateFpsTitle(win r.Window, ren r.Renderer) !none {
+		// Brings the pointer's shape of a click-through window in step with the frame just
+		// committed, of which the box at (`left`, `top`), `width` by `height` device
+		// pixels, was drawn: the window is there for the pointer where the frame's alpha
+		// is not 0. The host is told only when that changed somewhere in the box.
+		//
+		// A renderer that cannot give the frame's pixels, or a desktop that cannot shape
+		// a window, leaves the window whole and is not asked again for it: such a window
+		// takes every press, as one opened without `clickThrough` does.
+		internal def reshape(win r.Window, left int, top int, width int, height int, wide int, high int) {
+			let id = win.id()
+			return when unshaped.hasKey(id) || width <= 0 || height <= 0
+			let ren = cfg.renderer
+			let host = cfg.host
+			return when ren is none || host is none
+			let failed = false
+			let fresh = ren.read(win, left, top, width, height) onerror (err error) {
+				failed = true
+				recover byte[]
+			}
+			if failed || fresh.len() < width * height * 4 {
+				unshaped = unshaped.set(id, true)
+				return
+			}
+			let held = shapes.get(id)
+			let changed = false
+			let all = fresh
+			if held is none || held.width != wide || held.height != high {
+				// The first frame, or one of another size: all of it is the shape. A part
+				// is drawn only over a whole frame of the same size, so it is not seen
+				// here.
+				return unless width == wide && height == high
+				shapes = shapes.set(id, WindowShape{width: wide, height: high, pixels: fresh})
+				changed = true
+			} else {
+				changed = patchCover(held.pixels, wide, fresh, left, top, width, height)
+				all = held.pixels
+			}
+			return unless changed
+			host.setWindowShape(win, wide, high, all) onerror (err error) {
+				unshaped = unshaped.set(id, true)
+				recover none
+			}
+		}
+
+		internal def updateFpsTitle(win r.Window, host r.Host) !none {
 			return none unless cfg.showFPS
 
 			let id = win.id()
@@ -332,12 +770,17 @@ partial module std.ui {
 			let base = cfg.defaultWindow.title
 			base = baseTitles[id] when baseTitles.hasKey(id)
 			let title = sprintf("%s (%s)", base, state.lastText)
-			let _ = ren.setWindowTitle(win, title)
+			let _ = host.setWindowTitle(win, title)
 			return none
 		}
 
-		// Opens a window for `root` and returns when the user closes it. The whole of a single-
-		// window application's main.
+		// Opens a window for `root` and returns when no window is open any more: an
+		// application's main. Windows opened meanwhile with `openWindow` get their events and
+		// frames from the same loop. When the user asks to close a window, `closeRequested`
+		// is emitted first and the window closes unless a handler cancels; a window that is
+		// only hidden (`visible` false) stays open, so an application in the tray keeps
+		// running until it closes its windows. `stop` ends it too: it closes its windows and
+		// returns.
 		//
 		// Fails when the service is not configured or not running, or when the window cannot be opened or rendered.
 		@commit()
@@ -345,26 +788,195 @@ partial module std.ui {
 			fail "UI must be configured before run" unless isConfigured()
 			fail "UI service is not running" unless running
 
-			let win = try openWindow(root, cfg)
+			let _ = try openWindow(root, cfg)
 
-			for {
-				let evts = try pollPlatformEvents(win)
-				let shouldClose = false
-				for let (_, evt) in evts {
-					shouldClose = true when evt.kind == PlatformEventKind.Close
+			looping = true
+			defer def () {
+				looping = false
+			}()
+			for wins.len() > 0 && !stopAsked {
+				let closing r.Window[]
+				try readHost()
+				let events = waiting
+				waiting = []
+				// Handlers may open or close windows while this pass runs.
+				for let evt in events {
+					if evt.kind == PlatformEventKind.TrayActivate {
+						let _ = trayActivated()
+						continue
+					}
+					let win = windowOf(evt.window)
+					continue when win is none
 					try pumpOne(win, evt)
+					// A pointer move that changed nothing on the page asks for no frame.
+					let moved = evt.kind == PlatformEventKind.MouseMove && scenes.hasKey(win.id()) && !scenes[win.id()].touched
+					owed = owed.set(win.id(), settleFrames) unless moved
+					continue when evt.kind != PlatformEventKind.Close
+					let request = closeRequested(new CloseRequest(win))
+					closing.push(win) unless request.cancelled
+				}
+				for let (_, win) in closing {
+					try closeWindow(win) when isOpen(win)
 				}
 
-				break when shouldClose
+				for let (_, win) in wins {
+					try syncWindow(win)
+				}
 				watchDisplays()
-				try renderOne(win)
+				// The desktop's look changed: every window shows it.
+				if look.changed {
+					look.changed = false
+					oweAll()
+				}
+				// A hot build that loaded new code shows it without waiting for an event.
+				let loaded = hotGeneration()
+				if loaded != generation {
+					generation = loaded
+					oweAll()
+				}
+				// A component asked for a frame with `redraw()`: it does not say which window
+				// it is in.
+				oweAll(1) when frames.frameAsked()
+				// A style that reads another component asked for the layout after one that
+				// moved something.
+				let settling = frames.settleAsked()
+				// What `@persist` fields and kept windows changed is written once it rests.
+				writeKeptDue(time.now())
+				// A std component asked to be drawn at about this time.
+				oweAll(1) when wakeDue(time.now())
+				let drawn = false
+				for let (_, win) in wins {
+					// A window nobody sees is not drawn, nor one nothing happened in.
+					continue when !win.visible || win.state == WindowState.Minimized
+					if scenes.hasKey(win.id()) {
+						// A frame the window is owed for that alone continues the chain of
+						// such layouts; one owed for anything else starts the count again.
+						let left = owed.get(win.id())
+						let alone = settling && (left is none || left == 0)
+						owed = owed.set(win.id(), 1) when alone
+						scenes[win.id()].settling = alone
+					}
+					if frameDue(win) {
+						try renderOne(win)
+						drawn = true
+						continue
+					}
+					// A component of the window asked, while it was drawn, to be drawn
+					// again: a spinner turns on every frame the display shows.
+					if scenes.hasKey(win.id()) && scenes[win.id()].animating() {
+						try renderOne(win, true)
+						drawn = true
+					}
+				}
+				frames.focusPassed(wins.len())
 
-				// Avoid pegging a core if vsync is disabled.
-				time.sleep(1ms) when cfg.vsync == false
+				// A pass that drew nothing waits for an event, or for the time a component
+				// asked to be drawn at; one that drew without vsync yields, not to hold a core.
+				if !drawn && wins.len() > 0 && !stopAsked {
+					let host = try windowHost()
+					// Until an event, the time a component asked a whole frame at, or the
+					// next step of one that is drawn again by itself.
+					let now = time.now()
+					let rest = wakeIn(now, idlePause)
+					for let (_, win) in wins {
+						continue when !win.visible || win.state == WindowState.Minimized || !scenes.hasKey(win.id())
+						rest = scenes[win.id()].animateIn(now, rest)
+					}
+					try host.wait(rest)
+				} else if drawn && cfg.vsync == false {
+					time.sleep(1ms)
+				}
+			}
+			if stopAsked {
+				let open r.Window[] = []
+				for let (_, win) in wins {
+					open.push(win)
+				}
+				for let (_, win) in open {
+					closeWindow(win) onerror recover none
+				}
+				// The tray icon goes here too, on the task the window system knows: with it
+				// the host shuts the window system down, which another task must not do.
+				// `cfg` here is the window's; the service's own holds the host.
+				let shell = self.cfg.host
+				if trayShown && !(shell is none) {
+					shell.hideTray() onerror recover none
+				}
+				trayShown = false
+			}
+			return none
+		}
+
+		// Tells the host what changed on the window since the last pass: `visible` and
+		// `state` as the application set them, and the text input of the focused component.
+		//
+		// Fails when the host cannot show, hide or change the state of the window.
+		internal def syncWindow(win r.Window) !none {
+			let host = try windowHost()
+			let id = win.id()
+			if !shownAs.hasKey(id) || shownAs[id] != win.visible {
+				try host.setWindowVisible(win, win.visible)
+				shownAs = shownAs.set(id, win.visible)
+			}
+			if !stateAs.hasKey(id) || stateAs[id] != win.state {
+				try host.setWindowState(win, win.state)
+				stateAs = stateAs.set(id, win.state)
+			}
+			// The application moved or resized the window: the host is told. Else the
+			// window follows what the desktop, or the user, did with it.
+			let known = boundsAs.get(id)
+			if !(known is none) && !sameBounds(win.bounds, known) {
+				try host.setWindowBounds(win, win.bounds)
+				boundsAs = boundsAs.set(id, win.bounds)
+				owed = owed.set(id, settleFrames)
+			} else {
+				let now = host.windowBounds(win) onerror recover win.bounds
+				if !sameBounds(now, win.bounds) {
+					win.bounds = now
+					boundsAs = boundsAs.set(id, now)
+				}
+			}
+			keepPlacement(win)
+			return none unless scenes.hasKey(id)
+
+			// The pointer's shape follows the component it is over. A host that cannot
+			// change it is no reason to stop the window.
+			let shape = scenes[id].cursor
+			let had = cursorAs
+			if had is none || had != shape {
+				cursorAs = shape
+				host.setCursor(win, shape) onerror recover none
 			}
 
-			try closeWindow(win)
+			// Text input is on while a component that edits text has the focus. An input
+			// method the host cannot reach is no reason to stop the window: the keys
+			// still arrive as keys.
+			let was = typingAs.get(id)
+			let focus = scenes[id].focused()
+			if !(focus is TextInputClient) {
+				return none when was is none
+				host.stopTextInput(win) onerror recover none
+				typingAs = typingAs.delete(id)
+				return none
+			}
+			let client TextInputClient = focus
+			let caret = client.caretRect()
+			let now = "{client.inputKind()} {float(caret.left)} {float(caret.top)} {float(caret.width)} {float(caret.height)}"
+			return none when !(was is none) && was == now
+			if was is none || !was.startsWith("{client.inputKind()} ") {
+				host.startTextInput(win, client.inputKind()) onerror recover none
+			}
+			host.setTextInputCaret(win, caret) onerror recover none
+			typingAs = typingAs.set(id, now)
 			return none
+		}
+
+		// Whether the window is still one of the open ones.
+		internal def isOpen(win r.Window) bool {
+			for let (_, w) in wins {
+				return true when w.id() == win.id()
+			}
+			return false
 		}
 
 		// Opens a window for `root` with the `UIConfig.defaultWindow` settings and returns when the
@@ -376,24 +988,77 @@ partial module std.ui {
 			return await run(root, cfg.defaultWindow)
 		}
 
+		// Hands what a pointer did to the window's scene and returns the component under
+		// it. A platform event's position is in the frame's device pixels.
+		internal def pointerAt(scene Scene, win r.Window, phase PointerPhase, evt r.PlatformEvent) component {
+			let scale = 1.0
+			scale = scales[win.id()] when scales.hasKey(win.id())
+			let at = new Point<Pixels>(evt.position.x / scale * 1(px), evt.position.y / scale * 1(px))
+			return scene.pointer(phase, at, evt.button, new Point<Pixels>(evt.delta.x / scale * 1(px), evt.delta.y / scale * 1(px)), scale, evt.clicks)
+		}
+
 		internal def pumpOne(win r.Window, evt r.PlatformEvent) !none {
+			return none unless scenes.hasKey(win.id())
+			let scene = scenes[win.id()]
+			// What the host says is held, before the event is routed.
+			if evt.kind := PlatformEventKind.MouseMove || PlatformEventKind.MouseWheel || PlatformEventKind.MouseUp || PlatformEventKind.MouseDown || PlatformEventKind.KeyDown || PlatformEventKind.KeyUp {
+				scene.hold(evt.modifiers)
+			}
 			match evt.kind {
 				case PlatformEventKind.Close:
 					let _ = close(CloseEvent{reason: "request"})
 				case PlatformEventKind.Resize:
 					let _ = resize(ResizeEvent{size: evt.size})
 				case PlatformEventKind.MouseMove:
-					let _ = mouseMove(MouseMoveEvent{target: "", position: evt.position, delta: evt.delta})
+					let _ = mouseMove(MouseMoveEvent{target: pointerAt(scene, win, PointerPhase.Move, evt), position: evt.position, delta: evt.delta})
 				case PlatformEventKind.MouseWheel:
-					let _ = mouseWheel(MouseWheelEvent{target: "", position: evt.position, delta: evt.delta})
+					let _ = mouseWheel(MouseWheelEvent{target: pointerAt(scene, win, PointerPhase.Scroll, evt), position: evt.position, delta: evt.delta})
 				case PlatformEventKind.MouseUp:
-					let _ = click(ClickEvent{target: "", position: evt.position, button: evt.button, clicks: 1})
+					let _ = click(ClickEvent{target: pointerAt(scene, win, PointerPhase.Up, evt), position: evt.position, button: evt.button, clicks: evt.clicks})
+				case PlatformEventKind.MouseDown:
+					let _ = pointerAt(scene, win, PointerPhase.Down, evt)
+				case PlatformEventKind.MouseLeave:
+					let _ = pointerAt(scene, win, PointerPhase.Leave, evt)
 				case PlatformEventKind.KeyDown:
-					let _ = keyDown(KeyEvent{target: "", key: evt.key})
+					let pressed = KeyEvent{target: scene.root, key: evt.key, modifiers: evt.modifiers, repeat: evt.repeat, code: evt.code, text: evt.text}
+					let _ = scene.key(pressed)
+					let _ = keyDown(pressed)
 				case PlatformEventKind.KeyUp:
-					let _ = keyUp(KeyEvent{target: "", key: evt.key})
+					let released = KeyEvent{target: scene.root, key: evt.key, modifiers: evt.modifiers, down: false, code: evt.code}
+					let _ = scene.key(released)
+					let _ = keyUp(released)
+				case PlatformEventKind.DragOver, PlatformEventKind.Drop, PlatformEventKind.DragLeave:
+					let scale = 1.0
+					scale = scales[win.id()] when scales.hasKey(win.id())
+					let at = new Point<Pixels>(evt.position.x / scale * 1(px), evt.position.y / scale * 1(px))
+					match evt.kind {
+						case PlatformEventKind.DragOver:
+							let _ = scene.dragOver(at)
+						case PlatformEventKind.Drop:
+							let _ = scene.drop(at, DragData{text: evt.text, files: evt.files})
+						default:
+							let _ = scene.dragLeave()
+					}
 				case PlatformEventKind.TextInput:
-					let _ = textInput(TextInputEvent{target: "", rune: evt.rune})
+					let _ = scene.text(evt.text)
+					for let (_, rune) in evt.text {
+						let _ = textInput(TextInputEvent{target: scene.focused(), rune: rune})
+					}
+				case PlatformEventKind.TextCompose:
+					let focus = scene.focused()
+					if focus is TextInputClient {
+						focus.compose(evt.text, evt.caret)
+					}
+				case PlatformEventKind.Focus:
+					win.active = true
+				case PlatformEventKind.Blur:
+					win.active = false
+					// Keys let go of while another window has the keyboard are not heard.
+					scene.hold(Modifiers{})
+				case PlatformEventKind.StateChange:
+					win.state = evt.state
+					stateAs = stateAs.set(win.id(), evt.state)
+					let _ = windowStateChanged(win)
 				default:
 			}
 			return none
@@ -402,7 +1067,7 @@ partial module std.ui {
 		// Reads the platform events waiting on the window and emits the `std.ui` event for each.
 		// Returns the raw events it consumed.
 		//
-		// Fails when the service is not running, no renderer is configured, or the window is unknown.
+		// Fails when the service is not running or the window is unknown.
 		@commit()
 		def pumpEvents(win r.Window) !r.PlatformEvent[] {
 			let evts = try pollPlatformEvents(win)
@@ -417,7 +1082,7 @@ partial module std.ui {
 		// Fails when the service is not running or a window cannot be read.
 		@commit()
 		def pumpAll() !none {
-			fail "UI service is not running" unless running
+			try readHost()
 			for let (_, win) in wins {
 				let _ = try pumpEvents(win)
 			}
@@ -431,12 +1096,12 @@ partial module std.ui {
 		// grants the Window Management permission.
 		@query()
 		def displays() Display[] {
-			let ren = cfg.renderer
-			if !(ren is none) {
-				let found = ren.displays() onerror recover []
+			let host = cfg.host
+			if !(host is none) && running {
+				let found = host.displays() onerror recover []
 				return found when found.len() > 0
 			}
-			return [Display{primary:true}]
+			return [Display{primary: true}]
 		}
 
 		// The platform's look settings: colour scheme, accent, contrast, motion,
@@ -449,15 +1114,25 @@ partial module std.ui {
 			return known
 		}
 
+		// The theme styles read when no other is given: the platform's scheme, accent,
+		// contrast and fonts with the std light or dark palette. It is one object, kept in
+		// step with `appearanceChange`.
+		@query()
+		def theme() Theme {
+			let held = look.theme
+			return held unless held is none
+			let made = new Theme(appearance())
+			look.theme = made
+			return made
+		}
+
 		// The display the window is on: the one holding most of it.
 		//
 		// Fails when the service is not running or the window is unknown.
 		@query()
 		def display(win r.Window) !Display {
-			fail "UI service is not running" unless running
-			let ren = cfg.renderer
-			fail "UI renderer is not configured" when ren is none
-			let bounds = try ren.windowBounds(win)
+			let host = try windowHost()
+			let bounds = try host.windowBounds(win)
 			return displayAt(bounds, displays())
 		}
 
@@ -471,6 +1146,11 @@ partial module std.ui {
 			for watch.wait() {
 				let now = readAppearance()
 				state.current = now
+				let theme = state.theme
+				theme.follow(now) unless theme is none
+				state.changed = true
+				let host = cfg.host
+				host.wake() unless host is none
 				let _ = appearanceChange(now)
 			}
 		}
@@ -494,10 +1174,10 @@ partial module std.ui {
 					let _ = displaysChange(current)
 				}
 			}
-			let ren = cfg.renderer
-			return when ren is none
+			let host = cfg.host
+			return when host is none
 			for let (_, win) in wins {
-				let bounds = ren.windowBounds(win) onerror continue
+				let bounds = host.windowBounds(win) onerror continue
 				let on = displayAt(bounds, current)
 				let onKey = "{on.name} {on.scale}"
 				let id = win.id()
@@ -529,6 +1209,13 @@ partial module std.ui {
 			return evt
 		}
 
+		// Emitted when a component's `@state` field is assigned a different value. Changing an
+		// array or an object in place does not emit it.
+		@emit()
+		def stateChange(change StateChange) StateChange {
+			return change
+		}
+
 		// Emitted for a click, resolved to the component under it.
 		@emit()
 		def click(evt ClickEvent) ClickEvent {
@@ -551,6 +1238,26 @@ partial module std.ui {
 		@emit()
 		def resize(evt ResizeEvent) ResizeEvent {
 			return evt
+		}
+
+		// Emitted when the user asks to close a window, before it closes. A handler calls
+		// `request.cancel()` to keep it open.
+		@emit(immediate = true)
+		def closeRequested(request CloseRequest) CloseRequest {
+			return request
+		}
+
+		// Emitted when a window is minimized, maximized, restored or made fullscreen; read
+		// its `state`.
+		@emit()
+		def windowStateChanged(window r.Window) r.Window {
+			return window
+		}
+
+		// Emitted when the tray icon itself is clicked.
+		@emit()
+		def trayActivated() bool {
+			return true
 		}
 
 		// Emitted when the user asks to close a window.

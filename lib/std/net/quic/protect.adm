@@ -1,0 +1,177 @@
+// QUIC packet protection (RFC 9001 §5): keys from a traffic secret, the
+// AEAD over the payload, header protection, and the Retry integrity tag.
+internal partial module std.net.quic.wire {
+	use (
+		std.crypto.cipher::(AEAD, AES, newAES, newGCM, chacha20)
+		std.crypto.hash::(Hash, hkdfExtract)
+		std.net.tls
+	)
+
+	// QUIC version 1 (RFC 9000).
+	const version1 = 1
+
+	// Keys protects packets in one direction at one encryption level.
+	type Keys {
+		suite   tls.CipherSuite
+		// The traffic secret, kept for the next key update.
+		secret  byte[]
+		aead    AEAD
+		iv      byte[]
+		hpKey   byte[]
+		// The AES block cipher of header protection; none for ChaCha20.
+		hpBlock ?AES
+
+		def new(suite tls.CipherSuite, secret byte[], aead AEAD, iv byte[], hpKey byte[], hpBlock ?AES) {
+			self.suite = suite
+			self.secret = secret
+			self.aead = aead
+			self.iv = iv
+			self.hpKey = hpKey
+			self.hpBlock = hpBlock
+		}
+
+		// nonce is the AEAD nonce of a packet number: the IV with the
+		// number folded into its last bytes (RFC 9001 §5.3).
+		def nonce(pn int) byte[] {
+			let out = iv.clone()
+			for let i = 0; i < 8; i++ {
+				out[11 - i] = out[11 - i] ^ byte((pn >> (8 * i)) & 0xFF)
+			}
+			return out
+		}
+
+		// mask is the five header protection bytes for a 16-byte sample
+		// of ciphertext (RFC 9001 §5.4.3, §5.4.4).
+		// Fails only when the ChaCha20 call does.
+		def mask(sample byte[]) !byte[] {
+			let block = hpBlock
+			if block is none {
+				let counter = uint32(sample[0]) | (uint32(sample[1]) << 8) | (uint32(sample[2]) << 16) | (uint32(sample[3]) << 24)
+				return try chacha20(hpKey, sample[4:16], counter, [0, 0, 0, 0, 0])
+			}
+			let out byte[] = []
+			out.len(16)
+			block.encryptBlock(out, sample)
+			return out[:5]
+		}
+	}
+
+	// deriveKeys makes the keys of a traffic secret for a TLS 1.3 suite
+	// with the labels "quic key", "quic iv" and "quic hp".
+	// Fails only when HKDF or the cipher refuses the key.
+	def deriveKeys(suite tls.CipherSuite, secret byte[]) !Keys {
+		let hash = tls.suiteHash(suite)
+		let size = tls.suiteKeySize(suite)
+		let key = try tls.hkdfExpandLabel(hash, secret, "quic key", [], size)
+		let iv = try tls.hkdfExpandLabel(hash, secret, "quic iv", [], 12)
+		let hp = try tls.hkdfExpandLabel(hash, secret, "quic hp", [], size)
+		return try keysFrom(suite, secret, key, iv, hp)
+	}
+
+	// nextKeys is the keys after a key update (RFC 9001 §6): a new secret
+	// with the label "quic ku", the header protection key unchanged.
+	// Fails only when HKDF does.
+	def nextKeys(current Keys) !Keys {
+		let hash = tls.suiteHash(current.suite)
+		let secret = try tls.hkdfExpandLabel(hash, current.secret, "quic ku", [], current.secret.len())
+		let size = tls.suiteKeySize(current.suite)
+		let key = try tls.hkdfExpandLabel(hash, secret, "quic key", [], size)
+		let iv = try tls.hkdfExpandLabel(hash, secret, "quic iv", [], 12)
+		return try keysFrom(current.suite, secret, key, iv, current.hpKey)
+	}
+
+	def keysFrom(suite tls.CipherSuite, secret byte[], key byte[], iv byte[], hp byte[]) !Keys {
+		let aead = try tls.suiteAEAD(suite, key)
+		return new Keys(suite, secret, aead, iv, hp, none) when tls.suiteUsesChaCha20(suite)
+		return new Keys(suite, secret, aead, iv, hp, try newAES(hp))
+	}
+
+	// initialKeys derives the Initial keys both sides compute from the
+	// client's first destination connection ID (RFC 9001 §5.2): the
+	// client's sending keys, then the server's.
+	// Fails only when HKDF does.
+	def initialKeys(dcid byte[]) !(Keys, Keys) {
+		let salt byte[] = [0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a]
+		let initial = hkdfExtract(Hash.SHA256, salt, dcid)
+		let client = try tls.hkdfExpandLabel(Hash.SHA256, initial, "client in", [], 32)
+		let server = try tls.hkdfExpandLabel(Hash.SHA256, initial, "server in", [], 32)
+		return (try deriveKeys(tls.CipherSuite.AES128GCMSHA256, client), try deriveKeys(tls.CipherSuite.AES128GCMSHA256, server))
+	}
+
+	// setLength fills in the two-byte length field of a long header.
+	def setLength(packet byte[], at int, value int) {
+		packet[at] = byte(0x40 | (value >> 8))
+		packet[at + 1] = byte(value & 0xFF)
+	}
+
+	// seal protects a packet: `packet` holds the header from `start`
+	// through the packet number (pnLength bytes, ending the array), the
+	// payload is encrypted behind it and the header protection applied.
+	// The payload must be at least 4 - pnLength bytes so the sample
+	// exists. Fails only when the header protection cipher does.
+	def seal(keys Keys, packet byte[], start int, pnLength int, pn int, payload byte[]) !none {
+		let pnOffset = packet.len() - pnLength
+		let sealed = keys.aead.seal(keys.nonce(pn), payload, packet[start:])
+		packet.push(...sealed)
+		let mask = try keys.mask(packet[pnOffset + 4:pnOffset + 20])
+		let long = (packet[start] & 0x80) != 0
+		packet[start] = packet[start] ^ (mask[0] & (long ?? (0x0f, 0x1f)))
+		for let i = 0; i < pnLength; i++ {
+			packet[pnOffset + i] = packet[pnOffset + i] ^ mask[1 + i]
+		}
+		return none
+	}
+
+	// Opened is a packet with its header protection removed: the first
+	// byte, the full packet number, and what the AEAD still has to open.
+	struct Opened {
+		first      byte
+		pn         int
+		// The header through the packet number, unprotected: the AEAD's
+		// associated data.
+		header     byte[]
+		ciphertext byte[]
+		ok         bool   = true
+	}
+
+	// unprotect removes the header protection of the packet at `start`
+	// and recovers its packet number against the largest one received in
+	// its space. `ok` is false when the packet is too short to sample.
+	// Fails only when the header protection cipher does.
+	def unprotect(keys Keys, datagram byte[], start int, h Header, largest int) !Opened {
+		return Opened{first: 0, pn: 0, header: [], ciphertext: [], ok: false} when h.pnOffset + 20 > h.end
+		let mask = try keys.mask(datagram[h.pnOffset + 4:h.pnOffset + 20])
+		let long = (datagram[start] & 0x80) != 0
+		let first = datagram[start] ^ (mask[0] & (long ?? (0x0f, 0x1f)))
+		let pnLength = int(first & 0x03) + 1
+		let header = datagram[start:h.pnOffset + pnLength].clone()
+		header[0] = first
+		let truncated = 0
+		for let i = 0; i < pnLength; i++ {
+			let b = datagram[h.pnOffset + i] ^ mask[1 + i]
+			header[h.pnOffset - start + i] = b
+			truncated = (truncated << 8) | int(b)
+		}
+		return Opened{first: first, pn: decodePacketNumber(largest, truncated, 8 * pnLength), header: header, ciphertext: datagram[h.pnOffset + pnLength:h.end]}
+	}
+
+	// open decrypts the payload of an unprotected packet.
+	// Fails when the tag does not verify.
+	def open(keys Keys, packet Opened) !byte[] {
+		return try keys.aead.open(keys.nonce(packet.pn), packet.ciphertext, packet.header)
+	}
+
+	// retryTag is the integrity tag of a Retry packet (RFC 9001 §5.8)
+	// over the client's original destination connection ID and the
+	// packet without its tag.
+	// Fails only when the cipher does.
+	def retryTag(originalDCID byte[], packet byte[]) !byte[] {
+		let key byte[] = [0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e]
+		let nonce byte[] = [0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb]
+		let pseudo byte[] = [byte(originalDCID.len())]
+		pseudo.push(...originalDCID)
+		pseudo.push(...packet)
+		let aead = try newGCM(try newAES(key), 12, 16)
+		return aead.seal(nonce, [], pseudo)
+	}
+}

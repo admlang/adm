@@ -1,0 +1,237 @@
+// The tasks behind `localAudio` and `localVideo`, and the picture
+// conversions they need.
+partial module std.media.call {
+	use (
+		std.devices
+		std.formats.audio
+		std.formats.video
+		std.net.rtp
+		std.net.webrtc
+		std.simd
+		std.time
+	)
+
+	// Samples a channel in a packet of sound: 20 ms at 48 kHz.
+	internal const packetSamples = 960
+
+	// pumpSound reads the source to its end, a packet's worth at a time,
+	// and writes Opus packets to the track; silence the encoder left out
+	// moves the track's clock on without a packet. A packet the track
+	// does not take yet (the connection is not up) is dropped.
+	internal async def pumpSound(source audio.AudioStream, track webrtc.LocalTrack, bitsPerSecond int) {
+		let info = source.info()
+		let inChannels = int(info.channels)
+		let channels = inChannels >= 2 ?? (2, 1)
+		let converter = new audio.Converter(int(info.sampleRate), inChannels, 48000, channels)
+		let encoder = new audio.OpusEncoder(channels, bitsPerSecond)
+		encoder.dtx = true
+		let chunk float32[]
+		chunk.len(int(info.sampleRate) / 50 * inChannels)
+		let waiting float32[]
+		let packet float32[]
+		packet.len(packetSamples * channels)
+		let began = int(time.monoNs())
+		let sent = 0
+		for {
+			let failed = false
+			let got = source.read(chunk) onerror (err error) {
+				failed = true
+				recover 0
+			}
+			break when failed || got == 0
+			let fresh = converter.passes() ?? (chunk[:got * inChannels], converter.convert(chunk[:got * inChannels]))
+			waiting = waiting + fresh
+			let at = 0
+			for waiting.len() - at >= packet.len() {
+				waiting[at:at + packet.len()].copy(packet)
+				at += packet.len()
+				// A source that reads faster than it plays is held to
+				// real time.
+				let ahead = began + sent * 20000000 - int(time.monoNs())
+				time.sleep(duration(ahead)) when ahead > 2000000
+				sent++
+				// Sound before the connection is up is read and let go.
+				continue unless track.ready()
+				let coded = encoder.encode(packet, packetSamples) onerror recover byte[]
+				if coded.len() <= 2 {
+					track.skip(20ms)
+				} else {
+					track.writeFrame(coded, 20ms) onerror recover none
+				}
+			}
+			waiting = waiting[at:].clone() when at > 0
+		}
+	}
+
+	// pumpCamera encodes the camera's frames as they come.
+	internal async def pumpCamera(camera devices.Camera, track webrtc.LocalTrack) {
+		let sender = new PictureSender(track)
+		let jpeg = new video.MJPEG()
+		let last = int(time.monoNs())
+		for camera.isOpen() {
+			let failed = false
+			let frame = camera.frame() onerror (err error) {
+				failed = true
+				recover devices.Frame{width: 0, height: 0, format: devices.PixelFormat.Yuyv, data: [], sequence: 0}
+			}
+			break when failed
+			let now = int(time.monoNs())
+			let length = duration((now - last).max(1000000).min(1000000000))
+			last = now
+			let picture = video.VideoFrame{width: 0, height: 0, y: [], u: [], v: [], yStride: 0, uvStride: 0, time: 0s, length: length, keyframe: false, matrix: 601}
+			if frame.format == devices.PixelFormat.Yuyv {
+				picture = video.fromPacked(frame.data, frame.width, frame.height)
+			} else {
+				let spoiled = false
+				let decoded = jpeg.decode(video.Packet{track: 0, data: frame.data, pts: 0s, dts: 0s, length: length, keyframe: true}) onerror (err error) {
+					spoiled = true
+					recover []
+				}
+				// A damaged frame is one picture less.
+				continue when spoiled || decoded.len() == 0
+				picture = decoded[0]
+			}
+			picture.length = length
+			sender.send(picture)
+		}
+	}
+
+	// pumpStream encodes a video stream's pictures, each at its time.
+	internal async def pumpStream(stream video.VideoStream, track webrtc.LocalTrack) {
+		let sender = new PictureSender(track)
+		let began = int(time.monoNs())
+		for {
+			let ended = false
+			let picture = stream.next() onerror (err error) {
+				ended = true
+				recover none
+			}
+			break when ended || picture is none
+			let ahead = began + int(picture.time) - int(time.monoNs())
+			time.sleep(duration(ahead)) when ahead > 1000000
+			sender.send(picture)
+		}
+	}
+
+	// PictureSender encodes pictures for a track, as VP8 or H.264 by the
+	// track's format, at the bitrate the connection allows it, a key frame first, when the peer asks, and
+	// again after one the track did not take (the connection was not up:
+	// what the peer then sees first must stand alone).
+	internal type PictureSender {
+		track   webrtc.LocalTrack
+		encoder ?video.VideoEncoder = none
+		// The size the encoder was made for.
+		wide    int                 = 0
+		high    int                 = 0
+		needKey bool                = true
+
+		def new(track webrtc.LocalTrack) {
+			self.track = track
+		}
+
+		// coderFor is the encoder for pictures of this one's size: a new
+		// one when the size changes, which starts with a key frame.
+		internal def coderFor(plain video.VideoFrame) video.VideoEncoder {
+			let have = encoder
+			return have unless have is none || wide != int(plain.width) || high != int(plain.height)
+			let rate = plain.length > 0s ?? ((1000000000 / int(plain.length)).max(1).min(120), 30)
+			wide = int(plain.width)
+			high = int(plain.height)
+			let made video.VideoEncoder = new video.VP8Encoder(wide, high, track.bitrate(), rate)
+			made = new video.H264Encoder(wide, high, track.bitrate(), rate) when track.format == rtp.PayloadFormat.H264
+			encoder = made
+			needKey = true
+			return made
+		}
+
+		def send(picture video.VideoFrame) {
+			// A picture before the connection is up is not encoded: it
+			// would be refused, and would count against the bitrate.
+			if !track.ready() {
+				needKey = true
+				return
+			}
+			let failed = false
+			let plain = fourTwoZero(picture) onerror (err error) {
+				failed = true
+				recover picture
+			}
+			return when failed
+			let coder = coderFor(plain)
+			coder.setBitrate(track.bitrate())
+			let key = track.keyframeRequested() || needKey
+			let packet = coder.encode(plain, key) onerror (err error) {
+				failed = true
+				recover video.Packet{track: 0, data: [], pts: 0s, dts: 0s, length: 0s, keyframe: false}
+			}
+			return when failed
+			let length = plain.length > 0s ?? (plain.length, 33ms)
+			needKey = false
+			track.writeFrame(packet.data, length, packet.keyframe) onerror (err error) {
+				needKey = true
+				recover none
+			}
+		}
+	}
+
+	// fourTwoZero is the picture as the encoder takes it: 8 bits, chroma
+	// at half the width and half the height. Chroma that has every row
+	// (4:2:2) is averaged two rows at a time, chroma at full size (4:4:4)
+	// four samples at a time; a picture without chroma gets grey. Fails
+	// for more than 8 bits or a picture on the GPU.
+	internal def fourTwoZero(picture video.VideoFrame) !video.VideoFrame {
+		fail "call: pictures of {picture.bitDepth} bits or on the GPU are not sent" unless picture.bitDepth == 8 && !picture.onGpu
+		return picture when picture.chroma == video.ChromaLayout.Yuv420
+		let w = int(picture.width)
+		let h = int(picture.height)
+		let cw = (w + 1) / 2
+		let ch = (h + 1) / 2
+		let u byte[]
+		u.len(cw * ch)
+		let v byte[]
+		v.len(cw * ch)
+		if picture.chroma == video.ChromaLayout.Yuv422 {
+			halveRows(picture.u, picture.uvStride, u, cw, ch, h)
+			halveRows(picture.v, picture.uvStride, v, cw, ch, h)
+		} else if picture.chroma == video.ChromaLayout.Yuv444 {
+			quarter(picture.u, picture.uvStride, u, cw, ch, w, h)
+			quarter(picture.v, picture.uvStride, v, cw, ch, w, h)
+		} else {
+			fail "call: pictures with {picture.chroma} chroma are not sent" unless picture.chroma == video.ChromaLayout.Mono
+			u.fill(128)
+			v.fill(128)
+		}
+		return video.VideoFrame{width: picture.width, height: picture.height, y: picture.y, u: u, v: v, yStride: picture.yStride, uvStride: cw, time: picture.time, length: picture.length, keyframe: picture.keyframe, matrix: picture.matrix, fullRange: picture.fullRange}
+	}
+
+	// halveRows averages each two rows of a plane `wide` samples wide
+	// into one; a last row without a partner is copied.
+	internal def halveRows(src byte[], stride int, out byte[], wide int, rows int, height int) {
+		for let j = 0; j < rows; j++ {
+			let upper = 2 * j * stride
+			let lower = 2 * j + 1 < height ?? (upper + stride, upper)
+			let to = j * wide
+			let i = 0
+			for i + 32 <= wide && lower + i + 32 <= src.len() {
+				simd.store32<byte>(out, to + i, simd.avg(simd.load32<byte>(src, upper + i), simd.load32<byte>(src, lower + i)))
+				i += 32
+			}
+			for i < wide {
+				out[to + i] = byte((int(src[upper + i]) + int(src[lower + i]) + 1) >> 1)
+				i++
+			}
+		}
+	}
+
+	// quarter averages each two by two samples of a plane into one.
+	internal def quarter(src byte[], stride int, out byte[], wide int, rows int, width int, height int) {
+		for let j = 0; j < rows; j++ {
+			let upper = 2 * j * stride
+			let lower = 2 * j + 1 < height ?? (upper + stride, upper)
+			for let i = 0; i < wide; i++ {
+				let right = 2 * i + 1 < width ?? (2 * i + 1, 2 * i)
+				out[j * wide + i] = byte((int(src[upper + 2 * i]) + int(src[upper + right]) + int(src[lower + 2 * i]) + int(src[lower + right]) + 2) >> 2)
+			}
+		}
+	}
+}

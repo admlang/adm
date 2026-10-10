@@ -1,0 +1,175 @@
+// Devices and codecs to WebRTC tracks and back: sound and pictures are
+// captured, encoded and written to a `webrtc.LocalTrack`; what a
+// `webrtc.RemoteTrack` receives is decoded and played or handed out as
+// pictures.
+//
+//     let mic = try devices.openMicrophone()
+//     let camera = try devices.openCamera((try devices.cameras())[0].id, 1280, 720)
+//     try pc.addTrack(try call.localAudio(mic))
+//     try pc.addTrack(try call.localVideo(camera))
+partial module std.media.call {
+	use (
+		std.devices
+		std.formats.audio
+		std.formats.video
+		std.media.player::(AudioSink)
+		std.net.rtp
+		std.net.webrtc
+		std.time
+	)
+
+	// localAudio makes a track that carries `source` as Opus: a task reads
+	// it 20 ms at a time, converts it to 48 kHz (more than two channels to
+	// two), encodes it at `bitsPerSecond` and writes the packets to the
+	// track, leaving silence out (discontinuous transmission). A
+	// microphone sets the pace itself; a source that reads faster (a
+	// file) is paced to real time. The task ends when the source does (a
+	// microphone that is closed) or fails. Fails for a source without
+	// channels or a sample rate.
+	def localAudio(source audio.AudioStream, bitsPerSecond int = 32000) !webrtc.LocalTrack {
+		let info = source.info()
+		fail "call: the sound source has no channels or no sample rate" when info.channels == 0 || info.sampleRate == 0
+		let track = new webrtc.LocalTrack(rtp.PayloadFormat.Opus)
+		track.limit(bitsPerSecond)
+		let task = async pumpSound(source, track, bitsPerSecond)
+		task.keepAlive()
+		return track
+	}
+
+	// localVideo makes a track that carries a camera's pictures as VP8,
+	// or as H.264 (Constrained Baseline) with `format` saying so: a
+	// task takes each frame as the camera delivers it, encodes it at the
+	// bitrate the connection allows the track (at most `bitsPerSecond`)
+	// and writes it, with a key frame first and whenever the peer asks.
+	// The task ends when the camera is closed or fails. Fails for a
+	// format no encoder here makes.
+	def localVideo(camera devices.Camera, bitsPerSecond int = 1500000, format rtp.PayloadFormat = rtp.PayloadFormat.VP8) !webrtc.LocalTrack {
+		fail "call: pictures are sent as VP8 or H.264, not {format}" unless format := rtp.PayloadFormat.VP8 || rtp.PayloadFormat.H264
+		let track = new webrtc.LocalTrack(format)
+		track.limit(bitsPerSecond)
+		let task = async pumpCamera(camera, track)
+		task.keepAlive()
+		return track
+	}
+
+	// localVideo with the pictures of a video stream (a file's): each is
+	// sent at its own time, the stream's end ends the task.
+	def localVideo(stream video.VideoStream, bitsPerSecond int = 1500000, format rtp.PayloadFormat = rtp.PayloadFormat.VP8) !webrtc.LocalTrack {
+		fail "call: pictures are sent as VP8 or H.264, not {format}" unless format := rtp.PayloadFormat.VP8 || rtp.PayloadFormat.H264
+		let track = new webrtc.LocalTrack(format)
+		track.limit(bitsPerSecond)
+		let task = async pumpStream(stream, track)
+		task.keepAlive()
+		return track
+	}
+
+	// play plays the sound of a track the peer sends through a speaker (or
+	// any sink) until the connection ends, and then returns. Packets the
+	// peer left out or that never came play as silence of their length.
+	// Fails for a track that is not Opus, when a packet does not decode,
+	// or as the sink does.
+	def play(track webrtc.RemoteTrack, sink AudioSink) !none {
+		fail "call: play takes an Opus track, not {track.format}" unless track.format == rtp.PayloadFormat.Opus
+		let decoder = try new audio.Opus().decoder(opusHead)
+		let converter = new audio.Converter(48000, 2, sink.sampleRate(), sink.channels())
+		// The timestamp the next packet has when nothing is missing.
+		let due = -1
+		for {
+			let ended = false
+			let late = false
+			let frame = track.readFrame(1s) onerror (err error) {
+				ended = err is webrtc.WebRtcError
+				late = !ended
+				recover rtp.Frame{data: [], timestamp: 0, keyframe: false, firstSequence: 0, lastSequence: 0}
+			}
+			return none when ended
+			continue when late
+			// Up to a second of what is missing, as silence.
+			if due >= 0 && frame.timestamp > due {
+				let gap float32[]
+				gap.len((frame.timestamp - due).min(48000) * 2)
+				try sink.write(converter.passes() ?? (gap, converter.convert(gap)))
+			}
+			let samples = try decoder.decode(frame.data)
+			due = frame.timestamp + samples.len() / 2
+			try sink.write(converter.passes() ?? (samples, converter.convert(samples)))
+		}
+		return none
+	}
+
+	// frames is the decoded pictures of a track the peer sends (VP8, VP9,
+	// H.264 or AV1). Fails for a track of another format.
+	def frames(track webrtc.RemoteTrack) !RemoteVideo {
+		return new RemoteVideo(track, try decoderFor(track.format))
+	}
+
+	// RemoteVideo decodes the pictures of a remote track as they arrive.
+	type RemoteVideo {
+		track            webrtc.RemoteTrack
+		internal decoder video.VideoDecoder
+		// Nothing decodes before a key frame; after a frame that did not
+		// decode the next key frame starts over.
+		internal started bool               = false
+		internal held    video.VideoFrame[] = []
+
+		def new(track webrtc.RemoteTrack, decoder video.VideoDecoder) {
+			self.track = track
+			self.decoder = decoder
+		}
+
+		// next waits for the next picture; none once the connection has
+		// ended. A frame that does not decode is dropped and a key frame
+		// asked for. Fails with NetError (TimedOut) when no picture comes
+		// in `timeout`.
+		def next(timeout duration = 5s) !?video.VideoFrame {
+			for held.len() == 0 {
+				let ended = false
+				let failure ?error = none
+				let frame = track.readFrame(timeout) onerror (err error) {
+					ended = err is webrtc.WebRtcError
+					failure = err
+					recover rtp.Frame{data: [], timestamp: 0, keyframe: false, firstSequence: 0, lastSequence: 0}
+				}
+				return none when ended
+				fail failure unless failure is none
+				if !started && !frame.keyframe {
+					track.requestKeyframe()
+					continue
+				}
+				let spoiled = false
+				let at = duration(frame.timestamp * 100000 / 9)
+				held = decoder.decode(video.Packet{track: 0, data: frame.data, pts: at, dts: at, length: 0s, keyframe: frame.keyframe}) onerror (err error) {
+					spoiled = true
+					recover []
+				}
+				started = !spoiled
+				track.requestKeyframe() when spoiled
+			}
+			return held.shift()
+		}
+	}
+
+	// The identification header of what `play` decodes: two channels at
+	// 48 kHz, nothing skipped, no gain (RFC 7845 §5.1).
+	internal const opusHead = byte[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0, 0, 0x80, 0xBB, 0, 0, 0, 0, 0]
+
+	// decoderFor is the decoder of a track's format, set up for packets
+	// without a container's setup bytes.
+	internal def decoderFor(format rtp.PayloadFormat) !video.VideoDecoder {
+		fail "call: no decoder for {format} tracks" unless format := rtp.PayloadFormat.VP8 || rtp.PayloadFormat.VP9 || rtp.PayloadFormat.H264 || rtp.PayloadFormat.AV1
+		let codec = "vp8"
+		let decoder video.VideoDecoder = new video.VP8()
+		if format == rtp.PayloadFormat.H264 {
+			codec = "h264"
+			decoder = new video.H264()
+		} else if format == rtp.PayloadFormat.AV1 {
+			codec = "av1"
+			decoder = new video.AV1()
+		} else if format == rtp.PayloadFormat.VP9 {
+			codec = "vp9"
+			decoder = new video.VP9()
+		}
+		try decoder.configure(video.Track{index: 0, kind: video.TrackKind.Video, codec: codec})
+		return decoder
+	}
+}

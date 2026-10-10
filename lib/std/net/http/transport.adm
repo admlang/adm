@@ -1,6 +1,7 @@
 partial module std.net.http {
 	use (
 		std.net.http.h2::*
+		std.net.http.h3::(QuicPool)
 		std.bytes
 		std.data.encoding
 		std.io
@@ -13,7 +14,7 @@ partial module std.net.http {
 		std.services.diagnostics::(metric)
 		std.time
 		std.net.http.transport::*
-		std.net.http.proxy::(socks5Connect, connectTunnel)
+		std.net.http.proxy::(tunnelThrough)
 	)
 
 	// RoundTripper sends one request and returns its response, no
@@ -76,6 +77,10 @@ partial module std.net.http {
 		// known to take the HTTP/2 preface in cleartext (h2c). Needs
 		// `http2`; a request through an HTTP proxy stays on HTTP/1.1.
 		http2PriorKnowledge    bool        = false
+		// When https requests go over HTTP/3 (RFC 9114): never, for
+		// origins that advertised it, or always. A request through a
+		// proxy stays on TCP.
+		http3                  HTTP3Mode   = HTTP3Mode.Off
 		// Largest response header block accepted; 1 MiB.
 		maxResponseHeaderBytes int         = 1024 * 1024
 		// Bytes of a request body held so an idempotent request can be
@@ -94,6 +99,7 @@ partial module std.net.http {
 		internal active   map<string, int>
 		internal sessions map<string, http2.Conn[]>
 		internal closed   bool                            = false
+		internal quicPool QuicPool
 
 		// Shared by every transport of the process.
 		@metric("net.http.client.requests.total")
@@ -111,6 +117,7 @@ partial module std.net.http {
 			self.idle = {}
 			self.active = {}
 			self.sessions = {}
+			quicPool = new QuicPool()
 		}
 
 		// Implements RoundTripper. Takes an idle connection for the key
@@ -126,10 +133,15 @@ partial module std.net.http {
 		// when a phase timeout passes.
 		def roundTrip(req Request) !Response {
 			requestsMetric.inc()
-			return deliver(req) onerror (err error) {
+			let res = deliver(req) onerror (err error) {
 				errorsMetric.inc()
 				fail err
 			}
+			if http3 == HTTP3Mode.Advertised && req.url.scheme.lower() == "https" {
+				let host = req.url.hostname()
+				quicPool.learn(joinHostPort(host, req.url.effectivePort()), host, res.headers.get("Alt-Svc"))
+			}
+			return res
 		}
 
 		// `roundTrip` without the metrics.
@@ -139,6 +151,10 @@ partial module std.net.http {
 			fail HttpError{message: "request URL needs a scheme and a host: {req.url.str()}", op: "transport", text: req.url.str()} when scheme == "" || req.url.host == ""
 			fail HttpError{message: "unsupported scheme: {scheme}", op: "transport", text: scheme} unless scheme := "http" || "https"
 			let key = try keyFor(req)
+			if http3 != HTTP3Mode.Off && scheme == "https" && key.endsWith("|") {
+				let over = try quicPool.send(req, http3, tls, dialTimeout, responseHeaderTimeout)
+				return over unless over is none
+			}
 			// A short body is read now, so a stale pooled connection can be
 			// retried with the same bytes.
 			let resendable = req.body is none
@@ -265,6 +281,7 @@ partial module std.net.http {
 			for let conn in takeSessions(true) {
 				conn.close() onerror recover none
 			}
+			quicPool.closeAll()
 		}
 
 		// Closes the pool: idle connections now, active ones as they
@@ -464,36 +481,38 @@ partial module std.net.http {
 				return direct
 			}
 			let proxyScheme = proxyURL.scheme.lower()
-			let proxyAddr = joinHostPort(proxyURL.hostname(), proxyURL.effectivePort())
-			let conn = try opener.dial("tcp", proxyAddr, dialTimeout)
-			let user = ""
-			let password = ""
-			let info = proxyURL.user
-			if !(info is none) {
-				user = info.username
-				let secret = info.password
-				password = secret unless secret is none
+			let proxyHost = proxyURL.hostname()
+			let proxyPort = proxyURL.effectivePort()
+			proxyPort = 1080 when proxyPort == 0
+			let conn = try opener.dial("tcp", joinHostPort(proxyHost, proxyPort), dialTimeout)
+			// An `https` proxy is spoken to over TLS; what it tunnels runs
+			// inside that connection.
+			let toProxy = try proxyStream(conn, proxyHost, proxyScheme == "https", tls, tlsHandshakeTimeout)
+			let web = proxyScheme := "http" || "https"
+			if web && !secure {
+				let pc = new PooledConnection(key, toProxy)
+				pc.owner = self
+				pc.proxyURL = proxyURL.str()
+				let info = proxyURL.user
+				if !(info is none) {
+					let secret = info.password
+					pc.proxyAuth = basicCredentials(info.username, secret is none ?? ("", secret))
+				}
+				return pc
 			}
-			if proxyScheme := "socks5" || "socks5h" || "socks" {
-				try socks5Connect(conn, target, user, password, dialTimeout)
-				let tunnelled = new PooledConnection(key, try secureStream(conn, host, secure, tls, tlsHandshakeTimeout, protocols))
-				tunnelled.owner = self
-				tunnelled.cleartextHTTP2 = cleartext
-				return tunnelled
+			let failure ?error = none
+			tunnelThrough(toProxy, proxyURL, target, dialTimeout) onerror (err error) {
+				failure = err
+				recover none
 			}
-			let auth = ""
-			auth = basicCredentials(user, password) when user != ""
-			if secure {
-				try connectTunnel(conn, target, auth, dialTimeout)
-				let inside = new PooledConnection(key, try secureStream(conn, host, true, tls, tlsHandshakeTimeout, protocols))
-				inside.owner = self
-				return inside
+			if !(failure is none) {
+				toProxy.close() onerror recover none
+				fail failure
 			}
-			let pc = new PooledConnection(key, conn)
-			pc.owner = self
-			pc.proxyURL = proxyURL.str()
-			pc.proxyAuth = auth
-			return pc
+			let tunnelled = new PooledConnection(key, try secureStream(toProxy, host, secure, tls, tlsHandshakeTimeout, protocols))
+			tunnelled.owner = self
+			tunnelled.cleartextHTTP2 = cleartext && !web
+			return tunnelled
 		}
 
 		// Blocks while the host is at `maxConnsPerHost`.
@@ -840,7 +859,7 @@ internal partial module std.net.http.transport {
 	// running the handshake within the timeout; a plain request gets the
 	// socket back. Fails with TLSError or CertificateError from the
 	// handshake, the socket closed.
-	def secureStream(conn net.Connection, host string, secure bool, config ?tls.Config, handshakeTimeout duration, protocols string[] = []) !net.Stream {
+	def secureStream(conn net.Stream, host string, secure bool, config ?tls.Config, handshakeTimeout duration, protocols string[] = []) !net.Stream {
 		return conn unless secure
 		let given = tls.Config{}
 		given = config unless config is none
@@ -857,6 +876,18 @@ internal partial module std.net.http.transport {
 		return secured when failure is none
 		conn.close() onerror recover none
 		fail failure
+	}
+
+	// proxyStream is the stream to a proxy: the socket, or for an `https`
+	// proxy the TLS connection over it, verified under the proxy's host
+	// name with the transport's TLS settings. Fails as `secureStream`.
+	def proxyStream(conn net.Connection, host string, secure bool, config ?tls.Config, handshakeTimeout duration) !net.Stream {
+		return conn unless secure
+		let given = tls.Config{}
+		given = config unless config is none
+		let cfg = tls.withServerName(given, host)
+		cfg.alpn = [alpnHTTP11]
+		return try secureStream(conn, host, true, cfg, handshakeTimeout, [alpnHTTP11])
 	}
 
 	// refusedStream reports whether an HTTP/2 exchange failed before the

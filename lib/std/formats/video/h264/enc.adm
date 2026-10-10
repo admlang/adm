@@ -1,0 +1,1612 @@
+// The H.264 encoder for video: Constrained Baseline pictures (ITU-T H.264
+// Annex A.2.1.1) coded with CAVLC. It works on the decoder's own state:
+// each macroblock is predicted, reconstructed and filtered by the code
+// that decodes it, so the pictures it predicts from are the ones a
+// decoder will have.
+internal partial module std.formats.video.h264 {
+	use (
+		std.formats.video.vp8::(vp8Sad16, vp8Sad8)
+		std.gfx.bands::(bandCount, bandOf, forBands)
+		std.mem
+		std.simd
+	)
+
+	// How far a vector may reach, in whole samples either way.
+	const h264SearchRange = 32
+
+	// The search's planes reach `h264PlanePad` samples beyond the picture
+	// on every side, so that a candidate near the border is read like any
+	// other; the plane of whole samples reaches `h264PlaneMargin`, for the
+	// six taps of the samples half way.
+	const h264PlanePad = 16
+
+	// The largest difference between two vectors of a search, in quarter
+	// samples: each reaches `h264SearchRange` either way.
+	const h264MvSpan = 8 * h264SearchRange
+	const h264PlaneMargin = 24
+
+	// A whole-sample match that leaves more than `h264RefineAbove` (a
+	// sum of absolute differences) is refined to half and quarter
+	// samples; one whose refined match leaves more than `h264SplitAbove`
+	// (a sum of absolute Hadamard differences, as every cost after the
+	// whole-sample search) is tried in halves and quarters with vectors
+	// of their own. Both are in units of what a bit is worth (`lambda`),
+	// which stops counting at `h264ThresholdLambda`, its value at QP 30:
+	// at QP 22 fixed thresholds of 256 and 768 cost 2% of the bytes of
+	// one of three clips, at QP 38 thresholds that grow on cost as much.
+	// With them the search takes 55 to 85% of the time it takes without,
+	// for at most 0.08 dB and 1% of the bytes (QP 22, 30 and 38).
+	// Above `h264IntraAbove` the macroblock is tried without the
+	// picture before it.
+	const h264RefineAbove = 32
+	const h264SplitAbove = 96
+	const h264ThresholdLambda = 8
+	const h264IntraAbove = 0
+
+	// The least bits a macroblock that is not skipped takes: its type,
+	// a vector's two differences of zero and an empty pattern.
+	const h264UnskippedBits = 4
+
+	// The bits of an intra macroblock type in a P slice, about.
+	const h264IntraTypeBits = 5
+
+	// What a bit is worth in sums of differences at each QP.
+	const h264Lambda = int[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 23, 25, 29, 32, 36, 40, 45, 51, 57, 64, 72, 81, 91]
+
+	// The levels (Table A-1): level_idc, then the most macroblocks a
+	// second, macroblocks a picture and kbit/s it allows.
+	const h264Levels = int[
+		10, 1485, 99, 64,
+		11, 3000, 396, 192,
+		12, 6000, 396, 384,
+		13, 11880, 396, 768,
+		20, 11880, 396, 2000,
+		21, 19800, 792, 4000,
+		22, 20250, 1620, 4000,
+		30, 40500, 1620, 10000,
+		31, 108000, 3600, 14000,
+		32, 216000, 5120, 20000,
+		40, 245760, 8192, 20000,
+		41, 245760, 8192, 50000,
+		42, 522240, 8704, 50000,
+		50, 589824, 22080, 135000,
+		51, 983040, 36864, 240000,
+		52, 2073600, 36864, 240000
+	]
+
+	// h264LevelFor is the lowest level_idc that allows pictures of
+	// `wMbs` x `hMbs` macroblocks, `frameRate` a second, at
+	// `bitsPerSecond`; the highest when none does.
+	def h264LevelFor(wMbs int, hMbs int, frameRate int, bitsPerSecond int) int {
+		let mbs = wMbs * hMbs
+		for let i = 0; i < h264Levels.len(); i += 4 {
+			let size = h264Levels[i + 2]
+			continue when mbs > size || mbs * frameRate > h264Levels[i + 1] || bitsPerSecond > h264Levels[i + 3] * 1000
+			// Neither side may be longer than the square root of eight
+			// pictures.
+			continue when wMbs * wMbs > 8 * size || hMbs * hMbs > 8 * size
+			return h264Levels[i]
+		}
+		return 52
+	}
+
+	// Where the sample at each quarter-sample position is read: the
+	// plane of whole samples (0) and those of the samples half way to the
+	// right (1), down (2) and both (3). Per position `fy * 4 + fx`: a
+	// plane with the offset (x, y) of its sample, and a second one whose
+	// sample it is averaged with (§8.4.2.2.1), -1 for none.
+	const h264QuarterFrom = int[
+		0, 0, 0, -1, 0, 0,
+		0, 0, 0, 1, 0, 0,
+		1, 0, 0, -1, 0, 0,
+		1, 0, 0, 0, 1, 0,
+		0, 0, 0, 2, 0, 0,
+		1, 0, 0, 2, 0, 0,
+		1, 0, 0, 3, 0, 0,
+		1, 0, 0, 2, 1, 0,
+		2, 0, 0, -1, 0, 0,
+		2, 0, 0, 3, 0, 0,
+		3, 0, 0, -1, 0, 0,
+		3, 0, 0, 2, 1, 0,
+		2, 0, 0, 0, 0, 1,
+		2, 0, 0, 1, 0, 1,
+		3, 0, 0, 1, 0, 1,
+		2, 1, 0, 1, 0, 1
+	]
+
+	// h264SadAverage is the sum of absolute differences between the `n`
+	// x `n` block (16 or 8) of `src` at `so`, rows `ss` apart, and the
+	// rounded-up average of the blocks of `a` at `ao` and `b` at `bo`,
+	// rows `stride` apart.
+	def h264SadAverage(src byte[], so int, ss int, a byte[], ao int, b byte[], bo int, stride int, n int) int {
+		if n == 16 {
+			let acc = simd.splat16<uint16>(0)
+			for let j = 0; j < 16; j++ {
+				let x = simd.load16<byte>(a, ao + j * stride)
+				let y = simd.load16<byte>(b, bo + j * stride)
+				// (x + y + 1) >> 1 without leaving the byte lanes.
+				let p = (x | y) - ((x ^ y) >> 1)
+				let s = simd.load16<byte>(src, so + j * ss)
+				acc = acc + simd.convert<byte, uint16>(simd.or(simd.subSat(p, s), simd.subSat(s, p)))
+			}
+			return int(simd.sum(acc))
+		}
+		let acc = simd.splat8<uint16>(0)
+		for let j = 0; j < 8; j++ {
+			let x = simd.load8<byte>(a, ao + j * stride)
+			let y = simd.load8<byte>(b, bo + j * stride)
+			let p = (x | y) - ((x ^ y) >> 1)
+			let s = simd.load8<byte>(src, so + j * ss)
+			acc = acc + simd.convert<byte, uint16>(simd.or(simd.subSat(p, s), simd.subSat(s, p)))
+		}
+		return int(simd.sum(acc))
+	}
+
+	// h264Reach is the most a transform coefficient of a 4x4 block,
+	// times its multiplier at QP `q`, can be for each unit of the block's
+	// sum of absolute differences: a coefficient is at most that sum
+	// times the product of its two basis rows' largest entries (1 or 2).
+	// A block whose sum times this, plus the rounding, stays below the
+	// quantiser's divisor has no level.
+	def h264Reach(mf int[], q int) int {
+		return mf[q * 16].max(2 * mf[q * 16 + 1]).max(4 * mf[q * 16 + 5])
+	}
+
+	// H264Search is what one band of the motion search works with.
+	type H264Search {
+		kit  H264Kit<byte>
+		tmp  int[]
+		pred byte[]
+		// Per quarter of the macroblock: what the macroblock's vector
+		// leaves of it, its own vector and what that leaves.
+		base int[]
+		qx   int[]
+		qy   int[]
+		qs   int[]
+		// The vectors of the macroblock's quarters as a neighbour sees
+		// them while its partitions are weighed, those they had in the
+		// picture before, and the vector `near` read last.
+		cx   int[]
+		cy   int[]
+		wasX int[]
+		wasY int[]
+		nx   int           = 0
+		ny   int           = 0
+
+		def new() {
+			kit = h264ByteKit()
+			tmp = h264Zeros(640)
+			pred = h264Bytes(256)
+			base = h264Zeros(4)
+			qx = h264Zeros(4)
+			qy = h264Zeros(4)
+			qs = h264Zeros(4)
+			cx = h264Zeros(4)
+			cy = h264Zeros(4)
+			wasX = h264Zeros(4)
+			wasY = h264Zeros(4)
+		}
+	}
+
+	// H264PictureEncoder encodes 8-bit 4:2:0 pictures of one size, one
+	// slice each: the first and any asked for as IDR pictures, the others
+	// from the reference picture before them.
+	//
+	// The tools: Intra 16x16 and Intra 4x4 with every mode, inter
+	// macroblocks in 16x16, 16x8, 8x16 and 8x8 partitions with quarter
+	// sample vectors, skipped macroblocks, the deblocking filter.
+	type H264PictureEncoder {
+		width        int
+		height       int
+		wMbs         int
+		hMbs         int
+		mbs          int
+		stride       int
+		cstride      int
+		frameRate    int
+		// The QP of the next picture, 0 to 51.
+		qp           int              = 30
+		// Bits a second the level is chosen for.
+		bitrate      int              = 1000000
+		started      bool             = false
+		// The picture to encode, padded to whole macroblocks.
+		sy           byte[]
+		su           byte[]
+		sv           byte[]
+		sps          H264Sps
+		pps          H264Pps
+		hdr          H264SliceHeader
+		rec          H264SliceDecoder
+		cur          H264Picture
+		ref          H264Picture
+		refs         H264Picture[]
+		noRefs       H264Picture[]
+		sliceParams  int[]
+		bits         H264BitWriter
+		cavlc        H264CavlcWriter
+		lastRefNum   int              = 0
+		idrId        int              = 0
+		uid          int              = 0
+		quant        int[]
+		quantRows    uint16[]
+		lambda       int              = 1
+		// The bits of a signed Exp-Golomb code for each difference of
+		// vectors, -`h264MvSpan` to `h264MvSpan`.
+		mvBits       byte[]
+		// What the search found per macroblock: its partitions (the
+		// P mb_type), a vector per quarter in quarter samples and the
+		// sum of absolute differences they leave.
+		part         int[]
+		mvX          int[]
+		mvY          int[]
+		cost         int[]
+		searches     H264Search[]
+		// What the search reads: four planes one after the other, the
+		// reference picture's luma and that luma half a sample to the
+		// right, down and both (one array, so that reading a candidate
+		// picks no array), and the picture they were made of (-1: none).
+		// Each has the picture's border samples repeated around it: its
+		// rows are `planeStride` apart, `planeHeight` of them, and the
+		// picture starts `h264PlaneMargin` rows and samples in.
+		halves       byte[]
+		planeStride  int
+		planeHeight  int
+		halvesOf     int              = -1
+		// The macroblock in work: the levels of its 24 blocks in raster
+		// order of coefficients (16 luma, 4 Cb, 4 Cr), which of them have
+		// a level (not 0), the DC coefficients of Intra 16x16 luma or of
+		// chroma before they are levels, and those levels.
+		lev          int16[]
+		coded        int[]
+		dc           int[]
+		lumaDcLev    int16[]
+		chromaDcLev  int16[]
+		chromaDcSum  int[]
+		// Whether a few lone levels of 1 are dropped from inter
+		// macroblocks, in luma and in chroma: they cost more bits than
+		// the picture gains by them. Off to measure what that is worth.
+		dropsLuma    bool             = true
+		dropsChroma  bool             = true
+		skipRun      int              = 0
+		// coded_block_pattern codes by pattern, intra and inter.
+		intraCbpCode int[]
+		interCbpCode int[]
+		// Macroblocks of the last picture coded intra and skipped.
+		intraCount   int              = 0
+		skipCount    int              = 0
+
+		def new(width int, height int, frameRate int = 30) {
+			self.width = width
+			self.height = height
+			self.frameRate = frameRate.max(1)
+			wMbs = (width + 15) >> 4
+			hMbs = (height + 15) >> 4
+			mbs = wMbs * hMbs
+			stride = wMbs * 16
+			cstride = wMbs * 8
+			sy = h264Bytes(stride * hMbs * 16)
+			su = h264Bytes(cstride * hMbs * 8)
+			sv = h264Bytes(cstride * hMbs * 8)
+			sps = new H264Sps()
+			sps.profile = 66
+			sps.constraintFlags = 0xE0
+			sps.log2MaxFrameNum = 8
+			sps.pocType = 2
+			sps.maxNumRefFrames = 1
+			sps.widthMbs = wMbs
+			sps.heightMbs = hMbs
+			sps.frameMbsOnly = true
+			sps.direct8x8Inference = true
+			sps.cropRight = (stride - width) >> 1
+			sps.cropBottom = (hMbs * 16 - height) >> 1
+			sps.maxNumReorderFrames = 0
+			sps.maxDecFrameBuffering = 1
+			pps = new H264Pps()
+			pps.numSliceGroups = 1
+			pps.numRefIdxL0Default = 1
+			pps.numRefIdxL1Default = 1
+			pps.picInitQp = 26
+			pps.prepare(sps, 0)
+			hdr = new H264SliceHeader()
+			rec = new H264SliceDecoder()
+			cur = new H264Picture()
+			cur.allocate(wMbs, hMbs, 1, 8)
+			ref = new H264Picture()
+			ref.allocate(wMbs, hMbs, 1, 8)
+			refs = H264Picture[]
+			refs.push(ref)
+			noRefs = H264Picture[]
+			sliceParams = h264Zeros(5 * (mbs + 1))
+			bits = new H264BitWriter()
+			cavlc = new H264CavlcWriter()
+			quant = h264QuantTable()
+			quantRows = h264QuantRows()
+			mvBits = h264Bytes(2 * h264MvSpan + 1)
+			for let d = 0 - h264MvSpan; d <= h264MvSpan; d++ {
+				mvBits[d + h264MvSpan] = byte(h264SeBits(d))
+			}
+			part = h264Zeros(mbs)
+			mvX = h264Zeros(4 * mbs)
+			mvY = h264Zeros(4 * mbs)
+			cost = h264Zeros(mbs)
+			searches = H264Search[]
+			for let b = 0; b < bandCount(hMbs, width * height); b++ {
+				searches.push(new H264Search())
+			}
+			planeStride = stride + 2 * h264PlaneMargin
+			planeHeight = hMbs * 16 + 2 * h264PlaneMargin
+			halves = h264Bytes(4 * planeStride * planeHeight)
+			lev = h264LevelArray(24 * 16)
+			coded = h264Zeros(24)
+			dc = h264Zeros(16)
+			lumaDcLev = h264LevelArray(16)
+			chromaDcLev = h264LevelArray(8)
+			chromaDcSum = h264Zeros(2)
+			intraCbpCode = h264Zeros(48)
+			interCbpCode = h264Zeros(48)
+			for let code = 0; code < 48; code++ {
+				intraCbpCode[h264IntraCbp[code]] = code
+				interCbpCode[h264InterCbp[code]] = code
+			}
+		}
+
+		// load copies a picture into the padded source planes, repeating
+		// its last column and row.
+		def load(y byte[], yStride int, u byte[], v byte[], cStride int) {
+			let cw = (width + 1) >> 1
+			let ch = (height + 1) >> 1
+			pad(y, yStride, width, height, sy, stride, 16 * hMbs)
+			pad(u, cStride, cw, ch, su, cstride, 8 * hMbs)
+			pad(v, cStride, cw, ch, sv, cstride, 8 * hMbs)
+		}
+
+		internal def pad(src byte[], from int, w int, h int, out byte[], wide int, rows int) {
+			for let j = 0; j < rows; j++ {
+				let s = (j < h ?? (j, h - 1)) * from
+				let d = j * wide
+				mem.copyN(out, d, src, s, w)
+				let last = src[s + w - 1]
+				for let i = w; i < wide; i++ {
+					out[d + i] = last
+				}
+			}
+		}
+
+		// encode encodes the picture `load` took and returns its access
+		// unit as an Annex B byte stream: an IDR picture with its
+		// parameter sets before it when asked, and always the first. A
+		// `droppable` picture (never an IDR one) is no reference, so a
+		// stream stays decodable without it; two in a row are not
+		// allowed. A `repeat` picture (never an IDR one either) shows
+		// the picture before it again in a few bytes, whatever picture
+		// was loaded.
+		def encode(forceKey bool = false, droppable bool = false, repeat bool = false) byte[] {
+			let key = forceKey || !started
+			let kept = key || !droppable
+			let again = repeat && !key
+			lambda = h264Lambda[qp]
+			let pic = cur
+			pic.start()
+			uid++
+			pic.uid = uid
+			pic.poc = uid
+			pic.idr = key
+			pic.intra = key
+			pic.ref = h264RefShort
+			let h = hdr
+			h.nalType = key ?? (5, 1)
+			h.nalRefIdc = kept ?? (key ?? (3, 2), 0)
+			h.idr = key
+			h.firstMb = 0
+			h.sliceType = key ?? (h264SliceI, h264SliceP)
+			h.ppsId = 0
+			h.frameNum = key ?? (0, (lastRefNum + 1) & 255)
+			h.idrPicId = idrId
+			h.numRefIdxActive[0] = key ?? (0, 1)
+			h.numRefIdxActive[1] = 0
+			h.qp = qp
+			pic.frameNum = h.frameNum
+			refs[0] = ref
+			bits.reset()
+			writeSliceHeader()
+			skipRun = 0
+			intraCount = 0
+			skipCount = 0
+			if again {
+				bits.ue(mbs)
+				skipCount = mbs
+			} else {
+				let s = rec
+				let num = pic.addSlice()
+				s.beginSlice(h, sps, pps, pic, num, refs, key ?? (0, 1), noRefs, 0)
+				// Nothing predicts from a picture that is not kept: it
+				// needs no filtering here.
+				if kept {
+					sliceParams[0] = 0
+					sliceParams[1] = 0
+					sliceParams[2] = 0
+					sliceParams[3] = pps.chromaQpOffset
+					sliceParams[4] = pps.secondChromaQpOffset
+					s.deblock.start(pic, s.qpGrid, s.nzc, s.cbpGrid, sliceParams, 1, false)
+				}
+				if key {
+					mvX.fill(0)
+					mvY.fill(0)
+				} else {
+					if halvesOf != ref.uid {
+						// Every row of whole samples before the samples
+						// half way, which read three rows up and down.
+						forBands(hMbs, width * height, padRows)
+						forBands(hMbs, width * height, halfRows)
+						halvesOf = ref.uid
+					}
+					// The vectors first, bands of rows at once: a search
+					// reads the picture and the reference only.
+					forBands(hMbs, width * height, searchRows)
+				}
+				for let addr = 0; addr < mbs; addr++ {
+					s.startMb(addr)
+					if key {
+						let (mode, whole) = chooseIntra16()
+						intraMb(0, mode, whole, chooseIntra4(whole))
+					} else {
+						interMb()
+					}
+					s.rowDone() when kept
+				}
+				bits.ue(skipRun) when skipRun > 0
+				s.deblock.complete() when kept
+			}
+			bits.close()
+			let out = h264Bytes(96 + bits.pos + bits.pos / 2)
+			let end = 0
+			if key {
+				end = writeParameterSets(out)
+				idrId = (idrId + 1) & 15
+			}
+			end = h264PutNal(out, end, (h.nalRefIdc << 5) | h.nalType, bits.data, bits.pos)
+			out.len(end)
+			if kept {
+				lastRefNum = h.frameNum
+				if !again {
+					cur = ref
+					ref = pic
+				}
+			}
+			started = true
+			return out
+		}
+
+		// writeParameterSets writes the sequence and the picture
+		// parameter set (§7.3.2.1 and §7.3.2.2) to `out` and returns
+		// where they end. The slice's RBSP is in `bits`: they are
+		// written with a writer of their own.
+		internal def writeParameterSets(out byte[]) int {
+			let s = sps
+			s.level = h264LevelFor(wMbs, hMbs, frameRate, bitrate)
+			let b = new H264BitWriter()
+			b.put(s.profile, 8)
+			b.put(s.constraintFlags, 8)
+			b.put(s.level, 8)
+			b.ue(s.id)
+			b.ue(s.log2MaxFrameNum - 4)
+			b.ue(s.pocType)
+			b.ue(s.maxNumRefFrames)
+			b.flag(false)
+			b.ue(wMbs - 1)
+			b.ue(hMbs - 1)
+			b.flag(true)
+			b.flag(true)
+			let cropped = s.cropRight != 0 || s.cropBottom != 0
+			b.flag(cropped)
+			if cropped {
+				b.ue(0)
+				b.ue(s.cropRight)
+				b.ue(0)
+				b.ue(s.cropBottom)
+			}
+			// The usability information: the picture rate, and that
+			// pictures come out in the order they are sent, none held
+			// back.
+			b.flag(true)
+			b.flag(false)
+			b.flag(false)
+			b.flag(false)
+			b.flag(false)
+			b.flag(true)
+			b.put(0, 16)
+			b.put(1, 16)
+			b.put(0, 16)
+			b.put(2 * frameRate, 16)
+			b.flag(false)
+			b.flag(false)
+			b.flag(false)
+			b.flag(false)
+			b.flag(true)
+			b.flag(true)
+			b.ue(0)
+			b.ue(0)
+			b.ue(16)
+			b.ue(16)
+			b.ue(s.maxNumReorderFrames)
+			b.ue(s.maxDecFrameBuffering)
+			b.close()
+			let end = h264PutNal(out, 0, 0x67, b.data, b.pos)
+			let p = pps
+			b.reset()
+			b.ue(p.id)
+			b.ue(p.spsId)
+			b.flag(false)
+			b.flag(false)
+			b.ue(0)
+			b.ue(p.numRefIdxL0Default - 1)
+			b.ue(p.numRefIdxL1Default - 1)
+			b.flag(false)
+			b.put(0, 2)
+			b.se(p.picInitQp - 26)
+			b.se(0)
+			b.se(p.chromaQpOffset)
+			b.flag(false)
+			b.flag(false)
+			b.flag(false)
+			b.close()
+			return h264PutNal(out, end, 0x68, b.data, b.pos)
+		}
+
+		// writeSliceHeader writes the header of the picture's one slice
+		// (§7.3.3) as `hdr` has it.
+		internal def writeSliceHeader() {
+			let h = hdr
+			let b = bits
+			b.ue(0)
+			b.ue(h.idr ?? (7, 5))
+			b.ue(h.ppsId)
+			b.put(h.frameNum, sps.log2MaxFrameNum)
+			b.ue(h.idrPicId) when h.idr
+			if !h.idr {
+				// The reference lists as the parameter set has them.
+				b.flag(false)
+				b.flag(false)
+			}
+			if h.nalRefIdc != 0 {
+				b.flag(false)
+				b.flag(false) when h.idr
+			}
+			b.se(h.qp - pps.picInitQp)
+		}
+
+		// searchRows finds the vectors of the macroblock rows `from` up
+		// to `to`.
+		internal def searchRows(from int, to int) {
+			let sc = searches[bandOf(from, hMbs, bandCount(hMbs, width * height))]
+			let src = sy
+			let refY = halves
+			for let mby = from; mby < to; mby++ {
+				for let mbx = 0; mbx < wMbs; mbx++ {
+					searchMb(sc, src, refY, mbx, mby, from)
+				}
+			}
+		}
+
+		// padRows copies the reference luma of the macroblock rows `from`
+		// up to `to` into the first plane of `halves`, each row's first
+		// and last sample repeated through the margin, and the first and
+		// last row through the margin above and below.
+		def padRows(from int, to int) {
+			let refY = ref.samples8.y
+			let planes = halves
+			let high = hMbs * 16
+			let m = h264PlaneMargin
+			let first = from == 0 ?? (0 - m, from * 16)
+			let last = to == hMbs ?? (high + m, to * 16)
+			for let y = first; y < last; y++ {
+				let s = h264Clip3(0, high - 1, y) * stride
+				let d = (y + m) * planeStride
+				mem.copyN(planes, d + m, refY, s, stride)
+				planes.fill(refY[s], d, d + m)
+				planes.fill(refY[s + stride - 1], d + m + stride, d + planeStride)
+			}
+		}
+
+		// halfRows interpolates the three half-sample planes of `halves`
+		// for the macroblock rows `from` up to `to`, and for the pad
+		// around them, from its first plane with the decoder's own
+		// filter. `padRows` has run for every row.
+		def halfRows(from int, to int) {
+			let sc = searches[bandOf(from, hMbs, bandCount(hMbs, width * height))]
+			let planes = halves
+			let high = hMbs * 16
+			let wide = planeStride
+			let size = wide * planeHeight
+			let m = h264PlaneMargin
+			let first = from == 0 ?? (0 - h264PlanePad, from * 16)
+			let last = to == hMbs ?? (high + h264PlanePad, to * 16)
+			for let y = first; y < last; y += 16 {
+				for let x = 0 - h264PlanePad; x < stride + h264PlanePad; x += 16 {
+					let at = (y + m) * wide + x + m
+					h264McLuma(planes, 0, wide, wide, planeHeight, x + m, y + m, 2, 0, 16, 16, planes, size + at, wide, sc.kit, sc.tmp)
+					h264McLuma(planes, 0, wide, wide, planeHeight, x + m, y + m, 0, 2, 16, 16, planes, 2 * size + at, wide, sc.kit, sc.tmp)
+					h264McLuma(planes, 0, wide, wide, planeHeight, x + m, y + m, 2, 2, 16, 16, planes, 3 * size + at, wide, sc.kit, sc.tmp)
+				}
+			}
+		}
+
+		// vectorBits is the bits of the two differences of a vector.
+		def vectorBits(dx int, dy int) int {
+			let span = h264MvSpan
+			return h264SeBits(dx) + h264SeBits(dy) when dx < 0 - span || dx > span || dy < 0 - span || dy > span
+			return int(mvBits[dx + span]) + int(mvBits[dy + span])
+		}
+
+		// blockCost is what the reference moved by (`vx`, `vy`) quarter
+		// samples leaves of the `n` x `n` block (16 or 8) of the picture
+		// at (`x`, `y`): the sum of absolute differences, or with
+		// `hadamard` the sum of absolute Hadamard differences of its 4x4
+		// blocks, which is closer to the bits a residual takes. `planes`
+		// is `halves`. Within the planes' pad a sub-sample position is
+		// read from them, as one of them or the average of two; a block
+		// that reaches further out is interpolated.
+		def blockCost(sc H264Search, src byte[], planes byte[], x int, y int, n int, vx int, vy int, hadamard bool) int {
+			let so = y * stride + x
+			let rx = x + (vx >> 2)
+			let ry = y + (vy >> 2)
+			let high = hMbs * 16
+			let wide = planeStride
+			let m = h264PlaneMargin
+			if rx >= 0 - h264PlanePad && ry >= 0 - h264PlanePad && rx + n < stride + h264PlanePad && ry + n < high + h264PlanePad {
+				let k = ((vy & 3) * 4 + (vx & 3)) * 6
+				let size = wide * planeHeight
+				let at = (ry + m) * wide + rx + m
+				let ao = h264QuarterFrom[k] * size + at + h264QuarterFrom[k + 2] * wide + h264QuarterFrom[k + 1]
+				let second = h264QuarterFrom[k + 3]
+				if second < 0 {
+					return h264SatdArea(src, so, stride, planes, ao, wide, n >> 2, n >> 2) when hadamard
+					return vp8Sad16(src, so, stride, planes, ao, wide) when n == 16
+					return vp8Sad8(src, so, stride, planes, ao, wide)
+				}
+				let bo = second * size + at + h264QuarterFrom[k + 5] * wide + h264QuarterFrom[k + 4]
+				return h264SatdAverage(src, so, stride, planes, ao, planes, bo, wide, n) when hadamard
+				return h264SadAverage(src, so, stride, planes, ao, planes, bo, wide, n)
+			}
+			h264McLuma(planes, m * wide + m, wide, stride, high, rx, ry, vx & 3, vy & 3, n, n, sc.pred, 0, 16, sc.kit, sc.tmp)
+			return h264SatdArea(src, so, stride, sc.pred, 0, 16, n >> 2, n >> 2) when hadamard
+			return vp8Sad16(src, so, stride, sc.pred, 0, 16) when n == 16
+			return vp8Sad8(src, so, stride, sc.pred, 0, 16)
+		}
+
+		// refine moves the vector (`vx`, `vy`) of a block that leaves
+		// `sad` by steps of `unit` quarter samples and then half of that,
+		// down to `least`, while a neighbour is cheaper, the bits of its
+		// difference to (`nearX`, `nearY`) counted. Returns the vector
+		// and what it leaves. `sad` and what is returned are sums of
+		// absolute Hadamard differences when `hadamard`.
+		internal def refine(sc H264Search, src byte[], refY byte[], x int, y int, n int, vx int, vy int, sad int, nearX int, nearY int, unit int, least int, hadamard bool) (int, int, int) {
+			let best = sad + lambda * vectorBits(vx - nearX, vy - nearY)
+			let reach = h264SearchRange * 4
+			let step = unit
+			for step >= least {
+				let fromX = vx
+				let fromY = vy
+				for let d = 0; d < 8; d++ {
+					// The eight neighbours, row by row, without the middle.
+					let k = d < 4 ?? (d, d + 1)
+					let cx = fromX + step * (k % 3 - 1)
+					let cy = fromY + step * (k / 3 - 1)
+					continue when cx < 0 - reach || cx > reach || cy < 0 - reach || cy > reach
+					let here = blockCost(sc, src, refY, x, y, n, cx, cy, hadamard)
+					let c = here + lambda * vectorBits(cx - nearX, cy - nearY)
+					if c < best {
+						best = c
+						sad = here
+						vx = cx
+						vy = cy
+					}
+				}
+				step = step >> 1
+			}
+			return (vx, vy, sad)
+		}
+
+		// near reads into `sc.nx` and `sc.ny` the vector the search holds
+		// for the 8x8 block at (`gx`, `gy`), counted in such blocks from
+		// the picture's corner, as a block of the macroblock (`mbx`,
+		// `mby`) may predict from it: false where there is none, outside
+		// the picture, above the band's first row `first` or in a
+		// macroblock searched later. A block of the macroblock itself is
+		// read from `sc.cx` and `sc.cy`.
+		internal def near(sc H264Search, mbx int, mby int, first int, gx int, gy int) bool {
+			let nx = gx >> 1
+			let ny = gy >> 1
+			return false when gx < 0 || nx >= wMbs || ny < first || ny > mby || (ny == mby && nx > mbx)
+			let q = (gy & 1) * 2 + (gx & 1)
+			if nx == mbx && ny == mby {
+				sc.nx = sc.cx[q]
+				sc.ny = sc.cy[q]
+				return true
+			}
+			let at = 4 * (ny * wMbs + nx) + q
+			sc.nx = mvX[at]
+			sc.ny = mvY[at]
+			return true
+		}
+
+		// predicted is the vector a decoder predicts (§8.4.1.3) for the
+		// partition `w` 8x8 blocks wide at (`gx`, `gy`) from what the
+		// search holds (`near`): the median of the vectors to the left,
+		// above and above to the right (above to the left where that one
+		// is missing), or the only one there is. `prefer` names the one a
+		// half of a macroblock takes when it is there: 1 the one above
+		// (upper 16x8), 2 the one to the left (lower 16x8, left 8x16),
+		// 3 the one above to the right (right 8x16).
+		def predicted(sc H264Search, mbx int, mby int, first int, gx int, gy int, w int, prefer int) (int, int) {
+			let hasA = near(sc, mbx, mby, first, gx - 1, gy)
+			let ax = hasA ?? (sc.nx, 0)
+			let ay = hasA ?? (sc.ny, 0)
+			let hasB = near(sc, mbx, mby, first, gx, gy - 1)
+			let bx = hasB ?? (sc.nx, 0)
+			let by = hasB ?? (sc.ny, 0)
+			let hasC = near(sc, mbx, mby, first, gx + w, gy - 1)
+			hasC = near(sc, mbx, mby, first, gx - 1, gy - 1) unless hasC
+			let cx = hasC ?? (sc.nx, 0)
+			let cy = hasC ?? (sc.ny, 0)
+			return (bx, by) when prefer == 1 && hasB
+			return (ax, ay) when prefer == 2 && hasA
+			return (cx, cy) when prefer == 3 && hasC
+			return (ax, ay) when hasA && !hasB && !hasC
+			return (bx, by) when hasB && !hasA && !hasC
+			return (cx, cy) when hasC && !hasA && !hasB
+			return (h264Median(ax, bx, cx), h264Median(ay, by, cy))
+		}
+
+		// half finds the vector for the half of a macroblock made of the
+		// quarters `a` and `b`: the macroblock's or either quarter's,
+		// whichever leaves least. Returns the vector and what it leaves,
+		// the bits of its difference to (`nearX`, `nearY`) counted.
+		internal def half(sc H264Search, src byte[], refY byte[], x int, y int, a int, b int, vx int, vy int, nearX int, nearY int) (int, int, int) {
+			let bestX = vx
+			let bestY = vy
+			let best = sc.base[a] + sc.base[b] + lambda * vectorBits(vx - nearX, vy - nearY)
+			for let i = 0; i < 2; i++ {
+				let own = i == 0 ?? (a, b)
+				let other = i == 0 ?? (b, a)
+				let cx = sc.qx[own]
+				let cy = sc.qy[own]
+				continue when cx == bestX && cy == bestY
+				let c = sc.qs[own] + blockCost(sc, src, refY, x + (other & 1) * 8, y + (other >> 1) * 8, 8, cx, cy, true) + lambda * vectorBits(cx - nearX, cy - nearY)
+				if c < best {
+					best = c
+					bestX = cx
+					bestY = cy
+				}
+			}
+			return (bestX, bestY, best)
+		}
+
+		// quarter finds the vector of the 8x8 quarter `q` of the
+		// macroblock at (`x`, `y`), whose own vector (`vx`, `vy`) leaves
+		// `from` of it: whole samples from that vector, the predicted one
+		// (`nearX`, `nearY`) and the quarter's in the picture before, then
+		// the eight two samples around the best while one of them is
+		// better, the same one sample around, then half and quarter
+		// samples. Returns the vector and what it leaves
+		// (a sum of absolute Hadamard differences).
+		internal def quarter(sc H264Search, src byte[], refY byte[], x int, y int, q int, vx int, vy int, from int, nearX int, nearY int) (int, int, int) {
+			let px = x + (q & 1) * 8
+			let py = y + (q >> 1) * 8
+			let so = py * stride + px
+			let wide = planeStride
+			let ro = (py + h264PlaneMargin) * wide + px + h264PlaneMargin
+			let maxX = stride - 8
+			let maxY = 16 * hMbs - 8
+			let bestX = 0
+			let bestY = 0
+			let sad = 0
+			let best = 1 << 40
+			for let i = 0; i < 3; i++ {
+				let seedX = i == 0 ?? (vx, i == 1 ?? (nearX, sc.wasX[q]))
+				let seedY = i == 0 ?? (vy, i == 1 ?? (nearY, sc.wasY[q]))
+				let cx = h264Clip3(0, maxX, px + ((seedX + 2) >> 2)) - px
+				let cy = h264Clip3(0, maxY, py + ((seedY + 2) >> 2)) - py
+				continue when i > 0 && cx == bestX && cy == bestY
+				let here = vp8Sad8(src, so, stride, refY, ro + cy * wide + cx, wide)
+				let c = here + lambda * vectorBits(cx * 4 - nearX, cy * 4 - nearY)
+				if c < best {
+					best = c
+					sad = here
+					bestX = cx
+					bestY = cy
+				}
+			}
+			let step = 2
+			for step >= 1 && sad > 0 {
+				let midX = bestX
+				let midY = bestY
+				for let d = 0; d < 8; d++ {
+					let k = d < 4 ?? (d, d + 1)
+					let cx = midX + step * (k % 3 - 1)
+					let cy = midY + step * (k / 3 - 1)
+					continue when cx < 0 - h264SearchRange || cx > h264SearchRange || cy < 0 - h264SearchRange || cy > h264SearchRange
+					continue when px + cx < 0 || px + cx > maxX || py + cy < 0 || py + cy > maxY
+					let here = vp8Sad8(src, so, stride, refY, ro + cy * wide + cx, wide)
+					let c = here + lambda * vectorBits(cx * 4 - nearX, cy * 4 - nearY)
+					if c < best {
+						best = c
+						sad = here
+						bestX = cx
+						bestY = cy
+					}
+				}
+				step = step >> 1 when bestX == midX && bestY == midY
+			}
+			let startX = bestX * 4
+			let startY = bestY * 4
+			if startX != vx || startY != vy {
+				// The macroblock's vector, where it is no whole sample.
+				let here = blockCost(sc, src, refY, px, py, 8, vx, vy, false)
+				if here + lambda * vectorBits(vx - nearX, vy - nearY) <= best {
+					sad = here
+					startX = vx
+					startY = vy
+				}
+			}
+			let (hx, hy, hs) = refine(sc, src, refY, px, py, 8, startX, startY, sad, nearX, nearY, 2, 2, false)
+			let start = hx == vx && hy == vy ?? (from, blockCost(sc, src, refY, px, py, 8, hx, hy, true))
+			return refine(sc, src, refY, px, py, 8, hx, hy, start, nearX, nearY, 1, 1, true)
+		}
+
+		// searchMb finds the partitions and vectors of one macroblock in
+		// the reference picture. A vector's bits are counted against the
+		// one a decoder would predict from the vectors found so far
+		// (`predicted`): those above only inside the band (`first` is the
+		// band's first row), so that bands do not wait for each other and
+		// the result is the same however they are scheduled. The whole
+		// samples start from no motion, the predicted vector, those to
+		// the left, above and above to the right, and the macroblock's
+		// in the picture before; then a diamond of steps 8, 4, 2 and 1.
+		internal def searchMb(sc H264Search, src byte[], refY byte[], mbx int, mby int, first int) {
+			let m = mby * wMbs + mbx
+			let x = mbx * 16
+			let y = mby * 16
+			let so = y * stride + x
+			let wide = planeStride
+			let ro = (y + h264PlaneMargin) * wide + x + h264PlaneMargin
+			let maxX = stride - 16
+			let maxY = 16 * hMbs - 16
+			let xs = mvX
+			let ys = mvY
+			for let q = 0; q < 4; q++ {
+				sc.wasX[q] = xs[4 * m + q]
+				sc.wasY[q] = ys[4 * m + q]
+			}
+			let (nearX, nearY) = predicted(sc, mbx, mby, first, 2 * mbx, 2 * mby, 2, 0)
+			let bestX = 0
+			let bestY = 0
+			let sad = vp8Sad16(src, so, stride, refY, ro, wide)
+			let best = sad + lambda * vectorBits(0 - nearX, 0 - nearY)
+			for let i = 0; i < 5 && sad > 0; i++ {
+				let seedX = nearX
+				let seedY = nearY
+				if i == 1 {
+					continue unless near(sc, mbx, mby, first, 2 * mbx - 1, 2 * mby)
+				} else if i == 2 {
+					continue unless near(sc, mbx, mby, first, 2 * mbx, 2 * mby - 1)
+				} else if i == 3 {
+					continue unless near(sc, mbx, mby, first, 2 * mbx + 2, 2 * mby - 1)
+				}
+				if i >= 1 && i <= 3 {
+					seedX = sc.nx
+					seedY = sc.ny
+				} else if i == 4 {
+					seedX = sc.wasX[0]
+					seedY = sc.wasY[0]
+				}
+				let cx = h264Clip3(0, maxX, x + ((seedX + 2) >> 2)) - x
+				let cy = h264Clip3(0, maxY, y + ((seedY + 2) >> 2)) - y
+				continue when (cx == 0 && cy == 0) || (cx == bestX && cy == bestY)
+				let here = vp8Sad16(src, so, stride, refY, ro + cy * wide + cx, wide)
+				let c = here + lambda * vectorBits(cx * 4 - nearX, cy * 4 - nearY)
+				if c < best {
+					best = c
+					sad = here
+					bestX = cx
+					bestY = cy
+				}
+			}
+			// A diamond that halves its step while it finds nothing better.
+			let step = 8
+			for step >= 1 && sad > 0 {
+				let moved = false
+				for let d = 0; d < 4; d++ {
+					let cx = bestX + (d == 0 ?? (step, d == 1 ?? (0 - step, 0)))
+					let cy = bestY + (d == 2 ?? (step, d == 3 ?? (0 - step, 0)))
+					continue when cx < 0 - h264SearchRange || cx > h264SearchRange || cy < 0 - h264SearchRange || cy > h264SearchRange
+					continue when x + cx < 0 || x + cx > maxX || y + cy < 0 || y + cy > maxY
+					let here = vp8Sad16(src, so, stride, refY, ro + cy * wide + cx, wide)
+					let c = here + lambda * vectorBits(cx * 4 - nearX, cy * 4 - nearY)
+					if c < best {
+						best = c
+						sad = here
+						bestX = cx
+						bestY = cy
+						moved = true
+					}
+				}
+				step = step >> 1 unless moved
+			}
+			let vx = bestX * 4
+			let vy = bestY * 4
+			// Half samples by sums of absolute differences, quarter
+			// samples by Hadamard sums, which every cost is from here on.
+			if sad > h264RefineAbove * lambda.min(h264ThresholdLambda) && sad > 0 {
+				let (hx, hy, hs) = refine(sc, src, refY, x, y, 16, vx, vy, sad, nearX, nearY, 2, 2, false)
+				let (rx, ry, rs) = refine(sc, src, refY, x, y, 16, hx, hy, blockCost(sc, src, refY, x, y, 16, hx, hy, true), nearX, nearY, 1, 1, true)
+				vx = rx
+				vy = ry
+				sad = rs
+			} else if sad > 0 {
+				sad = blockCost(sc, src, refY, x, y, 16, vx, vy, true)
+			}
+			part[m] = 0
+			cost[m] = sad
+			for let q = 0; q < 4; q++ {
+				xs[4 * m + q] = vx
+				ys[4 * m + q] = vy
+			}
+			let above = h264SplitAbove * lambda.min(h264ThresholdLambda)
+			return when sad <= above
+			// Quarter by quarter, then the halves from what the quarters
+			// found: the partitions that cost least are taken, their
+			// bits counted. A quarter the macroblock's vector leaves a
+			// quarter of the threshold or less of keeps that vector.
+			let whole = sad + lambda * (vectorBits(vx - nearX, vy - nearY) + 1)
+			let quarters = lambda * 9
+			let leaves = 0
+			for let q = 0; q < 4; q++ {
+				let (fromX, fromY) = predicted(sc, mbx, mby, first, 2 * mbx + (q & 1), 2 * mby + (q >> 1), 1, 0)
+				let from = blockCost(sc, src, refY, x + (q & 1) * 8, y + (q >> 1) * 8, 8, vx, vy, true)
+				sc.base[q] = from
+				let rx = vx
+				let ry = vy
+				let rs = from
+				if from > above >> 2 {
+					let (qx, qy, qs) = quarter(sc, src, refY, x, y, q, vx, vy, from, fromX, fromY)
+					rx = qx
+					ry = qy
+					rs = qs
+				}
+				sc.qx[q] = rx
+				sc.qy[q] = ry
+				sc.qs[q] = rs
+				sc.cx[q] = rx
+				sc.cy[q] = ry
+				leaves += rs
+				quarters += rs + lambda * vectorBits(rx - fromX, ry - fromY)
+			}
+			let (tpx, tpy) = predicted(sc, mbx, mby, first, 2 * mbx, 2 * mby, 2, 1)
+			let (tx, ty, tc) = half(sc, src, refY, x, y, 0, 1, vx, vy, tpx, tpy)
+			sc.cx[0] = tx
+			sc.cy[0] = ty
+			let (bpx, bpy) = predicted(sc, mbx, mby, first, 2 * mbx, 2 * mby + 1, 2, 2)
+			let (bx, by, bc) = half(sc, src, refY, x, y, 2, 3, vx, vy, bpx, bpy)
+			let (lpx, lpy) = predicted(sc, mbx, mby, first, 2 * mbx, 2 * mby, 1, 2)
+			let (lx, ly, lc) = half(sc, src, refY, x, y, 0, 2, vx, vy, lpx, lpy)
+			sc.cx[0] = lx
+			sc.cy[0] = ly
+			let (gpx, gpy) = predicted(sc, mbx, mby, first, 2 * mbx + 1, 2 * mby, 1, 3)
+			let (gx, gy, gc) = half(sc, src, refY, x, y, 1, 3, vx, vy, gpx, gpy)
+			let rows = tc + bc + lambda * 3
+			let columns = lc + gc + lambda * 3
+			return when whole <= rows && whole <= columns && whole <= quarters
+			if rows <= columns && rows <= quarters {
+				part[m] = 1
+				cost[m] = rows
+				for let q = 0; q < 4; q++ {
+					xs[4 * m + q] = q < 2 ?? (tx, bx)
+					ys[4 * m + q] = q < 2 ?? (ty, by)
+				}
+			} else if columns <= quarters {
+				part[m] = 2
+				cost[m] = columns
+				for let q = 0; q < 4; q++ {
+					xs[4 * m + q] = (q & 1) == 0 ?? (lx, gx)
+					ys[4 * m + q] = (q & 1) == 0 ?? (ly, gy)
+				}
+			} else {
+				part[m] = 3
+				cost[m] = leaves
+				for let q = 0; q < 4; q++ {
+					xs[4 * m + q] = sc.qx[q]
+					ys[4 * m + q] = sc.qy[q]
+				}
+			}
+		}
+
+		// setMotion gives the macroblock in work the partitions `shape`
+		// (a P mb_type) with the vectors the search found: the motion
+		// grids are filled and the differences to the predicted vectors
+		// kept for writing.
+		internal def setMotion(shape int) {
+			let s = rec
+			let mo = s.motion
+			let at = 4 * s.mbAddr
+			s.mbType = h264PMbTypes[shape]
+			for let i = 0; i < 4; i++ {
+				s.refIdx[i] = 0
+				s.refIdx[4 + i] = -1
+				s.subType[i] = h264PSubTypes[0]
+			}
+			mo.fill(1, 0, 0, 4, 4, -1, 0, 0)
+			if shape == 0 {
+				mo.predict(0, 0, 0, 4, 0, h264ShapeAny)
+				s.mvdX[0] = mvX[at] - mo.mx
+				s.mvdY[0] = mvY[at] - mo.my
+				mo.fill(0, 0, 0, 4, 4, 0, mvX[at], mvY[at])
+			} else if shape == 1 {
+				for let i = 0; i < 2; i++ {
+					mo.predict(0, 0, i * 2, 4, 0, i == 0 ?? (h264Shape16x8Top, h264Shape16x8Bottom))
+					s.mvdX[i] = mvX[at + i * 2] - mo.mx
+					s.mvdY[i] = mvY[at + i * 2] - mo.my
+					mo.fill(0, 0, i * 2, 4, 2, 0, mvX[at + i * 2], mvY[at + i * 2])
+				}
+			} else if shape == 2 {
+				for let i = 0; i < 2; i++ {
+					mo.predict(0, i * 2, 0, 2, 0, i == 0 ?? (h264Shape8x16Left, h264Shape8x16Right))
+					s.mvdX[i] = mvX[at + i] - mo.mx
+					s.mvdY[i] = mvY[at + i] - mo.my
+					mo.fill(0, i * 2, 0, 2, 4, 0, mvX[at + i], mvY[at + i])
+				}
+			} else {
+				for let i = 0; i < 4; i++ {
+					mo.predict(0, (i & 1) * 2, (i >> 1) * 2, 2, 0, h264ShapeAny)
+					s.mvdX[i * 4] = mvX[at + i] - mo.mx
+					s.mvdY[i * 4] = mvY[at + i] - mo.my
+					mo.fill(0, (i & 1) * 2, (i >> 1) * 2, 2, 2, 0, mvX[at + i], mvY[at + i])
+				}
+			}
+		}
+
+		// interMb codes the macroblock in work of a P picture: skipped
+		// where the vector it would get leaves nothing to code, else
+		// with the partitions the search found, or intra where that
+		// leaves less.
+		internal def interMb() {
+			let s = rec
+			let m = s.mbAddr
+			let x = s.mbx * 16
+			let y = s.mby * 16
+			let shape = part[m]
+			s.motion.pSkip()
+			let skipX = s.motion.mx
+			let skipY = s.motion.my
+			let skips = shape == 0 && mvX[4 * m] == skipX && mvY[4 * m] == skipY
+			if !skips {
+				// The vector a skipped macroblock gets, where it leaves
+				// no more than what the search found: the bits its
+				// vector saves are not counted, since what a skipped
+				// macroblock leaves stays in every picture that follows.
+				let left = blockCost(searches[0], sy, halves, x, y, 16, skipX, skipY, true)
+				if left <= cost[m] {
+					skips = true
+					shape = 0
+					for let q = 0; q < 4; q++ {
+						mvX[4 * m + q] = skipX
+						mvY[4 * m + q] = skipY
+					}
+				} else if left <= cost[m] + lambda * h264UnskippedBits {
+					// Within what not skipping costs at the least, the
+					// macroblock is skipped when the skip vector leaves
+					// nothing to code.
+					s.decodeSkip()
+					if quantInter() == 0 {
+						for let q = 0; q < 4; q++ {
+							mvX[4 * m + q] = skipX
+							mvY[4 * m + q] = skipY
+						}
+						skipRun++
+						skipCount++
+						return
+					}
+				}
+			}
+			let cbp = 0
+			if skips {
+				s.decodeSkip()
+				cbp = quantInter()
+				if cbp == 0 {
+					skipRun++
+					skipCount++
+					return
+				}
+				// Coded after all, with the same vector.
+				setMotion(0)
+				s.noteMb()
+			} else {
+				setMotion(shape)
+				s.interPredict(s.kit8)
+				if cost[m] > h264IntraAbove {
+					// Intra where it leaves less than inter, the bits of
+					// the types and of the vectors' differences counted.
+					// Intra 4x4 is not tried where Intra 16x16 leaves
+					// more than twice what inter does.
+					let count = shape == 0 ?? (1, shape == 3 ?? (4, 2))
+					let step = shape == 3 ?? (4, 1)
+					let head = shape == 0 ?? (1, shape == 3 ?? (9, 3))
+					for let i = 0; i < count; i++ {
+						head += vectorBits(s.mvdX[i * step], s.mvdY[i * step])
+					}
+					let inter = h264SatdArea(sy, y * stride + x, stride, cur.samples8.y, s.ly0, s.ls, 4, 4) + lambda * head
+					let (mode, plain) = chooseIntra16()
+					let whole = plain + lambda * h264IntraTypeBits
+					let small = plain > 2 * inter ?? (inter, chooseIntra4(whole.min(inter) - lambda * h264IntraTypeBits) + lambda * h264IntraTypeBits)
+					if small < inter || whole < inter {
+						intraMb(5, mode, whole, small)
+						return
+					}
+					s.interPredict(s.kit8)
+				}
+				s.noteMb()
+				cbp = quantInter()
+			}
+			emitLuma(3, false, cbp)
+			emitChroma(false, cbp)
+			s.planeResidual(s.kit8, 0)
+			s.chromaResidual(s.kit8)
+			flushSkips()
+			let b = bits
+			b.ue(shape)
+			if shape == 3 {
+				b.put(15, 4)
+			}
+			let parts = shape == 0 ?? (1, shape == 3 ?? (4, 2))
+			let apart = shape == 3 ?? (4, 1)
+			for let i = 0; i < parts; i++ {
+				b.se(s.mvdX[i * apart])
+				b.se(s.mvdY[i * apart])
+			}
+			b.ue(interCbpCode[cbp])
+			if cbp != 0 {
+				b.se(0)
+				writeResidual(false, cbp)
+			}
+		}
+
+		// flushSkips writes the run of skipped macroblocks before a coded
+		// one of a P picture.
+		internal def flushSkips() {
+			return when hdr.idr
+			bits.ue(skipRun)
+			skipRun = 0
+		}
+
+		// quantInter quantises what the prediction in the picture leaves
+		// of the macroblock in work into `lev`, and drops what costs more
+		// bits than it is worth: a few lone levels of 1. Returns the
+		// coded block pattern.
+		internal def quantInter() int {
+			let s = rec
+			let pl = cur.samples8
+			let src = sy
+			let dst = pl.y
+			let so = s.mby * 16 * stride + s.mbx * 16
+			let q = s.qp
+			let shift = 15 + q / 6
+			let bias = (1 << shift) / 6
+			let levels = lev
+			let has = coded
+			let mf = quant
+			let rows = quantRows
+			let cbp = 0
+			let worth = 0
+			if vp8Sad16(src, so, stride, dst, s.ly0, s.ls) * h264Reach(mf, q) + bias < (1 << shift) {
+				// Too little is left for any level: no block is
+				// transformed.
+				has.fill(0, 0, 16)
+				return quantChroma(false) << 4
+			}
+			for let b8 = 0; b8 < 4; b8++ {
+				let r = (b8 >> 1) * 8 + (b8 & 1) * 2
+				let any = 0
+				let score = 0
+				for let half = 0; half < 2; half++ {
+					let at = r + half * 4
+					let o = (at >> 2) * 4
+					let both = h264ForwardQuant8(src, so + o * stride + (at & 3) * 4, stride, dst, s.ly0 + o * s.ls + (at & 3) * 4, s.ls, rows, q * 8, bias, shift, levels, at * 16, at * 16 + 16, dc, -1)
+					has[at] = both & 1
+					has[at + 1] = both >> 1
+					any = any | both
+					score += h264Decimate(levels, at * 16, h264Zigzag4x4, 0, 16) when (both & 1) != 0 && score < 9
+					score += h264Decimate(levels, at * 16 + 16, h264Zigzag4x4, 0, 16) when (both & 2) != 0 && score < 9
+				}
+				continue when any == 0
+				if score < 4 && dropsLuma {
+					clearQuarter(b8)
+					continue
+				}
+				worth += score
+				cbp = cbp | (1 << b8)
+			}
+			if cbp != 0 && worth < 6 && dropsLuma {
+				for let b8 = 0; b8 < 4; b8++ {
+					clearQuarter(b8) when (cbp & (1 << b8)) != 0
+				}
+				cbp = 0
+			}
+			return cbp | (quantChroma(false) << 4)
+		}
+
+		// clearQuarter drops the levels of the four luma blocks of an 8x8
+		// quarter of the macroblock.
+		internal def clearQuarter(b8 int) {
+			for let k = 0; k < 4; k++ {
+				let r = ((b8 >> 1) * 2 + (k >> 1)) * 4 + (b8 & 1) * 2 + (k & 1)
+				continue when coded[r] == 0
+				coded[r] = 0
+				lev.fill(0, r * 16, r * 16 + 16)
+			}
+		}
+
+		// quantChroma quantises what the prediction in the picture leaves
+		// of both chroma blocks of the macroblock in work, their DC
+		// coefficients apart. Returns the chroma part of the coded block
+		// pattern: 0 for nothing, 1 for DC levels only, 2 with others.
+		internal def quantChroma(intra bool) int {
+			let s = rec
+			let pl = cur.samples8
+			let so = s.mby * 8 * cstride + s.mbx * 8
+			let q = s.qpc0
+			let shift = 15 + q / 6
+			let bias = (1 << shift) / (intra ?? (3, 6))
+			let levels = lev
+			let has = coded
+			let mf = quant
+			let ac = 0
+			let score = 0
+			if !intra && (vp8Sad8(su, so, cstride, pl.u, s.cy0, s.cls) + vp8Sad8(sv, so, cstride, pl.v, s.cy0, s.cls)) * h264Reach(mf, q) + bias < (1 << shift) {
+				has.fill(0, 16, 24)
+				chromaDcSum[0] = 0
+				chromaDcSum[1] = 0
+				return 0
+			}
+			for let c = 0; c < 2; c++ {
+				let src = c == 0 ?? (su, sv)
+				let dst = c == 0 ?? (pl.u, pl.v)
+				for let b = 0; b < 4; b += 2 {
+					let k = 16 + c * 4 + b
+					let both = h264ForwardQuant8(src, so + b * 2 * cstride, cstride, dst, s.cy0 + b * 2 * s.cls, s.cls, quantRows, q * 8, bias, shift, levels, k * 16, k * 16 + 16, dc, c * 4 + b)
+					has[k] = both & 1
+					has[k + 1] = both >> 1
+					ac = ac | both
+					score += h264Decimate(levels, k * 16, h264Zigzag4x4, 1, 15) when (both & 1) != 0 && score < 9
+					score += h264Decimate(levels, k * 16 + 16, h264Zigzag4x4, 1, 15) when (both & 2) != 0 && score < 9
+				}
+				h264ForwardChromaDc(dc, c * 4)
+				chromaDcSum[c] = h264QuantDc(dc, c * 4, 4, mf[q * 16], bias, shift, chromaDcLev, c * 4)
+			}
+			if ac != 0 && !intra && score < 7 && dropsChroma {
+				for let b = 16; b < 24; b++ {
+					continue when has[b] == 0
+					has[b] = 0
+					levels.fill(0, b * 16, b * 16 + 16)
+				}
+				ac = 0
+			}
+			return 2 when ac != 0
+			return chromaDcSum[0] + chromaDcSum[1] != 0 ?? (1, 0)
+		}
+
+		// emitLuma hands the luma levels of the macroblock in work to the
+		// decoder state as a parsed macroblock has them: coefficients,
+		// their count per block and the pattern. `list` is the scaling
+		// list: 0 intra, 3 inter.
+		internal def emitLuma(list int, i16 bool, cbp int) {
+			let s = rec
+			let g = s.nzc
+			let dq = pps.dequant4
+			let at = s.dqAt4(list, s.qp)
+			let base = s.mby * 4 * s.gw + s.mbx * 4
+			let word = 0
+			for let r = 0; r < 16; r++ {
+				let i = base + (r >> 2) * s.gw + (r & 3)
+				g[i] = 0
+				g[i] = h264Dequant4(lev, r * 16, dq, at, s.coeff, r * 16) when coded[r] != 0
+			}
+			if i16 {
+				let any = 0
+				for let r = 0; r < 16; r++ {
+					s.lumaDc[r] = int(lumaDcLev[r])
+					any = any | s.lumaDc[r]
+				}
+				word = h264CbpLumaDc when any != 0
+			}
+			s.cbp = cbp
+			s.cbpGrid[s.mbAddr] = word
+		}
+
+		// emitChroma hands the chroma levels to the decoder state, after
+		// `emitLuma` or the Intra 4x4 blocks.
+		internal def emitChroma(intra bool, cbp int) {
+			let s = rec
+			let dq = pps.dequant4
+			let word = s.cbpGrid[s.mbAddr] | cbp
+			let c0 = s.mby * 2 * s.cgw + s.mbx * 2
+			for let c = 0; c < 2; c++ {
+				let g = c == 0 ?? (s.nzCb, s.nzCr)
+				let at = s.dqAt4((intra ?? (1, 4)) + c, c == 0 ?? (s.qpc0, s.qpc1))
+				if (cbp & 0x30) != 0 {
+					for let b = 0; b < 4; b++ {
+						s.chromaDc[c * 8 + b] = int(chromaDcLev[c * 4 + b])
+					}
+					word = word | (c == 0 ?? (h264CbpCbDc, h264CbpCrDc)) when chromaDcSum[c] != 0
+				}
+				for let b = 0; b < 4; b++ {
+					let i = c0 + (b >> 1) * s.cgw + (b & 1)
+					let k = 16 + c * 4 + b
+					g[i] = 0
+					g[i] = h264Dequant4(lev, k * 16, dq, at, s.coeff, s.chromaBase(c) + b * 16) when (cbp & 0x20) != 0 && coded[k] != 0
+				}
+			}
+			s.cbp = cbp
+			s.cbpGrid[s.mbAddr] = word
+		}
+
+		// writeResidual writes the levels of the macroblock in work
+		// (§7.3.5.3) with the pattern `cbp`.
+		internal def writeResidual(i16 bool, cbp int) {
+			let s = rec
+			let b = bits
+			let g = s.nzc
+			let levels = lev
+			let zig = h264Zigzag4x4
+			if i16 {
+				cavlc.block(b, s.lumaNc(g, 0, 0), 16, lumaDcLev, 0, zig, 0)
+				if (cbp & 15) != 0 {
+					for let z = 0; z < 16; z++ {
+						let r = h264Raster[z]
+						cavlc.block(b, s.lumaNc(g, r & 3, r >> 2), 15, levels, r * 16, zig, 1)
+					}
+				}
+			} else {
+				for let b8 = 0; b8 < 4; b8++ {
+					continue when (cbp & (1 << b8)) == 0
+					for let k = 0; k < 4; k++ {
+						let bx = (b8 & 1) * 2 + (k & 1)
+						let by = (b8 >> 1) * 2 + (k >> 1)
+						cavlc.block(b, s.lumaNc(g, bx, by), 16, levels, (by * 4 + bx) * 16, zig, 0)
+					}
+				}
+			}
+			if (cbp & 0x30) != 0 {
+				cavlc.block(b, -1, 4, chromaDcLev, 0, h264ChromaDcScan, 0)
+				cavlc.block(b, -1, 4, chromaDcLev, 4, h264ChromaDcScan, 0)
+			}
+			if (cbp & 0x20) != 0 {
+				for let c = 0; c < 2; c++ {
+					let gc = c == 0 ?? (s.nzCb, s.nzCr)
+					for let k = 0; k < 4; k++ {
+						cavlc.block(b, s.chromaNc(gc, k & 1, k >> 1), 15, levels, (16 + c * 4 + k) * 16, zig, 1)
+					}
+				}
+			}
+		}
+
+		// chooseIntra16 predicts the luma of the macroblock in work with
+		// the Intra 16x16 mode that leaves least and returns the mode
+		// and what it leaves, its bits counted. The prediction is in the
+		// picture. In a P picture the DC coefficients are counted as they
+		// are coded (`h264SatdIntra16`), which weighs the mode against
+		// inter better; in an I picture, where it is weighed against
+		// Intra 4x4 alone, the plain sum does better (0.1 dB on two of
+		// six clips).
+		internal def chooseIntra16() (int, int) {
+			let s = rec
+			let dst = cur.samples8.y
+			let so = s.mby * 16 * stride + s.mbx * 16
+			let top = s.intraAt(0, -1)
+			let left = s.intraLeft(-1, 0, 16)
+			let corner = s.intraAt(-1, -1)
+			let best = 1 << 40
+			let mode = 2
+			let last = -1
+			for let k = 0; k < 4; k++ {
+				continue when (k == 0 && !top) || (k == 1 && !left) || (k == 3 && !(top && left && corner))
+				h264Pred16(dst, s.ly0, s.ls, k, top, left, 255)
+				last = k
+				let c = lambda * (k == 2 ?? (1, 3))
+				if hdr.idr {
+					c += h264SatdArea(sy, so, stride, dst, s.ly0, s.ls, 4, 4)
+				} else {
+					c += h264SatdIntra16(sy, so, stride, dst, s.ly0, s.ls, dc)
+				}
+				if c < best {
+					best = c
+					mode = k
+				}
+			}
+			h264Pred16(dst, s.ly0, s.ls, mode, top, left, 255) unless last == mode
+			return (mode, best)
+		}
+
+		// chooseIntra4 codes the luma of the macroblock in work as 16
+		// Intra 4x4 blocks, each with the mode that leaves least,
+		// reconstructed in the picture before the next is predicted from
+		// it. Returns what the modes leave, their bits counted, or
+		// `limit` as soon as that is reached: the blocks are then left
+		// half done.
+		internal def chooseIntra4(limit int) int {
+			let s = rec
+			let dst = cur.samples8.y
+			let src = sy
+			let so = s.mby * 16 * stride + s.mbx * 16
+			let q = s.qp
+			let shift = 15 + q / 6
+			let bias = (1 << shift) / 3
+			let dq = pps.dequant4
+			let dqAt = s.dqAt4(0, q)
+			let levels = lev
+			let rows = quantRows
+			let edge = s.edge
+			let kit = s.kit8
+			let ls = s.ls
+			let total = lambda * 24
+			for let z = 0; z < 16; z++ {
+				let r = h264Raster[z]
+				let bx = r & 3
+				let by = r >> 2
+				let g = (s.mby * 4 + by) * s.gw + s.mbx * 4 + bx
+				let off = s.ly0 + by * 4 * ls + bx * 4
+				let from = so + by * 4 * stride + bx * 4
+				let top = s.intraAt(bx * 4, by * 4 - 1)
+				let left = s.intraLeft(bx * 4 - 1, by * 4, 4)
+				let corner = s.intraAt(bx * 4 - 1, by * 4 - 1)
+				let topRight = false
+				if by == 0 {
+					topRight = s.intraAt(bx * 4 + 4, -1)
+				} else if bx < 3 {
+					topRight = h264ZOrder[(by - 1) * 4 + bx + 1] < z
+				}
+				h264GatherEdge(dst, off, ls, 4, edge, top, left, corner, topRight)
+				let likely = s.predictedMode(bx, by)
+				let best = 1 << 40
+				let mode = 2
+				let last = -1
+				for let k = 0; k < 9; k++ {
+					// Vertical and the two diagonals from above need the
+					// row above, horizontal ones the column to the left,
+					// the others both and the corner.
+					if k := 0 || 3 || 7 {
+						continue unless top
+					} else if k := 1 || 8 {
+						continue unless left
+					} else if k != 2 {
+						continue unless top && left && corner
+					}
+					h264PredBlock(dst, off, ls, 4, k, edge, top, left, 255)
+					last = k
+					let c = h264Satd4(src, from, stride, dst, off, ls) + lambda * (k == likely ?? (1, 4))
+					if c < best {
+						best = c
+						mode = k
+					}
+				}
+				total += best
+				return limit when total >= limit
+				h264PredBlock(dst, off, ls, 4, mode, edge, top, left, 255) unless last == mode
+				s.modes[g] = mode
+				s.prevFlag[z] = mode == likely ?? (1, 0)
+				s.remMode[z] = mode < likely ?? (mode, mode - 1)
+				let any = h264ForwardQuant4(src, from, stride, dst, off, ls, rows, q * 8, bias, shift, levels, r * 16)
+				coded[r] = any
+				let n = 0
+				n = h264Dequant4(levels, r * 16, dq, dqAt, s.coeff, r * 16) when any != 0
+				s.nzc[g] = n
+				kit.idct4(dst, off, ls, s.coeff, r * 16, 255) when n != 0
+			}
+			return total
+		}
+
+		// chooseChroma predicts both chroma blocks of the macroblock in
+		// work with the mode that leaves least and returns it. The
+		// prediction is in the picture.
+		internal def chooseChroma() int {
+			let s = rec
+			let pl = cur.samples8
+			let so = s.mby * 8 * cstride + s.mbx * 8
+			let top = s.intraAt(0, -1)
+			let left = s.intraLeft(-1, 0, 16)
+			let corner = s.intraAt(-1, -1)
+			let best = 1 << 40
+			let mode = 0
+			let last = -1
+			for let k = 0; k < 4; k++ {
+				continue when (k == 1 && !left) || (k == 2 && !top) || (k == 3 && !(top && left && corner))
+				h264PredChroma(pl.u, s.cy0, s.cls, k, top, left, left, 8, 255)
+				h264PredChroma(pl.v, s.cy0, s.cls, k, top, left, left, 8, 255)
+				last = k
+				let c = h264SatdArea(su, so, cstride, pl.u, s.cy0, s.cls, 2, 2) + h264SatdArea(sv, so, cstride, pl.v, s.cy0, s.cls, 2, 2) + lambda * (k == 0 ?? (1, 3))
+				if c < best {
+					best = c
+					mode = k
+				}
+			}
+			if last != mode {
+				h264PredChroma(pl.u, s.cy0, s.cls, mode, top, left, left, 8, 255)
+				h264PredChroma(pl.v, s.cy0, s.cls, mode, top, left, left, 8, 255)
+			}
+			return mode
+		}
+
+		// intraMb codes the macroblock in work without the picture
+		// before it: as the Intra 4x4 blocks `chooseIntra4` left in the
+		// picture when they leave less (`small`) than the Intra 16x16
+		// mode `mode` does (`whole`), else with that mode. `first` is the
+		// mb_type of the first intra type in the slice: 0 in I slices, 5
+		// in P slices.
+		internal def intraMb(first int, mode int, whole int, small int) {
+			let s = rec
+			let b = bits
+			intraCount++
+			let fine = small < whole
+			let cbp = 0
+			if fine {
+				s.mbType = h264MbIntra4x4
+				for let b8 = 0; b8 < 4; b8++ {
+					let k = (b8 >> 1) * 8 + (b8 & 1) * 2
+					cbp = cbp | (1 << b8) when (coded[k] | coded[k + 1] | coded[k + 4] | coded[k + 5]) != 0
+				}
+				s.cbpGrid[s.mbAddr] = 0
+			} else {
+				s.mbType = h264MbIntra16x16
+				s.i16Mode = mode
+				let dst = cur.samples8.y
+				let so = s.mby * 16 * stride + s.mbx * 16
+				let top = s.intraAt(0, -1)
+				let left = s.intraLeft(-1, 0, 16)
+				h264Pred16(dst, s.ly0, s.ls, mode, top, left, 255)
+				let q = s.qp
+				let shift = 15 + q / 6
+				let bias = (1 << shift) / 3
+				let any = 0
+				for let r = 0; r < 16; r += 2 {
+					let o = (r >> 2) * 4
+					let both = h264ForwardQuant8(sy, so + o * stride + (r & 3) * 4, stride, dst, s.ly0 + o * s.ls + (r & 3) * 4, s.ls, quantRows, q * 8, bias, shift, lev, r * 16, r * 16 + 16, dc, r)
+					coded[r] = both & 1
+					coded[r + 1] = both >> 1
+					any = any | both
+				}
+				h264ForwardLumaDc(dc, 0)
+				h264QuantDc(dc, 0, 16, quant[q * 16], bias, shift, lumaDcLev, 0)
+				cbp = any != 0 ?? (15, 0)
+				emitLuma(0, true, cbp)
+			}
+			s.chromaMode = chooseChroma()
+			cbp = cbp | (quantChroma(true) << 4)
+			emitChroma(true, cbp)
+			s.noteMb()
+			if fine {
+				s.intraChroma(s.kit8)
+				s.chromaResidual(s.kit8)
+			} else {
+				s.reconstruct()
+			}
+			flushSkips()
+			if fine {
+				b.ue(first)
+				for let z = 0; z < 16; z++ {
+					b.put(s.prevFlag[z], 1)
+					b.put(s.remMode[z], 3) when s.prevFlag[z] == 0
+				}
+				b.ue(s.chromaMode)
+				b.ue(intraCbpCode[cbp])
+				if cbp != 0 {
+					b.se(0)
+					writeResidual(false, cbp)
+				}
+			} else {
+				b.ue(first + 1 + mode + 4 * (cbp >> 4) + ((cbp & 15) != 0 ?? (12, 0)))
+				b.ue(s.chromaMode)
+				b.se(0)
+				writeResidual(true, cbp)
+			}
+		}
+	}
+}

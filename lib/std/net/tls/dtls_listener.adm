@@ -1,0 +1,457 @@
+partial module std.net.tls {
+	use (
+		std.bytes::(Endian)
+		std.net
+		std.net.waiting::(awaitSignal)
+		std.crypto::(rand)
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// The ClientHellos from new addresses a listener holds connections for
+	// before it accepts them.
+	internal const dtlsAcceptBacklog = 64
+	// Datagrams a connection of a listener may have waiting.
+	internal const dtlsPeerInbox = 256
+
+	// DTLSListener accepts DTLS connections on one UDP socket. A ClientHello
+	// from a new address is answered without keeping any state until it
+	// returns a cookie (a HelloVerifyRequest for DTLS 1.2, a
+	// HelloRetryRequest for DTLS 1.3), unless the config turns the cookie
+	// exchange off; then the handshake runs on a task of its own and the
+	// connection waits for `accept`. With connection IDs, a connection
+	// follows its peer to a new address once a record from there
+	// authenticates (RFC 9146 §6). A client that starts over from the address
+	// of a connection replaces it once it returned a cookie, which it is
+	// asked for whatever the config says (RFC 6347 §4.2.8, RFC 9147 §5.11).
+	type DTLSListener {
+		internal core ListenerCore
+
+		def new(core ListenerCore) {
+			self.core = core
+		}
+
+		// accept waits for the next connection whose handshake completed;
+		// 0s or less waits without end. Fails with NetError: TimedOut when
+		// the timeout passes, Closed once the listener is closed.
+		def accept(timeout duration = 0s) !DTLSConn {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				fail net.errorOf(net.ErrorCode.Closed, "accept", "", "listener is closed") unless core.running
+				if core.accepted.len() > 0 {
+					let conn = <-core.accepted
+					return conn
+				}
+				let left = deadline == 0 ?? (500000000, deadline - int(time.monoNs()))
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no connection before the timeout") when left <= 0
+				let step = left > 500000000 ?? (500000000, left)
+				let sleep = time.sleepChan(duration(step))
+				select {
+					case core.accepted:
+						let conn = <-core.accepted
+						return conn
+					case sleep:
+				}
+			}
+			fail "unreachable"
+		}
+
+		// address is the address the socket is bound to.
+		def address() net.Address {
+			return core.socket.localAddr()
+		}
+
+		// close stops accepting and closes the socket, and with it every
+		// connection on it. Fails when the socket refuses to close.
+		def close() !none {
+			core.running = false
+			for let (_, peer) in core.table.all() {
+				peer.closed = true
+			}
+			return try core.socket.close()
+		}
+
+		// Closes the listener when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+
+	// OpeningHello is a ClientHello that came whole in the first record of
+	// a datagram, in the clear: the record's sequence number, the
+	// message_seq, the message body and what it says.
+	internal struct OpeningHello {
+		recordSeq  int
+		messageSeq int
+		body       byte[]
+		hello      ClientHello
+	}
+
+	// openingHello reads a datagram as the ClientHello that opens a
+	// connection, none when it starts with anything else. Fails with
+	// DecodeError or the alert of a ClientHello that does not parse.
+	internal def openingHello(datagram byte[]) !?OpeningHello {
+		return none when datagram.len() < dtlsHeaderSize + dtlsHandshakeHeaderSize
+		let c = new Cursor(datagram)
+		return none unless (try c.u8()) == recordHandshake && (try c.u8()) == 0xFE
+		try c.u8()
+		return none unless (try c.u16()) == 0
+		let recordSeq = try c.u48()
+		let fragment = new Cursor(try c.vec16())
+		return none unless (try fragment.u8()) == handshakeClientHello
+		let length = try fragment.u24()
+		let messageSeq = try fragment.u16()
+		let offset = try fragment.u24()
+		let fragmentLength = try fragment.u24()
+		return none unless offset == 0 && fragmentLength == length
+		let body = try fragment.bytes(length)
+		return OpeningHello{recordSeq: recordSeq, messageSeq: messageSeq, body: body.clone(), hello: try parseClientHello(body, true)}
+	}
+
+	// ListenerCore is what a DTLSListener runs: the socket's receive loop,
+	// the routing of datagrams to connections, the stateless cookie
+	// answers and the handshakes of new connections.
+	internal type ListenerCore {
+		socket         net.Socket
+		config         DTLSConfig
+		secret         byte[]
+		atomic running bool              = true
+		table          PeerTable
+		accepted       channel<DTLSConn>
+		// The record layer of the handshakes that only answer with a
+		// cookie: they write nothing through it.
+		answers        RecordLayer
+
+		def new(socket net.Socket, config DTLSConfig, secret byte[]) {
+			self.socket = socket
+			self.config = config
+			self.secret = secret
+			table = new PeerTable()
+			accepted = new channel<DTLSConn>(dtlsAcceptBacklog)
+			answers = new RecordLayer(new DatagramLayer(new ListenerPeer(table, socket, ""), false))
+		}
+
+		// receiveLoop reads datagrams until the listener closes.
+		def receiveLoop() {
+			let buf byte[]
+			buf.len(65536)
+			for running {
+				let closed = false
+				let (n, from) = socket.readFrom(buf, 500ms) onerror (err error) {
+					closed = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover (0, new net.Address())
+				}
+				return when closed
+				continue when n <= 0
+				dispatch(buf[0:n].clone(), from.str())
+			}
+		}
+
+		// dispatch routes one datagram: to the connection of its address,
+		// or of its connection ID; a ClientHello from a new address gets a
+		// cookie, or a connection once it returns one. So does a ClientHello
+		// that is not the one the connection of its address began with: the
+		// client started over.
+		def dispatch(datagram byte[], from string) {
+			let opening = openingHello(datagram) onerror recover none
+			let known = table.at(from)
+			if !(known is none) {
+				if opening is none || opening.hello.random.equals(known.helloRandom) {
+					known.deliver(datagram, from)
+					return
+				}
+				startConnection(datagram, opening, from, known) onerror recover none
+				return
+			}
+			let byCID = peerOfConnectionID(datagram)
+			if !(byCID is none) {
+				byCID.deliver(datagram, from)
+				return
+			}
+			return when opening is none || !running
+			startConnection(datagram, opening, from, none) onerror recover none
+		}
+
+		// peerOfConnectionID is the connection whose connection ID the
+		// datagram's first record carries, none when it carries none this
+		// listener issued.
+		def peerOfConnectionID(datagram byte[]) ?ListenerPeer {
+			let size = config.connectionIDLength
+			return none when size == 0 || datagram.len() < 1
+			let first = int(datagram[0])
+			return table.withID(datagram[11:11 + size].hex()) when first == recordTLS12CID && datagram.len() >= 11 + size
+			return table.withID(datagram[1:1 + size].hex()) when (first & 0xF0) == 0x30 && datagram.len() >= 1 + size
+			return none
+		}
+
+		// startConnection answers the ClientHello that opens a connection.
+		// Without a valid cookie, when cookies are on or the address has a
+		// connection to replace, it is answered statelessly, with the
+		// record sequence number of the ClientHello (RFC 6347 §4.2.1); with
+		// one, a connection starts, and the one it replaces closes. Fails
+		// when the ClientHello cannot be answered.
+		def startConnection(datagram byte[], opening OpeningHello, from string, replaced ?ListenerPeer) !none {
+			let context = from.bytes()
+			let cookies = config.cookieExchange || !(replaced is none)
+			if cookies && !cookieValid(opening.hello, context) {
+				let hs = new ServerHandshake(config.tls, answers)
+				hs.dtls = parametersOf(config, context, secret)
+				hs.hello = opening.hello
+				hs.helloBytes = handshakeMessage(handshakeClientHello, opening.body)
+				let reply = try hs.cookieReply()
+				let replyBody = reply[4:]
+				let replyFragment = u8(int(reply[0])) + u24(replyBody.len()) + u16(0) + u24(0) + u24(replyBody.len()) + replyBody
+				let record = u8(recordHandshake) + u16(versionDTLS12) + uint64(opening.recordSeq).bytes(Endian.Big) + u16(replyFragment.len()) + replyFragment
+				try socket.writeTo(record, from, 1s)
+				return none
+			}
+			return none when table.pendingCount() >= dtlsAcceptBacklog
+			try replaced.close() unless replaced is none
+			let peer = new ListenerPeer(table, socket, from)
+			peer.helloRandom = opening.hello.random
+			let conn = new DTLSConn(peer, config, false)
+			conn.cookieSecret = cookies ?? (secret, byte[])
+			conn.params.peerContext = context
+			conn.layer.writeCiphers[0].nextSeq = opening.recordSeq
+			// After a stateless cookie round the ClientHello is the client's
+			// second message; the server's first answer takes its number
+			// (RFC 6347 §4.2.2).
+			conn.layer.nextSendSeq = opening.messageSeq
+			conn.layer.nextReceiveSeq = opening.messageSeq
+			if config.connectionIDLength > 0 {
+				conn.params.ownConnectionID = try rand(config.connectionIDLength)
+				peer.addConnectionID(conn.params.ownConnectionID)
+			}
+			table.register(from, peer)
+			peer.deliver(datagram, from)
+			let task = async serve(conn)
+			task.keepAlive()
+			return none
+		}
+
+		// cookieValid reports whether a ClientHello returns a cookie this
+		// listener issued to the address.
+		def cookieValid(hello ClientHello, context byte[]) bool {
+			let now = unixSeconds()
+			return verifyCookie12(secret, context, hello, now) when hello.dtlsCookie.len() > 0
+			return !(openCookie13(secret, context, hello.cookie, now) is none) when hello.cookie.len() > 0
+			return false
+		}
+
+		// serve runs a connection's handshake and hands the connection to
+		// `accept`, or drops it.
+		def serve(conn DTLSConn) {
+			table.changePending(1)
+			let ok = true
+			conn.handshake() onerror (err error) {
+				ok = false
+				recover none
+			}
+			table.changePending(-1)
+			if !ok || !running {
+				conn.close() onerror recover none
+				return
+			}
+			accepted <- conn
+		}
+	}
+
+	// PeerTable is a listener's connections by peer address and by the
+	// connection IDs issued to them, and how many handshakes run. Safe
+	// from many tasks.
+	internal type PeerTable {
+		peers   map<string, ListenerPeer>
+		byID    map<string, ListenerPeer>
+		pending int                       = 0
+
+		def new() {}
+
+		atomic def at(from string) ?ListenerPeer {
+			return peers.get(from)
+		}
+
+		atomic def withID(id string) ?ListenerPeer {
+			return byID.get(id)
+		}
+
+		atomic def all() ListenerPeer[] {
+			let out ListenerPeer[]
+			for let (_, peer) in peers {
+				out.push(peer)
+			}
+			return out
+		}
+
+		atomic def register(from string, peer ListenerPeer) {
+			peers[from] = peer
+		}
+
+		atomic def registerID(id string, peer ListenerPeer) {
+			byID[id] = peer
+		}
+
+		// move re-keys a connection under the address its peer now sends
+		// from.
+		atomic def move(from string, to string, peer ListenerPeer) {
+			peers.delete(from)
+			peers[to] = peer
+		}
+
+		// forget drops a connection that closed.
+		atomic def forget(peer ListenerPeer) {
+			peers.delete(peer.remote)
+			for let (_, id) in peer.ids {
+				byID.delete(id)
+			}
+		}
+
+		atomic def changePending(delta int) {
+			pending += delta
+		}
+
+		atomic def pendingCount() int {
+			return pending
+		}
+	}
+
+	// parametersOf is the DTLS parameters of a server on a listener: the
+	// config's SRTP profiles and connection IDs, the cookie key and what the
+	// cookie binds to.
+	internal def parametersOf(config DTLSConfig, context byte[], secret byte[]) DTLSParameters {
+		let profiles int[]
+		for let profile in config.srtpProfiles {
+			profiles.push(int(profile))
+		}
+		return DTLSParameters{srtpProfiles: profiles, srtpMKI: config.srtpMKI, connectionIDs: config.connectionIDs, cookieSecret: secret, peerContext: context}
+	}
+
+	// ListenerPeer is the datagram transport of one connection of a
+	// listener: datagrams the listener routed to it, sent back through the
+	// listener's socket to the peer's address.
+	internal type ListenerPeer {
+		weak table     ?PeerTable
+		socket         net.Socket
+		remote         string
+		// The address of the datagram handed out last, when it is not
+		// `remote`: it becomes `remote` once a record from it authenticates
+		// as newer than any before.
+		lastSource     string        = ""
+		ids            string[]      = []
+		// The random of the ClientHello the connection began with: another
+		// one from the same address is a client starting over.
+		helloRandom    byte[]        = []
+		atomic queue   byte[][]      = []
+		atomic sources string[]      = []
+		signal         channel<none>
+		atomic closed  bool          = false
+
+		def new(table PeerTable, socket net.Socket, remote string) {
+			self.table = table
+			self.socket = socket
+			self.remote = remote
+			signal = new channel<none>(1)
+		}
+
+		// deliver queues a datagram the listener routed here, dropping it
+		// when too many wait.
+		def deliver(datagram byte[], from string) {
+			enqueue(datagram, from)
+			signal.offer(none)
+		}
+
+		internal atomic def enqueue(datagram byte[], from string) {
+			return when queue.len() >= dtlsPeerInbox
+			queue.push(datagram)
+			sources.push(from)
+		}
+
+		internal atomic def dequeue() ?(byte[], string) {
+			return none when queue.len() == 0
+			let datagram = queue[0]
+			let from = sources[0]
+			queue = queue[1:]
+			sources = sources[1:]
+			return (datagram, from)
+		}
+
+		// send sends one datagram to the peer. Fails when the connection or
+		// the listener is closed, or the send is refused or times out.
+		def send(data byte[], timeout duration) !none {
+			fail net.errorOf(net.ErrorCode.Closed, "send", remote, "connection is closed") when closed
+			try socket.writeTo(data, remote, timeout)
+			return none
+		}
+
+		// receive waits for the next datagram routed here. Fails when the
+		// connection or the listener is closed, the timeout passes (0s or
+		// less waits without end), or the datagram does not fit in buf.
+		def receive(buf byte[], timeout duration) !int {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				fail net.errorOf(net.ErrorCode.Closed, "receive", remote, "connection is closed") when closed
+				let next = dequeue()
+				if !(next is none) {
+					let (datagram, from) = next
+					lastSource = from == remote ?? ("", from)
+					fail net.errorOf(net.ErrorCode.Other, "receive", remote, "datagram of {datagram.len()} bytes does not fit in {buf.len()}") when datagram.len() > buf.len()
+					datagram.copy(buf)
+					return datagram.len()
+				}
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", remote, "timed out") unless awaitSignal(signal, deadline)
+			}
+			fail "unreachable"
+		}
+
+		// confirmSource makes the address of the datagram handed out last
+		// the peer's, after a record in it authenticated as the newest yet
+		// (RFC 9146 §6).
+		def confirmSource() {
+			return when lastSource == ""
+			let moved = lastSource
+			lastSource = ""
+			let owner = table
+			owner.move(remote, moved, self) unless owner is none
+			remote = moved
+		}
+
+		// addConnectionID routes records carrying a connection ID this side
+		// issued to this connection.
+		def addConnectionID(id byte[]) {
+			ids.push(id.hex())
+			let owner = table
+			owner.registerID(id.hex(), self) unless owner is none
+		}
+
+		// close stops the connection's traffic and lets the listener forget
+		// it; the socket stays the listener's.
+		def close() !none {
+			closed = true
+			let owner = table
+			owner.forget(self) unless owner is none
+			return none
+		}
+
+		def isOpen() bool {
+			return !closed
+		}
+	}
+
+	// dtlsListen binds a UDP address and accepts DTLS connections on it.
+	// Fails with PolicyDenied when the policy denies listening, NetError
+	// when the address cannot be bound, TLSError when the config has no
+	// certificate.
+	def dtlsListen(address string, config DTLSConfig) !DTLSListener {
+		fail tlsError(Alert.InternalError, "a DTLS server needs a certificate in its TLS config") when config.tls.certificates.len() == 0 && config.tls.getCertificate is none
+		try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "dtls://" + address)
+		let at = try net.parseAddress(address)
+		let socket = try net.socket(at.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+		socket.bind(address) onerror (err error) {
+			socket.close() onerror recover none
+			fail err
+		}
+		let core = new ListenerCore(socket, config, try rand(32))
+		let receiver = async core.receiveLoop()
+		receiver.keepAlive()
+		return new DTLSListener(core)
+	}
+}

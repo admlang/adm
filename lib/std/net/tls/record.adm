@@ -3,6 +3,7 @@ partial module std.net.tls {
 		std.io
 		std.net
 		std.crypto.cipher::(AEAD)
+		std.crypto.hash::(Hash)
 	)
 
 	// Record content types of RFC 8446 §5.1, the byte on the wire. The
@@ -14,6 +15,10 @@ partial module std.net.tls {
 	const recordHandshake = 22
 	// Application data, and every protected record's outer type.
 	const recordApplicationData = 23
+	// A protected DTLS 1.2 record carrying a connection ID (RFC 9146 §4).
+	const recordTLS12CID = 25
+	// A DTLS 1.3 acknowledgment of handshake records (RFC 9147 §7).
+	const recordACK = 26
 
 	// The most plaintext one record carries (2^14).
 	const maxPlaintext = 16384
@@ -27,6 +32,49 @@ partial module std.net.tls {
 	struct Record {
 		contentType int
 		payload     byte[]
+	}
+
+	// HandshakeCarrier moves a TLS 1.3 handshake for a transport that has
+	// no TLS records, as QUIC does (RFC 9001 §4): handshake messages
+	// travel at an encryption level (0 before any key, 1 under the
+	// handshake secrets, 2 under the application secrets), and the
+	// traffic secrets are handed over instead of protecting records.
+	interface HandshakeCarrier {
+		// Sends handshake bytes at the level. Fails as the transport does.
+		def sendHandshake(level int, data byte[]) !none
+		// Waits for handshake bytes of the level. Fails as the transport
+		// does, or when the peer closes.
+		def receiveHandshake(level int) !byte[]
+		// Takes the secret that protects one direction from the level on.
+		// Fails when the keys cannot be derived.
+		def installSecret(level int, forWriting bool, suite CipherSuite, secret byte[]) !none
+	}
+
+	// DatagramRecords is the record layer of a DTLS connection as the
+	// handshake sees it (RFC 6347 §4.1, RFC 9147 §4): it frames, numbers,
+	// protects, fragments and retransmits records, and hands handshake
+	// messages over whole, in order and in TLS framing.
+	interface DatagramRecords {
+		// The next record: one handshake message, an alert, a DTLS 1.2
+		// change_cipher_spec, or application data. `legacy` is set once
+		// DTLS 1.2 was agreed. Fails when the timeout passes without the
+		// handshake moving, or as the transport does.
+		def readRecord(legacy bool, timeout duration) !Record
+		// Sends a record: handshake messages and change_cipher_spec join the
+		// flight being built, sent and retransmitted as one. Fails as the
+		// transport does.
+		def writeRecord(contentType int, payload byte[], legacy bool) !none
+		// DTLS 1.2: the key the peer's change_cipher_spec switches
+		// incoming records to.
+		def stageReadKey(key TrafficKey)
+		// DTLS 1.2: protects outgoing records from the next epoch on.
+		def installWriteKey(key TrafficKey)
+		// Whether incoming handshake records are protected.
+		def isProtected() bool
+		// DTLS 1.3: the traffic secret of one direction from the epoch on
+		// (2 under the handshake secrets, 3 under the first application
+		// ones). Fails when the keys cannot be derived.
+		def installSecret(epoch int, forWriting bool, suite CipherSuite, hash Hash, secret byte[]) !none
 	}
 
 	// TrafficKey protects one direction: the AEAD under the traffic key, the
@@ -71,7 +119,7 @@ partial module std.net.tls {
 		// explicitNonce is how many nonce bytes travel with a TLS 1.2 record:
 		// the eight AES-GCM keeps out of its 4-byte salt (RFC 5288 §3), none
 		// for ChaCha20-Poly1305, whose nonce is the TLS 1.3 one (RFC 7905 §2).
-		internal def explicitNonce() int {
+		def explicitNonce() int {
 			return 12 - iv.len()
 		}
 
@@ -86,7 +134,13 @@ partial module std.net.tls {
 		// the explicit nonce is the sequence number. It advances the
 		// sequence number.
 		def seal12(header byte[], chunk byte[]) byte[] {
-			let aad = additionalData(header, chunk.len())
+			return sealWith(additionalData(header, chunk.len()), chunk)
+		}
+
+		// sealWith protects a fragment the TLS 1.2 way under additional data
+		// of the caller's (DTLS 1.2 has its own, RFC 6347 §4.1.2.1, RFC 9146
+		// §5) and returns the record body. It advances the sequence number.
+		def sealWith(aad byte[], chunk byte[]) byte[] {
 			return cipher.seal(nonce(), chunk, aad) when explicitNonce() == 0
 			let explicit = sequenceBytes()
 			sequence++
@@ -96,10 +150,16 @@ partial module std.net.tls {
 		// open12 authenticates and decrypts one TLS 1.2 record body. It
 		// advances the sequence number. Fails with BadRecordMAC.
 		def open12(header byte[], body byte[]) !byte[] {
-			let explicit = explicitNonce()
-			let length = body.len() - explicit - cipher.overhead()
+			let length = body.len() - explicitNonce() - cipher.overhead()
 			fail tlsError(Alert.BadRecordMAC, "record authentication failed") when length < 0
-			let aad = additionalData(header, length)
+			return try openWith(additionalData(header, length), body)
+		}
+
+		// openWith is `open12` under additional data of the caller's. Fails
+		// with BadRecordMAC.
+		def openWith(aad byte[], body byte[]) !byte[] {
+			let explicit = explicitNonce()
+			fail tlsError(Alert.BadRecordMAC, "record authentication failed") when body.len() < explicit + cipher.overhead()
 			let at = iv + body[0:explicit]
 			if explicit == 0 {
 				at = nonce()
@@ -116,29 +176,48 @@ partial module std.net.tls {
 	// padding removal. It reads and writes through the net.Connection with
 	// `timeout` when one is given, any io.Reader and io.Writer pair otherwise.
 	type RecordLayer {
-		reader      io.Reader
-		writer      io.Writer
-		conn        ?net.Connection
-		timeout     duration        = 30s
+		// The stream side, none for a DTLS record layer.
+		reader      ?io.Reader        = none
+		writer      ?io.Writer        = none
+		conn        ?net.Stream
+		timeout     duration          = 30s
 		readKey     ?TrafficKey
 		writeKey    ?TrafficKey
 		// The legacy version written into record headers: 0x0301 for the
 		// first ClientHello, 0x0303 afterwards (RFC 8446 §5.1).
-		version     int             = 0x0301
+		version     int               = 0x0301
 		// TLS 1.2 record protection (RFC 5246 §6.2.3.3) once keys are set:
 		// the content type stays in the header and a change_cipher_spec
 		// record switches the read key to the staged one.
-		legacy      bool            = false
+		legacy      bool              = false
 		nextReadKey ?TrafficKey
+		// Set, the handshake travels through the carrier and no record is
+		// read or written; the levels count the secrets installed.
+		carrier     ?HandshakeCarrier = none
+		readLevel   int               = 0
+		writeLevel  int               = 0
+		// Set, records are DTLS ones and travel through this layer.
+		datagram    ?DatagramRecords  = none
 
 		def new(reader io.Reader, writer io.Writer) {
 			self.reader = reader
 			self.writer = writer
 		}
 
+		// A record layer of a DTLS connection: records travel through
+		// `datagram`, and there is no stream.
+		def new(datagram DatagramRecords) {
+			self.datagram = datagram
+		}
+
 		// stageReadKey keeps the key a TLS 1.2 peer's change_cipher_spec
 		// switches incoming records to.
 		def stageReadKey(cipher AEAD, iv byte[]) {
+			let dtls = datagram
+			if !(dtls is none) {
+				dtls.stageReadKey(new TrafficKey(cipher, iv))
+				return
+			}
 			nextReadKey = new TrafficKey(cipher, iv)
 		}
 
@@ -147,13 +226,56 @@ partial module std.net.tls {
 			readKey = new TrafficKey(cipher, iv)
 		}
 
+		// setReadSecret switches incoming records to the TLS 1.3 traffic
+		// secret, or hands it to the carrier. Fails when HKDF or the
+		// carrier does.
+		def setReadSecret(suite CipherSuite, hash Hash, secret byte[]) !none {
+			let dtls = datagram
+			if !(dtls is none) {
+				readLevel++
+				return try dtls.installSecret(readLevel + 1, false, suite, hash, secret)
+			}
+			let through = carrier
+			if !(through is none) {
+				readLevel++
+				return try through.installSecret(readLevel, false, suite, secret)
+			}
+			let (cipher, iv) = try trafficKeyFor(suite, hash, secret)
+			setReadKey(cipher, iv)
+			return none
+		}
+
+		// setWriteSecret is `setReadSecret` for outgoing records.
+		def setWriteSecret(suite CipherSuite, hash Hash, secret byte[]) !none {
+			let dtls = datagram
+			if !(dtls is none) {
+				writeLevel++
+				return try dtls.installSecret(writeLevel + 1, true, suite, hash, secret)
+			}
+			let through = carrier
+			if !(through is none) {
+				writeLevel++
+				return try through.installSecret(writeLevel, true, suite, secret)
+			}
+			let (cipher, iv) = try trafficKeyFor(suite, hash, secret)
+			setWriteKey(cipher, iv)
+			return none
+		}
+
 		// setWriteKey protects outgoing records with a fresh sequence number.
 		def setWriteKey(cipher AEAD, iv byte[]) {
+			let dtls = datagram
+			if !(dtls is none) {
+				dtls.installWriteKey(new TrafficKey(cipher, iv))
+				return
+			}
 			writeKey = new TrafficKey(cipher, iv)
 		}
 
 		// isProtected reports whether incoming records are decrypted.
 		def isProtected() bool {
+			let dtls = datagram
+			return dtls.isProtected() unless dtls is none
 			return !(readKey is none)
 		}
 
@@ -166,6 +288,10 @@ partial module std.net.tls {
 		// caller to drop; under TLS 1.2 it installs the staged read key, and
 		// fails with UnexpectedMessage when none is staged.
 		def read() !Record {
+			let dtls = datagram
+			return try dtls.readRecord(legacy, timeout) unless dtls is none
+			let through = carrier
+			return Record{contentType: recordHandshake, payload: try through.receiveHandshake(readLevel)} unless through is none
 			let header byte[]
 			header.len(recordHeaderSize)
 			try readInto(header)
@@ -213,6 +339,15 @@ partial module std.net.tls {
 		// fragmenting at 2^14 bytes and protecting them when a write key is
 		// set. Fails as the underlying write does.
 		def write(contentType int, payload byte[]) !none {
+			let dtls = datagram
+			return try dtls.writeRecord(contentType, payload, legacy) unless dtls is none
+			let through = carrier
+			if !(through is none) {
+				// Alerts and change_cipher_spec have no place without
+				// records: the transport reports errors itself.
+				return none when contentType != recordHandshake
+				return try through.sendHandshake(writeLevel, payload)
+			}
 			let off = 0
 			for off < payload.len() {
 				let end = off + maxPlaintext
@@ -227,6 +362,8 @@ partial module std.net.tls {
 		// Fails as the underlying write does.
 		def writeAlert(alert Alert, fatal bool = true) !none {
 			let level = fatal ?? (2, 1)
+			let dtls = datagram
+			return try dtls.writeRecord(recordAlert, byte[byte(level), byte(int(alert))], legacy) unless dtls is none
 			return try writeFragment(recordAlert, byte[byte(level), byte(int(alert))])
 		}
 
@@ -266,7 +403,9 @@ partial module std.net.tls {
 		internal def readInto(buf byte[]) !none {
 			let connection = conn
 			if connection is none {
-				io.readFull(reader, buf) onerror (err error) {
+				let from = reader
+				fail tlsError(Alert.InternalError, "DTLS records have no stream") when from is none
+				io.readFull(from, buf) onerror (err error) {
 					fail err when err is net.NetError
 					fail tlsError(Alert.DecodeError, "stream ended inside a record")
 				}
@@ -283,10 +422,16 @@ partial module std.net.tls {
 
 		internal def writeOut(data byte[]) !none {
 			let connection = conn
-			return try connection.writeAll(data, timeout) unless connection is none
+			let to = writer
 			let off = 0
 			for off < data.len() {
-				let n = try writer.write(data[off:])
+				let n = 0
+				if !(connection is none) {
+					n = try connection.write(data[off:], timeout)
+				} else {
+					fail tlsError(Alert.InternalError, "DTLS records have no stream") when to is none
+					n = try to.write(data[off:])
+				}
 				fail tlsError(Alert.InternalError, "transport wrote nothing") when n == 0
 				off += n
 			}

@@ -228,12 +228,27 @@ partial module std.net.tls {
 		// TLS 1.2: the master secret and both randoms, for exporters.
 		master12             byte[]            = []
 		randoms12            byte[]            = []
+		// Over a `HandshakeCarrier`: the QUIC transport parameters to
+		// send, and the ones the client sent.
+		quicParameters       byte[]            = []
+		peerQuicParameters   byte[]            = []
+		// Over DTLS: what the server accepts beyond TLS, and what it
+		// agreed to.
+		dtls                 ?DTLSParameters   = none
+		// DTLS 1.3: a cookie this server issued that the second
+		// ClientHello carries, verified.
+		cookieChecked        bool              = false
 
 		def new(config Config, records RecordLayer) {
 			self.config = config
 			self.records = records
 			reader = new HandshakeReader(records)
 			schedule = new KeySchedule(Hash.SHA256)
+		}
+
+		// datagram reports whether the handshake runs over DTLS.
+		internal def datagram() bool {
+			return !(dtls is none)
 		}
 
 		// run performs the whole handshake. Fails with TLSError naming the
@@ -255,27 +270,121 @@ partial module std.net.tls {
 		def readClientHello() !none {
 			let (kind, body, raw) = try reader.next()
 			fail tlsError(Alert.UnexpectedMessage, "expected ClientHello, got message {kind}") when kind != handshakeClientHello
-			hello = try parseClientHello(body)
+			hello = try parseClientHello(body, datagram())
 			helloBytes = raw
 			records.version = 0x0303
 			try negotiate()
 			schedule.hash = hash
 			if version12 {
+				try verifyClient12() when needsCookie()
+				schedule.useDatagramTranscript()
 				schedule.update(helloBytes)
 				return none
 			}
-			try helloRetry() when shareFor(group) is none
+			schedule.useTLSTranscript()
+			if datagram() {
+				schedule.labelPrefix = labelDTLS13
+				fail tlsError(Alert.IllegalParameter, "DTLS 1.3 ClientHello with a legacy cookie") when hello.dtlsCookie.len() > 0
+				try resumeFromCookie() when hello.cookie.len() > 0 && needsCookie()
+			}
+			try helloRetry() when !cookieChecked && (shareFor(group) is none || needsCookie())
 			try checkPSK()
 			schedule.update(helloBytes)
 			return none
+		}
+
+		// needsCookie reports whether this DTLS server makes the client
+		// prove its address with a cookie before it answers
+		// (RFC 6347 §4.2.1, RFC 9147 §5.1).
+		internal def needsCookie() bool {
+			let options = dtls
+			return !(options is none) && options.cookieSecret.len() > 0
+		}
+
+		// verifyClient12 runs the DTLS 1.2 cookie exchange, a few rounds at
+		// most, until a ClientHello carries a cookie this server issued to
+		// its address:
+		// HelloVerifyRequest, then the ClientHello again. Neither the first
+		// ClientHello nor the HelloVerifyRequest enters the transcript.
+		internal def verifyClient12() !none {
+			let options = dtls
+			fail tlsError(Alert.InternalError, "no DTLS parameters") when options is none
+			let rounds = 0
+			for !verifyCookie12(options.cookieSecret, options.peerContext, hello, unixSeconds()) {
+				rounds++
+				fail tlsError(Alert.HandshakeFailure, "the client returned no valid cookie in {helloVerifyRounds} rounds") when rounds > helloVerifyRounds
+				try records.write(recordHandshake, marshalHelloVerifyRequest(cookie12(options.cookieSecret, options.peerContext, hello, unixSeconds())))
+				let (kind, body, raw) = try reader.next()
+				fail tlsError(Alert.UnexpectedMessage, "expected ClientHello, got message {kind}") when kind != handshakeClientHello
+				let again = try parseClientHello(body, true)
+				fail tlsError(Alert.IllegalParameter, "ClientHello after HelloVerifyRequest changes its random") when again.random.hex() != hello.random.hex()
+				hello = again
+				helloBytes = raw
+				try negotiate()
+				schedule.hash = hash
+				fail tlsError(Alert.IllegalParameter, "ClientHello after HelloVerifyRequest changes the version") unless version12
+			}
+			return none
+		}
+
+		// resumeFromCookie takes up a DTLS 1.3 handshake whose
+		// HelloRetryRequest went out statelessly (RFC 8446 §4.2.2): the
+		// cookie carries the suite, the group asked for and the hash of the
+		// first ClientHello, so the transcript is the synthetic
+		// message_hash, the HelloRetryRequest rebuilt byte for byte, then
+		// this ClientHello. A cookie that does not verify ends the handshake
+		// (RFC 9147 §5.1).
+		internal def resumeFromCookie() !none {
+			let options = dtls
+			fail tlsError(Alert.InternalError, "no DTLS parameters") when options is none
+			let issued = openCookie13(options.cookieSecret, options.peerContext, hello.cookie, unixSeconds())
+			fail tlsError(Alert.IllegalParameter, "ClientHello carries a cookie this server did not issue") when issued is none
+			let (cookieSuite, cookieGroup, firstHash) = issued
+			fail tlsError(Alert.IllegalParameter, "ClientHello changes the cipher suite of the HelloRetryRequest") when int(cookieSuite) != int(suite)
+			if cookieGroup != 0 {
+				fail tlsError(Alert.IllegalParameter, "ClientHello shares no key for group {cookieGroup}") when shareFor(cookieGroup) is none
+				group = cookieGroup
+			}
+			let retry = retryRequest(cookieGroup, hello.cookie)
+			schedule.transcript = byte[byte(handshakeMessageHash), 0, 0, byte(firstHash.len())] + firstHash
+			schedule.update(marshalServerHello(retry))
+			cookieChecked = true
+			return none
+		}
+
+		// retryRequest is the HelloRetryRequest this server sends: the
+		// suite taken, the group to share a key for (0 for none), and the
+		// cookie (empty for none).
+		internal def retryRequest(selected int, cookie byte[]) ServerHello {
+			let retryRandom = hexdecode(helloRetryRequestRandom) onerror recover []
+			let sessionID = datagram() ?? (byte[], hello.sessionID)
+			return ServerHello{random: retryRandom, sessionID: sessionID, cipherSuite: int(suite), supportedVersion: wireVersion(Version.TLS13, datagram()), selectedGroup: selected, cookie: cookie, isHelloRetryRequest: true, datagram: datagram()}
+		}
+
+		// cookieReply is what a DTLS listener sends, without keeping any
+		// state, to a ClientHello that carries no valid cookie: a
+		// HelloVerifyRequest under DTLS 1.2, a HelloRetryRequest with a
+		// cookie under DTLS 1.3. The ClientHello must have been read into
+		// `hello` and `helloBytes`. Fails with the alert for a ClientHello
+		// this server cannot answer.
+		def cookieReply() !byte[] {
+			let options = dtls
+			fail tlsError(Alert.InternalError, "no DTLS parameters") when options is none
+			try negotiate()
+			let now = unixSeconds()
+			return marshalHelloVerifyRequest(cookie12(options.cookieSecret, options.peerContext, hello, now)) when version12
+			let selected = shareFor(group) is none ?? (group, 0)
+			let cookie = sealCookie13(options.cookieSecret, options.peerContext, suite, selected, digest(hash, helloBytes), now)
+			return marshalServerHello(retryRequest(selected, cookie))
 		}
 
 		// negotiate picks the version, suite, ALPN protocol, group,
 		// certificate and signature scheme from what the client offers.
 		internal def negotiate() !none {
 			fail tlsError(Alert.InternalError, "minVersion is above maxVersion") when config.minVersion == Version.TLS13 && config.maxVersion == Version.TLS12
-			if config.maxVersion == Version.TLS12 || !hello.supportedVersions.includes(0x0304) {
-				let offers12 = hello.supportedVersions.len() == 0 || hello.supportedVersions.includes(0x0303)
+			try negotiateDatagram()
+			if config.maxVersion == Version.TLS12 || !hello.supportedVersions.includes(wireVersion(Version.TLS13, datagram())) {
+				let offers12 = hello.supportedVersions.len() == 0 || hello.supportedVersions.includes(wireVersion(Version.TLS12, datagram()))
 				fail tlsError(Alert.ProtocolVersion, "client does not offer TLS 1.3") when config.minVersion == Version.TLS13
 				fail tlsError(Alert.ProtocolVersion, "no protocol version in common") unless offers12
 				return try negotiate12()
@@ -297,10 +406,43 @@ partial module std.net.tls {
 			return none
 		}
 
+		// negotiateDatagram picks what a DTLS handshake agrees beyond TLS:
+		// the first SRTP profile of this side's list the client offers
+		// (RFC 5764 §4.1.1), the client's MKI echoed, and the connection
+		// IDs when the client offered the extension (RFC 9146 §3). A server
+		// configured with SRTP profiles refuses a client that offers none
+		// of them.
+		internal def negotiateDatagram() !none {
+			let options = dtls
+			if options is none {
+				fail tlsError(Alert.UnsupportedExtension, "client offers SRTP profiles on a TLS connection") when hello.srtpProfiles.len() > 0
+				return none
+			}
+			options.srtpProfile = 0
+			options.agreedMKI = []
+			for let (_, profile) in options.srtpProfiles {
+				continue when options.srtpProfile != 0
+				options.srtpProfile = profile when hello.srtpProfiles.includes(profile)
+			}
+			fail tlsError(Alert.HandshakeFailure, "client offers none of the SRTP profiles this server takes") when options.srtpProfiles.len() > 0 && options.srtpProfile == 0
+			options.agreedMKI = hello.srtpMKI when options.srtpProfile != 0
+			options.connectionIDAgreed = options.connectionIDs && hello.offersConnectionID
+			options.peerConnectionID = options.connectionIDAgreed ?? (hello.connectionID, byte[])
+			return none
+		}
+
 		// negotiateALPNAndGroup takes the first ALPN protocol of the config
 		// the client offers, and the first group of `curvePreferences` it
 		// supports.
 		internal def negotiateALPNAndGroup() !none {
+			if records.carrier is none {
+				fail tlsError(Alert.UnsupportedExtension, "client sent QUIC transport parameters on a TLS connection") when hello.hasQuicParameters
+			} else {
+				// RFC 9001 §8.1 and §8.2.
+				fail tlsError(Alert.MissingExtension, "the client sent no QUIC transport parameters") unless hello.hasQuicParameters
+				fail tlsError(Alert.NoApplicationProtocol, "QUIC needs an application protocol from both sides") when config.alpn.len() == 0 || hello.alpnProtocols.len() == 0
+				peerQuicParameters = hello.quicParameters
+			}
 			state.alpn = ""
 			if config.alpn.len() > 0 && hello.alpnProtocols.len() > 0 {
 				for let (_, protocol) in config.alpn {
@@ -446,17 +588,20 @@ partial module std.net.tls {
 		// server name and now share a key for the group (RFC 8446 §4.1.4).
 		internal def helloRetry() !none {
 			fail tlsError(Alert.IllegalParameter, "second ClientHello shares no key for group {group}") when hello.cookie.len() > 0
-			let retryRandom = hexdecode(helloRetryRequestRandom) onerror recover []
-			let retry = ServerHello{random: retryRandom, sessionID: hello.sessionID, cipherSuite: int(suite), supportedVersion: 0x0304, selectedGroup: group, isHelloRetryRequest: true}
-			let retryBytes = marshalServerHello(retry)
+			let selected = shareFor(group) is none ?? (group, 0)
+			let cookie byte[] = []
+			let options = dtls
+			cookie = sealCookie13(options.cookieSecret, options.peerContext, suite, selected, digest(hash, helloBytes), unixSeconds()) when !(options is none) && options.cookieSecret.len() > 0
+			let retryBytes = marshalServerHello(retryRequest(selected, cookie))
 			schedule.update(helloBytes)
 			schedule.replaceWithMessageHash()
 			schedule.update(retryBytes)
 			try records.write(recordHandshake, retryBytes)
-			try records.write(recordChangeCipherSpec, byte[1]) when hello.sessionID.len() > 0
+			try records.write(recordChangeCipherSpec, byte[1]) when hello.sessionID.len() > 0 && !datagram()
 			let (kind, body, raw) = try reader.next()
 			fail tlsError(Alert.UnexpectedMessage, "expected the second ClientHello, got message {kind}") when kind != handshakeClientHello
-			let second = try parseClientHello(body)
+			let second = try parseClientHello(body, datagram())
+			fail tlsError(Alert.IllegalParameter, "second ClientHello does not return the cookie") when second.cookie.hex() != cookie.hex()
 			fail tlsError(Alert.IllegalParameter, "second ClientHello drops the cipher suite") unless second.cipherSuites.includes(int(suite))
 			fail tlsError(Alert.IllegalParameter, "second ClientHello changes the session id") when second.sessionID.hex() != hello.sessionID.hex()
 			fail tlsError(Alert.IllegalParameter, "second ClientHello changes the server name") when second.serverName != hello.serverName
@@ -486,7 +631,7 @@ partial module std.net.tls {
 				continue when now < issued || now - issued > sessionTicketLifetime
 				let cut = helloBytes.len() - clientHelloBindersLength(hello)
 				let sum = digest(hash, schedule.transcript + helloBytes[0:cut])
-				let expected = try pskBinder(hash, ticketPSK, sum)
+				let expected = try pskBinder(hash, ticketPSK, sum, schedule.labelPrefix)
 				fail tlsError(Alert.DecryptError, "pre-shared key binder does not verify") unless constantTimeEqual(expected, hello.pskBinders[i])
 				psk = ticketPSK
 				resumed = true
@@ -505,7 +650,12 @@ partial module std.net.tls {
 			fail tlsError(Alert.InternalError, "no key share for group {group}") when share is none
 			let (mine, shared) = try keyExchange(share)
 			random = try rand(32) when random.len() == 0
-			let sh = ServerHello{random: random, sessionID: hello.sessionID, cipherSuite: int(suite), supportedVersion: 0x0304, keyShare: mine, selectedIdentity: selectedIdentity}
+			let sh = ServerHello{random: random, sessionID: datagram() ?? (byte[], hello.sessionID), cipherSuite: int(suite), supportedVersion: wireVersion(Version.TLS13, datagram()), keyShare: mine, selectedIdentity: selectedIdentity, datagram: datagram()}
+			let options = dtls
+			if !(options is none) && options.connectionIDAgreed {
+				sh.hasConnectionID = true
+				sh.connectionID = options.ownConnectionID
+			}
 			let shBytes = marshalServerHello(sh)
 			try records.write(recordHandshake, shBytes)
 			schedule.update(shBytes)
@@ -513,13 +663,16 @@ partial module std.net.tls {
 			try schedule.deriveHandshake(shared)
 			// Middlebox compatibility (RFC 8446 §D.4): a dummy
 			// change_cipher_spec when the client sent a legacy session id.
-			try records.write(recordChangeCipherSpec, byte[1]) when hello.sessionID.len() > 0
-			let (writeKey, writeIV) = try trafficKeyFor(suite, hash, schedule.serverHandshakeTrafficSecret)
-			records.setWriteKey(writeKey, writeIV)
-			let (readKey, readIV) = try trafficKeyFor(suite, hash, schedule.clientHandshakeTrafficSecret)
-			records.setReadKey(readKey, readIV)
+			try records.write(recordChangeCipherSpec, byte[1]) when hello.sessionID.len() > 0 && !datagram()
+			try records.setWriteSecret(suite, hash, schedule.serverHandshakeTrafficSecret)
+			try records.setReadSecret(suite, hash, schedule.clientHandshakeTrafficSecret)
 
-			let flight = marshalEncryptedExtensions(EncryptedExtensions{alpnProtocol: state.alpn})
+			let extensions = EncryptedExtensions{alpnProtocol: state.alpn, hasQuicParameters: !(records.carrier is none), quicParameters: quicParameters}
+			if !(options is none) {
+				extensions.srtpProfile = options.srtpProfile
+				extensions.srtpMKI = options.agreedMKI
+			}
+			let flight = marshalEncryptedExtensions(extensions)
 			schedule.update(flight)
 			if !resumed && config.clientAuth != ClientAuthType.NoClientCert {
 				let request = marshalCertificateRequest(CertificateRequest{requestContext: [], signatureAlgorithms: signatureSchemeCodes(supportedSignatureSchemes())})
@@ -546,8 +699,7 @@ partial module std.net.tls {
 			schedule.update(finished)
 			try records.write(recordHandshake, flight + finished)
 			try schedule.deriveMaster()
-			let (appKey, appIV) = try trafficKeyFor(suite, hash, schedule.serverTrafficSecret)
-			records.setWriteKey(appKey, appIV)
+			try records.setWriteSecret(suite, hash, schedule.serverTrafficSecret)
 			return none
 		}
 
@@ -581,9 +733,8 @@ partial module std.net.tls {
 			fail tlsError(Alert.DecryptError, "client Finished does not verify") unless constantTimeEqual(expected, body)
 			schedule.update(raw)
 			try schedule.deriveResumption()
-			let (readKey, readIV) = try trafficKeyFor(suite, hash, schedule.clientTrafficSecret)
-			records.setReadKey(readKey, readIV)
-			state.version = Version.TLS13
+			try records.setReadSecret(suite, hash, schedule.clientTrafficSecret)
+			state.version = datagram() ?? (Version.DTLS13, Version.TLS13)
 			state.cipherSuite = suite
 			state.serverName = hello.serverName
 			state.handshakeComplete = true
@@ -634,7 +785,7 @@ partial module std.net.tls {
 			fail tlsError(Alert.InternalError, "no certificate selected") when pair is none
 			let issuesTicket = config.sessionTicketKey.len() > 0 && hello.offersSessionTicket && config.clientAuth == ClientAuthType.NoClientCert
 			let key = try newEphemeralKey(group)
-			let sh = ServerHello{random: random, sessionID: [], cipherSuite: int(suite), alpnProtocol: state.alpn, extendedMasterSecret: true, secureRenegotiation: hello.secureRenegotiation, ecPointFormats: hello.ecPointFormats, serverNameAck: hello.serverName != "", sessionTicket: issuesTicket}
+			let sh = withDatagram12(ServerHello{random: random, sessionID: [], cipherSuite: int(suite), alpnProtocol: state.alpn, extendedMasterSecret: true, secureRenegotiation: hello.secureRenegotiation, ecPointFormats: hello.ecPointFormats, serverNameAck: hello.serverName != "", sessionTicket: issuesTicket})
 			let params = hello.random + random + serverKeyExchangeParams(group, key.public)
 			let signsWith = scheme
 			fail tlsError(Alert.InternalError, "no signature scheme selected") when signsWith is none
@@ -696,7 +847,7 @@ partial module std.net.tls {
 			let master = resumedMaster
 			master12 = master
 			randoms12 = hello.random + random
-			let sh = ServerHello{random: random, sessionID: hello.sessionID, cipherSuite: int(suite), alpnProtocol: state.alpn, extendedMasterSecret: true, secureRenegotiation: hello.secureRenegotiation, serverNameAck: hello.serverName != "", sessionTicket: true}
+			let sh = withDatagram12(ServerHello{random: random, sessionID: hello.sessionID, cipherSuite: int(suite), alpnProtocol: state.alpn, extendedMasterSecret: true, secureRenegotiation: hello.secureRenegotiation, serverNameAck: hello.serverName != "", sessionTicket: true})
 			let shBytes = marshalServerHello(sh)
 			try records.write(recordHandshake, shBytes)
 			schedule.update(shBytes)
@@ -729,8 +880,23 @@ partial module std.net.tls {
 			return none
 		}
 
+		// withDatagram12 adds to a DTLS 1.2 ServerHello what it answers
+		// beyond TLS: the legacy version, use_srtp and connection_id.
+		internal def withDatagram12(sh ServerHello) ServerHello {
+			let options = dtls
+			return sh when options is none
+			sh.datagram = true
+			sh.srtpProfile = options.srtpProfile
+			sh.srtpMKI = options.agreedMKI
+			if options.connectionIDAgreed {
+				sh.hasConnectionID = true
+				sh.connectionID = options.ownConnectionID
+			}
+			return sh
+		}
+
 		internal def complete12() {
-			state.version = Version.TLS12
+			state.version = datagram() ?? (Version.DTLS12, Version.TLS12)
 			state.cipherSuite = suite
 			state.serverName = hello.serverName
 			state.handshakeComplete = true
@@ -777,7 +943,7 @@ partial module std.net.tls {
 		def sendTicket() !none {
 			return none when config.sessionTicketKey.len() == 0
 			let nonce = byte[0, 0]
-			let key = try resumptionPSK(hash, schedule.resumptionMasterSecret, nonce)
+			let key = try resumptionPSK(hash, schedule.resumptionMasterSecret, nonce, schedule.labelPrefix)
 			let add = try rand(4)
 			let ageAdd = int(add[0]) << 24 | int(add[1]) << 16 | int(add[2]) << 8 | int(add[3])
 			let issued = NewSessionTicket{lifetime: sessionTicketLifetime, ageAdd: ageAdd, nonce: nonce, ticket: try sealTicket(config.sessionTicketKey, suite, key, state.alpn, unixSeconds())}

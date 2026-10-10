@@ -1,0 +1,488 @@
+// The data channels of a peer connection over its SCTP association: the
+// establishment protocol (DCEP, RFC 8832), the payload protocol
+// identifiers and the closing by stream reset of RFC 8831.
+internal std.net.webrtc partial module std.net.webrtc.peer {
+	use (
+		std.net
+		std.net.sctp
+		std.net.waiting::(awaitSignal)
+		std.net.webrtc::*
+		std.time
+	)
+
+	// DcepType is the message type of a DCEP message (RFC 8832 §8.2.1).
+	enum DcepType {
+		Ack = 0x02,
+		Open = 0x03
+	}
+
+	// ChannelKind is the reliability a DATA_CHANNEL_OPEN asks for (§5.1):
+	// its channel type without the unordered bit (0x80).
+	enum ChannelKind {
+		Reliable = 0x00,
+		PartialRetransmit = 0x01,
+		PartialTimed = 0x02
+	}
+
+	// OpenRequest is a DATA_CHANNEL_OPEN message: the reliability with
+	// its parameter (the number of retransmissions, or the lifetime in
+	// milliseconds), the priority, the label and the subprotocol.
+	struct OpenRequest {
+		kind        ChannelKind = ChannelKind.Reliable
+		ordered     bool        = true
+		priority    int         = 0
+		reliability int         = 0
+		label       string      = ""
+		protocol    string      = ""
+	}
+
+	// openBytes is a DATA_CHANNEL_OPEN on the wire (RFC 8832 §5.1).
+	def openBytes(request OpenRequest) byte[] {
+		let label = request.label.bytes()
+		let protocol = request.protocol.bytes()
+		let head = byte[byte(int(DcepType.Open)), byte(int(request.kind) | (request.ordered ?? (0, 0x80))), byte((request.priority >> 8) & 0xFF), byte(request.priority & 0xFF), byte((request.reliability >> 24) & 0xFF), byte((request.reliability >> 16) & 0xFF), byte((request.reliability >> 8) & 0xFF), byte(request.reliability & 0xFF), byte((label.len() >> 8) & 0xFF), byte(label.len() & 0xFF), byte((protocol.len() >> 8) & 0xFF), byte(protocol.len() & 0xFF)]
+		return head + label + protocol
+	}
+
+	// parseOpen reads a DATA_CHANNEL_OPEN. Fails with WebRtcError for
+	// another message, an unknown channel type, or lengths that pass the
+	// message.
+	def parseOpen(data byte[]) !OpenRequest {
+		fail transportError("a DATA_CHANNEL_OPEN of {data.len()} bytes") when data.len() < 12 || int(data[0]) != int(DcepType.Open)
+		let kind = int(data[1]) & 0x7F
+		fail transportError("channel type {int(data[1])} is not one of RFC 8832") when kind > 2
+		let labelSize = int(data[8]) << 8 | int(data[9])
+		let protocolSize = int(data[10]) << 8 | int(data[11])
+		fail transportError("a DATA_CHANNEL_OPEN shorter than its label and protocol") when 12 + labelSize + protocolSize > data.len()
+		let request = OpenRequest{ordered: (int(data[1]) & 0x80) == 0, priority: int(data[2]) << 8 | int(data[3]), reliability: int(data[4]) << 24 | int(data[5]) << 16 | int(data[6]) << 8 | int(data[7]), label: string(data[12:12 + labelSize]), protocol: string(data[12 + labelSize:12 + labelSize + protocolSize])}
+		request.kind = ChannelKind.PartialRetransmit when kind == 1
+		request.kind = ChannelKind.PartialTimed when kind == 2
+		return request
+	}
+
+	// requestFor is the DATA_CHANNEL_OPEN that asks for a channel with the
+	// options.
+	def requestFor(label string, options DataChannelOptions) OpenRequest {
+		let request = OpenRequest{ordered: options.ordered, label: label, protocol: options.protocol}
+		let sends = options.maxRetransmits
+		let lifetime = options.maxPacketLifeTime
+		if !(sends is none) {
+			request.kind = ChannelKind.PartialRetransmit
+			request.reliability = sends
+		} else if !(lifetime is none) {
+			request.kind = ChannelKind.PartialTimed
+			request.reliability = int(lifetime) / 1000000
+		}
+		return request
+	}
+
+	// optionsOf is the options a DATA_CHANNEL_OPEN asks for.
+	def optionsOf(request OpenRequest) DataChannelOptions {
+		let options = DataChannelOptions{ordered: request.ordered, protocol: request.protocol}
+		options.maxRetransmits = request.reliability when request.kind == ChannelKind.PartialRetransmit
+		options.maxPacketLifeTime = duration(request.reliability * 1000000) when request.kind == ChannelKind.PartialTimed
+		return options
+	}
+
+	// ChannelCore is one data channel as the connection keeps it. Before
+	// the association exists it has no stream and, unless it was
+	// negotiated, no stream number (-1).
+	type ChannelCore {
+		id      int
+		label   string
+		options DataChannelOptions
+		stream  ?sctp.Stream       = none
+		state   DataChannelState   = DataChannelState.Connecting
+		inbox   DataMessage[]      = []
+		arrived channel<none>
+
+		def new(label string, options DataChannelOptions) {
+			self.label = label
+			self.options = options
+			let wanted = options.id
+			id = wanted is none ?? (-1, wanted)
+			arrived = new channel<none>(1)
+		}
+	}
+
+	// Channels is the data channels of a peer connection. Channels made
+	// before its SCTP association exists wait; `attach` gives them their
+	// streams. A task reads the association and sorts its messages to the
+	// channels; the state changes under the lock, messages are sent
+	// outside it.
+	type Channels {
+		association    ?sctp.Association     = none
+		// This side is the DTLS client and opens even streams, the other
+		// odd ones (RFC 8832 §6).
+		even           bool                  = true
+		// The largest message the peer takes ("a=max-message-size"), 0 for
+		// any.
+		maxMessageSize int                   = 262144
+		channels       map<int, ChannelCore>
+		// Channels made before the association, and channels the peer
+		// opened that `accept` has not handed out.
+		waiting        ChannelCore[]         = []
+		offered        ChannelCore[]         = []
+		changed        channel<none>
+		over           bool                  = false
+
+		def new() {
+			changed = new channel<none>(1)
+		}
+
+		// attach gives the channels their association, opens those made
+		// before it, and begins reading it. `even` says this side is the
+		// DTLS client.
+		def attach(link sctp.Association, even bool) {
+			for let core in adopt(link, even) {
+				launch(core) onerror (err error) {
+					forget(core)
+					recover none
+				}
+			}
+			let reader = async run(link)
+			reader.keepAlive()
+		}
+
+		internal atomic def adopt(link sctp.Association, even bool) ChannelCore[] {
+			// A new association (a new DTLS connection under it) starts
+			// over: the channels of the old one are closed.
+			for let id in channels.keys() {
+				let old = channels.get(id)
+				channels.delete(id)
+				continue when old is none
+				old.state = DataChannelState.Closed
+				old.arrived.offer(none)
+			}
+			over = false
+			association = link
+			self.even = even
+			let placed ChannelCore[]
+			for let core in waiting {
+				let failed = false
+				place(core, link) onerror (err error) {
+					failed = true
+					recover none
+				}
+				if failed {
+					core.state = DataChannelState.Closed
+					core.arrived.offer(none)
+				} else {
+					placed.push(core)
+				}
+			}
+			waiting = []
+			return placed
+		}
+
+		// wanted reports whether a channel exists or waits: a description
+		// then offers the data section.
+		atomic def wanted() bool {
+			return waiting.len() > 0 || channels.len() > 0
+		}
+
+		// open makes a channel: one both sides agreed on beforehand is
+		// used as it is, another is announced to the peer with a
+		// DATA_CHANNEL_OPEN on the lowest free stream of this side's
+		// parity and may be used at once (RFC 8832 §6); before the
+		// association exists the channel waits in `Connecting`. Fails with
+		// WebRtcError when the connection is closed, both a number of
+		// retransmissions and a lifetime are given, a negotiated channel
+		// names no stream, the stream is in use or none is free; as SCTP
+		// does when the request cannot be sent.
+		def open(label string, options DataChannelOptions = DataChannelOptions{}) !ChannelCore {
+			let core = try claim(label, options)
+			return core when core.stream is none
+			launch(core) onerror (err error) {
+				forget(core)
+				fail err
+			}
+			return core
+		}
+
+		internal atomic def claim(label string, options DataChannelOptions) !ChannelCore {
+			fail transportError("the connection is closed") when over
+			fail transportError("a channel is given up after a number of retransmissions or after a time, not both") unless options.maxRetransmits is none || options.maxPacketLifeTime is none
+			fail transportError("a negotiated channel names its stream") when options.negotiated && options.id is none
+			let core = new ChannelCore(label, options)
+			fail transportError("stream {core.id} is not a stream number") when core.id < -1 || core.id > 65534
+			let link = association
+			if link is none {
+				for let other in waiting {
+					fail transportError("stream {core.id} carries a channel already") when core.id >= 0 && other.id == core.id
+				}
+				waiting.push(core)
+				return core
+			}
+			try place(core, link)
+			return core
+		}
+
+		// place gives a channel its stream: the one it names, else the
+		// lowest free one of this side's parity. Fails with WebRtcError
+		// when the stream is in use or none is free.
+		internal def place(core ChannelCore, link sctp.Association) !none {
+			if core.id < 0 {
+				for let candidate = even ?? (0, 1); candidate < 65535; candidate += 2 {
+					continue when channels.hasKey(candidate)
+					core.id = candidate
+					break
+				}
+				fail transportError("no stream is free for another channel") when core.id < 0
+			}
+			fail transportError("stream {core.id} carries a channel already") when channels.hasKey(core.id)
+			core.options.id = core.id
+			core.stream = link.openStream(core.id)
+			channels[core.id] = core
+			return none
+		}
+
+		// launch announces a placed channel to the peer, unless it was
+		// negotiated, gives its stream the delivery its options ask for,
+		// and opens it. Fails as SCTP does.
+		internal def launch(core ChannelCore) !none {
+			let stream = core.stream
+			return none when stream is none
+			// The request itself goes in order and reliably (§6).
+			try stream.send(openBytes(requestFor(core.label, core.options)), sctp.PayloadProtocol.DCEP) unless core.options.negotiated
+			shape(core)
+			opened(core)
+			return none
+		}
+
+		internal atomic def opened(core ChannelCore) {
+			core.state = DataChannelState.Open when core.state == DataChannelState.Connecting
+			core.arrived.offer(none)
+		}
+
+		// shape gives the channel's stream the delivery its options ask
+		// for.
+		internal def shape(core ChannelCore) {
+			let stream = core.stream
+			return when stream is none
+			stream.ordered = core.options.ordered
+			stream.maxRetransmits = core.options.maxRetransmits
+			stream.maxLifetime = core.options.maxPacketLifeTime
+		}
+
+		// waitOpen waits until a channel is open. Fails with NetError
+		// (TimedOut), WebRtcError when it closed instead.
+		def waitOpen(core ChannelCore, timeout duration) !none {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let now = stateOf(core)
+				return none when now == DataChannelState.Open
+				fail transportError("the channel is {now}") unless now == DataChannelState.Connecting
+				fail net.errorOf(net.ErrorCode.TimedOut, "open", "", "the channel did not open in time") unless awaitSignal(core.arrived, deadline)
+			}
+			fail transportError("unreachable")
+		}
+
+		internal atomic def forget(core ChannelCore) {
+			channels.delete(core.id)
+			core.state = DataChannelState.Closed
+			core.arrived.offer(none)
+		}
+
+		// accept waits for a channel the peer opened; 0s or less waits
+		// without end. Fails with NetError (TimedOut), WebRtcError once the
+		// connection is closed.
+		def accept(timeout duration = 30s) !ChannelCore {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let core = try takeOffered()
+				return core unless core is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "accept", "", "no channel before the timeout") unless awaitSignal(changed, deadline)
+			}
+			fail transportError("unreachable")
+		}
+
+		internal atomic def takeOffered() !?ChannelCore {
+			return offered.shift() when offered.len() > 0
+			fail transportError("the connection is closed") when over
+			return none
+		}
+
+		atomic def idOf(core ChannelCore) int {
+			return core.id
+		}
+
+		atomic def stateOf(core ChannelCore) DataChannelState {
+			return core.state
+		}
+
+		// send sends a message on a channel, an empty one as RFC 8831 §6.6
+		// says (one zero byte under the Empty protocol identifiers). Fails
+		// with WebRtcError when the channel is not open or the message is
+		// longer than the peer takes, as SCTP does otherwise.
+		def send(core ChannelCore, data byte[], text bool) !none {
+			fail transportError("the channel is {stateOf(core)}") unless stateOf(core) == DataChannelState.Open
+			fail transportError("a message of {data.len()} bytes is longer than the {maxMessageSize} the peer takes") when maxMessageSize > 0 && data.len() > maxMessageSize
+			let stream = core.stream
+			fail transportError("the channel has no stream yet") when stream is none
+			return try stream.send([0], text ?? (sctp.PayloadProtocol.StringEmpty, sctp.PayloadProtocol.BinaryEmpty)) when data.len() == 0
+			return try stream.send(data, text ?? (sctp.PayloadProtocol.String, sctp.PayloadProtocol.Binary))
+		}
+
+		// receive waits for the next message of a channel. Fails with
+		// NetError (TimedOut), WebRtcError once the channel is closed and
+		// read to the end.
+		def receive(core ChannelCore, timeout duration) !DataMessage {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let message = try takeMessage(core)
+				return message unless message is none
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "no message before the timeout") unless awaitSignal(core.arrived, deadline)
+			}
+			fail transportError("unreachable")
+		}
+
+		internal atomic def takeMessage(core ChannelCore) !?DataMessage {
+			return core.inbox.shift() when core.inbox.len() > 0
+			fail transportError("the channel is closed") when core.state == DataChannelState.Closed
+			return none
+		}
+
+		// close closes a channel by resetting its stream (RFC 8831 §6.7);
+		// the peer resets its side in answer, which closes it here. Fails
+		// as SCTP does.
+		def close(core ChannelCore) !none {
+			return none unless beginClose(core)
+			let stream = core.stream
+			return none when stream is none
+			return try stream.reset()
+		}
+
+		internal atomic def beginClose(core ChannelCore) bool {
+			if core.state == DataChannelState.Connecting {
+				// Never opened: nothing to tell the peer.
+				core.state = DataChannelState.Closed
+				let place = waiting.indexOf(core)
+				waiting.remove(place) when place >= 0
+				core.arrived.offer(none)
+				return false
+			}
+			return false unless core.state == DataChannelState.Open
+			core.state = DataChannelState.Closing
+			return true
+		}
+
+		// ---- The reading task ----
+
+		internal def run(link sctp.Association) {
+			for {
+				let ended = false
+				let reset = -1
+				let message = link.receive(0s) onerror (err error) {
+					if err is sctp.SctpError && err.streamReset {
+						reset = err.stream
+					} else {
+						ended = true
+					}
+					recover sctp.Message{stream: -1, data: []}
+				}
+				break when ended
+				if reset >= 0 {
+					takeReset(reset)
+					continue
+				}
+				if message.protocol == int(sctp.PayloadProtocol.DCEP) {
+					takeControl(message)
+					continue
+				}
+				takeMessageOf(message)
+			}
+			ended(link)
+		}
+
+		// takeControl takes a DCEP message: an OPEN makes a channel and is
+		// acknowledged; an ACK needs nothing, the channel is in use
+		// already.
+		internal def takeControl(message sctp.Message) {
+			return when message.data.len() == 0 || int(message.data[0]) != int(DcepType.Open)
+			let request = parseOpen(message.data) onerror recover OpenRequest{label: "", priority: -1}
+			return when request.priority < 0
+			let core = offer(message.stream, request)
+			return when core is none
+			let stream = core.stream
+			return when stream is none
+			stream.send([byte(int(DcepType.Ack))], sctp.PayloadProtocol.DCEP) onerror recover none
+			shape(core)
+			announce(core)
+		}
+
+		// announce hands a channel the peer opened to `accept`, once its
+		// stream delivers as the peer asked.
+		internal atomic def announce(core ChannelCore) {
+			offered.push(core)
+			changed.offer(none)
+		}
+
+		// offer makes the channel a peer's OPEN asks for; none for a
+		// stream of this side's parity or one in use (§6).
+		internal atomic def offer(id int, request OpenRequest) ?ChannelCore {
+			return none when over || channels.hasKey(id) || (id % 2 == 0) == even
+			let options = optionsOf(request)
+			options.id = id
+			let link = association
+			return none when link is none
+			let core = new ChannelCore(request.label, options)
+			core.stream = link.openStream(id)
+			core.state = DataChannelState.Open
+			channels[id] = core
+			return core
+		}
+
+		internal atomic def takeMessageOf(message sctp.Message) {
+			let core = channels.get(message.stream)
+			return when core is none
+			let text = message.protocol := int(sctp.PayloadProtocol.String) || int(sctp.PayloadProtocol.StringEmpty)
+			let blank = message.protocol := int(sctp.PayloadProtocol.StringEmpty) || int(sctp.PayloadProtocol.BinaryEmpty)
+			core.inbox.push(DataMessage{data: blank ?? ([], message.data), text: text})
+			core.arrived.offer(none)
+		}
+
+		// takeReset takes the peer's reset of a stream: the channel
+		// closes, after this side reset its own direction when the peer
+		// began.
+		internal def takeReset(id int) {
+			let (core, mirror) = endChannel(id)
+			return when core is none || !mirror
+			let stream = core.stream
+			return when stream is none
+			stream.reset() onerror recover none
+		}
+
+		internal atomic def endChannel(id int) (?ChannelCore, bool) {
+			let core = channels.get(id)
+			return (none, false) when core is none
+			let mirror = core.state == DataChannelState.Open
+			core.state = DataChannelState.Closed
+			channels.delete(id)
+			core.arrived.offer(none)
+			return (core, mirror)
+		}
+
+		// ended closes every channel when the association in use ended; a
+		// replaced one ending changes nothing.
+		internal atomic def ended(link sctp.Association) {
+			let current = association
+			return unless !(current is none) && current == link
+			shut()
+		}
+
+		// shut closes every channel when the association ended.
+		atomic def shut() {
+			over = true
+			for let core in waiting {
+				core.state = DataChannelState.Closed
+				core.arrived.offer(none)
+			}
+			for let (_, core) in channels {
+				core.state = DataChannelState.Closed
+				core.arrived.offer(none)
+			}
+			changed.offer(none)
+		}
+	}
+}

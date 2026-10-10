@@ -1,0 +1,496 @@
+internal partial module std.formats.video.vp9 {
+	use std.simd
+
+	// The loop filter runs after the whole frame is decoded, a superblock
+	// at a time: its vertical edges, then its horizontal ones. A superblock
+	// needs the one above and the one above to the right finished, so rows
+	// of superblocks run on tasks two superblocks behind the row above;
+	// the result does not depend on how the tasks interleave.
+
+	const vp9MaxLfBands = 8
+
+	// The edge masks of one superblock in one plane, per row of 8x8
+	// blocks a bit per column, and the filter levels of the blocks.
+	type Vp9LfScratch {
+		m16    int[]
+		m8     int[]
+		m4     int[]
+		mInner int[]
+		levels int[]
+
+		def new() {
+			m16.len(8)
+			m8.len(8)
+			m4.len(8)
+			mInner.len(8)
+			levels.len(64)
+		}
+	}
+
+	// What the loop filter of a frame reads: the frame, its block
+	// modes and the thresholds by level.
+	type Vp9Lf {
+		cur      Vp9Frame
+		ssx      int
+		ssy      int
+		bitDepth int
+		miCols   int
+		miRows   int
+		miSize   byte[]
+		miSkip   byte[]
+		miTx     byte[]
+		miRef0   int8[]
+		miLevel  byte[]
+		lim      int[]
+		mblim    int[]
+
+		def new() {
+			cur = new Vp9Frame()
+			lim.len(64)
+			mblim.len(64)
+		}
+
+		// The edge thresholds by level for a frame's sharpness.
+		def sharpness(sharp int) {
+			for let lvl = 0; lvl < 64; lvl++ {
+				let inside = lvl >> ((sharp > 0 ?? (1, 0)) + (sharp > 4 ?? (1, 0)))
+				inside = 9 - sharp when sharp > 0 && inside > 9 - sharp
+				inside = 1 when inside < 1
+				lim[lvl] = inside
+				mblim[lvl] = 2 * (lvl + 2) + inside
+			}
+		}
+	}
+
+	// The filter level of every [segment][reference][mode class] for a
+	// frame, into `levels` (64 entries).
+	def vp9LfLevels(h Vp9Header, levels int[]) {
+		let scale = 1 << (h.lfLevel >> 5)
+		for let seg = 0; seg < 8; seg++ {
+			let lvl = h.lfLevel
+			if h.segActive(seg, vp9SegAltLf) {
+				let data = h.segData[seg * 4 + vp9SegAltLf]
+				lvl = vp9Clamp(h.segAbsDelta ?? (data, h.lfLevel + data), 0, 63)
+			}
+			for let ref = 0; ref < 4; ref++ {
+				for let mode = 0; mode < 2; mode++ {
+					let v = lvl
+					if h.lfDeltas {
+						v += h.lfRefDeltas[ref] * scale
+						v += h.lfModeDeltas[mode] * scale when ref > 0
+						v = vp9Clamp(v, 0, 63)
+					}
+					levels[(seg * 4 + ref) * 2 + mode] = v
+				}
+			}
+		}
+	}
+
+	// Filters the whole frame.
+	def vp9LoopFilter(f Vp9Lf) {
+		let sbRows = (f.miRows + 7) >> 3
+		let sbCols = (f.miCols + 7) >> 3
+		let bands = vp9Min(vp9MaxLfBands, sbRows)
+		if bands <= 1 {
+			let sc = new Vp9LfScratch()
+			for let r = 0; r < sbRows; r++ {
+				for let c = 0; c < sbCols; c++ {
+					vp9LfSuperblock(f, sc, r * 8, c * 8)
+				}
+			}
+			return
+		}
+		// A row tells the next one of each superblock it finishes.
+		let progress = channel<bool>[]
+		for let r = 0; r < sbRows; r++ {
+			progress.push(new channel<bool>(size = sbCols))
+		}
+		let done = new channel<bool>(size = bands)
+		for let b = 0; b < bands; b++ {
+			async vp9LfTask(f, progress, b, bands, sbRows, sbCols, done)
+		}
+		for let b = 0; b < bands; b++ {
+			<-done
+		}
+	}
+
+	async def vp9LfTask(f Vp9Lf, progress channel<bool>[], first int, step int, sbRows int, sbCols int, done channel<bool>) {
+		let sc = new Vp9LfScratch()
+		for let r = first; r < sbRows; r += step {
+			let seen = 0
+			for let c = 0; c < sbCols; c++ {
+				if r > 0 {
+					let need = vp9Min(c + 2, sbCols)
+					for seen < need {
+						<-progress[r - 1]
+						seen++
+					}
+				}
+				vp9LfSuperblock(f, sc, r * 8, c * 8)
+				progress[r] <- true
+			}
+		}
+		done <- true
+	}
+
+	// Filters the superblock at (miRow, miCol) in every plane.
+	def vp9LfSuperblock(f Vp9Lf, sc Vp9LfScratch, miRow int, miCol int) {
+		for let plane = 0; plane < 3; plane++ {
+			let ssx = plane == 0 ?? (0, f.ssx)
+			let ssy = plane == 0 ?? (0, f.ssy)
+			let p = plane == 0 ?? (f.cur.y, plane == 1 ?? (f.cur.u, f.cur.v))
+			let stride = plane == 0 ?? (f.cur.stride, f.cur.cstride)
+			let rowStep = 1 << ssy
+			let colStep = 1 << ssx
+			let x0 = (miCol * 8) >> ssx
+			let miSize = f.miSize
+			let miSkip = f.miSkip
+			let miRef0 = f.miRef0
+			let miTx = f.miTx
+			let miLevel = f.miLevel
+			let lim = f.lim
+			let mblim = f.mblim
+			let bd = f.bitDepth
+			let miCols = f.miCols
+			let miRows = f.miRows
+			let m16 = sc.m16
+			let m8 = sc.m8
+			let m4 = sc.m4
+			let mInner = sc.mInner
+			let levels = sc.levels
+			m16.fill(0)
+			m8.fill(0)
+			m4.fill(0)
+			mInner.fill(0)
+			levels.fill(0)
+			for let r = 0; r < 8 && miRow + r < miRows; r += rowStep {
+				let c16 = 0
+				let c8 = 0
+				let c4 = 0
+				for let c = 0; c < 8 && miCol + c < miCols; c += colStep {
+					let cell = (miRow + r) * miCols + miCol + c
+					let size = int(miSize[cell])
+					let skipThis = miSkip[cell] != 0 && miRef0[cell] > 0
+					let w8 = vp9Max(1, (1 << vp9BlockWl[size]) >> 1)
+					let h8 = vp9Max(1, (1 << vp9BlockHl[size]) >> 1)
+					let edgeLeft = vp9BlockWl[size] == 0 || (c & (w8 - 1)) == 0
+					let edgeAbove = vp9BlockHl[size] == 0 || (r & (h8 - 1)) == 0
+					let skipC = skipThis && !edgeLeft
+					let skipR = skipThis && !edgeAbove
+					let tx = vp9UvTxSize[((size * 4 + int(miTx[cell])) * 2 + ssx) * 2 + ssy]
+					let borderC = ssx != 0 && miCol + c == miCols - 1
+					let borderR = ssy != 0 && miRow + r == miRows - 1
+					let k = c >> ssx
+					let bit = 1 << k
+					let level = int(miLevel[cell])
+					levels[r * 8 + k] = level
+					continue when level == 0
+					if tx >= 2 {
+						let spacing = tx == 3 ?? (3, 1)
+						if !skipC && (k & spacing) == 0 {
+							if borderC {
+								c8 = c8 | bit
+							} else {
+								c16 = c16 | bit
+							}
+						}
+						if !skipR && ((r >> ssy) & spacing) == 0 {
+							if borderR {
+								m8[r] = m8[r] | bit
+							} else {
+								m16[r] = m16[r] | bit
+							}
+						}
+						continue
+					}
+					if !skipC {
+						if tx == 1 || (k & 3) == 0 {
+							c8 = c8 | bit
+						} else {
+							c4 = c4 | bit
+						}
+					}
+					if !skipR {
+						if tx == 1 || ((r >> ssy) & 3) == 0 {
+							m8[r] = m8[r] | bit
+						} else {
+							m4[r] = m4[r] | bit
+						}
+					}
+					mInner[r] = mInner[r] | bit when !skipThis && tx == 0 && !borderC
+				}
+				// The frame's left edge is not filtered.
+				if miCol == 0 {
+					c16 = c16 & ~1
+					c8 = c8 & ~1
+					c4 = c4 & ~1
+				}
+				let at = (((miRow + r) * 8) >> ssy) * stride + x0
+				let inner = mInner[r]
+				for let k = 0; k < 8; k++ {
+					let bit = 1 << k
+					let level = levels[r * 8 + k]
+					if (c16 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, true, 16, level, lim, mblim, bd)
+					} else if (c8 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, true, 8, level, lim, mblim, bd)
+					} else if (c4 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, true, 4, level, lim, mblim, bd)
+					}
+					vp9LfEdge(p, at + k * 8 + 4, stride, true, 4, level, lim, mblim, bd) when (inner & bit) != 0
+				}
+			}
+			for let r = 0; r < 8 && miRow + r < miRows; r += rowStep {
+				let borderR = ssy != 0 && miRow + r == miRows - 1
+				let inner = borderR ?? (0, mInner[r])
+				let r16 = m16[r]
+				let r8 = m8[r]
+				let r4 = m4[r]
+				// Nor is its top edge.
+				if miRow + r == 0 {
+					r16 = 0
+					r8 = 0
+					r4 = 0
+				}
+				let at = (((miRow + r) * 8) >> ssy) * stride + x0
+				for let k = 0; k < 8; k++ {
+					let bit = 1 << k
+					let level = levels[r * 8 + k]
+					if (r16 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, false, 16, level, lim, mblim, bd)
+					} else if (r8 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, false, 8, level, lim, mblim, bd)
+					} else if (r4 & bit) != 0 {
+						vp9LfEdge(p, at + k * 8, stride, false, 4, level, lim, mblim, bd)
+					}
+					vp9LfEdge(p, at + k * 8 + 4 * stride, stride, false, 4, level, lim, mblim, bd) when (inner & bit) != 0
+				}
+			}
+		}
+	}
+
+	// Filters eight lines across the edge before p[at] with the filter
+	// of `size` 4, 8 or 16: for a vertical edge the lines are the eight
+	// rows from `at` down, for a horizontal one the eight columns from
+	// `at` on.
+	def vp9LfEdge(p uint16[], at int, stride int, vertical bool, size int, level int, lim int[], mblim int[], bd int) {
+		let bd8 = bd - 8
+		let zero = simd.splat8<int32>(int32(0))
+		let limit = simd.splat8<int32>(int32(lim[level] << bd8))
+		let blimit = simd.splat8<int32>(int32(mblim[level] << bd8))
+		let thresh = simd.splat8<int32>(int32((level >> 4) << bd8))
+		let flatT = simd.splat8<int32>(int32(1 << bd8))
+		let maxv = simd.splat8<int32>(int32((1 << bd) - 1))
+		let dmin = simd.splat8<int32>(int32(-128 * (1 << bd8)))
+		let dmax = simd.splat8<int32>(int32(128 * (1 << bd8) - 1))
+		let wide = size == 16
+		let p7 = zero
+		let p6 = zero
+		let p5 = zero
+		let p4 = zero
+		let p3 = zero
+		let p2 = zero
+		let p1 = zero
+		let p0 = zero
+		let q0 = zero
+		let q1 = zero
+		let q2 = zero
+		let q3 = zero
+		let q4 = zero
+		let q5 = zero
+		let q6 = zero
+		let q7 = zero
+		if vertical && wide {
+			let a0 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 8))
+			let a1 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + stride - 8))
+			let a2 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 2 * stride - 8))
+			let a3 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 3 * stride - 8))
+			let a4 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 4 * stride - 8))
+			let a5 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 5 * stride - 8))
+			let a6 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 6 * stride - 8))
+			let a7 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 7 * stride - 8))
+			(p7, p6, p5, p4, p3, p2, p1, p0) = simd.transpose8(a0, a1, a2, a3, a4, a5, a6, a7)
+			let b0 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at))
+			let b1 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + stride))
+			let b2 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 2 * stride))
+			let b3 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 3 * stride))
+			let b4 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 4 * stride))
+			let b5 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 5 * stride))
+			let b6 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 6 * stride))
+			let b7 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 7 * stride))
+			(q0, q1, q2, q3, q4, q5, q6, q7) = simd.transpose8(b0, b1, b2, b3, b4, b5, b6, b7)
+		} else if vertical {
+			let a0 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 4))
+			let a1 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + stride - 4))
+			let a2 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 2 * stride - 4))
+			let a3 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 3 * stride - 4))
+			let a4 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 4 * stride - 4))
+			let a5 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 5 * stride - 4))
+			let a6 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 6 * stride - 4))
+			let a7 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 7 * stride - 4))
+			(p3, p2, p1, p0, q0, q1, q2, q3) = simd.transpose8(a0, a1, a2, a3, a4, a5, a6, a7)
+		} else {
+			if wide {
+				p7 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 8 * stride))
+				p6 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 7 * stride))
+				p5 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 6 * stride))
+				p4 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 5 * stride))
+				q4 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 4 * stride))
+				q5 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 5 * stride))
+				q6 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 6 * stride))
+				q7 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 7 * stride))
+			}
+			p3 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 4 * stride))
+			p2 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 3 * stride))
+			p1 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - 2 * stride))
+			p0 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at - stride))
+			q0 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at))
+			q1 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + stride))
+			q2 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 2 * stride))
+			q3 = simd.convert<uint16, int32>(simd.load8<uint16>(p, at + 3 * stride))
+		}
+		let two = simd.splat8<int32>(int32(2))
+		let three = simd.splat8<int32>(int32(3))
+		let four = simd.splat8<int32>(int32(4))
+		let fm = (p3 - p2).abs().le(limit) & (p2 - p1).abs().le(limit) & (p1 - p0).abs().le(limit)
+		fm = fm & (q1 - q0).abs().le(limit) & (q2 - q1).abs().le(limit) & (q3 - q2).abs().le(limit)
+		fm = fm & ((p0 - q0).abs() * two + ((p1 - q1).abs() >> 1)).le(blimit)
+		return unless fm.any()
+		// The narrow filter.
+		let hev = (p1 - p0).abs().gt(thresh) | (q1 - q0).abs().gt(thresh)
+		let fa = hev.blend(simd.clamp(p1 - q1, dmin, dmax), zero)
+		fa = simd.clamp((q0 - p0) * three + fa, dmin, dmax)
+		let f1 = simd.min(fa + four, dmax) >> 3
+		let f2 = simd.min(fa + three, dmax) >> 3
+		let g = (f1 + simd.splat8<int32>(int32(1))) >> 1
+		let np0 = simd.clamp(p0 + f2, zero, maxv)
+		let nq0 = simd.clamp(q0 - f1, zero, maxv)
+		let np1 = hev.blend(p1, simd.clamp(p1 + g, zero, maxv))
+		let nq1 = hev.blend(q1, simd.clamp(q1 - g, zero, maxv))
+		let np2 = p2
+		let nq2 = q2
+		let np3 = p3
+		let nq3 = q3
+		let np4 = p4
+		let nq4 = q4
+		let np5 = p5
+		let nq5 = q5
+		let np6 = p6
+		let nq6 = q6
+		if size >= 8 {
+			let flat = (p1 - p0).abs().le(flatT) & (q1 - q0).abs().le(flatT) & (p2 - p0).abs().le(flatT)
+			flat = flat & (q2 - q0).abs().le(flatT) & (p3 - p0).abs().le(flatT) & (q3 - q0).abs().le(flatT)
+			if flat.any() {
+				let s = p2 + p1 + p0 + q0 + four
+				np2 = flat.blend((p3 * three + p2 + s) >> 3, np2)
+				np1 = flat.blend((p3 * two + p1 + s + q1) >> 3, np1)
+				np0 = flat.blend((p3 + p0 + s + q1 + q2) >> 3, np0)
+				nq0 = flat.blend((s + q0 + q1 + q2 + q3) >> 3, nq0)
+				nq1 = flat.blend((p1 + p0 + q0 + q1 * two + q2 + q3 * two + four) >> 3, nq1)
+				nq2 = flat.blend((p0 + q0 + q1 + q2 * two + q3 * three + four) >> 3, nq2)
+			}
+			if wide {
+				let flat2 = (p4 - p0).abs().le(flatT) & (q4 - q0).abs().le(flatT) & (p5 - p0).abs().le(flatT) & (q5 - q0).abs().le(flatT)
+				flat2 = flat2 & (p6 - p0).abs().le(flatT) & (q6 - q0).abs().le(flatT) & (p7 - p0).abs().le(flatT) & (q7 - q0).abs().le(flatT)
+				let c16 = flat2 & flat
+				if c16.any() {
+					let eight = simd.splat8<int32>(int32(8))
+					// The window of fifteen samples slides from p6 to q6.
+					let sum = p7 * simd.splat8<int32>(int32(7)) + p6 * two + p5 + p4 + p3 + p2 + p1 + p0 + q0 + eight
+					np6 = c16.blend(sum >> 4, np6)
+					sum = sum - p7 - p6 + p5 + q1
+					np5 = c16.blend(sum >> 4, np5)
+					sum = sum - p7 - p5 + p4 + q2
+					np4 = c16.blend(sum >> 4, np4)
+					sum = sum - p7 - p4 + p3 + q3
+					np3 = c16.blend(sum >> 4, np3)
+					sum = sum - p7 - p3 + p2 + q4
+					np2 = c16.blend(sum >> 4, np2)
+					sum = sum - p7 - p2 + p1 + q5
+					np1 = c16.blend(sum >> 4, np1)
+					sum = sum - p7 - p1 + p0 + q6
+					np0 = c16.blend(sum >> 4, np0)
+					sum = sum - p7 - p0 + q0 + q7
+					nq0 = c16.blend(sum >> 4, nq0)
+					sum = sum - p6 - q0 + q1 + q7
+					nq1 = c16.blend(sum >> 4, nq1)
+					sum = sum - p5 - q1 + q2 + q7
+					nq2 = c16.blend(sum >> 4, nq2)
+					sum = sum - p4 - q2 + q3 + q7
+					nq3 = c16.blend(sum >> 4, nq3)
+					sum = sum - p3 - q3 + q4 + q7
+					nq4 = c16.blend(sum >> 4, nq4)
+					sum = sum - p2 - q4 + q5 + q7
+					nq5 = c16.blend(sum >> 4, nq5)
+					sum = sum - p1 - q5 + q6 + q7
+					nq6 = c16.blend(sum >> 4, nq6)
+				}
+			}
+		}
+		np0 = fm.blend(np0, p0)
+		np1 = fm.blend(np1, p1)
+		np2 = fm.blend(np2, p2)
+		nq0 = fm.blend(nq0, q0)
+		nq1 = fm.blend(nq1, q1)
+		nq2 = fm.blend(nq2, q2)
+		if vertical && wide {
+			np3 = fm.blend(np3, p3)
+			np4 = fm.blend(np4, p4)
+			np5 = fm.blend(np5, p5)
+			np6 = fm.blend(np6, p6)
+			nq3 = fm.blend(nq3, q3)
+			nq4 = fm.blend(nq4, q4)
+			nq5 = fm.blend(nq5, q5)
+			nq6 = fm.blend(nq6, q6)
+			let (a0, a1, a2, a3, a4, a5, a6, a7) = simd.transpose8(p7, np6, np5, np4, np3, np2, np1, np0)
+			simd.store8<uint16>(p, at - 8, simd.convert<int32, uint16>(a0))
+			simd.store8<uint16>(p, at + stride - 8, simd.convert<int32, uint16>(a1))
+			simd.store8<uint16>(p, at + 2 * stride - 8, simd.convert<int32, uint16>(a2))
+			simd.store8<uint16>(p, at + 3 * stride - 8, simd.convert<int32, uint16>(a3))
+			simd.store8<uint16>(p, at + 4 * stride - 8, simd.convert<int32, uint16>(a4))
+			simd.store8<uint16>(p, at + 5 * stride - 8, simd.convert<int32, uint16>(a5))
+			simd.store8<uint16>(p, at + 6 * stride - 8, simd.convert<int32, uint16>(a6))
+			simd.store8<uint16>(p, at + 7 * stride - 8, simd.convert<int32, uint16>(a7))
+			let (b0, b1, b2, b3, b4, b5, b6, b7) = simd.transpose8(nq0, nq1, nq2, nq3, nq4, nq5, nq6, q7)
+			simd.store8<uint16>(p, at, simd.convert<int32, uint16>(b0))
+			simd.store8<uint16>(p, at + stride, simd.convert<int32, uint16>(b1))
+			simd.store8<uint16>(p, at + 2 * stride, simd.convert<int32, uint16>(b2))
+			simd.store8<uint16>(p, at + 3 * stride, simd.convert<int32, uint16>(b3))
+			simd.store8<uint16>(p, at + 4 * stride, simd.convert<int32, uint16>(b4))
+			simd.store8<uint16>(p, at + 5 * stride, simd.convert<int32, uint16>(b5))
+			simd.store8<uint16>(p, at + 6 * stride, simd.convert<int32, uint16>(b6))
+			simd.store8<uint16>(p, at + 7 * stride, simd.convert<int32, uint16>(b7))
+			return
+		}
+		if vertical {
+			let (a0, a1, a2, a3, a4, a5, a6, a7) = simd.transpose8(p3, np2, np1, np0, nq0, nq1, nq2, q3)
+			simd.store8<uint16>(p, at - 4, simd.convert<int32, uint16>(a0))
+			simd.store8<uint16>(p, at + stride - 4, simd.convert<int32, uint16>(a1))
+			simd.store8<uint16>(p, at + 2 * stride - 4, simd.convert<int32, uint16>(a2))
+			simd.store8<uint16>(p, at + 3 * stride - 4, simd.convert<int32, uint16>(a3))
+			simd.store8<uint16>(p, at + 4 * stride - 4, simd.convert<int32, uint16>(a4))
+			simd.store8<uint16>(p, at + 5 * stride - 4, simd.convert<int32, uint16>(a5))
+			simd.store8<uint16>(p, at + 6 * stride - 4, simd.convert<int32, uint16>(a6))
+			simd.store8<uint16>(p, at + 7 * stride - 4, simd.convert<int32, uint16>(a7))
+			return
+		}
+		if wide {
+			simd.store8<uint16>(p, at - 7 * stride, simd.convert<int32, uint16>(fm.blend(np6, p6)))
+			simd.store8<uint16>(p, at - 6 * stride, simd.convert<int32, uint16>(fm.blend(np5, p5)))
+			simd.store8<uint16>(p, at - 5 * stride, simd.convert<int32, uint16>(fm.blend(np4, p4)))
+			simd.store8<uint16>(p, at - 4 * stride, simd.convert<int32, uint16>(fm.blend(np3, p3)))
+			simd.store8<uint16>(p, at + 3 * stride, simd.convert<int32, uint16>(fm.blend(nq3, q3)))
+			simd.store8<uint16>(p, at + 4 * stride, simd.convert<int32, uint16>(fm.blend(nq4, q4)))
+			simd.store8<uint16>(p, at + 5 * stride, simd.convert<int32, uint16>(fm.blend(nq5, q5)))
+			simd.store8<uint16>(p, at + 6 * stride, simd.convert<int32, uint16>(fm.blend(nq6, q6)))
+		}
+		if size >= 8 {
+			simd.store8<uint16>(p, at - 3 * stride, simd.convert<int32, uint16>(np2))
+			simd.store8<uint16>(p, at + 2 * stride, simd.convert<int32, uint16>(nq2))
+		}
+		simd.store8<uint16>(p, at - 2 * stride, simd.convert<int32, uint16>(np1))
+		simd.store8<uint16>(p, at - stride, simd.convert<int32, uint16>(np0))
+		simd.store8<uint16>(p, at, simd.convert<int32, uint16>(nq0))
+		simd.store8<uint16>(p, at + stride, simd.convert<int32, uint16>(nq1))
+	}
+}

@@ -1,0 +1,1568 @@
+// The DTLS record layer (RFC 6347 §4, RFC 9147 §4-7, RFC 9146): records
+// over a datagram transport, the handshake messages fragmented across
+// them, flights retransmitted on a timer, and DTLS 1.3 acknowledgments.
+partial module std.net.tls {
+	use (
+		std.bytes::(Endian)
+		std.net
+		std.net.sequence::(Ranges, ReplayWindow, expand)
+		std.crypto.cipher::(AES, newAES, chacha20)
+		std.crypto.hash::(Hash)
+		std.time
+	)
+
+	// The DTLSPlaintext header (RFC 6347 §4.1): type, version, epoch,
+	// sequence number, length.
+	internal const dtlsHeaderSize = 13
+	// The DTLS handshake header (RFC 6347 §4.2.2): type, length,
+	// message_seq, fragment offset and fragment length.
+	internal const dtlsHandshakeHeaderSize = 12
+	// The datagram a retransmission falls back to after two that went
+	// unanswered (RFC 6347 §4.1.1.1): IPv4's minimum of 576 bytes less the
+	// IP and UDP headers.
+	internal const dtlsSafeDatagram = 548
+	// The cap on the retransmission timer (RFC 9147 §5.8.2).
+	internal const dtlsMaxTimeout = 60s
+	// The floor on a timer set from a measured round trip, so scheduling
+	// jitter does not cause spurious retransmissions.
+	internal const dtlsMinTimeout = 50ms
+	// Records of epochs not keyed yet that are held for later.
+	internal const dtlsHeldRecords = 64
+	// How far ahead of the next expected handshake message fragments are
+	// kept.
+	internal const dtlsMessagesAhead = 16
+	// The largest handshake message accepted: a certificate chain of a few
+	// dozen certificates.
+	internal const dtlsMaxMessage = 262144
+	// Records that may fail authentication under one key before the
+	// connection is closed (RFC 9147 §4.5.3, AES-GCM and ChaCha20-Poly1305).
+	internal const dtlsForgeryLimit = 68719476736
+	// How long one datagram may take to leave when the caller gives no
+	// timeout: flights, retransmissions, ACKs and alerts.
+	internal const dtlsSendTimeout = 5s
+	// What `planWait` answers beside a time to wait: the deadline passed,
+	// or a timer was due and has been served.
+	internal const waitPassed = -1
+	internal const waitServed = -2
+
+	// DatagramCipher is one direction of one epoch: the AEAD and its IV,
+	// under DTLS 1.3 the key that hides record numbers, the next sequence
+	// number to send, and the anti-replay window over those received
+	// (RFC 6347 §4.1.2.6, RFC 9147 §4.5.1).
+	internal type DatagramCipher {
+		epoch    int
+		key      ?TrafficKey
+		snAES    ?AES
+		snChaCha byte[]       = []
+		nextSeq  int          = 0
+		window   ReplayWindow
+		failures int          = 0
+		// The mask of the last record, and the block ChaCha20 turns into
+		// one: kept so a record costs no allocation for them.
+		masked   byte[]
+		zeros    byte[]
+
+		def new(epoch int, key ?TrafficKey) {
+			self.epoch = epoch
+			self.key = key
+			masked.len(16)
+			zeros.len(16)
+			window = new ReplayWindow()
+		}
+
+		// mask is the DTLS 1.3 record number mask over the first 16 bytes
+		// of a ciphertext (RFC 9147 §4.2.3): AES-ECB of them, or the
+		// ChaCha20 block they name as counter and nonce. The result is good
+		// until the next call. Fails when the cipher refuses the key.
+		def mask(sample byte[]) !byte[] {
+			let aes = snAES
+			if !(aes is none) {
+				aes.encryptBlock(masked, sample[0:16])
+				return masked
+			}
+			return try chacha20(snChaCha, sample[4:16], uint32(0).fromBytes(sample[0:4], Endian.Little), zeros)
+		}
+
+		// open authenticates and decrypts a DTLS 1.2 record body under the
+		// record number (epoch and sequence number) and additional data,
+		// none when it is not authentic.
+		def open(number uint64, aad byte[], body byte[]) ?byte[] {
+			let traffic = key
+			return none when traffic is none
+			traffic.sequence = number
+			let authentic = true
+			let plaintext = traffic.openWith(aad, body) onerror (err error) {
+				authentic = false
+				recover []
+			}
+			return none unless authentic
+			return plaintext
+		}
+
+		// openUnified authenticates and decrypts a DTLS 1.3 record body
+		// under its sequence number, with the unmasked header as additional
+		// data (RFC 9147 §4); none when it is not authentic.
+		def openUnified(seq int, header byte[], body byte[]) ?byte[] {
+			let traffic = key
+			return none when traffic is none
+			traffic.sequence = uint64(seq)
+			let authentic = true
+			let plaintext = traffic.cipher.open(traffic.nonce(), body, header) onerror (err error) {
+				authentic = false
+				recover []
+			}
+			return none unless authentic
+			return plaintext
+		}
+	}
+
+	// OutMessage is a handshake message, or a DTLS 1.2 change_cipher_spec,
+	// in a flight: its epoch, message_seq and body, and under DTLS 1.3 the
+	// byte ranges of the body the peer acknowledged.
+	internal type OutMessage {
+		contentType int
+		epoch       int
+		kind        int
+		seq         int
+		body        byte[]
+		acked       Ranges
+		// A message without a body (a change_cipher_spec, an empty
+		// handshake message) was acknowledged.
+		whole       bool   = false
+
+		def new(contentType int, epoch int, kind int, seq int, body byte[]) {
+			self.contentType = contentType
+			self.epoch = epoch
+			self.kind = kind
+			self.seq = seq
+			self.body = body
+			acked = new Ranges()
+		}
+
+		// ack records that the peer holds bytes start to end of the body.
+		def ack(start int, end int) {
+			acked.add(start, end)
+			whole = true when body.len() == 0
+		}
+
+		// touched reports whether the peer acknowledged any of it.
+		def touched() bool {
+			return whole || !acked.isEmpty()
+		}
+
+		// pending is the ranges of the body not acknowledged, as start, end
+		// pairs; a message without a body is one range of nothing until
+		// acknowledged.
+		def pending() int[] {
+			return acked.gaps(body.len()) when body.len() > 0
+			return whole ?? (int[], [0, 0])
+		}
+	}
+
+	// SentFragment is what one record carried, for the DTLS 1.3 ACKs that
+	// name it.
+	internal struct SentFragment {
+		message OutMessage
+		start   int
+		end     int
+	}
+
+	// Flight is messages sent and retransmitted as one (RFC 6347 §4.2.4,
+	// RFC 9147 §5.8): when it went out, how often it was repeated, the
+	// timer, whether it waits for an ACK rather than the peer's next
+	// flight, and whether it is the last of a handshake, kept to repeat
+	// when the peer repeats its own.
+	internal type Flight {
+		messages    OutMessage[]
+		sent        bool         = false
+		sentAt      int          = 0
+		retransmits int          = 0
+		dueAt       int          = 0
+		needsAck    bool         = false
+		final       bool         = false
+		done        bool         = false
+		// The DTLS 1.3 KeyUpdate this flight carries: once acknowledged,
+		// the layer sends under the next epoch.
+		keyUpdate   bool         = false
+
+		def new() {}
+
+		// acknowledged reports whether the peer holds every message.
+		def acknowledged() bool {
+			for let (_, m) in messages {
+				return false when m.pending().len() > 0
+			}
+			return true
+		}
+	}
+
+	// ReassembledMessage collects the fragments of one incoming handshake
+	// message until it is whole.
+	internal type ReassembledMessage {
+		kind    int
+		length  int
+		epoch   int
+		data    byte[]
+		have    Ranges
+		// A fragment arrived: a message without a body is whole with one.
+		started bool   = false
+
+		def new(kind int, length int, epoch int) {
+			self.kind = kind
+			self.length = length
+			self.epoch = epoch
+			data.len(length)
+			have = new Ranges()
+		}
+
+		// add copies a fragment in. Fails with IllegalParameter when it
+		// changes bytes already received (RFC 9147 §5.5).
+		def add(offset int, fragment byte[]) !none {
+			let end = offset + fragment.len()
+			for let i = 0; i < have.bounds.len(); i += 2 {
+				let lo = have.bounds[i].max(offset)
+				let hi = have.bounds[i + 1].min(end)
+				continue when lo >= hi
+				fail tlsError(Alert.IllegalParameter, "a retransmitted handshake fragment changes its bytes") unless data[lo:hi].equals(fragment[lo - offset:hi - offset])
+			}
+			fragment.copy(data[offset:end])
+			have.add(offset, end)
+			started = true
+			return none
+		}
+
+		// complete reports whether every byte arrived.
+		def complete() bool {
+			return started && have.reach() >= length
+		}
+
+		// contiguous is how many bytes from the start arrived.
+		def contiguous() int {
+			return have.reach()
+		}
+	}
+
+	// RecordNumber names a record: its epoch and sequence number (RFC 9147
+	// §4).
+	internal struct RecordNumber {
+		epoch int
+		seq   int
+	}
+
+	// FramedMessage is a handshake message with the message_seq it went
+	// or came with, for the DTLS 1.2 transcript.
+	internal struct FramedMessage {
+		message byte[]
+		seq     int
+	}
+
+	// DatagramLayer is the record layer of one DTLS connection. It is the
+	// handshake's `DatagramRecords` and its transcript framer, and carries
+	// the connection's application data and alerts afterwards. All its
+	// work happens inside the calls made on it; a connection that is
+	// neither read nor written does not answer retransmissions. Its state
+	// changes under its lock and the transport is used outside it, so one
+	// task may receive while others send.
+	internal type DatagramLayer {
+		transport          net.DatagramTransport
+		isClient           bool
+		// The largest datagram sent.
+		mtu                int                          = 1200
+		initialTimeout     duration                     = 1s
+		timeout            duration                     = 1s
+		// 12 or 13 once the handshake shows the version, 0 before.
+		version            int                          = 0
+		readCiphers        DatagramCipher[]
+		writeCiphers       DatagramCipher[]
+		readEpoch          int                          = 0
+		writeEpoch         int                          = 0
+		// DTLS 1.3: the suite and hash of the traffic secrets.
+		suite              CipherSuite                  = CipherSuite.AES128GCMSHA256
+		hash               Hash                         = Hash.SHA256
+		// DTLS 1.2: the peer's change_cipher_spec arrived, and was handed
+		// to the handshake.
+		ccsArrived         bool                         = false
+		ccsDelivered       bool                         = false
+		nextSendSeq        int                          = 0
+		nextReceiveSeq     int                          = 0
+		assembling         map<int, ReassembledMessage>
+		ready              byte[][]                     = []
+		readyEpochs        int[]                        = []
+		alerts             byte[][]                     = []
+		appData            byte[][]                     = []
+		framed             FramedMessage[]              = []
+		flight             ?Flight                      = none
+		posted             Flight[]                     = []
+		peerSpoke          bool                         = false
+		// DTLS 1.3: what each handshake record sent carried, by record
+		// number (epoch above the 48 bits of the sequence number).
+		sentFragments      map<int, SentFragment>
+		// DTLS 1.3: handshake records received and not acknowledged yet;
+		// when the ACK for them is due.
+		toAck              RecordNumber[]               = []
+		ackDueAt           int                          = 0
+		ackNow             bool                         = false
+		// Protected records of an epoch not keyed yet, held for when it is.
+		held               byte[][]                     = []
+		handshakeDone      bool                         = false
+		closed             bool                         = false
+		// A protocol violation found while processing, reported to the
+		// caller of the next read.
+		failure            ?error                       = none
+		// Connection IDs: the ones this side accepts, its length, and the
+		// one records to the peer carry.
+		ownConnectionIDs   byte[][]                     = []
+		// What the handshake negotiates beyond TLS, the connection IDs among
+		// it.
+		params             ?DTLSParameters              = none
+		spareIDs           byte[][]                     = []
+		// The newest record authenticated, as epoch, sequence: an address
+		// change counts only for a newer one (RFC 9146 §6).
+		newestEpoch        int                          = -1
+		newestSeq          int                          = -1
+		// A record newer than any before authenticated in the datagram
+		// being processed.
+		advanced           bool                         = false
+		buffer             byte[]
+		// Datagrams ready to leave: what the layer decides to send is queued
+		// under its lock and sent outside it by `drain`.
+		outbox             byte[][]                     = []
+		// The datagram counter of the last retransmission caused by a
+		// peer's repeat, so one datagram causes at most one.
+		repeatsAnswered    int                          = 0
+		datagramsSeen      int                          = 0
+		// This side sent a flight: the next new handshake record of the
+		// peer starts the flight that ACKs cover from then on.
+		ackRestart         bool                         = false
+		// The peer's messages before this one were answered by this side's
+		// last flight: a repeat of one of them means that flight was lost.
+		answeredBelow      int                          = 0
+		// DTLS 1.3: the next write secret, installed once the peer
+		// acknowledged the KeyUpdate that announced it (RFC 9147 §8).
+		pendingWriteSecret byte[]                       = []
+
+		def new(transport net.DatagramTransport, isClient bool) {
+			self.transport = transport
+			self.isClient = isClient
+			readCiphers.push(new DatagramCipher(0, none))
+			writeCiphers.push(new DatagramCipher(0, none))
+		}
+
+		// ---- DatagramRecords ----
+
+		// readRecord hands the handshake its next record. Fails with
+		// TLSError for a protocol violation, NetError (TimedOut) when the
+		// peer sends nothing useful for `timeout`, or as the transport does.
+		def readRecord(legacy bool, timeout duration) !Record {
+			let deadline = int(time.monoNs()) + int(timeout)
+			for {
+				let next = try pollRecord(legacy)
+				try drain()
+				return next unless next is none
+				try wait(deadline)
+			}
+			fail tlsError(Alert.InternalError, "unreachable")
+		}
+
+		// pollRecord is the handshake's next record when one is ready; else
+		// what this side has to send is queued and the answer is none. Fails
+		// with a violation found while processing, or once the layer is
+		// closed.
+		internal atomic def pollRecord(legacy bool) !?Record {
+			try raiseFailure()
+			let next = try nextRecord(legacy)
+			return next unless next is none
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			try queueFlights()
+			return none
+		}
+
+		// raiseFailure fails with the violation found while processing, once.
+		internal def raiseFailure() !none {
+			let found = failure
+			return none when found is none
+			failure = none
+			fail found
+		}
+
+		// nextRecord is the record the handshake reads next, none when it
+		// has to wait. Under DTLS 1.2 the peer's change_cipher_spec comes
+		// right before its first handshake message of the next epoch, so
+		// the handshake sees them in the order they were sent even when the
+		// datagrams were not. Fails with UnexpectedMessage for a handshake
+		// message that arrived under another epoch than its place in the
+		// handshake has: the hellos in the clear, the rest of a DTLS 1.3
+		// handshake under the handshake keys, a DTLS 1.2 one in the clear up
+		// to the change_cipher_spec and protected after.
+		internal def nextRecord(legacy bool) !?Record {
+			if ready.len() > 0 {
+				let epoch = readyEpochs[0]
+				if legacy && epoch >= 1 && !ccsDelivered {
+					return none unless ccsArrived
+					ccsDelivered = true
+					return Record{contentType: recordChangeCipherSpec, payload: byte[1]}
+				}
+				let message = ready.shift()
+				readyEpochs.shift()
+				let kind = int(message[0])
+				let wanted = handshakeEpoch(kind)
+				fail tlsError(Alert.UnexpectedMessage, "handshake message {kind} arrived under epoch {epoch}, not {wanted}") when epoch != wanted
+				return Record{contentType: recordHandshake, payload: message}
+			}
+			return Record{contentType: recordAlert, payload: alerts.shift()} when alerts.len() > 0
+			return none
+		}
+
+		// handshakeEpoch is the epoch a message of the handshake must
+		// arrive under at this point of it (RFC 6347 §4.1, RFC 9147 §6.1).
+		internal def handshakeEpoch(kind int) int {
+			return 0 when kind := handshakeClientHello || handshakeServerHello || handshakeHelloVerifyRequest
+			return 2 when version == 13
+			return ccsDelivered ?? (1, 0)
+		}
+
+		// newMessageEpoch is the lowest epoch a handshake message not seen
+		// yet may arrive under now: what the peer sends once its records are
+		// protected is not taken in the clear.
+		internal def newMessageEpoch() int {
+			return handshakeDone ?? (3, 2) when version == 13
+			return ccsDelivered ?? (1, 0)
+		}
+
+		// writeRecord queues handshake messages and change_cipher_spec into
+		// the flight being built, and sends alerts and application data at
+		// once. Fails as the transport does.
+		def writeRecord(contentType int, payload byte[], legacy bool) !none {
+			try queueRecord(contentType, payload, legacy)
+			return try drain()
+		}
+
+		// queueRecord is `writeRecord` without the sending: what has to
+		// leave waits for `drain`. Fails when handshake bytes are not whole
+		// messages.
+		atomic def queueRecord(contentType int, payload byte[], legacy bool) !none {
+			version = 12 when legacy
+			if contentType == recordHandshake {
+				let current = openFlight()
+				let at = 0
+				for at < payload.len() {
+					let next = splitHandshake(payload[at:])
+					fail tlsError(Alert.InternalError, "handshake bytes are not whole messages") when next is none
+					let (kind, body, used) = next
+					let message = payload[at:at + used]
+					framed.push(FramedMessage{message: message.clone(), seq: nextSendSeq}) unless handshakeDone || version == 13
+					current.messages.push(new OutMessage(recordHandshake, writeEpoch, kind, nextSendSeq, body.clone()))
+					nextSendSeq++
+					at += used
+				}
+				return none
+			}
+			if contentType == recordChangeCipherSpec {
+				let current = openFlight()
+				current.messages.push(new OutMessage(recordChangeCipherSpec, writeEpoch, 0, -1, []))
+				return none
+			}
+			outbox.push(try seal(contentType, payload, writeEpoch))
+			return none
+		}
+
+		// openFlight is the flight new messages join: the one being built,
+		// or a new one once the peer answered the last.
+		internal def openFlight() Flight {
+			let current = flight
+			return current when !(current is none) && !current.sent
+			if handshakeDone && version == 13 {
+				let post = new Flight()
+				post.needsAck = true
+				posted.push(post)
+				return post
+			}
+			let fresh = new Flight()
+			flight = fresh
+			peerSpoke = false
+			return fresh
+		}
+
+		atomic def stageReadKey(key TrafficKey) {
+			version = 12
+			readCiphers.push(new DatagramCipher(1, key))
+			readEpoch = 1
+			replayHeld()
+		}
+
+		atomic def installWriteKey(key TrafficKey) {
+			version = 12
+			writeCiphers.push(new DatagramCipher(1, key))
+			writeEpoch = 1
+		}
+
+		atomic def isProtected() bool {
+			return readEpoch >= 2 when version == 13
+			return ccsDelivered
+		}
+
+		// installSecret keys one direction of an epoch from a DTLS 1.3
+		// traffic secret: the AEAD key and IV, and the record number key
+		// (RFC 9147 §4.2.3), all under the "dtls13" label prefix. Fails
+		// when the keys cannot be derived.
+		atomic def installSecret(epoch int, forWriting bool, suite CipherSuite, hash Hash, secret byte[]) !none {
+			version = 13
+			self.suite = suite
+			self.hash = hash
+			let size = suiteKeySize(suite)
+			let (key, iv) = try trafficKeys(hash, secret, size, labelDTLS13)
+			let cipher = new DatagramCipher(epoch, new TrafficKey(try suiteAEAD(suite, key), iv))
+			let snKey = try hkdfExpandLabel(hash, secret, "sn", [], size, labelDTLS13)
+			if suiteUsesChaCha20(suite) {
+				cipher.snChaCha = snKey
+			} else {
+				cipher.snAES = try newAES(snKey)
+			}
+			if forWriting {
+				writeCiphers = keptCiphers(writeCiphers, epoch)
+				writeCiphers.push(cipher)
+				writeEpoch = epoch
+				return none
+			}
+			readCiphers = keptCiphers(readCiphers, epoch)
+			readCiphers.push(cipher)
+			readEpoch = epoch
+			replayHeld()
+			return none
+		}
+
+		// keptCiphers is the ciphers that stay when `epoch` gets its keys:
+		// epoch 0, the handshake's, and of the application epochs only the
+		// one before, whose records may still be on their way (RFC 9147
+		// §4.2.1).
+		internal def keptCiphers(ciphers DatagramCipher[], epoch int) DatagramCipher[] {
+			return ciphers.filter(c => c.epoch < 3 || c.epoch >= epoch - 1)
+		}
+
+		// ---- TranscriptFramer ----
+
+		// datagramForm gives handshake messages their DTLS 1.2 transcript
+		// form: the 12-byte header with the message_seq each was sent or
+		// received with, as one fragment (RFC 6347 §4.2.6).
+		atomic def datagramForm(messages byte[]) byte[] {
+			let out byte[]
+			let at = 0
+			for at < messages.len() {
+				let next = splitHandshake(messages[at:])
+				break when next is none
+				let (kind, body, used) = next
+				let seq = takeFramed(messages[at:at + used])
+				out = out + u8(kind) + u24(body.len()) + u16(seq) + u24(0) + u24(body.len()) + body
+				at += used
+			}
+			return out
+		}
+
+		// takeFramed is the message_seq a message went or came with, and
+		// forgets it. A message this layer did not carry has none: the
+		// handshake then fails at its next read.
+		internal def takeFramed(message byte[]) int {
+			for let i = 0; i < framed.len(); i++ {
+				let entry = framed[i]
+				continue unless entry.message.equals(message)
+				framed.remove(i)
+				return entry.seq
+			}
+			failure = tlsError(Alert.InternalError, "a handshake message entered the transcript without passing the record layer") when failure is none
+			return 0
+		}
+
+		// ---- Application data and the end of the handshake ----
+
+		// finishHandshake ends the handshake on this side. DTLS 1.2: a
+		// flight this side sent last is final, repeated only when the peer
+		// repeats its own. DTLS 1.3: the client's last flight waits for the
+		// server's ACK, which the server sends now (RFC 9147 §5.7), with
+		// the session ticket it may have written after. Fails as the
+		// transport does.
+		def finishHandshake() !none {
+			try endHandshake()
+			return try drain()
+		}
+
+		internal atomic def endHandshake() !none {
+			handshakeDone = true
+			dropUnprotected()
+			held = []
+			let current = flight
+			if version == 12 {
+				sentFragments = map<int, SentFragment>{}
+				current.final = true when !(current is none) && !current.sent
+				return try queueFlights()
+			}
+			try queueAck() unless isClient
+			current.needsAck = true when !(current is none) && !current.sent
+			return try queueFlights()
+		}
+
+		// dropUnprotected forgets the messages the handshake left unread
+		// that arrived under an epoch nothing after the handshake comes
+		// under, and gives their message_seq back, so the peer's own message
+		// of that number is still taken.
+		internal def dropUnprotected() {
+			let minimum = newMessageEpoch()
+			for let i = 0; i < ready.len(); i++ {
+				continue when readyEpochs[i] >= minimum
+				nextReceiveSeq -= ready.len() - i
+				ready = ready[0:i].clone()
+				readyEpochs = readyEpochs[0:i].clone()
+				break
+			}
+			for let (_, seq) in assembling.keys() {
+				let message = assembling.get(seq)
+				assembling.delete(seq) when !(message is none) && message.epoch < minimum
+			}
+		}
+
+		// receive waits for the next datagram of application data, up to the
+		// deadline (monotonic ns, 0 for none), handling everything else that
+		// arrives on the way. none when the deadline passes, or when an
+		// alert or a handshake message waits for the caller. One task
+		// receives at a time. Fails with TLSError for a violation, as the
+		// transport does otherwise.
+		def receive(deadline int) !?byte[] {
+			for {
+				let data = try takeData()
+				return data unless data is none
+				let waits = try idle()
+				try drain()
+				return none unless waits
+				let moved = try waitUntil(deadline)
+				return none unless moved
+			}
+			fail tlsError(Alert.InternalError, "unreachable")
+		}
+
+		// takeData is the next application data that arrived, none when
+		// there is none. Fails with a violation found while processing.
+		internal atomic def takeData() !?byte[] {
+			try raiseFailure()
+			return none when appData.len() == 0
+			return appData.shift()
+		}
+
+		// idle reports whether nothing waits for the caller of `receive`
+		// (an alert, a handshake message, the end of the connection), and
+		// queues what this side has to send.
+		internal atomic def idle() !bool {
+			return false when ready.len() > 0 || alerts.len() > 0 || closed
+			try queueFlights()
+			return true
+		}
+
+		// takeHandshake is the next handshake message the peer sent after
+		// the handshake, none when there is none.
+		atomic def takeHandshake() ?byte[] {
+			return none when ready.len() == 0
+			readyEpochs.shift()
+			return ready.shift()
+		}
+
+		// takeAlert is the next alert the peer sent, none when there is
+		// none.
+		atomic def takeAlert() ?byte[] {
+			return none when alerts.len() == 0
+			return alerts.shift()
+		}
+
+		// sendApplication protects data as one record and sends it in one
+		// datagram, after the flight this side still has to send. Fails
+		// as the transport does, with TimedOut when the datagram does not
+		// leave within the timeout.
+		def sendApplication(data byte[], timeout duration) !none {
+			try queueApplication(data)
+			return try drain(timeout)
+		}
+
+		internal atomic def queueApplication(data byte[]) !none {
+			try queueFlights()
+			try serviceTimers()
+			outbox.push(try seal(recordApplicationData, data, writeEpoch))
+			return none
+		}
+
+		// sendAlert sends an alert record in a datagram of its own; alerts
+		// are never retransmitted (RFC 6347 §4.2.7). Fails as the transport
+		// does.
+		def sendAlert(alert Alert, fatal bool) !none {
+			try queueAlert(alert, fatal)
+			return try drain()
+		}
+
+		// queueAlert is `sendAlert` without the sending. Fails when the
+		// record cannot be protected.
+		atomic def queueAlert(alert Alert, fatal bool) !none {
+			outbox.push(try seal(recordAlert, byte[byte(fatal ?? (2, 1)), byte(int(alert))], writeEpoch))
+			return none
+		}
+
+		// overhead is how many bytes a record adds to its content at the
+		// current write epoch.
+		atomic def overhead() int {
+			return overheadAt(writeEpoch)
+		}
+
+		internal def overheadAt(epoch int) int {
+			let cipher = writeCiphers[cipherIndex(writeCiphers, epoch)]
+			let key = cipher.key
+			return dtlsHeaderSize when key is none
+			let tag = key.cipher.overhead()
+			let cid = peerCID().len()
+			return 1 + cid + 2 + 2 + 1 + tag when version == 13
+			return dtlsHeaderSize + cid + 1 + key.explicitNonce() + tag when cid > 0
+			return dtlsHeaderSize + key.explicitNonce() + tag
+		}
+
+		// ---- Sending ----
+
+		// flush sends the flight being built, and posted DTLS 1.3 messages
+		// not sent yet. Fails as the transport does.
+		def flush() !none {
+			try queueFlights()
+			return try drain()
+		}
+
+		// queueFlights is `flush` without the sending. Fails when a record
+		// cannot be protected.
+		atomic def queueFlights() !none {
+			let current = flight
+			if !(current is none) && !current.sent && current.messages.len() > 0 {
+				try transmit(current, true)
+			}
+			for let (_, post) in posted {
+				try transmit(post, true) unless post.sent || post.done
+			}
+			if ackNow {
+				ackNow = false
+				try queueAck()
+			}
+			return none
+		}
+
+		// drain sends the datagrams queued, each within the timeout: all of
+		// them, whoever queued them, so with several tasks sending, one may
+		// send another's. Fails with the first failure of the transport,
+		// after trying the rest.
+		def drain(timeout duration = dtlsSendTimeout) !none {
+			let failure ?error = none
+			for let datagram in takeOutgoing() {
+				transport.send(datagram, timeout) onerror (err error) {
+					failure = err when failure is none
+					recover none
+				}
+			}
+			fail failure unless failure is none
+			return none
+		}
+
+		// takeOutgoing empties the queue of datagrams to send into its
+		// caller's hands.
+		internal atomic def takeOutgoing() byte[][] {
+			let batch = outbox
+			outbox = []
+			return batch
+		}
+
+		// transmit sends the parts of a flight the peer does not hold and
+		// sets its timer: the first time and on every retransmission, which
+		// doubles the timer when `backoff` (a timer that fired) and keeps it
+		// when the peer's repeat or ACK asked for it. A final DTLS 1.2
+		// flight has no timer. Fails when a record cannot be protected.
+		internal def transmit(f Flight, backoff bool) !none {
+			let now = int(time.monoNs())
+			if f.sent {
+				f.retransmits++
+				if backoff {
+					timeout = timeout + timeout
+					timeout = dtlsMaxTimeout when timeout > dtlsMaxTimeout
+				}
+			} else {
+				f.sent = true
+				// The flight answers the peer's: no ACK for that one is due
+				// (RFC 9147 §7.1).
+				ackDueAt = 0
+				ackRestart = true
+				answeredBelow = nextReceiveSeq
+			}
+			f.sentAt = now
+			let limit = retransmitLimit(mtu, f.retransmits)
+			let datagram byte[]
+			for let (_, m) in f.messages {
+				let ranges = m.pending()
+				for let i = 0; i < ranges.len(); i += 2 {
+					let start = ranges[i]
+					let end = ranges[i + 1]
+					if m.contentType == recordChangeCipherSpec {
+						datagram = pack(datagram, try seal(recordChangeCipherSpec, byte[1], m.epoch), limit)
+						continue
+					}
+					let room = (limit - overheadAt(m.epoch) - dtlsHandshakeHeaderSize).max(64)
+					let at = start
+					for {
+						let stop = (at + room).min(end)
+						let fragment = u8(m.kind) + u24(m.body.len()) + u16(m.seq) + u24(at) + u24(stop - at) + m.body[at:stop]
+						if version != 12 {
+							let cipher = writeCiphers[cipherIndex(writeCiphers, m.epoch)]
+							sentFragments[recordKey(m.epoch, cipher.nextSeq)] = SentFragment{message: m, start: at, end: stop}
+						}
+						datagram = pack(datagram, try seal(recordHandshake, fragment, m.epoch), limit)
+						at = stop
+						break when at >= end
+					}
+				}
+			}
+			outbox.push(datagram) when datagram.len() > 0
+			f.dueAt = (f.final || f.done) ?? (0, now + int(timeout))
+			return none
+		}
+
+		// pack adds a record to the datagram being filled, queueing it first
+		// when the record would not fit.
+		internal def pack(datagram byte[], record byte[], limit int) byte[] {
+			return datagram + record when datagram.len() + record.len() <= limit
+			outbox.push(datagram) when datagram.len() > 0
+			return record
+		}
+
+		// seal encodes a record of the epoch: in the clear at epoch 0, as a
+		// DTLS 1.2 protected record (with the connection ID when the peer
+		// asked for one), or as a DTLS 1.3 DTLSCiphertext with its record
+		// number hidden. It takes the epoch's next sequence number. Fails
+		// when the cipher that hides a DTLS 1.3 record number refuses.
+		internal def seal(contentType int, payload byte[], epoch int) !byte[] {
+			let cipher = writeCiphers[cipherIndex(writeCiphers, epoch)]
+			let seq = cipher.nextSeq
+			cipher.nextSeq++
+			let key = cipher.key
+			let cid byte[] = []
+			cid = peerCID() unless key is none
+			return try sealUnified(cipher, key, cid, contentType, payload, seq) when version == 13 && !(key is none)
+			// DTLSPlaintext or DTLSCiphertext of DTLS 1.2: type, version,
+			// epoch and sequence number, the connection ID if any, length.
+			let header byte[]
+			header.len(dtlsHeaderSize + cid.len())
+			header[0] = byte(cid.len() > 0 ?? (recordTLS12CID, contentType))
+			header[1] = byte(versionDTLS12 >> 8)
+			header[2] = byte(versionDTLS12 & 0xFF)
+			let number = uint64(epoch) << uint64(48) | uint64(seq)
+			for let i = 0; i < 8; i++ {
+				header[3 + i] = byte((number >> uint64(56 - 8 * i)) & uint64(0xFF))
+			}
+			cid.copy(header[11:])
+			let body = payload
+			if !(key is none) {
+				key.sequence = number
+				if cid.len() > 0 {
+					let inner byte[]
+					inner.len(payload.len() + 1)
+					payload.copy(inner)
+					inner[payload.len()] = byte(contentType)
+					body = key.sealWith(connectionIDData(header[1:3], header[3:11], cid, inner.len()), inner)
+				} else {
+					body = key.seal12(header, payload)
+				}
+			}
+			header[header.len() - 2] = byte(body.len() >> 8)
+			header[header.len() - 1] = byte(body.len() & 0xFF)
+			return header + body
+		}
+
+		// sealUnified writes a DTLS 1.3 DTLSCiphertext (RFC 9147 §4): the
+		// unified header with the connection ID, a 16-bit sequence number and
+		// the length; the header with the sequence number in the clear is the
+		// additional data, and the sequence number is then masked. Fails
+		// when the masking cipher refuses.
+		internal def sealUnified(cipher DatagramCipher, key TrafficKey, cid byte[], contentType int, payload byte[], seq int) !byte[] {
+			let size = cid.len()
+			let length = payload.len() + 1 + key.cipher.overhead()
+			let header byte[]
+			header.len(5 + size)
+			header[0] = byte(0x2C | (size > 0 ?? (0x10, 0)) | (cipher.epoch & 0x03))
+			cid.copy(header[1:])
+			header[1 + size] = byte((seq >> 8) & 0xFF)
+			header[2 + size] = byte(seq & 0xFF)
+			header[3 + size] = byte(length >> 8)
+			header[4 + size] = byte(length & 0xFF)
+			let inner byte[]
+			inner.len(payload.len() + 1)
+			payload.copy(inner)
+			inner[payload.len()] = byte(contentType)
+			key.sequence = uint64(seq)
+			let body = key.cipher.seal(key.nonce(), inner, header)
+			let mask = try cipher.mask(body)
+			header[1 + size] = header[1 + size] ^ mask[0]
+			header[2 + size] = header[2 + size] ^ mask[1]
+			return header + body
+		}
+
+		// queueAck queues a DTLS 1.3 ACK of the handshake records not
+		// acknowledged yet (RFC 9147 §7), in increasing order, under the
+		// newest write epoch, which must not be older than any record it
+		// names. Fails when the record cannot be protected.
+		internal def queueAck() !none {
+			return none unless version == 13
+			return none when toAck.len() == 0 || writeEpoch < 2
+			let list byte[]
+			for let (_, number) in toAck.clone().sort((a, b) => a.epoch < b.epoch || (a.epoch == b.epoch && a.seq < b.seq)) {
+				return none when number.epoch > writeEpoch
+				list = list + uint64(number.epoch).bytes(Endian.Big) + uint64(number.seq).bytes(Endian.Big)
+			}
+			ackDueAt = 0
+			outbox.push(try seal(recordACK, vec16(list), writeEpoch))
+			// During the handshake an ACK covers the current flight only;
+			// afterwards each record is acknowledged once.
+			toAck = [] when handshakeDone
+			return none
+		}
+
+		// ---- Receiving ----
+
+		// wait blocks for one datagram or one timer, up to the handshake
+		// deadline (monotonic ns). Fails with NetError (TimedOut) at the
+		// deadline, as the transport does otherwise.
+		internal def wait(deadline int) !none {
+			let moved = try waitUntil(deadline)
+			fail net.errorOf(net.ErrorCode.TimedOut, "dtls handshake", "", "the peer did not answer in time") unless moved
+			return none
+		}
+
+		// waitUntil blocks for one datagram or one timer, up to the
+		// deadline (monotonic ns, 0 for none). false when the deadline
+		// passed. Fails as the transport does.
+		def waitUntil(deadline int) !bool {
+			let wait = try planWait(deadline)
+			try drain()
+			return false when wait == waitPassed
+			return true when wait == waitServed
+			// A datagram as large as UDP allows, kept from the first wait on.
+			buffer.len(65536) when buffer.len() == 0
+			let timedOut = false
+			let n = transport.receive(buffer, duration(wait)) onerror (err error) {
+				timedOut = err is net.NetError && err.kind == net.ErrorCode.TimedOut
+				fail err unless timedOut
+				recover 0
+			}
+			try take(n)
+			try drain()
+			return true
+		}
+
+		// planWait is how long to wait for a datagram, in nanoseconds (0
+		// without end): until the next timer or the deadline. `waitPassed`
+		// when the deadline passed, `waitServed` when a timer was due and
+		// what it sends is queued.
+		internal atomic def planWait(deadline int) !int {
+			let now = int(time.monoNs())
+			return waitPassed when deadline > 0 && now >= deadline
+			let wake = nextTimer()
+			wake = deadline when deadline > 0 && (wake == 0 || deadline < wake)
+			return 0 when wake == 0
+			return wake - now when wake > now
+			try serviceTimers()
+			return waitServed
+		}
+
+		// take processes the datagram of `n` bytes the transport put into
+		// the buffer (0 when the wait timed out) and serves the timers.
+		internal atomic def take(n int) !none {
+			try process(buffer[0:n]) when n > 0
+			return try serviceTimers()
+		}
+
+		// nextTimer is when the next retransmission or delayed ACK is due
+		// (monotonic ns), 0 for none.
+		internal def nextTimer() int {
+			let wake = 0
+			let current = flight
+			wake = current.dueAt when !(current is none) && current.sent && !current.done && current.dueAt > 0
+			for let (_, post) in posted {
+				continue when post.done || !post.sent || post.dueAt == 0
+				wake = post.dueAt when wake == 0 || post.dueAt < wake
+			}
+			wake = ackDueAt when ackDueAt > 0 && (wake == 0 || ackDueAt < wake)
+			return wake
+		}
+
+		// serviceTimers queues the flights and delayed ACKs that are due.
+		// Fails when a record cannot be protected.
+		internal def serviceTimers() !none {
+			let now = int(time.monoNs())
+			let current = flight
+			if !(current is none) && current.sent && !current.done && current.dueAt > 0 && current.dueAt <= now {
+				try transmit(current, true)
+			}
+			for let (_, post) in posted {
+				continue when post.done || !post.sent || post.dueAt == 0 || post.dueAt > now
+				try transmit(post, true)
+			}
+			try queueAck() when ackDueAt > 0 && ackDueAt <= now
+			posted = posted.filter(p => !p.done)
+			return none
+		}
+
+		// process reads the records of one datagram, which it does not keep.
+		// Records that do not parse, authenticate or fit the connection are
+		// dropped (RFC 6347 §4.1.2.7); a record whose epoch has no keys yet
+		// is held.
+		atomic def process(datagram byte[]) !none {
+			datagramsSeen++
+			advanced = false
+			let at = 0
+			for at < datagram.len() {
+				let used = 0
+				if (int(datagram[at]) & 0xE0) == 0x20 {
+					used = try readUnified(datagram, at)
+				} else {
+					used = try readPlain(datagram, at)
+				}
+				break when used <= 0
+				at += used
+			}
+			let peer = transport
+			if advanced && peer is ListenerPeer {
+				let moved ListenerPeer = peer
+				moved.confirmSource()
+			}
+			return none
+		}
+
+		// readPlain reads a record with the DTLSPlaintext header: in the
+		// clear at epoch 0, DTLS 1.2 protected after, or a DTLS 1.2 record
+		// with a connection ID. Records in the clear are not checked for
+		// replay: nothing authenticates their numbers (RFC 6347 §4.1.2.6).
+		// Returns the bytes it took, 0 when the rest of the datagram is
+		// unusable.
+		internal def readPlain(datagram byte[], at int) !int {
+			return 0 when datagram.len() - at < dtlsHeaderSize
+			let c = new Cursor(datagram)
+			c.pos = at
+			let contentType = try c.u8()
+			let wire = try c.bytes(2)
+			return 0 unless int(wire[0]) == 0xFE
+			let numberBytes = datagram[c.pos:c.pos + 8]
+			let epoch = try c.u16()
+			let seq = try c.u48()
+			let cid byte[] = []
+			if contentType == recordTLS12CID {
+				return 0 when ownCIDSize() == 0 || c.remaining() < ownCIDSize() + 2
+				cid = try c.bytes(ownCIDSize())
+			}
+			let length = try c.u16()
+			return 0 when c.remaining() < length
+			let body = try c.bytes(length)
+			let used = c.pos - at
+			// Records over the limit are invalid, and dropped like any
+			// other (RFC 6347 §4.1.2.7).
+			return used when length > maxCiphertext
+			if epoch == 0 {
+				return used when length > maxPlaintext || contentType == recordTLS12CID
+				try dispatch(contentType, 0, seq, body.clone())
+				return used
+			}
+			// A DTLS 1.3 connection takes no DTLS 1.2 protected records.
+			return used when version == 13
+			let index = cipherIndex(readCiphers, epoch)
+			if index < 0 {
+				holdRecord(datagram[at:at + used])
+				return used
+			}
+			let cipher = readCiphers[index]
+			let key = cipher.key
+			return used when key is none
+			// With a connection ID of its own, this side takes protected
+			// records only in the CID form (RFC 9146 §3).
+			return used when ownCIDSize() > 0 && contentType != recordTLS12CID
+			return used when contentType == recordTLS12CID && !ownsConnectionID(cid)
+			return used when cipher.window.seen(seq)
+			let number = uint64(epoch) << uint64(48) | uint64(seq)
+			let overhead = key.explicitNonce() + key.cipher.overhead()
+			if contentType == recordTLS12CID {
+				return used when length <= overhead
+				let inner = cipher.open(number, connectionIDData(wire, numberBytes, cid, length - overhead), body)
+				return try forged(cipher, used) when inner is none
+				let end = inner.len()
+				for end > 0 && inner[end - 1] == 0 {
+					end--
+				}
+				return used when end == 0 || end - 1 > maxPlaintext
+				cipher.window.mark(seq)
+				noteNewest(epoch, seq)
+				try dispatch(int(inner[end - 1]), epoch, seq, inner[0:end - 1])
+				return used
+			}
+			return used when length < overhead
+			let plaintext = cipher.open(number, numberBytes + u8(contentType) + wire + u16(length - overhead), body)
+			return try forged(cipher, used) when plaintext is none
+			return used when plaintext.len() > maxPlaintext
+			cipher.window.mark(seq)
+			noteNewest(epoch, seq)
+			try dispatch(contentType, epoch, seq, plaintext)
+			return used
+		}
+
+		// forged counts a record that failed authentication and closes the
+		// connection at the limit of RFC 9147 §4.5.3. Returns the bytes
+		// the record took.
+		internal def forged(cipher DatagramCipher, used int) !int {
+			cipher.failures++
+			fail tlsError(Alert.BadRecordMAC, "too many records failed authentication") when cipher.failures >= dtlsForgeryLimit
+			return used
+		}
+
+		// readUnified reads a DTLS 1.3 DTLSCiphertext: it finds the epoch
+		// from its low bits, unmasks and rebuilds the sequence number
+		// (RFC 9147 §4.2.2-4.2.3), authenticates, and checks it against the
+		// replay window only after (§4.5.1). Returns the bytes it took, 0
+		// when the rest of the datagram is unusable. Fails when the cipher
+		// that hides record numbers refuses.
+		internal def readUnified(datagram byte[], at int) !int {
+			let c = new Cursor(datagram)
+			c.pos = at
+			let flags = try c.u8()
+			let cid byte[] = []
+			if (flags & 0x10) != 0 {
+				return 0 when ownCIDSize() == 0 || c.remaining() < ownCIDSize()
+				cid = try c.bytes(ownCIDSize())
+			}
+			let seqSize = ((flags & 0x08) != 0) ?? (2, 1)
+			return 0 when c.remaining() < seqSize
+			let seqAt = c.pos - at
+			c.pos += seqSize
+			let length = c.remaining()
+			if (flags & 0x04) != 0 {
+				return 0 when c.remaining() < 2
+				length = try c.u16()
+			}
+			return 0 when c.remaining() < length
+			// The header as received: its sequence number is unmasked in
+			// place, the datagram being read once.
+			let header = datagram[at:c.pos]
+			let body = try c.bytes(length)
+			let used = c.pos - at
+			return used when length < 16 || length > maxCiphertext
+			return used when (flags & 0x10) == 0 && ownCIDSize() > 0
+			return used when (flags & 0x10) != 0 && !ownsConnectionID(cid)
+			let index = unifiedEpoch(flags & 0x03)
+			if index < 0 {
+				holdRecord(datagram[at:at + used])
+				return used
+			}
+			let cipher = readCiphers[index]
+			let mask = try cipher.mask(body)
+			let low = int(header[seqAt] ^ mask[0])
+			header[seqAt] = byte(low)
+			if seqSize == 2 {
+				let second = int(header[seqAt + 1] ^ mask[1])
+				header[seqAt + 1] = byte(second)
+				low = low << 8 | second
+			}
+			let seq = expand(cipher.window.highest + 1, low, seqSize * 8)
+			let inner = cipher.openUnified(seq, header, body)
+			return try forged(cipher, used) when inner is none
+			return used when cipher.window.seen(seq)
+			let end = inner.len()
+			for end > 0 && inner[end - 1] == 0 {
+				end--
+			}
+			return used when end == 0 || end - 1 > maxPlaintext
+			cipher.window.mark(seq)
+			noteNewest(cipher.epoch, seq)
+			try dispatch(int(inner[end - 1]), cipher.epoch, seq, inner[0:end - 1])
+			return used
+		}
+
+		// unifiedEpoch is the index of the read cipher whose epoch ends in
+		// the two bits: the newest such keyed epoch (RFC 9147 §4.2.2), -1
+		// when none is keyed yet.
+		internal def unifiedEpoch(bits int) int {
+			let found = -1
+			for let i = 0; i < readCiphers.len(); i++ {
+				let cipher = readCiphers[i]
+				continue when cipher.epoch < 2 || (cipher.epoch & 0x03) != bits
+				found = i when found < 0 || cipher.epoch > readCiphers[found].epoch
+			}
+			return found
+		}
+
+		// noteNewest remembers the newest record authenticated, and marks
+		// the datagram as having advanced past every one before.
+		internal def noteNewest(epoch int, seq int) {
+			if epoch > newestEpoch || (epoch == newestEpoch && seq > newestSeq) {
+				newestEpoch = epoch
+				newestSeq = seq
+				advanced = true
+			}
+		}
+
+		// ownsConnectionID reports whether a connection ID is one this side
+		// issued.
+		internal def ownsConnectionID(cid byte[]) bool {
+			for let (_, own) in ownConnectionIDs {
+				return true when own.equals(cid)
+			}
+			return false
+		}
+
+		// holdRecord keeps a record of an epoch not keyed yet, up to a
+		// bound, while the handshake may still key it.
+		internal def holdRecord(record byte[]) {
+			return when handshakeDone || held.len() >= dtlsHeldRecords
+			held.push(record.clone())
+		}
+
+		// replayHeld processes the held records again after an epoch got its
+		// keys; those still without keys are held again.
+		internal def replayHeld() {
+			let pending = held
+			held = []
+			for let (_, record) in pending {
+				process(record) onerror (err error) {
+					failure = err when failure is none
+					recover none
+				}
+			}
+		}
+
+		// dispatch handles one record: an authenticated one, or one in the
+		// clear (epoch 0), which counts only for what the peer may still
+		// send in the clear.
+		internal def dispatch(contentType int, epoch int, seq int, payload byte[]) !none {
+			switch {
+				case contentType == recordHandshake:
+					try readFragments(payload, epoch, seq)
+				case contentType == recordChangeCipherSpec:
+					// DTLS 1.3 has none (RFC 9147 §5).
+					return none when version == 13 || epoch != 0
+					return none unless payload.len() == 1 && payload[0] == 1
+					ccsArrived = true
+				case contentType == recordAlert:
+					return none unless payload.len() == 2
+					// An alert in the clear counts until the peer's first
+					// protected record authenticated: from then on its alerts
+					// are protected too.
+					return none when epoch == 0 && (handshakeDone || newestEpoch >= 1)
+					alerts.push(payload)
+				case contentType == recordApplicationData:
+					let minimum = version == 13 ?? (3, 1)
+					return none when epoch < minimum || closed
+					appData.push(payload)
+				case contentType == recordACK:
+					try readAck(payload, epoch) when version == 13
+			}
+			return none
+		}
+
+		// readFragments takes the handshake fragments of one record:
+		// fragments of the next messages are reassembled, repeats of
+		// messages already taken make this side repeat its own flight, and
+		// under DTLS 1.3 the record is noted for acknowledgment. A message
+		// not seen yet is taken only under an epoch the peer may send it
+		// under now, and a fragment under a newer epoch replaces what came
+		// for the same message under an older one.
+		internal def readFragments(payload byte[], epoch int, seq int) !none {
+			let c = new Cursor(payload)
+			let buffered = false
+			let repeated = false
+			for c.remaining() >= dtlsHandshakeHeaderSize {
+				let kind = try c.u8()
+				let length = try c.u24()
+				let messageSeq = try c.u16()
+				let offset = try c.u24()
+				let fragmentLength = try c.u24()
+				break when c.remaining() < fragmentLength
+				let fragment = try c.bytes(fragmentLength)
+				continue when offset + fragmentLength > length || length > dtlsMaxMessage
+				if messageSeq < nextReceiveSeq {
+					// A DTLS 1.2 peer that renegotiates restarts message_seq
+					// at 0 under the protected epoch: its request is handed
+					// up whole, to be declined.
+					if handshakeDone && version == 12 && epoch >= 1 && (kind := handshakeClientHello || handshakeHelloRequest) && offset == 0 && fragmentLength == length {
+						ready.push(u8(kind) + u24(length) + fragment.clone())
+						readyEpochs.push(epoch)
+						continue
+					}
+					// A repeat of the flight this side answered: its answer was
+					// lost. Parts of the flight still arriving are no reason.
+					repeated = true when messageSeq < answeredBelow
+					buffered = true
+					continue
+				}
+				continue when messageSeq >= nextReceiveSeq + dtlsMessagesAhead || epoch < newMessageEpoch()
+				let found = assembling.get(messageSeq)
+				continue when !(found is none) && found.epoch > epoch
+				let message ReassembledMessage
+				if found is none || found.epoch < epoch {
+					message = new ReassembledMessage(kind, length, epoch)
+					assembling[messageSeq] = message
+				} else {
+					message = found
+				}
+				continue unless message.kind == kind && message.length == length
+				let inOrder = messageSeq == nextReceiveSeq && offset <= message.contiguous()
+				try message.add(offset, fragment)
+				buffered = true
+				ackNow = true unless inOrder
+			}
+			if version == 13 && buffered && epoch >= 2 {
+				if ackRestart && !repeated {
+					ackRestart = false
+					toAck = []
+				}
+				toAck.push(RecordNumber{epoch: epoch, seq: seq})
+				if handshakeDone {
+					ackNow = true
+				} else if ackDueAt == 0 {
+					ackDueAt = int(time.monoNs()) + int(timeout) / 4
+				}
+			}
+			deliverReady()
+			if repeated {
+				try answerRepeat()
+			}
+			return none
+		}
+
+		// deliverReady moves the messages complete in order to the ready
+		// queue, in TLS framing. The first one of the peer's next flight
+		// acknowledges this side's last flight (RFC 6347 §4.2.4).
+		internal def deliverReady() {
+			for {
+				let message = assembling.get(nextReceiveSeq)
+				break when message is none
+				break unless message.complete()
+				assembling.delete(nextReceiveSeq)
+				let tlsForm = u8(message.kind) + u24(message.length) + message.data
+				ready.push(tlsForm)
+				readyEpochs.push(message.epoch)
+				framed.push(FramedMessage{message: tlsForm, seq: nextReceiveSeq}) unless handshakeDone || version == 13
+				nextReceiveSeq++
+				peerSpoke = true
+				acknowledgeFlight()
+			}
+		}
+
+		// acknowledgeFlight ends the timer of this side's handshake flight
+		// once the peer answered it, and sets the timer from the round trip
+		// when the flight needed no retransmission (RFC 9147 §5.8.2).
+		internal def acknowledgeFlight() {
+			let current = flight
+			return when current is none || current.done || !current.sent || current.needsAck || current.final
+			current.done = true
+			current.dueAt = 0
+			forgetFragments(current)
+			if current.retransmits == 0 {
+				let rtt = int(time.monoNs()) - current.sentAt
+				let next = duration(rtt + rtt / 2)
+				next = dtlsMinTimeout when next < dtlsMinTimeout
+				next = initialTimeout when next > initialTimeout
+				timeout = next
+			}
+		}
+
+		// forgetFragments drops what is kept about the records of a flight
+		// the peer holds.
+		internal def forgetFragments(f Flight) {
+			for let (_, key) in sentFragments.keys() {
+				let fragment = sentFragments.get(key)
+				sentFragments.delete(key) when !(fragment is none) && f.messages.includes(fragment.message)
+			}
+		}
+
+		// answerRepeat answers a peer that repeated messages this side
+		// already took: its flight or part of it went missing, so this
+		// side repeats its own last flight, or under DTLS 1.3 its ACK once
+		// the handshake is done (RFC 9147 §5.8.1). One datagram causes at
+		// most one repeat.
+		internal def answerRepeat() !none {
+			return none when repeatsAnswered == datagramsSeen
+			repeatsAnswered = datagramsSeen
+			let current = flight
+			if version == 13 && handshakeDone {
+				ackNow = true
+				return none
+			}
+			return none when current is none || !current.sent
+			return none when current.needsAck && current.acknowledged()
+			return try transmit(current, false)
+		}
+
+		// readAck takes a DTLS 1.3 ACK that came under `epoch`: every record
+		// it names of that epoch or an older one counts as held by the peer
+		// (an ACK is never older than what it acknowledges, RFC 9147 §7); a
+		// flight fully held stops its timer, one partly held sends what is
+		// missing now (§7.2).
+		internal def readAck(payload byte[], epoch int) !none {
+			return none when payload.len() < 2
+			let c = new Cursor(payload)
+			let length = try c.u16()
+			return none when length != c.remaining() || length % 16 != 0
+			let any = false
+			for !c.done() {
+				let recordEpoch = try c.u64()
+				let recordSeq = try c.u64()
+				continue when recordEpoch > epoch || recordSeq >> 48 != 0
+				let key = recordKey(recordEpoch, recordSeq)
+				let fragment = sentFragments.get(key)
+				continue when fragment is none
+				fragment.message.ack(fragment.start, fragment.end)
+				sentFragments.delete(key)
+				any = true
+			}
+			return none unless any
+			let current = flight
+			if !(current is none) {
+				try settle(current)
+			}
+			for let (_, post) in posted {
+				try settle(post) unless post.done
+			}
+			return none
+		}
+
+		// settle ends a flight the peer holds whole, or sends what it
+		// misses. Fails as the transport does.
+		internal def settle(f Flight) !none {
+			return none when !f.sent || f.done
+			if f.acknowledged() {
+				f.done = true
+				f.dueAt = 0
+				forgetFragments(f)
+				try keyUpdateAcknowledged() when f.keyUpdate
+				return none
+			}
+			let partly = false
+			for let (_, m) in f.messages {
+				partly = true when m.touched()
+			}
+			try transmit(f, false) when partly
+			return none
+		}
+
+		// peerCID is the connection ID records to the peer carry: the one it
+		// asked for once agreed, none otherwise.
+		internal def peerCID() byte[] {
+			let agreed = params
+			return [] when agreed is none || !agreed.connectionIDAgreed
+			return agreed.peerConnectionID
+		}
+
+		// ownCIDSize is the length of the connection IDs records to this
+		// side carry, 0 when none was agreed (RFC 9146 §3).
+		internal def ownCIDSize() int {
+			let agreed = params
+			return 0 when agreed is none || !agreed.connectionIDAgreed
+			return agreed.ownConnectionID.len()
+		}
+
+		// ---- DTLS 1.3 key updates ----
+
+		// sendKeyUpdate sends a KeyUpdate and keeps the next write secret
+		// until the peer acknowledges it; this side sends under the current
+		// keys until then. Fails as the transport does.
+		def sendKeyUpdate(message byte[], nextSecret byte[]) !none {
+			try queueKeyUpdate(message, nextSecret)
+			return try drain()
+		}
+
+		// queueKeyUpdate is `sendKeyUpdate` without the sending.
+		atomic def queueKeyUpdate(message byte[], nextSecret byte[]) !none {
+			pendingWriteSecret = nextSecret
+			try queueRecord(recordHandshake, message, false)
+			let post = posted[posted.len() - 1]
+			post.keyUpdate = true
+			return try queueFlights()
+		}
+
+		// keyUpdating reports whether a KeyUpdate waits for its ACK.
+		atomic def keyUpdating() bool {
+			return pendingWriteSecret.len() > 0
+		}
+
+		// updateReadKeys moves incoming records to the next epoch, under the
+		// secret a KeyUpdate of the peer's leads to. Fails when the keys
+		// cannot be derived.
+		atomic def updateReadKeys(suite CipherSuite, hash Hash, secret byte[]) !none {
+			return try installSecret(readEpoch + 1, false, suite, hash, secret)
+		}
+
+		// ---- Connection IDs and the end ----
+
+		// usePeerConnectionID makes records to the peer carry another
+		// connection ID of its own.
+		atomic def usePeerConnectionID(id byte[]) {
+			let agreed = params
+			agreed.peerConnectionID = id unless agreed is none
+		}
+
+		// keepSpareID keeps a connection ID of the peer's for later, up to
+		// `limit` of them.
+		atomic def keepSpareID(id byte[], limit int) {
+			spareIDs.push(id) when spareIDs.len() < limit
+		}
+
+		// useSpareID moves records to the peer to its next spare connection
+		// ID; false when there is none.
+		atomic def useSpareID() bool {
+			return false when spareIDs.len() == 0
+			usePeerConnectionID(spareIDs.shift())
+			return true
+		}
+
+		// acceptConnectionID takes records carrying another connection ID
+		// this side issued.
+		atomic def acceptConnectionID(id byte[]) {
+			ownConnectionIDs.push(id)
+		}
+
+		// shut ends the layer: nothing is received any more.
+		atomic def shut() {
+			closed = true
+		}
+
+		internal def keyUpdateAcknowledged() !none {
+			let secret = pendingWriteSecret
+			return none when secret.len() == 0
+			pendingWriteSecret = []
+			return try installSecret(writeEpoch + 1, true, suite, hash, secret)
+		}
+	}
+
+	// connectionIDData is what a DTLS 1.2 record with a connection ID
+	// authenticates beside its content (RFC 9146 §5): the header as sent
+	// (`wire` its version, `number` its epoch and sequence number), the
+	// connection ID with its length, and the length of the inner plaintext.
+	internal def connectionIDData(wire byte[], number byte[], cid byte[], innerLength int) byte[] {
+		return byte[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] + u8(recordTLS12CID) + u8(cid.len()) + u8(recordTLS12CID) + wire + number + cid + u16(innerLength)
+	}
+
+	// recordKey is a record number as one integer: the epoch above the 48
+	// bits of the sequence number.
+	internal def recordKey(epoch int, seq int) int {
+		return epoch << 48 | seq
+	}
+
+	// retransmitLimit is the datagram size a flight goes out in: the MTU,
+	// then after two unanswered retransmissions the minimum IPv4 datagram,
+	// and after four two thirds of that, so the fragments land in other
+	// datagrams than the ones that went missing (RFC 6347 §4.1.1.1,
+	// RFC 9147 §4.4).
+	internal def retransmitLimit(mtu int, retransmits int) int {
+		return mtu when retransmits < 2
+		let safe = mtu.min(dtlsSafeDatagram)
+		return safe when retransmits < 4
+		return (safe * 2 / 3).max(200)
+	}
+
+	// cipherIndex is the index of the cipher of an epoch, -1 for none.
+	internal def cipherIndex(ciphers DatagramCipher[], epoch int) int {
+		for let i = ciphers.len() - 1; i >= 0; i-- {
+			return i when ciphers[i].epoch == epoch
+		}
+		return -1
+	}
+}

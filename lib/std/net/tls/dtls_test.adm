@@ -1,0 +1,764 @@
+partial module std.net.tls {
+	use (
+		std.bytes::(Endian)
+		std.testing
+		std.crypto.hash::(Hash)
+		std.net
+		std.net.sequence::(Ranges, expand)
+		std.net.linktest::(LinkEnd, linkPair)
+		std.net.udp
+		std.time
+	)
+
+	// DatagramReport is what a served DTLS connection saw.
+	type DatagramReport {
+		state    ConnectionState
+		failure  string          = ""
+		echoed   string          = ""
+		exported string          = ""
+		srtp     ?SRTPKeys       = none
+
+		def new() {}
+	}
+
+	// serveDatagram runs the server side: handshake, one message answered
+	// in upper case, then a wait for the client's close.
+	internal async def serveDatagram(conn DTLSConn, report DatagramReport) none {
+		runDatagramServer(conn, report) onerror (err error) {
+			report.failure = err.message
+			recover none
+		}
+		return none
+	}
+
+	internal def runDatagramServer(conn DTLSConn, report DatagramReport) !none {
+		try conn.handshake()
+		report.state = conn.connectionState()
+		report.exported = (try conn.exportKeyingMaterial("EXPORTER-adm-test", "ctx".bytes(), 40)).hex()
+		report.srtp = try conn.srtpKeys() unless (conn.srtpProfile() is none)
+		let message = try conn.receive(5s)
+		report.echoed = string(message)
+		try conn.send(string(message).upper().bytes(), 5s)
+		// Answers retransmissions and acknowledgments until the client
+		// closes.
+		conn.receive(5s) onerror recover []
+		return none
+	}
+
+	// echoDatagram connects a client to a server over the link, sends
+	// "ping", expects "PING", closes, and returns the client.
+	internal def echoDatagram(clientEnd LinkEnd, serverEnd LinkEnd, clientConfig DTLSConfig, serverConfig DTLSConfig, report DatagramReport) !DTLSConn {
+		let server = dtlsServer(serverEnd, serverConfig)
+		let task = async serveDatagram(server, report)
+		let conn = dtlsClient(clientEnd, clientConfig)
+		try conn.handshake()
+		try conn.send("ping".bytes(), 5s)
+		let answer = try conn.receive(5s)
+		assert string(answer) == "PING"
+		try conn.close()
+		await task
+		return conn
+	}
+
+	internal def datagramServerConfig() !DTLSConfig {
+		let pair = try parseKeyPair(testECCertPEM, testECKeyPEM)
+		return DTLSConfig{tls: Config{certificates: [pair], alpn: ["webrtc"]}, retransmitTimeout: 100ms, handshakeTimeout: 10s}
+	}
+
+	internal def datagramClientConfig() !DTLSConfig {
+		return DTLSConfig{tls: Config{serverName: "localhost", rootCAs: try poolOf(testECCertPEM), alpn: ["webrtc"]}, retransmitTimeout: 100ms, handshakeTimeout: 10s}
+	}
+
+	check "DTLS" {
+		// Record numbers: the replay window, reconstruction from the low
+		// bits, and ACK ordering.
+		@test()
+		def TestRecordNumbers() !none {
+			let cipher = new DatagramCipher(2, none)
+			assert !cipher.window.seen(0)
+			cipher.window.mark(0)
+			cipher.window.mark(5)
+			assert cipher.window.seen(0) && cipher.window.seen(5) && !cipher.window.seen(3) && !cipher.window.seen(6)
+			cipher.window.mark(100)
+			assert cipher.window.seen(5) && cipher.window.seen(100) && !cipher.window.seen(99)
+			assert expand(0, 5, 8) == 5
+			assert expand(250, 3, 8) == 259
+			assert expand(260, 250, 8) == 250
+			assert expand(70000, 4464, 16) == 70000
+			// A traffic key protects under additional data of the caller's,
+			// from the sequence number it is set to.
+			let aead = try suiteAEAD(CipherSuite.AES128GCMSHA256, "k".repeat(16).bytes())
+			let sealing = new TrafficKey(aead, "salt".bytes())
+			let opening = new TrafficKey(aead, "salt".bytes())
+			assert sealing.explicitNonce() == 8
+			sealing.sequence = uint64(7)
+			let body = sealing.sealWith("header".bytes(), "data".bytes())
+			assert body[0:8].equals(uint64(7).bytes(Endian.Big)) && string(try opening.openWith("header".bytes(), body)) == "data"
+			let authentic = true
+			opening.openWith("another".bytes(), body) onerror (err error) {
+				authentic = !(err is TLSError)
+				recover []
+			}
+			assert !authentic
+			let c = new Cursor(byte[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0, 0, 0, 1, 0, 0, 0, 2])
+			assert (try c.u48()) == 0x123456789ABC && (try c.u64()) == 0x100000002
+			return none
+		}
+
+		// Byte ranges merge and report their gaps; a message reassembles
+		// from fragments in any order, repeated or overlapping, and refuses
+		// a fragment that changes bytes it has.
+		@test()
+		def TestReassembly() !none {
+			let ranges = new Ranges()
+			assert ranges.isEmpty() && ranges.reach() == 0 && ranges.gaps(10).equals([0, 10])
+			ranges.add(4, 6)
+			ranges.add(0, 2)
+			assert ranges.bounds.equals([0, 2, 4, 6]) && ranges.reach() == 2 && ranges.gaps(10).equals([2, 4, 6, 10])
+			ranges.add(2, 4)
+			ranges.add(1, 5)
+			assert ranges.bounds.equals([0, 6]) && ranges.gaps(6).len() == 0
+			ranges.add(8, 9)
+			ranges.add(5, 20)
+			assert ranges.bounds.equals([0, 20])
+
+			let message = new ReassembledMessage(handshakeCertificate, 10, 0)
+			try message.add(6, "6789".bytes())
+			assert !message.complete() && message.contiguous() == 0
+			try message.add(0, "0123".bytes())
+			try message.add(2, "2345".bytes())
+			try message.add(2, "2345".bytes())
+			assert message.complete() && string(message.data) == "0123456789" && message.have.bounds.equals([0, 10])
+			let changed = false
+			message.add(3, "3x".bytes()) onerror (err error) {
+				changed = err is TLSError
+				recover none
+			}
+			assert changed
+			let bodiless = new ReassembledMessage(handshakeServerHelloDone, 0, 0)
+			assert !bodiless.complete()
+			try bodiless.add(0, [])
+			assert bodiless.complete()
+
+			let out = new OutMessage(recordHandshake, 2, handshakeFinished, 3, "0123456789".bytes())
+			assert out.pending().equals([0, 10]) && !out.touched()
+			out.ack(2, 5)
+			assert out.pending().equals([0, 2, 5, 10]) && out.touched()
+			out.ack(0, 2)
+			out.ack(5, 10)
+			assert out.pending().len() == 0
+			let spec = new OutMessage(recordChangeCipherSpec, 0, 0, -1, [])
+			assert spec.pending().equals([0, 0])
+			spec.ack(0, 0)
+			assert spec.pending().len() == 0
+			return none
+		}
+
+		// The DTLS pieces of the codec: SRTP profiles, HelloVerifyRequest,
+		// the cookies a server issues, the stateless answer to a
+		// ClientHello per version, and the two transcript forms.
+		@test()
+		def TestDatagramCodec() !none {
+			let profile = srtpProfileOf(7)
+			fail "profile 7 unknown" when profile is none
+			assert profile == SRTPProfile.AEADAES128GCM
+			assert srtpProfileOf(3) is none
+			assert srtpKeyLength(SRTPProfile.AEADAES256GCM) == 32 && srtpSaltLength(SRTPProfile.AEADAES256GCM) == 12
+			assert srtpKeyLength(SRTPProfile.AES128CMHMACSHA1Tag32) == 16 && srtpSaltLength(SRTPProfile.AES128CMHMACSHA1Tag32) == 14
+			assert srtpKeyLength(SRTPProfile.NullHMACSHA1Tag80) == 0 && srtpSaltLength(SRTPProfile.NullHMACSHA1Tag80) == 0
+
+			let verify = marshalHelloVerifyRequest("cookie".bytes())
+			assert int(verify[0]) == handshakeHelloVerifyRequest
+			assert string(try parseHelloVerifyRequest(verify[4:])) == "cookie"
+			let refused = parseHelloVerifyRequest(byte[0x03, 0x03, 1, 7]) onerror recover []
+			assert refused.len() == 0
+
+			let secret = "secret key of the server, 32 by".bytes()
+			let hello = ClientHello{random: "r".repeat(32).bytes(), sessionID: [], cipherSuites: [0x1301], datagram: true}
+			hello.dtlsCookie = cookie12(secret, "1.2.3.4:5".bytes(), hello, 1000)
+			assert verifyCookie12(secret, "1.2.3.4:5".bytes(), hello, 1030)
+			assert !verifyCookie12(secret, "1.2.3.4:6".bytes(), hello, 1030)
+			assert !verifyCookie12(secret, "1.2.3.4:5".bytes(), hello, 1000 + dtlsCookieLife + 1)
+			let sealed = sealCookie13(secret, "ctx".bytes(), CipherSuite.AES128GCMSHA256, groupSecp256r1, "h".repeat(32).bytes(), 1000)
+			let opened = openCookie13(secret, "ctx".bytes(), sealed, 1010)
+			fail "cookie does not open" when opened is none
+			let (suite, group, helloHash) = opened
+			assert suite == CipherSuite.AES128GCMSHA256 && group == groupSecp256r1 && helloHash.len() == 32
+			assert openCookie13(secret, "other".bytes(), sealed, 1010) is none
+
+			// A stateless server answers a DTLS 1.2 ClientHello with a
+			// HelloVerifyRequest and a DTLS 1.3 one with a HelloRetryRequest.
+			for let (_, version) in [Version.TLS12, Version.TLS13] {
+				let records = new RecordLayer(new DatagramLayer(new LinkEnd(), true))
+				let client = new ClientHandshake(Config{serverName: "localhost", maxVersion: version}, records)
+				client.dtls = DTLSParameters{}
+				try client.buildHello()
+				let serverConfig = try datagramServerConfig()
+				let server = new ServerHandshake(serverConfig.tls, new RecordLayer(new DatagramLayer(new LinkEnd(), false)))
+				server.dtls = DTLSParameters{cookieSecret: secret, peerContext: "ctx".bytes()}
+				server.hello = try parseClientHello(client.helloBytes[4:], true)
+				server.helloBytes = client.helloBytes
+				let reply = try server.cookieReply()
+				let kind = int(reply[0])
+				assert kind == (version == Version.TLS12 ?? (handshakeHelloVerifyRequest, handshakeServerHello))
+				if version == Version.TLS13 {
+					let retry = try parseServerHello(reply[4:], true)
+					assert retry.isHelloRetryRequest && retry.cookie.len() > 0 && retry.sessionID.len() == 0
+				}
+			}
+
+			// A DTLS 1.2 transcript holds each message with the message_seq
+			// it went with; a DTLS 1.3 one holds the TLS framing.
+			let layer = new DatagramLayer(new LinkEnd(), true)
+			let schedule = new KeySchedule(Hash.SHA256)
+			schedule.framer = layer
+			let message = handshakeMessage(handshakeClientHello, "body".bytes())
+			try layer.writeRecord(recordHandshake, message, false)
+			schedule.update(message)
+			assert schedule.transcript.hex() == message.hex()
+			schedule.useDatagramTranscript()
+			assert schedule.transcript.hex() == (u8(1) + u24(4) + u16(0) + u24(0) + u24(4) + "body".bytes()).hex()
+			let tlsForm = new KeySchedule(Hash.SHA256)
+			tlsForm.framer = layer
+			tlsForm.useTLSTranscript()
+			tlsForm.update(message)
+			assert tlsForm.transcript.hex() == message.hex()
+			return none
+		}
+
+		// maxPayload leaves room for the record's header and tag in the MTU.
+		@test()
+		def TestMaxPayload() !none {
+			let (a, b) = linkPair()
+			let report = new DatagramReport()
+			let conn = try echoDatagram(a, b, try datagramClientConfig(), try datagramServerConfig(), report)
+			assert conn.maxPayload() == 1200 - (1 + 2 + 2 + 1 + 16)
+			return none
+		}
+
+		// DTLS 1.2 over a lossless link: the HelloVerifyRequest round,
+		// ECDHE-ECDSA with AES-GCM, DTLS-SRTP keys that mirror each other,
+		// and exporters both ends agree on.
+		@test()
+		def TestDTLS12Loopback() !none {
+			let (a, b) = linkPair()
+			let serverConfig = try datagramServerConfig()
+			serverConfig.srtpProfiles = [SRTPProfile.AEADAES128GCM, SRTPProfile.AES128CMHMACSHA1Tag80]
+			let clientConfig = try datagramClientConfig()
+			clientConfig.tls.maxVersion = Version.TLS12
+			clientConfig.srtpProfiles = [SRTPProfile.AES128CMHMACSHA1Tag80, SRTPProfile.AEADAES128GCM]
+			let report = new DatagramReport()
+			let conn = try echoDatagram(a, b, clientConfig, serverConfig, report)
+			assert report.failure == "" && report.echoed == "ping"
+			let state = conn.connectionState()
+			assert state.version == Version.DTLS12 && report.state.version == Version.DTLS12
+			assert state.cipherSuite == CipherSuite.ECDHEECDSAWithAES128GCMSHA256
+			assert state.alpn == "webrtc" && state.verifiedChains.len() == 1
+			let profile = conn.srtpProfile()
+			fail "no SRTP profile agreed" when profile is none
+			assert profile == SRTPProfile.AEADAES128GCM
+			let keys = try conn.srtpKeys()
+			let served = report.srtp
+			fail "server exported no SRTP keys" when served is none
+			assert keys.localKey.hex() == served.remoteKey.hex() && keys.remoteSalt.hex() == served.localSalt.hex()
+			assert keys.localKey.len() == 16 && keys.localSalt.len() == 12
+			assert (try conn.exportKeyingMaterial("EXPORTER-adm-test", "ctx".bytes(), 40)).hex() == report.exported
+			return none
+		}
+
+		// DTLS 1.3 over a lossless link: the HelloRetryRequest with a
+		// cookie, SRTP in EncryptedExtensions, connection IDs both ways, and
+		// the final flight acknowledged.
+		@test()
+		def TestDTLS13Loopback() !none {
+			let (a, b) = linkPair()
+			let serverConfig = try datagramServerConfig()
+			serverConfig.srtpProfiles = [SRTPProfile.AES128CMHMACSHA1Tag80]
+			serverConfig.connectionIDLength = 6
+			let clientConfig = try datagramClientConfig()
+			clientConfig.srtpProfiles = [SRTPProfile.AES128CMHMACSHA1Tag80]
+			clientConfig.connectionIDLength = 4
+			let report = new DatagramReport()
+			let conn = try echoDatagram(a, b, clientConfig, serverConfig, report)
+			assert report.failure == "" && report.echoed == "ping"
+			let state = conn.connectionState()
+			assert state.version == Version.DTLS13 && report.state.version == Version.DTLS13
+			assert state.cipherSuite == CipherSuite.AES128GCMSHA256
+			assert conn.params.connectionIDAgreed && conn.params.peerConnectionID.len() == 6
+			let keys = try conn.srtpKeys()
+			let served = report.srtp
+			fail "server exported no SRTP keys" when served is none
+			assert keys.localKey.hex() == served.remoteKey.hex() && keys.localSalt.len() == 14
+			assert (try conn.exportKeyingMaterial("EXPORTER-adm-test", "ctx".bytes(), 40)).hex() == report.exported
+			return none
+		}
+
+		// Both handshakes complete over a link that drops every third
+		// datagram one way and every fourth the other, and holds back every
+		// fifth, with handshake messages fragmented by a small MTU.
+		@test()
+		def TestLossAndFragments() !none {
+			for let (_, version) in [Version.TLS12, Version.TLS13] {
+				let (a, b) = linkPair()
+				a.dropEvery = 3
+				b.dropEvery = 4
+				b.swapEvery = 5
+				let serverConfig = try datagramServerConfig()
+				serverConfig.mtu = 300
+				serverConfig.retransmitTimeout = 10ms
+				let clientConfig = try datagramClientConfig()
+				clientConfig.mtu = 300
+				clientConfig.retransmitTimeout = 10ms
+				clientConfig.tls.maxVersion = version
+				let report = new DatagramReport()
+				let server = dtlsServer(b, serverConfig)
+				let task = async serveDatagram(server, report)
+				let conn = dtlsClient(a, clientConfig)
+				try conn.handshake()
+				// Application data has no retransmission: the echo runs
+				// over a link that loses nothing.
+				a.dropEvery = 0
+				b.dropEvery = 0
+				b.swapEvery = 0
+				try conn.send("ping".bytes(), 5s)
+				assert string(try conn.receive(5s)) == "PING"
+				try conn.close()
+				await task
+				assert report.failure == ""
+				assert conn.connectionState().version == (version == Version.TLS12 ?? (Version.DTLS12, Version.DTLS13))
+			}
+			return none
+		}
+
+		// A DTLS 1.3 key update in each direction, the second asked for by
+		// the first, keeps data flowing.
+		@test()
+		def TestKeyUpdate() !none {
+			let (a, b) = linkPair()
+			let server = dtlsServer(b, try datagramServerConfig())
+			let report = new DatagramReport()
+			let task = async keyUpdateServer(server, report)
+			let conn = dtlsClient(a, try datagramClientConfig())
+			try conn.handshake()
+			try conn.updateKeys(true)
+			try conn.send("one".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "ONE"
+			try conn.send("two".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "TWO"
+			assert conn.layer.writeEpoch == 4 && conn.layer.readEpoch == 4
+			try conn.close()
+			await task
+			assert report.failure == ""
+			return none
+		}
+
+		// DTLS 1.3 connection ID updates: the client asks for spare IDs,
+		// the server issues them, the client moves its records to one, and
+		// data keeps flowing (RFC 9147 §9).
+		@test()
+		def TestConnectionIDUpdates() !none {
+			let (a, b) = linkPair()
+			let serverConfig = try datagramServerConfig()
+			serverConfig.connectionIDLength = 5
+			let server = dtlsServer(b, serverConfig)
+			let report = new DatagramReport()
+			let task = async keyUpdateServer(server, report)
+			let conn = dtlsClient(a, try datagramClientConfig())
+			try conn.handshake()
+			let first = conn.params.peerConnectionID.hex()
+			assert first.len() == 10
+			try conn.requestConnectionIDs(2)
+			try conn.send("one".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "ONE"
+			assert conn.layer.spareIDs.len() == 2
+			assert conn.switchConnectionID()
+			assert conn.params.peerConnectionID.hex() != first
+			try conn.send("two".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "TWO"
+			try conn.close()
+			await task
+			assert report.failure == ""
+			return none
+		}
+
+		// A DTLS 1.3 client against a DTLS 1.2 server agrees on 1.2; a
+		// DTLS 1.2 client against a DTLS 1.3 server fails.
+		@test()
+		def TestVersions() !none {
+			let (a, b) = linkPair()
+			let serverConfig = try datagramServerConfig()
+			serverConfig.tls.maxVersion = Version.TLS12
+			let report = new DatagramReport()
+			let conn = try echoDatagram(a, b, try datagramClientConfig(), serverConfig, report)
+			assert conn.connectionState().version == Version.DTLS12
+
+			let (c, d) = linkPair()
+			let modern = try datagramServerConfig()
+			modern.tls.minVersion = Version.TLS13
+			let old = try datagramClientConfig()
+			old.tls.maxVersion = Version.TLS12
+			let refused = new DatagramReport()
+			let server = dtlsServer(d, modern)
+			let task = async serveDatagram(server, refused)
+			let client = dtlsClient(c, old)
+			let reason = ""
+			client.handshake() onerror (err error) {
+				reason = err.message
+				recover none
+			}
+			await task
+			assert reason != ""
+			assert refused.failure.contains("TLS 1.3")
+			return none
+		}
+
+		// A client that offers SRTP profiles fails against a server that
+		// takes none of them.
+		@test()
+		def TestSRTPRefusal() !none {
+			let (a, b) = linkPair()
+			let serverConfig = try datagramServerConfig()
+			serverConfig.srtpProfiles = [SRTPProfile.AEADAES256GCM]
+			let clientConfig = try datagramClientConfig()
+			clientConfig.srtpProfiles = [SRTPProfile.AES128CMHMACSHA1Tag80]
+			let report = new DatagramReport()
+			let server = dtlsServer(b, serverConfig)
+			let task = async serveDatagram(server, report)
+			let client = dtlsClient(a, clientConfig)
+			let reason = ""
+			client.handshake() onerror (err error) {
+				reason = err.message
+				recover none
+			}
+			await task
+			assert reason != "" && report.failure.contains("SRTP")
+			return none
+		}
+
+		// Session tickets resume both versions.
+		@test()
+		def TestResumption() !none {
+			for let (_, version) in [Version.TLS12, Version.TLS13] {
+				let serverConfig = try datagramServerConfig()
+				serverConfig.tls.sessionTicketKey = "0123456789abcdef".bytes()
+				let clientConfig = try datagramClientConfig()
+				clientConfig.tls.sessionCache = new SessionCache()
+				clientConfig.tls.maxVersion = version
+				let (a, b) = linkPair()
+				let first = try echoDatagram(a, b, clientConfig, serverConfig, new DatagramReport())
+				assert !first.connectionState().resumed
+				let (c, d) = linkPair()
+				let report = new DatagramReport()
+				let second = try echoDatagram(c, d, clientConfig, serverConfig, report)
+				assert second.connectionState().resumed && report.state.resumed
+			}
+			return none
+		}
+
+		// A listener on a UDP socket: a stateless cookie round for each
+		// version, then accepted connections that echo.
+		@test()
+		def TestListener() !none {
+			let serverConfig = try datagramServerConfig()
+			let listener = try dtlsListen("127.0.0.1:0", serverConfig)
+			let address = listener.address().str()
+			for let (_, version) in [Version.TLS12, Version.TLS13] {
+				let report = new DatagramReport()
+				let task = async acceptOne(listener, report)
+				let clientConfig = try datagramClientConfig()
+				clientConfig.tls.maxVersion = version
+				let conn = try dtlsDial(address, clientConfig)
+				try conn.send("ping".bytes(), 5s)
+				assert string(try conn.receive(5s)) == "PING"
+				try conn.close()
+				await task
+				assert report.failure == "" && report.echoed == "ping"
+				assert conn.connectionState().version == (version == Version.TLS12 ?? (Version.DTLS12, Version.DTLS13))
+			}
+			try listener.close()
+			return none
+		}
+
+		// Records in the clear after the handshake change nothing: an alert
+		// does not close the connection, a KeyUpdate does not move the read
+		// keys, and an ACK does not settle a KeyUpdate this side sent.
+		@test()
+		def TestRecordsInTheClear() !none {
+			let (a, b) = linkPair()
+			let server = dtlsServer(b, try datagramServerConfig())
+			let report = new DatagramReport()
+			let task = async keyUpdateServer(server, report)
+			let conn = dtlsClient(a, try datagramClientConfig())
+			try conn.handshake()
+			assert conn.connectionState().version == Version.DTLS13
+
+			a.push(clearRecord(recordAlert, 5000, byte[2, int(Alert.HandshakeFailure)]))
+			let update = u8(handshakeKeyUpdate) + u24(1) + u16(conn.layer.nextReceiveSeq) + u24(0) + u24(1) + byte[0]
+			a.push(clearRecord(recordHandshake, 5001, update))
+			let quiet = conn.receive(300ms) onerror recover []
+			assert quiet.len() == 0 && conn.isOpen() && conn.layer.readEpoch == 3
+			try conn.send("still".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "STILL"
+
+			// The server's answers are lost from here on, so only the forged
+			// ACK could settle the KeyUpdate.
+			b.dropEvery = 1
+			try conn.updateKeys()
+			let numbers byte[]
+			for let seq = 0; seq < 16; seq++ {
+				numbers = numbers + uint64(3).bytes(Endian.Big) + uint64(seq).bytes(Endian.Big)
+			}
+			a.push(clearRecord(recordACK, 5002, vec16(numbers)))
+			conn.receive(300ms) onerror recover []
+			assert conn.layer.keyUpdating() && conn.layer.writeEpoch == 3
+			b.dropEvery = 0
+			try conn.send("after".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "AFTER"
+			for let i = 0; i < 20 && conn.layer.keyUpdating(); i++ {
+				conn.receive(200ms) onerror recover []
+			}
+			assert conn.layer.writeEpoch == 4
+			try conn.close()
+			await task
+			assert report.failure == ""
+			return none
+		}
+
+		// A record in the clear with a far sequence number does not make the
+		// client drop the server's flight, and a handshake message in the
+		// clear where a protected one belongs fails the handshake.
+		@test()
+		def TestHandshakeRecordsInTheClear() !none {
+			let (a, b) = linkPair()
+			let server = dtlsServer(b, try datagramServerConfig())
+			let report = new DatagramReport()
+			let task = async serveDatagram(server, report)
+			let conn = dtlsClient(a, try datagramClientConfig())
+			let stray = u8(handshakeServerHello) + u24(4) + u16(40) + u24(0) + u24(4) + byte[0, 0, 0, 0]
+			a.push(clearRecord(recordHandshake, 0x7FFFFFFFFFFF, stray))
+			try conn.handshake()
+			try conn.send("ping".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "PING"
+			try conn.close()
+			await task
+			assert report.failure == ""
+
+			let (c, d) = linkPair()
+			let config = try datagramServerConfig()
+			config.handshakeTimeout = 2s
+			let refused = new DatagramReport()
+			let refusing = async serveDatagram(dtlsServer(d, config), refused)
+			let client = dtlsClient(c, try datagramClientConfig())
+			// The server's HelloRetryRequest and ServerHello are messages 0
+			// and 1; its EncryptedExtensions is the one forged here.
+			c.push(clearRecord(recordHandshake, 7, u8(handshakeEncryptedExtensions) + u24(2) + u16(2) + u24(0) + u24(2) + u16(0)))
+			let failure = ""
+			client.handshake() onerror (err error) {
+				failure = err.message
+				recover none
+			}
+			assert failure.contains("epoch 0")
+			await refusing
+			return none
+		}
+
+		// One task receives while two send, the handshake started by
+		// whichever comes first: every message is echoed once.
+		@test()
+		def TestConcurrentSenders() !none {
+			let (a, b) = linkPair()
+			let server = dtlsServer(b, try datagramServerConfig())
+			let report = new DatagramReport()
+			let task = async keyUpdateServer(server, report)
+			let conn = dtlsClient(a, try datagramClientConfig())
+			let first = async sendMany(conn, "a", 60)
+			let second = async sendMany(conn, "b", 60)
+			let fromFirst = 0
+			let fromSecond = 0
+			for let i = 0; i < 120; i++ {
+				let echoed = string(try conn.receive(5s))
+				fromFirst++ when echoed == "A"
+				fromSecond++ when echoed == "B"
+			}
+			let firstFailure = await first
+			let secondFailure = await second
+			assert firstFailure == "" && secondFailure == ""
+			assert fromFirst == 60 && fromSecond == 60
+			try conn.updateKeys(true)
+			try conn.send("c".bytes(), 5s)
+			assert string(try conn.receive(5s)) == "C"
+			try conn.close()
+			await task
+			assert report.failure == ""
+			return none
+		}
+
+		@benchmark()
+		def BenchProtectRecords() {
+			protectRecords() onerror recover none
+		}
+
+		@benchmark()
+		def BenchAEADOnly() {
+			aeadOnly() onerror recover none
+		}
+
+		@test()
+		def TestProtectRecords() !none {
+			return try protectRecords()
+		}
+
+		// A client that starts over from the address of a connection gets
+		// a cookie round, with or without cookies in the config, and then
+		// replaces the connection.
+		@test()
+		def TestListenerRestartedClient() !none {
+			for let (_, cookies) in [true, false] {
+				let serverConfig = try datagramServerConfig()
+				serverConfig.cookieExchange = cookies
+				let listener = try dtlsListen("127.0.0.1:0", serverConfig)
+				let address = listener.address().str()
+				let first = new DatagramReport()
+				let firstTask = async acceptOne(listener, first)
+				let peer = try udp.dial(address)
+				let local = peer.localAddr().str()
+				let conn = dtlsClient(peer, try datagramClientConfig())
+				try conn.send("ping".bytes(), 5s)
+				assert string(try conn.receive(5s)) == "PING"
+				// The client goes away without a close_notify.
+				try peer.close()
+
+				let second = new DatagramReport()
+				let secondTask = async acceptOne(listener, second)
+				let again = dtlsClient(try udp.dial(address, local), try datagramClientConfig())
+				try again.send("ping".bytes(), 5s)
+				assert string(try again.receive(5s)) == "PING"
+				try again.close()
+				await firstTask
+				await secondTask
+				assert second.failure == "" && second.echoed == "ping"
+				try listener.close()
+			}
+			return none
+		}
+	}
+
+	// CaptureLink keeps the last datagram sent on it, for measuring the
+	// record layer without a peer.
+	internal type CaptureLink {
+		last byte[] = []
+
+		def new() {}
+
+		def send(data byte[], timeout duration) !none {
+			last = data
+			return none
+		}
+
+		def receive(buf byte[], timeout duration) !int {
+			fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "nothing arrives on a capture link")
+		}
+
+		def close() !none {
+			return none
+		}
+
+		def isOpen() bool {
+			return true
+		}
+	}
+
+	// protectRecords seals and opens 1000 application records of 1200 bytes
+	// under DTLS 1.3 keys.
+	internal def protectRecords() !none {
+		let link = new CaptureLink()
+		let sender = new DatagramLayer(link, true)
+		let receiver = new DatagramLayer(link, false)
+		let secret = "s".repeat(32).bytes()
+		try sender.installSecret(3, true, CipherSuite.AES128GCMSHA256, Hash.SHA256, secret)
+		try receiver.installSecret(3, false, CipherSuite.AES128GCMSHA256, Hash.SHA256, secret)
+		sender.handshakeDone = true
+		receiver.handshakeDone = true
+		let payload byte[]
+		payload.len(1200)
+		for let i = 0; i < 1000; i++ {
+			try sender.sendApplication(payload, 1s)
+			try receiver.process(link.last)
+			fail "record {i} was not taken" unless receiver.appData.len() == 1
+			receiver.appData.flush()
+		}
+		return none
+	}
+
+	// aeadOnly seals and opens 1000 messages of 1200 bytes with the bare
+	// AEAD, the floor under protectRecords.
+	internal def aeadOnly() !none {
+		let aead = try suiteAEAD(CipherSuite.AES128GCMSHA256, "k".repeat(16).bytes())
+		let nonce = "n".repeat(12).bytes()
+		let header = "hdr12".bytes()
+		let payload byte[]
+		payload.len(1201)
+		for let i = 0; i < 1000; i++ {
+			let sealed = aead.seal(nonce, payload, header)
+			try aead.open(nonce, sealed, header)
+		}
+		return none
+	}
+
+	// sendMany sends a text `count` times and returns the first failure's
+	// message, "" for none.
+	internal async def sendMany(conn DTLSConn, text string, count int) string {
+		let failure = ""
+		for let i = 0; i < count && failure == ""; i++ {
+			conn.send(text.bytes(), 5s) onerror (err error) {
+				failure = err.message
+				recover none
+			}
+		}
+		return failure
+	}
+
+	// clearRecord is a record in the clear (epoch 0), as anyone on the path
+	// can write one.
+	internal def clearRecord(contentType int, seq int, payload byte[]) byte[] {
+		return u8(contentType) + u16(versionDTLS12) + uint64(seq).bytes(Endian.Big) + u16(payload.len()) + payload
+	}
+
+	// keyUpdateServer echoes in upper case until the client closes.
+	internal async def keyUpdateServer(conn DTLSConn, report DatagramReport) none {
+		runEchoServer(conn) onerror (err error) {
+			report.failure = err.message
+			recover none
+		}
+		return none
+	}
+
+	internal def runEchoServer(conn DTLSConn) !none {
+		try conn.handshake()
+		for {
+			let message = conn.receive(5s) onerror recover []
+			return none unless conn.isOpen()
+			continue when message.len() == 0
+			try conn.send(string(message).upper().bytes(), 5s)
+		}
+		return none
+	}
+
+	internal def acceptWithin(listener DTLSListener, timeout duration) !?DTLSConn {
+		return try listener.accept(timeout)
+	}
+
+	// acceptOne accepts one connection of a listener and serves it.
+	internal async def acceptOne(listener DTLSListener, report DatagramReport) none {
+		let conn = acceptWithin(listener, 10s) onerror (err error) {
+			report.failure = "accept: {err.message}"
+			recover none
+		}
+		return none when conn is none
+		runDatagramServer(conn, report) onerror (err error) {
+			report.failure = err.message
+			recover none
+		}
+		return none
+	}
+}

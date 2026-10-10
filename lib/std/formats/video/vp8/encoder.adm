@@ -1,0 +1,1330 @@
+// The VP8 encoder (RFC 6386) for video.
+// It works on the decoder's own state: each macroblock is predicted,
+// reconstructed and filtered by the code that decodes it, so the frames
+// it predicts from are the ones a decoder will have.
+internal std.formats partial module std.formats.video.vp8 {
+	use (
+		std.gfx.bands::(bandCount, bandOf, forBands)
+		std.simd
+	)
+
+	// How an inter macroblock names its vector (RFC 6386 §16.3): none, the
+	// best or second-best neighbour's, or a new one.
+	const (
+		vp8ModeZero    = 0
+		vp8ModeNearest = 1
+		vp8ModeNear    = 2
+		vp8ModeNew     = 3
+		vp8ModeSplit   = 4
+	)
+
+	// A full-pixel search moves at most this far from where it starts, in
+	// pixels each way; a block whose best match differs more than the
+	// threshold per pixel is searched to a quarter pixel.
+	const vp8SearchRange = 24
+	// What a bit of a vector is charged in the search, in sixteenths of
+	// the luma quantiser step.
+	const vp8MvCharge = 1
+	// An AC coefficient counts for a level past this many sixteenths of a
+	// quantiser step: a wider dead zone than rounding to nearest, which
+	// spends the bits of the many small coefficients on a finer step.
+	const vp8Rounding = 3
+	// The luma mode that says every 4x4 block has a mode of its own
+	// (B_PRED), as `yModes` keeps it; whole-block modes are 0 to 3.
+	const vp8ModeB = 4
+	// A macroblock is tried block by block when its best whole-block
+	// prediction leaves more than this (a sum of absolute differences);
+	// the sixteen modes are charged this many sixteenths of the luma
+	// quantiser step each against what they save.
+	const vp8BTryAbove = 384
+	const vp8BModeCharge = 12
+	const vp8RefineAbove = 2 * 256
+	// A macroblock whose best vector leaves more than this is searched
+	// quarter by quarter, and takes four vectors when they leave less
+	// with their bits counted.
+	const vp8SplitAbove = 3 * 256
+	// The golden frame is replaced by every so many-th frame, and the
+	// alternate frame then takes the golden frame that was: two pictures
+	// from further back than the last one. A macroblock the last frame
+	// leaves more than `vp8RefineAbove` is searched in them as well, and
+	// predicted from one that leaves less by more than the bits that
+	// name it (`vp8RefBits`, charged as a vector's are).
+	const vp8GoldenEvery = 16
+	const vp8RefBits = 6
+
+	// vp8Sad16 is the sum of absolute differences of two 16x16 blocks of
+	// bytes, at `ao` and `bo` in planes of the given strides.
+	def vp8Sad16(a byte[], ao int, sa int, b byte[], bo int, sb int) int {
+		let acc = simd.splat16<uint16>(0)
+		for let j = 0; j < 16; j++ {
+			let x = simd.load16<byte>(a, ao + j * sa)
+			let y = simd.load16<byte>(b, bo + j * sb)
+			acc = acc + simd.convert<byte, uint16>(simd.or(simd.subSat(x, y), simd.subSat(y, x)))
+		}
+		return int(simd.sum(acc))
+	}
+
+	// vp8Sad8 is the sum of absolute differences of two 8x8 blocks of bytes.
+	def vp8Sad8(a byte[], ao int, sa int, b byte[], bo int, sb int) int {
+		let acc = simd.splat8<uint16>(0)
+		for let j = 0; j < 8; j++ {
+			let x = simd.load8<byte>(a, ao + j * sa)
+			let y = simd.load8<byte>(b, bo + j * sb)
+			acc = acc + simd.convert<byte, uint16>(simd.or(simd.subSat(x, y), simd.subSat(y, x)))
+		}
+		return int(simd.sum(acc))
+	}
+
+	// vp8SadGrid is the sum of absolute differences between an `n` x `n`
+	// block (16 or 8) of the workspace at `at` and of a plane at `so`.
+	def vp8SadGrid(ybr int[], at int, src byte[], so int, stride int, n int) int {
+		if n == 16 {
+			let acc = simd.splat16<int32>(0)
+			for let j = 0; j < 16; j++ {
+				let p = simd.convert<int, int32>(simd.load16<int>(ybr, at + j * 32))
+				let s = simd.convert<byte, int32>(simd.load16<byte>(src, so + j * stride))
+				acc = acc + simd.abs(p - s)
+			}
+			return int(simd.sum(acc))
+		}
+		let acc = simd.splat8<int32>(0)
+		for let j = 0; j < 8; j++ {
+			let p = simd.convert<int, int32>(simd.load8<int>(ybr, at + j * 32))
+			let s = simd.convert<byte, int32>(simd.load8<byte>(src, so + j * stride))
+			acc = acc + simd.abs(p - s)
+		}
+		return int(simd.sum(acc))
+	}
+
+	// vp8Search finds the vector of a macroblock in the last frame and
+	// the sum of absolute differences of the luma it predicts. It
+	// starts from no motion and from what the macroblocks to the left
+	// and above found, the one above only inside the band (`first` is
+	// the band's first row), so that bands do not wait for each other
+	// and the result is the same however they are scheduled. The results
+	// go to `o + m` of `foundR`, `foundC` and `foundCost`, a set of them
+	// for each frame searched; `quarters` allows several vectors.
+	def vp8Search(sy byte[], ref byte[], stride int, mbw int, mbh int, mbx int, mby int, first int, foundR int[], foundC int[], foundCost int[], o int, quarters bool, split int[], quarterR int[], quarterC int[], block int[], edge byte[], tmp int[], charge int) {
+		let m = mby * mbw + mbx
+		let yo = mby * 16 * stride + mbx * 16
+		let x = mbx * 16
+		let y = mby * 16
+		let maxX = stride - 16
+		let maxY = 16 * mbh - 16
+		// What a vector costs is counted from the one to the left: the
+		// one it is most often coded against.
+		let nearR = mbx > 0 ?? (foundR[o + m - 1], 0)
+		let nearC = mbx > 0 ?? (foundC[o + m - 1], 0)
+		let bestX = 0
+		let bestY = 0
+		let sad = vp8Sad16(sy, yo, stride, ref, yo, stride)
+		let best = sad + charge * vp8MvBits(0 - nearR, 0 - nearC)
+		for let i = 0; i < 2 && sad > 0; i++ {
+			let near = o + (i == 0 ?? (m - 1, m - mbw))
+			continue when (i == 0 && mbx == 0) || (i == 1 && mby == first)
+			let cx = vp8Clip(x + (foundC[near] >> 2), 0, maxX) - x
+			let cy = vp8Clip(y + (foundR[near] >> 2), 0, maxY) - y
+			continue when (cx == 0 && cy == 0) || (cx == bestX && cy == bestY)
+			let here = vp8Sad16(sy, yo, stride, ref, (y + cy) * stride + x + cx, stride)
+			let cost = here + charge * vp8MvBits(cy * 4 - nearR, cx * 4 - nearC)
+			if cost < best {
+				best = cost
+				sad = here
+				bestX = cx
+				bestY = cy
+			}
+		}
+		// A diamond that halves its step while it finds nothing better.
+		let step = 8
+		for step >= 1 && sad > 0 {
+			let moved = false
+			for let d = 0; d < 4; d++ {
+				let cx = bestX + (d == 0 ?? (step, d == 1 ?? (0 - step, 0)))
+				let cy = bestY + (d == 2 ?? (step, d == 3 ?? (0 - step, 0)))
+				continue when cx < 0 - vp8SearchRange || cx > vp8SearchRange || cy < 0 - vp8SearchRange || cy > vp8SearchRange
+				continue when x + cx < 0 || x + cx > maxX || y + cy < 0 || y + cy > maxY
+				let here = vp8Sad16(sy, yo, stride, ref, (y + cy) * stride + x + cx, stride)
+				let cost = here + charge * vp8MvBits(cy * 4 - nearR, cx * 4 - nearC)
+				if cost < best {
+					best = cost
+					sad = here
+					bestX = cx
+					bestY = cy
+					moved = true
+				}
+			}
+			step = step >> 1 unless moved
+		}
+		let r = bestY * 4
+		let c = bestX * 4
+		// To a half, then a quarter pixel, where the match leaves much.
+		if sad > vp8RefineAbove {
+			for let unit = 2; unit >= 1; unit-- {
+				let fromR = r
+				let fromC = c
+				for let d = 0; d < 8; d++ {
+					// The eight neighbours, row by row, without the middle.
+					let k = d < 4 ?? (d, d + 1)
+					let cr = fromR + unit * (k / 3 - 1)
+					let cc = fromC + unit * (k % 3 - 1)
+					continue when x * 4 + cc < 0 || x * 4 + cc > maxX * 4 || y * 4 + cr < 0 || y * 4 + cr > maxY * 4
+					vp8PredictPlane(ref, stride, 16 * mbh, x, y, 16, 16, cc * 2, cr * 2, block, 0, edge, tmp, false)
+					let here = vp8SadGrid(block, 0, sy, yo, stride, 16)
+					let cost = here + charge * vp8MvBits(cr - nearR, cc - nearC)
+					if cost < best {
+						best = cost
+						sad = here
+						r = cr
+						c = cc
+					}
+				}
+			}
+		}
+		foundR[o + m] = r
+		foundC[o + m] = c
+		foundCost[o + m] = sad
+		return unless quarters
+		split[m] = 0
+		return when sad <= vp8SplitAbove
+		// Quarter by quarter: four vectors are taken when they leave
+		// clearly less than the one, their bits counted.
+		let base = 4 * m
+		let total = 0
+		let bits = 8
+		for let q = 0; q < 4; q++ {
+			total += vp8SearchQuarter(sy, ref, stride, 16 * mbh, x + (q & 1) * 8, y + (q >> 1) * 8, r, c, quarterR, quarterC, base, q, block, edge, tmp, charge, nearR, nearC)
+			bits += vp8QuarterBits(quarterR, quarterC, base, q, quarterR[base + q], quarterC[base + q], nearR, nearC)
+		}
+		let one = quarterR[base]
+		let other = quarterC[base]
+		let same = true
+		for let q = 1; q < 4; q++ {
+			same = false when quarterR[base + q] != one || quarterC[base + q] != other
+		}
+		if same {
+			// The quarters agree on a vector the diamond missed.
+			if total + charge * vp8MvBits(one - nearR, other - nearC) < best {
+				foundR[o + m] = one
+				foundC[o + m] = other
+				foundCost[o + m] = total
+			}
+			return
+		}
+		if total + charge * bits < best {
+			split[m] = 1
+			foundCost[o + m] = total
+		}
+	}
+
+	// vp8QuarterBits is about what the vector (`r`, `c`) costs quarter
+	// `q` of a macroblock whose quarters' vectors are at `base` of `rs`
+	// and `cs`: little when the quarter to its left or above has it.
+	def vp8QuarterBits(rs int[], cs int[], base int, q int, r int, c int, nearR int, nearC int) int {
+		return 2 when (q & 1) == 1 && rs[base + q - 1] == r && cs[base + q - 1] == c
+		return 2 when q >= 2 && rs[base + q - 2] == r && cs[base + q - 2] == c
+		return 3 + vp8MvBits(r - nearR, c - nearC)
+	}
+
+	// vp8Sad8Moved is the sum of absolute differences between the 8x8
+	// block of the picture at (`x`, `y`) and the last frame's moved by
+	// (`r`, `c`) quarter pixels, or -1 when that lies outside the frame.
+	def vp8Sad8Moved(sy byte[], ref byte[], stride int, high int, x int, y int, r int, c int, block int[], edge byte[], tmp int[]) int {
+		return -1 when x * 4 + c < 0 || x * 4 + c > (stride - 8) * 4 || y * 4 + r < 0 || y * 4 + r > (high - 8) * 4
+		let so = y * stride + x
+		return vp8Sad8(sy, so, stride, ref, (y + (r >> 2)) * stride + x + (c >> 2), stride) when ((r | c) & 3) == 0
+		vp8PredictPlane(ref, stride, high, x, y, 8, 8, c * 2, r * 2, block, 0, edge, tmp, false)
+		return vp8SadGrid(block, 0, sy, so, stride, 8)
+	}
+
+	// vp8SearchQuarter finds the vector of quarter `q` of a macroblock,
+	// the 8x8 block at (`x`, `y`), and returns the sum of absolute
+	// differences it leaves; the vector goes to `base + q` of `rs` and
+	// `cs`. It starts from the macroblock's own vector (`wholeR`,
+	// `wholeC`), the quarters before it and no motion.
+	def vp8SearchQuarter(sy byte[], ref byte[], stride int, high int, x int, y int, wholeR int, wholeC int, rs int[], cs int[], base int, q int, block int[], edge byte[], tmp int[], charge int, nearR int, nearC int) int {
+		let bestR = 0
+		let bestC = 0
+		let sad = -1
+		let best = 0
+		for let i = 0; i < q + 2; i++ {
+			let cr = i == 0 ?? (wholeR, i > q ?? (0, rs[base + i - 1]))
+			let cc = i == 0 ?? (wholeC, i > q ?? (0, cs[base + i - 1]))
+			continue when sad >= 0 && cr == bestR && cc == bestC
+			let here = vp8Sad8Moved(sy, ref, stride, high, x, y, cr, cc, block, edge, tmp)
+			continue when here < 0
+			let cost = here + charge * vp8QuarterBits(rs, cs, base, q, cr, cc, nearR, nearC)
+			if sad < 0 || cost < best {
+				best = cost
+				sad = here
+				bestR = cr
+				bestC = cc
+			}
+		}
+		// A diamond on whole pixels around the best start.
+		let px = (bestC + 2) >> 2
+		let py = (bestR + 2) >> 2
+		let step = 4
+		for step >= 1 && sad > 0 {
+			let moved = false
+			for let d = 0; d < 4; d++ {
+				let cx = px + (d == 0 ?? (step, d == 1 ?? (0 - step, 0)))
+				let cy = py + (d == 2 ?? (step, d == 3 ?? (0 - step, 0)))
+				continue when cx < 0 - vp8SearchRange || cx > vp8SearchRange || cy < 0 - vp8SearchRange || cy > vp8SearchRange
+				let here = vp8Sad8Moved(sy, ref, stride, high, x, y, cy * 4, cx * 4, block, edge, tmp)
+				continue when here < 0
+				let cost = here + charge * vp8QuarterBits(rs, cs, base, q, cy * 4, cx * 4, nearR, nearC)
+				if cost < best {
+					best = cost
+					sad = here
+					bestR = cy * 4
+					bestC = cx * 4
+					px = cx
+					py = cy
+					moved = true
+				}
+			}
+			step = step >> 1 unless moved
+		}
+		// To a half, then a quarter pixel, where the match leaves much.
+		if sad > vp8RefineAbove / 4 {
+			for let unit = 2; unit >= 1; unit-- {
+				let fromR = bestR
+				let fromC = bestC
+				for let d = 0; d < 8; d++ {
+					let k = d < 4 ?? (d, d + 1)
+					let cr = fromR + unit * (k / 3 - 1)
+					let cc = fromC + unit * (k % 3 - 1)
+					let here = vp8Sad8Moved(sy, ref, stride, high, x, y, cr, cc, block, edge, tmp)
+					continue when here < 0
+					let cost = here + charge * vp8QuarterBits(rs, cs, base, q, cr, cc, nearR, nearC)
+					if cost < best {
+						best = cost
+						sad = here
+						bestR = cr
+						bestC = cc
+					}
+				}
+			}
+		}
+		rs[base + q] = bestR
+		cs[base + q] = bestC
+		return sad
+	}
+
+	// vp8MvBits is about what a vector costs to code as a difference of
+	// (`dr`, `dc`) quarter pixels to its neighbour's: nothing much when it
+	// is the neighbour's, a short code below two pixels, a long one above.
+	def vp8MvBits(dr int, dc int) int {
+		return 1 when dr == 0 && dc == 0
+		let a = dr.abs()
+		let b = dc.abs()
+		return 4 + (a == 0 ?? (1, a < 8 ?? (5, 12))) + (b == 0 ?? (1, b < 8 ?? (5, 12)))
+	}
+
+	// vp8WriteMv writes one vector component with the probabilities at
+	// `probs[p:]` (rows at 0, columns at 19), as `Vp8Decoder.readMv` reads
+	// it.
+	def vp8WriteMv(e Vp8BoolEncoder, probs int[], p int, value int) {
+		let a = value.abs()
+		if a < 8 {
+			e.put(probs[p], false)
+			if a < 4 {
+				e.put(probs[p + 2], false)
+				e.put(probs[p + 3], a >= 2)
+				e.put(probs[p + (a >= 2 ?? (5, 4))], (a & 1) == 1)
+			} else {
+				e.put(probs[p + 2], true)
+				e.put(probs[p + 6], a >= 6)
+				e.put(probs[p + (a >= 6 ?? (8, 7))], (a & 1) == 1)
+			}
+		} else {
+			e.put(probs[p], true)
+			for let i = 0; i < 3; i++ {
+				e.put(probs[p + 9 + i], ((a >> i) & 1) == 1)
+			}
+			for let i = 9; i > 3; i-- {
+				e.put(probs[p + 9 + i], ((a >> i) & 1) == 1)
+			}
+			// Bit 3 is implied when no higher bit is set: the value is
+			// at least 8.
+			e.put(probs[p + 12], ((a >> 3) & 1) == 1) when (a & 0xfff0) != 0
+		}
+		e.put(probs[p + 1], value < 0) when a != 0
+	}
+
+	// vp8CountMv counts, for one vector component, the bits `vp8WriteMv`
+	// writes with each probability: zeros at `2 * index`, ones behind.
+	def vp8CountMv(stats int[], p int, value int) {
+		let a = value.abs()
+		if a < 8 {
+			stats[2 * p]++
+			if a < 4 {
+				stats[2 * (p + 2)]++
+				stats[2 * (p + 3) + (a >= 2 ?? (1, 0))]++
+				stats[2 * (p + (a >= 2 ?? (5, 4))) + (a & 1)]++
+			} else {
+				stats[2 * (p + 2) + 1]++
+				stats[2 * (p + 6) + (a >= 6 ?? (1, 0))]++
+				stats[2 * (p + (a >= 6 ?? (8, 7))) + (a & 1)]++
+			}
+		} else {
+			stats[2 * p + 1]++
+			for let i = 0; i < 3; i++ {
+				stats[2 * (p + 9 + i) + ((a >> i) & 1)]++
+			}
+			for let i = 9; i > 3; i-- {
+				stats[2 * (p + 9 + i) + ((a >> i) & 1)]++
+			}
+			stats[2 * (p + 12) + ((a >> 3) & 1)]++ when (a & 0xfff0) != 0
+		}
+		stats[2 * (p + 1) + (value < 0 ?? (1, 0))]++ when a != 0
+	}
+
+	// Vp8Encoder encodes pictures as VP8 frames: a key frame first and on
+	// request, frames predicted from the one before otherwise.
+	type Vp8Encoder {
+		width      int
+		height     int
+		// The quantiser index of the next frame, 0 (finest) to 127.
+		quantIndex int        = 40
+		// The decoder state the frames are built on.
+		rec        Vp8Decoder
+		// Whether a frame was encoded: the next one may be predicted.
+		started    bool       = false
+		// The source picture padded to whole macroblocks.
+		sy         byte[]
+		su         byte[]
+		sv         byte[]
+		// What the frame's macroblocks were given: skipped, the luma and
+		// chroma intra modes (-1 for an inter macroblock), how the vector
+		// is named, its difference to the best neighbour's, the contexts
+		// its mode is coded with, and the quantised coefficients.
+		skips      int[]
+		yModes     int[]
+		uvModes    int[]
+		naming     int[]
+		deltaR     int[]
+		deltaC     int[]
+		contexts   int[]
+		stored     int16[]
+		upNz       int[]
+		upNzY16    int[]
+		res        int[]
+		resU       int[]
+		resV       int[]
+		dcs        int[]
+		coeffs     int[]
+		levels     int[]
+		updated    int[]
+		// What the search found for each macroblock of the frame: the
+		// vector in quarter pixels and the sum of absolute differences
+		// it leaves.
+		// The mode of each 4x4 luma block of a macroblock coded block by
+		// block, and the workspace of the trial: the levels, a block's
+		// residual and what a block was before a mode was tried on it.
+		bModes     int[]
+		bLevels    int[]
+		res4       int[]
+		// There is a set for each frame a macroblock may be predicted
+		// from (the last, the golden, the alternate, in that order), and
+		// `foundRef` is the frame the search chose.
+		foundR     int[]
+		foundC     int[]
+		foundCost  int[]
+		foundRef   int[]
+		// Whether the search gave the macroblock a vector for each of its
+		// quarters, and those vectors, four a macroblock.
+		foundSplit int[]
+		quarterR   int[]
+		quarterC   int[]
+		// How a macroblock of several vectors is written: its layout (an
+		// index of `vp8MbSplitCount`) and, for each partition, the context
+		// and the choice of the sub-vector tree (context * 4 + choice: left,
+		// above, none, new) with a new vector's difference to the best
+		// neighbour's.
+		layouts    int[]
+		subCodes   int[]
+		subR       int[]
+		subC       int[]
+		// A workspace for each band of rows the search runs on.
+		bandBlock  int[][]    = []
+		bandEdge   byte[][]   = []
+		bandTmp    int[][]    = []
+		// Counts of the last frame, for the caller's rate control.
+		intraCount int        = 0
+		skipCount  int        = 0
+		// The frame being coded repeats the last one.
+		repeating  bool       = false
+		// The frame being coded becomes the golden frame, and how many
+		// frames were coded since one did.
+		gilding    bool       = false
+		sinceGold  int        = 0
+		// How many macroblocks of the frame are predicted from the last
+		// frame and from the golden frame.
+		lastCount  int        = 0
+		goldCount  int        = 0
+
+		def new(width int, height int) {
+			self.width = width
+			self.height = height
+			rec = new Vp8Decoder()
+			rec.resize(width, height)
+			let n = rec.mbw * rec.mbh
+			sy = vp8Bytes(rec.yStride * 16 * rec.mbh)
+			su = vp8Bytes(rec.cStride * 8 * rec.mbh)
+			sv = vp8Bytes(rec.cStride * 8 * rec.mbh)
+			skips = vp8Zeros(n)
+			yModes = vp8Zeros(n)
+			uvModes = vp8Zeros(n)
+			naming = vp8Zeros(n)
+			deltaR = vp8Zeros(n)
+			deltaC = vp8Zeros(n)
+			contexts = vp8Zeros(4 * n)
+			stored.len(n * 400)
+			upNz = vp8Zeros(rec.mbw)
+			upNzY16 = vp8Zeros(rec.mbw)
+			res = vp8Zeros(256)
+			resU = vp8Zeros(64)
+			resV = vp8Zeros(64)
+			dcs = vp8Zeros(16)
+			coeffs = vp8Zeros(400)
+			levels = vp8Zeros(400)
+			updated = vp8Zeros(1056)
+			bModes = vp8Zeros(16 * n)
+			bLevels = vp8Zeros(256)
+			res4 = vp8Zeros(16)
+			foundR = vp8Zeros(3 * n)
+			foundC = vp8Zeros(3 * n)
+			foundCost = vp8Zeros(3 * n)
+			foundRef = vp8Zeros(n)
+			foundSplit = vp8Zeros(n)
+			quarterR = vp8Zeros(4 * n)
+			quarterC = vp8Zeros(4 * n)
+			layouts = vp8Zeros(n)
+			subCodes = vp8Zeros(16 * n)
+			subR = vp8Zeros(16 * n)
+			subC = vp8Zeros(16 * n)
+			for let b = 0; b < bandCount(rec.mbh, width * height); b++ {
+				bandBlock.push(vp8Zeros(32 * 16))
+				bandEdge.push(vp8Bytes(21 * 21))
+				bandTmp.push(vp8Zeros(21 * 16))
+			}
+		}
+
+		// load copies a picture into the padded source planes, repeating
+		// its last column and row.
+		def load(y byte[], yStride int, u byte[], v byte[], cStride int) {
+			let cw = (width + 1) >> 1
+			let ch = (height + 1) >> 1
+			pad(y, yStride, width, height, sy, rec.yStride, 16 * rec.mbh)
+			pad(u, cStride, cw, ch, su, rec.cStride, 8 * rec.mbh)
+			pad(v, cStride, cw, ch, sv, rec.cStride, 8 * rec.mbh)
+		}
+
+		internal def pad(src byte[], stride int, w int, h int, out byte[], wide int, rows int) {
+			for let j = 0; j < rows; j++ {
+				let s = (j < h ?? (j, h - 1)) * stride
+				let d = j * wide
+				src[s:s + w].copy(out[d:])
+				let last = src[s + w - 1]
+				for let i = w; i < wide; i++ {
+					out[d + i] = last
+				}
+			}
+		}
+
+		// encode encodes the picture `load` took and returns the frame: a
+		// key frame when asked, and always the first. A `droppable` frame
+		// (never a key frame) changes nothing a later frame builds on, so
+		// a stream stays decodable without it. A `repeat` frame (never a
+		// key frame either) shows the last frame again in a few bytes,
+		// whatever picture was loaded.
+		def encode(forceKey bool = false, droppable bool = false, repeat bool = false) byte[] {
+			let key = forceKey || !started
+			let kept = key || !droppable
+			repeating = repeat && !key
+			prepare(key, kept)
+			let n = rec.mbw * rec.mbh
+			intraCount = 0
+			skipCount = 0
+			// The vectors first, bands of rows at once: a search reads the
+			// picture and the last frame only.
+			if repeating {
+				foundR.fill(0)
+				foundC.fill(0)
+				foundCost.fill(0)
+				foundSplit.fill(0)
+				foundRef.fill(vp8RefLast)
+			} else if !key {
+				forBands(rec.mbh, width * height, searchRows)
+			}
+			for let mby = 0; mby < rec.mbh; mby++ {
+				for let mbx = 0; mbx < rec.mbw; mbx++ {
+					macroblock(mbx, mby, key)
+				}
+			}
+			// Nothing predicts from a frame that is not kept: it needs no
+			// filtering here.
+			if rec.level != 0 && kept {
+				rec.normalFilter()
+			}
+			let tokens = writeTokens()
+			let first = writeModes(key, kept, n)
+			rec.complete()
+			started = true
+			sinceGold = key || gilding ?? (0, sinceGold + 1)
+
+			let out byte[]
+			let tag = (first.len() << 5) | 0x10 | (key ?? (0, 1))
+			out.push(byte(tag & 255), byte((tag >> 8) & 255), byte((tag >> 16) & 255))
+			if key {
+				out.push(byte(0x9d), byte(0x01), byte(0x2a))
+				out.push(byte(width & 255), byte(width >> 8), byte(height & 255), byte(height >> 8))
+			}
+			let at = out.len()
+			out.len(at + first.len() + tokens.len())
+			first.copy(out[at:])
+			tokens.copy(out[at + first.len():])
+			return out
+		}
+
+		// prepare sets the decoder state up for the frame as its header will
+		// say: quantisers, loop filter, which references it replaces.
+		internal def prepare(key bool, kept bool) {
+			rec.keyframe = key
+			rec.version = 0
+			rec.bilinear = false
+			rec.fullPixel = false
+			rec.shown = true
+			rec.resetState() when key
+			rec.useSegment = false
+			rec.updateMap = false
+			rec.simple = false
+			// A repeated frame is the last one as it is: filtering it again
+			// would change it.
+			rec.level = repeating ?? (0, vp8Clip(quantIndex * 3 / 8, 0, 63))
+			rec.sharpness = 0
+			rec.useLFDelta = false
+			rec.applyQuant(quantIndex, 0, 0, 0, 0, 0)
+			// A frame that may be dropped is no reference of any kind.
+			gilding = !key && kept && !repeating && sinceGold >= vp8GoldenEvery
+			rec.refreshGolden = key || gilding
+			rec.refreshAlt = key
+			rec.refreshLast = kept
+			rec.copyToGolden = 0
+			rec.copyToAlt = gilding ?? (2, 0)
+			rec.signBias.fill(0)
+			rec.refreshProbs = kept
+			if !kept {
+				rec.savedToken = rec.tokenProb.clone()
+				rec.savedYMode = rec.yModeProb.clone()
+				rec.savedUVMode = rec.uvModeProb.clone()
+				rec.savedMv = rec.mvProb.clone()
+			}
+			rec.cur = rec.freePicture()
+			rec.y = rec.cur.y
+			rec.u = rec.cur.u
+			rec.v = rec.cur.v
+		}
+
+		// macroblock chooses how one macroblock is coded, quantises what
+		// is left of it and reconstructs it as a decoder will.
+		internal def macroblock(mbx int, mby int, key bool) {
+			let m = mby * rec.mbw + mbx
+			let ybr = rec.ybr
+			let yo = mby * 16 * rec.yStride + mbx * 16
+			let co = mby * 8 * rec.cStride + mbx * 8
+			let yAt = vp8YbrYY * 32 + vp8YbrYX
+			let uAt = vp8YbrBY * 32 + vp8YbrBX
+			let vAt = vp8YbrRY * 32 + vp8YbrRX
+			rec.segment = 0
+			rec.prepareYBR(mbx, mby)
+
+			let inter = false
+			let exact = false
+			let blocks = false
+			let several = false
+			let cost = 0
+			if !key {
+				rec.ref = foundRef[m]
+				let slot = (rec.ref - vp8RefLast) * rec.mbw * rec.mbh + m
+				cost = foundCost[slot]
+				rec.collectNear(mbx, mby, m)
+				if foundSplit[m] == 1 {
+					nameSplit(mbx, mby, m)
+				} else {
+					name(mbx, mby, m, foundR[slot], foundC[slot], rec.cnt[0])
+				}
+				exact = cost == 0
+				inter = repeating || cost <= vp8RefineAbove
+			}
+			if !inter {
+				// The intra candidates: the best whole-block mode, and
+				// block by block when that leaves much and the last frame
+				// more than three quarters of it (the luma is then coded and
+				// reconstructed in the workspace already). Block by block is charged its
+				// sixteen modes; an intra macroblock costs its modes and
+				// more bits per coefficient than one predicted from the
+				// last frame, so it must predict clearly better.
+				let whole = chooseLuma(mbx, mby, m, yo)
+				let pieces = whole
+				if whole > vp8BTryAbove && (key || cost * 4 > whole * 3) {
+					// It has to beat the whole-block mode, and the last
+					// frame by the margin below: the trial stops when it
+					// cannot any more.
+					let charge = 16 * vp8BModeCharge * rec.quant[1] / 16
+					let most = (key ?? (whole, whole.min(cost - 256))) - charge
+					pieces = most > 0 ?? (codeBlocks(m, yo, most) + charge, whole)
+				}
+				inter = !key && cost <= whole.min(pieces) + 256
+				blocks = !inter && pieces < whole
+			}
+			if inter {
+				several = naming[m] == vp8ModeSplit
+				rec.kind = several ?? (vp8KindSplit, rec.mvR[m] == 0 && rec.mvC[m] == 0 ?? (vp8KindZero, vp8KindMv))
+				rec.predictMacroblock(mbx, mby, m)
+				yModes[m] = -1
+			} else {
+				intraCount++
+				rec.ref = vp8RefIntra
+				rec.kind = blocks ?? (vp8KindBPred, vp8KindIntra)
+				rec.mvR[m] = 0
+				rec.mvC[m] = 0
+				if blocks {
+					yModes[m] = vp8ModeB
+				} else {
+					vp8Predict16(ybr, vp8EdgePred(mbx, mby, yModes[m]))
+				}
+				chooseChroma(mbx, mby, m, co)
+				let chroma = vp8EdgePred(mbx, mby, uvModes[m])
+				vp8Predict8(ybr, chroma, uAt)
+				vp8Predict8(ybr, chroma, vAt)
+			}
+			rec.mbRef[m] = rec.ref
+			rec.mbKind[m] = rec.kind
+			// Neither kind has a second-order block: each luma block keeps
+			// its DC.
+			let own = blocks || several
+			rec.hasY2 = !own
+
+			// A macroblock the last frame predicts exactly is done.
+			if inter && exact && (repeating || (vp8SadGrid(ybr, uAt, su, co, rec.cStride, 8) == 0 && vp8SadGrid(ybr, vAt, sv, co, rec.cStride, 8) == 0)) {
+				rec.coeff.fill(0)
+				rec.nzACMask = 0
+				rec.nzDCMask = 0
+				rec.storeYBR(mbx, mby)
+				rec.setFilter(m, false)
+				skips[m] = 1
+				skipCount++
+				return
+			}
+
+			// What is left after prediction, transformed and quantised.
+			let held = 0
+			if own {
+				// The chroma is as for any macroblock.
+				vp8Residual8(su, co, rec.cStride, ybr, uAt, resU)
+				vp8Residual8(sv, co, rec.cStride, ybr, vAt, resV)
+				for let n = 0; n < 4; n++ {
+					vp8ForwardDCT(resU, (n >> 1) * 32 + (n & 1) * 4, 8, coeffs, 256 + 16 * n)
+					vp8ForwardDCT(resV, (n >> 1) * 32 + (n & 1) * 4, 8, coeffs, 320 + 16 * n)
+				}
+				rec.coeff.fill(0, 0, 256)
+				rec.coeff.fill(0, 384, 400)
+				for let n = 16; n < 24; n++ {
+					held = held | (1 << n) when vp8QuantizeBlock(coeffs, 16 * n, levels, rec.coeff, 16 * n, rec.quant[4], rec.quant[5], vp8Rounding)
+				}
+				if several {
+					vp8Residual16(sy, yo, rec.yStride, ybr, yAt, res)
+					for let n = 0; n < 16; n++ {
+						vp8ForwardDCT(res, (n >> 2) * 64 + (n & 3) * 4, 16, coeffs, 16 * n)
+						held = held | (1 << n) when vp8QuantizeBlock(coeffs, 16 * n, levels, rec.coeff, 16 * n, rec.quant[0], rec.quant[1], vp8Rounding)
+					}
+				} else {
+					// The luma is coded and reconstructed already.
+					for let k = 0; k < 256; k++ {
+						levels[k] = bLevels[k]
+						held = held | (1 << 24) when bLevels[k] != 0
+					}
+				}
+				levels.fill(0, 384, 400)
+			} else {
+				vp8Residual16(sy, yo, rec.yStride, ybr, yAt, res)
+				vp8Residual8(su, co, rec.cStride, ybr, uAt, resU)
+				vp8Residual8(sv, co, rec.cStride, ybr, vAt, resV)
+				vp8TransformMacroblock(res, resU, resV, coeffs, dcs)
+				held = vp8QuantizeMacroblock(coeffs, levels, rec.coeff, rec.quant[1], rec.quant[2], rec.quant[3], rec.quant[4], rec.quant[5], vp8Rounding)
+			}
+			let any = held != 0
+			let acMask = held & (blocks ?? (0xff0000, 0xffffff))
+
+			// Reconstruct as the decoder will: the luma DCs come out of the
+			// second-order transform.
+			rec.inverseWHT16() unless own
+			let dcMask = 0
+			for let n = blocks ?? (16, 0); n < 24; n++ {
+				dcMask = dcMask | (1 << n) when rec.coeff[16 * n] != 0
+			}
+			rec.nzACMask = acMask
+			rec.nzDCMask = dcMask
+			rec.addResiduals()
+			rec.storeYBR(mbx, mby)
+			rec.setFilter(m, any)
+			skips[m] = any ?? (0, 1)
+			if any {
+				let base = m * 400
+				for let k = 0; k < 400; k++ {
+					stored[base + k] = int16(levels[k])
+				}
+			} else {
+				skipCount++
+			}
+		}
+
+		// chooseLuma picks the whole-block luma mode that predicts the
+		// macroblock best and returns the sum of absolute differences it
+		// leaves.
+		internal def chooseLuma(mbx int, mby int, m int, yo int) int {
+			let ybr = rec.ybr
+			let yAt = vp8YbrYY * 32 + vp8YbrYX
+			let luma = -1
+			for let mode = 0; mode < 4; mode++ {
+				vp8Predict16(ybr, vp8EdgePred(mbx, mby, mode))
+				let cost = vp8SadGrid(ybr, yAt, sy, yo, rec.yStride, 16)
+				if luma < 0 || cost < luma {
+					luma = cost
+					yModes[m] = mode
+				}
+			}
+			return luma
+		}
+
+		// chooseChroma picks the chroma mode that predicts both planes of
+		// the macroblock best.
+		internal def chooseChroma(mbx int, mby int, m int, co int) {
+			let ybr = rec.ybr
+			let uAt = vp8YbrBY * 32 + vp8YbrBX
+			let vAt = vp8YbrRY * 32 + vp8YbrRX
+			let best = -1
+			for let mode = 0; mode < 4; mode++ {
+				let p = vp8EdgePred(mbx, mby, mode)
+				vp8Predict8(ybr, p, uAt)
+				vp8Predict8(ybr, p, vAt)
+				let cost = vp8SadGrid(ybr, uAt, su, co, rec.cStride, 8) + vp8SadGrid(ybr, vAt, sv, co, rec.cStride, 8)
+				if best < 0 || cost < best {
+					best = cost
+					uvModes[m] = mode
+				}
+			}
+		}
+
+		// codeBlocks codes the luma of a macroblock block by block: each
+		// 4x4 block takes the mode of the ten that predicts it best from
+		// what is reconstructed around it, and is transformed, quantised
+		// (it keeps its DC: there is no second-order block) and
+		// reconstructed in the workspace before the next. The modes go to
+		// `bModes`, the levels to `bLevels`; returns the sum of absolute
+		// differences the predictions left, or more than `most` as soon
+		// as it is above that (the blocks behind are then not coded).
+		internal def codeBlocks(m int, yo int, most int) int {
+			let ybr = rec.ybr
+			let stride = rec.yStride
+			let total = 0
+			for let n = 0; n < 16; n++ {
+				let at = (4 * (n >> 2) + 1) * 32 + 4 * (n & 3) + 8
+				let so = yo + (n >> 2) * 4 * stride + (n & 3) * 4
+				let best = -1
+				let chosen = 0
+				for let mode = 0; mode < 10; mode++ {
+					vp8Predict4(ybr, mode, at)
+					let cost = vp8Sad4(ybr, at, sy, so, stride)
+					if best < 0 || cost < best {
+						best = cost
+						chosen = mode
+					}
+				}
+				vp8Predict4(ybr, chosen, at) unless chosen == 9
+				bModes[16 * m + n] = chosen
+				total += best
+				return total when total > most
+				vp8Residual4(sy, so, stride, ybr, at, res4)
+				vp8ForwardDCT(res4, 0, 4, coeffs, 16 * n)
+				if vp8QuantizeBlock(coeffs, 16 * n, bLevels, rec.coeff, 16 * n, rec.quant[0], rec.quant[1], vp8Rounding) {
+					vp8InverseDCT4(ybr, at, rec.coeff, 16 * n)
+				}
+			}
+			return total
+		}
+
+		// searchRows finds the vectors of the macroblock rows from `from`
+		// up to `to`, one band of the frame. The arrays are taken once
+		// here: a task that fetched them per macroblock would contend
+		// with the other bands for their reference counts.
+		internal def searchRows(from int, to int) {
+			let band = bandOf(from, rec.mbh, bandCount(rec.mbh, width * height))
+			let ref = rec.refs[vp8RefLast].y
+			// The golden and alternate frames, where they are other pictures.
+			let golden = rec.refs[vp8RefGolden].y
+			let alternate = rec.refs[vp8RefAltRef].y
+			let tryGolden = rec.refs[vp8RefGolden].id != rec.refs[vp8RefLast].id
+			let tryAlternate = rec.refs[vp8RefAltRef].id != rec.refs[vp8RefLast].id && rec.refs[vp8RefAltRef].id != rec.refs[vp8RefGolden].id
+			let chosen = foundRef
+			let count = rec.mbw * rec.mbh
+			let source = sy
+			let rows = foundR
+			let columns = foundC
+			let costs = foundCost
+			let splits = foundSplit
+			let quartersR = quarterR
+			let quartersC = quarterC
+			let block = bandBlock[band]
+			let edge = bandEdge[band]
+			let tmp = bandTmp[band]
+			let wide = rec.mbw
+			let high = rec.mbh
+			let stride = rec.yStride
+			// A bit of vector is worth this much sum of absolute differences.
+			let charge = (rec.quant[1] * vp8MvCharge / 16).max(1)
+			for let mby = from; mby < to; mby++ {
+				for let mbx = 0; mbx < wide; mbx++ {
+					vp8Search(source, ref, stride, wide, high, mbx, mby, from, rows, columns, costs, 0, true, splits, quartersR, quartersC, block, edge, tmp, charge)
+					let m = mby * wide + mbx
+					chosen[m] = vp8RefLast
+					let least = costs[m]
+					for let other = 1; other < 3; other++ {
+						let at = other * count + m
+						// A macroblock not searched leaves no vector for
+						// its neighbours to start from.
+						rows[at] = 0
+						columns[at] = 0
+						continue unless costs[m] > vp8RefineAbove && (other == 1 ?? (tryGolden, tryAlternate))
+						let still = vp8Sad16(source, mby * 16 * stride + mbx * 16, stride, other == 1 ?? (golden, alternate), mby * 16 * stride + mbx * 16, stride)
+						continue unless still < least
+						vp8Search(source, other == 1 ?? (golden, alternate), stride, wide, high, mbx, mby, from, rows, columns, costs, other * count, false, splits, quartersR, quartersC, block, edge, tmp, charge)
+						continue unless costs[at] + charge * vp8RefBits < least
+						least = costs[at]
+						chosen[m] = vp8RefLast + other
+						splits[m] = 0
+					}
+				}
+			}
+		}
+
+		// name finds how the vector is coded: the mode that names it and,
+		// for a new one, its difference to the best neighbour's (RFC 6386
+		// §16.3); the contexts of the mode's bits are kept for writing.
+		internal def name(mbx int, mby int, m int, r int, c int, zeroVotes int) {
+			let at = 4 * m
+			contexts[at] = zeroVotes
+			rec.mvR[m] = r
+			rec.mvC[m] = c
+			if r == 0 && c == 0 {
+				naming[m] = vp8ModeZero
+				return
+			}
+			rec.rankNear()
+			contexts[at + 1] = rec.cnt[1]
+			contexts[at + 2] = rec.cnt[2]
+			if r == rec.clampRow(rec.nearR[1], mby) && c == rec.clampCol(rec.nearC[1], mbx) {
+				naming[m] = vp8ModeNearest
+				return
+			}
+			if r == rec.clampRow(rec.nearR[2], mby) && c == rec.clampCol(rec.nearC[2], mbx) {
+				naming[m] = vp8ModeNear
+				return
+			}
+			let b = rec.cnt[1] >= rec.cnt[0] ?? (1, 0)
+			naming[m] = vp8ModeNew
+			deltaR[m] = r - rec.clampRow(rec.nearR[b], mby)
+			deltaC[m] = c - rec.clampCol(rec.nearC[b], mbx)
+			contexts[at + 3] = splitVotes(mbx, mby, m)
+		}
+
+		// splitVotes is the context of the bit that tells a new vector from
+		// several: how many neighbours have several.
+		internal def splitVotes(mbx int, mby int, m int) int {
+			let splits = 0
+			splits += 2 when mby > 0 && rec.mbKind[m - rec.mbw] == vp8KindSplit
+			splits += 2 when mbx > 0 && rec.mbKind[m - 1] == vp8KindSplit
+			splits += 1 when mbx > 0 && mby > 0 && rec.mbKind[m - rec.mbw - 1] == vp8KindSplit
+			return splits
+		}
+
+		// nameSplit finds how the four vectors the search gave the
+		// macroblock's quarters are coded (RFC 6386 §16.4): the layout with
+		// the fewest partitions that holds them, and for each partition
+		// whether its vector is the one to its left, above it, none or a new
+		// one. The block vectors go to the decoder state as `parseSplit`
+		// leaves them.
+		internal def nameSplit(mbx int, mby int, m int) {
+			let at = 4 * m
+			rec.rankNear()
+			contexts[at] = rec.cnt[0]
+			contexts[at + 1] = rec.cnt[1]
+			contexts[at + 2] = rec.cnt[2]
+			contexts[at + 3] = splitVotes(mbx, mby, m)
+			naming[m] = vp8ModeSplit
+			let b = rec.cnt[1] >= rec.cnt[0] ?? (1, 0)
+			let bestR = rec.clampRow(rec.nearR[b], mby)
+			let bestC = rec.clampCol(rec.nearC[b], mbx)
+			let part = 2
+			if quarterR[at] == quarterR[at + 1] && quarterC[at] == quarterC[at + 1] && quarterR[at + 2] == quarterR[at + 3] && quarterC[at + 2] == quarterC[at + 3] {
+				part = 0
+			} else if quarterR[at] == quarterR[at + 2] && quarterC[at] == quarterC[at + 2] && quarterR[at + 1] == quarterR[at + 3] && quarterC[at + 1] == quarterC[at + 3] {
+				part = 1
+			}
+			layouts[m] = part
+			let layout = part * 16
+			let count = vp8MbSplitCount[part]
+			let o = m * 16
+			for let n = 0; n < count; n++ {
+				let k = vp8MbSplitFirst[layout + n]
+				let quarter = at + (k >> 3) * 2 + ((k & 3) >> 1)
+				let r = quarterR[quarter]
+				let c = quarterC[quarter]
+				let lr = 0
+				let lc = 0
+				if (k & 3) != 0 {
+					let pl = vp8MbSplits[layout + k - 1]
+					lr = rec.partR[pl]
+					lc = rec.partC[pl]
+				} else if mbx > 0 {
+					lr = rec.blockMvR(m - 1, k + 3)
+					lc = rec.blockMvC(m - 1, k + 3)
+				}
+				let ar = 0
+				let ac = 0
+				if k >= 4 {
+					let pa = vp8MbSplits[layout + k - 4]
+					ar = rec.partR[pa]
+					ac = rec.partC[pa]
+				} else if mby > 0 {
+					ar = rec.blockMvR(m - rec.mbw, k + 12)
+					ac = rec.blockMvC(m - rec.mbw, k + 12)
+				}
+				let ctx = 0
+				if lr == ar && lc == ac {
+					ctx = (lr == 0 && lc == 0) ?? (4, 3)
+				} else if ar == 0 && ac == 0 {
+					ctx = 2
+				} else if lr == 0 && lc == 0 {
+					ctx = 1
+				}
+				let choice = 3
+				if r == lr && c == lc {
+					choice = 0
+				} else if r == ar && c == ac {
+					choice = 1
+				} else if r == 0 && c == 0 {
+					choice = 2
+				}
+				subCodes[o + n] = ctx * 4 + choice
+				subR[o + n] = r - bestR
+				subC[o + n] = c - bestC
+				rec.partR[n] = r
+				rec.partC[n] = c
+			}
+			for let k = 0; k < 16; k++ {
+				let pb = vp8MbSplits[layout + k]
+				rec.bmvR[o + k] = rec.partR[pb]
+				rec.bmvC[o + k] = rec.partC[pb]
+			}
+			rec.mvR[m] = rec.partR[count - 1]
+			rec.mvC[m] = rec.partC[count - 1]
+		}
+
+		// writeTokens codes the coefficients of every macroblock: once to
+		// count how the tokens fall, so the probabilities that pay for
+		// their update are changed, then with those.
+		internal def writeTokens() byte[] {
+			let probs = rec.tokenProb
+			updated.fill(0)
+			let tok = new Vp8BoolEncoder()
+			for let pass = 0; pass < 2; pass++ {
+				tok = new Vp8BoolEncoder()
+				tok.stats = vp8Zeros(2 * 1056) when pass == 0
+				upNz.fill(0)
+				upNzY16.fill(0)
+				for let mby = 0; mby < rec.mbh; mby++ {
+					let leftNz = 0
+					let leftNzY16 = 0
+					for let mbx = 0; mbx < rec.mbw; mbx++ {
+						let m = mby * rec.mbw + mbx
+						let whole = yModes[m] != vp8ModeB && !(yModes[m] < 0 && naming[m] == vp8ModeSplit)
+						if skips[m] == 1 {
+							leftNz = 0
+							upNz[mbx] = 0
+							// A macroblock coded block by block has no
+							// second-order block: that context stays.
+							if whole {
+								leftNzY16 = 0
+								upNzY16[mbx] = 0
+							}
+							continue
+						}
+						let from = m * 400
+						for let k = 0; k < 400; k++ {
+							levels[k] = int(stored[from + k])
+						}
+						if whole {
+							let nz = vp8PutBlock(tok, probs, levels, 384, vp8PlaneY2, leftNzY16 + upNzY16[mbx], 0)
+							leftNzY16 = nz
+							upNzY16[mbx] = nz
+						}
+						let lnz = leftNz & 15
+						let unz = upNz[mbx] & 15
+						for let j = 0; j < 4; j++ {
+							let bnz = (lnz >> j) & 1
+							for let i = 0; i < 4; i++ {
+								bnz = vp8PutBlock(tok, probs, levels, 16 * (j * 4 + i), whole ?? (vp8PlaneY1WithY2, vp8PlaneY1SansY2), bnz + ((unz >> i) & 1), whole ?? (1, 0))
+								unz = (unz & (15 ^ (1 << i))) | (bnz << i)
+							}
+							lnz = (lnz & (15 ^ (1 << j))) | (bnz << j)
+						}
+						let lnzC = leftNz >> 4
+						let unzC = upNz[mbx] >> 4
+						let base = 256
+						for let c = 0; c < 4; c += 2 {
+							for let j = 0; j < 2; j++ {
+								let bnz = (lnzC >> (j + c)) & 1
+								for let i = 0; i < 2; i++ {
+									bnz = vp8PutBlock(tok, probs, levels, base, vp8PlaneUV, bnz + ((unzC >> (i + c)) & 1), 0)
+									unzC = (unzC & (15 ^ (1 << (i + c)))) | (bnz << (i + c))
+									base += 16
+								}
+								lnzC = (lnzC & (15 ^ (1 << (j + c)))) | (bnz << (j + c))
+							}
+						}
+						leftNz = lnz | (lnzC << 4)
+						upNz[mbx] = unz | (unzC << 4)
+					}
+				}
+				vp8TuneProbs(tok.stats, probs, updated) when pass == 0
+			}
+			return tok.bytes()
+		}
+
+		// writeModes writes the first partition: the frame header, then
+		// each macroblock's modes and vectors.
+		internal def writeModes(key bool, kept bool, count int) byte[] {
+			let hdr = new Vp8BoolEncoder()
+			if key {
+				// Colour space and clamping: the defaults.
+				hdr.put(128, false)
+				hdr.put(128, false)
+			}
+			// No segments; the normal loop filter at the frame's level, no
+			// adjustments; one token partition; the quantiser index with no
+			// offsets.
+			hdr.put(128, false)
+			hdr.put(128, false)
+			hdr.literal(rec.level, 6)
+			hdr.literal(0, 3)
+			hdr.put(128, false)
+			hdr.literal(0, 2)
+			hdr.literal(quantIndex, 7)
+			for let i = 0; i < 5; i++ {
+				hdr.put(128, false)
+			}
+			if !key {
+				// Whether the frame becomes the golden one, never the
+				// alternate one, which takes the golden frame that was
+				// instead; no reference counts vectors backwards.
+				hdr.put(128, gilding)
+				hdr.put(128, false)
+				hdr.literal(0, 2) unless gilding
+				hdr.literal(rec.copyToAlt, 2)
+				hdr.put(128, false)
+				hdr.put(128, false)
+			}
+			// The probabilities of this frame are kept for the next, and
+			// the frame becomes the last one, unless it may be dropped.
+			hdr.put(128, kept)
+			hdr.put(128, kept) unless key
+			for let i = 0; i < 1056; i++ {
+				hdr.put(vp8TokenUpdateProb[i], updated[i] == 1)
+				hdr.literal(rec.tokenProb[i], 8) when updated[i] == 1
+			}
+			let skipProb = vp8Clip((count - skipCount) * 256 / count, 1, 255)
+			hdr.put(128, true)
+			hdr.literal(skipProb, 8)
+			let probIntra = vp8Clip(intraCount * 256 / count, 1, 255)
+			// Which frame the others are predicted from.
+			lastCount = 0
+			goldCount = 0
+			for let m = 0; !key && m < count; m++ {
+				continue unless yModes[m] < 0
+				lastCount++ when rec.mbRef[m] == vp8RefLast
+				goldCount++ when rec.mbRef[m] == vp8RefGolden
+			}
+			let further = count - intraCount - lastCount
+			let probLast = vp8Clip(lastCount * 256 / (count - intraCount).max(1), 1, 255)
+			let probGolden = vp8Clip(goldCount * 256 / further.max(1), 1, 255)
+			if !key {
+				hdr.literal(probIntra, 8)
+				hdr.literal(probLast, 8)
+				hdr.literal(probGolden, 8)
+				hdr.put(128, false)
+				hdr.put(128, false)
+				// The vector probabilities follow the frame's vectors where
+				// the new value pays for its seven bits; they stay for the
+				// frames behind (RFC 6386 §17.2).
+				let seen = vp8Zeros(2 * 38)
+				for let m = 0; m < count; m++ {
+					continue unless yModes[m] < 0
+					if naming[m] == vp8ModeNew {
+						vp8CountMv(seen, 0, deltaR[m])
+						vp8CountMv(seen, 19, deltaC[m])
+					}
+					for let n = 0; naming[m] == vp8ModeSplit && n < vp8MbSplitCount[layouts[m]]; n++ {
+						continue unless (subCodes[16 * m + n] & 3) == 3
+						vp8CountMv(seen, 0, subR[16 * m + n])
+						vp8CountMv(seen, 19, subC[16 * m + n])
+					}
+				}
+				for let i = 0; i < 38; i++ {
+					let n0 = seen[2 * i]
+					let n1 = seen[2 * i + 1]
+					let up = vp8MvUpdateProb[i]
+					// A probability is written as seven bits: even, or 1.
+					let half = vp8Clip((n0 * 128 + (n0 + n1) / 2) / (n0 + n1).max(1), 0, 127)
+					let fresh = half == 0 ?? (1, half * 2)
+					let better = n0 + n1 > 0 && vp8BitCost(n0, n1, fresh) + vp8BitCost(0, 1, up) + 7.0 < vp8BitCost(n0, n1, rec.mvProb[i]) + vp8BitCost(1, 0, up)
+					hdr.put(up, better)
+					continue unless better
+					hdr.literal(half, 7)
+					rec.mvProb[i] = fresh
+				}
+			}
+			// The modes of the 4x4 blocks above and to the left, which a key
+			// frame codes a block's mode by; a whole-block mode counts as
+			// that mode in each of its blocks.
+			let above = vp8Zeros(4 * rec.mbw)
+			let left = vp8Zeros(4)
+			for let m = 0; m < count; m++ {
+				let mbx = m % rec.mbw
+				left.fill(0) when mbx == 0
+				hdr.put(skipProb, skips[m] == 1)
+				let mode = yModes[m]
+				if key {
+					hdr.put(145, mode != vp8ModeB)
+					if mode == vp8ModeB {
+						for let j = 0; j < 4; j++ {
+							for let i = 0; i < 4; i++ {
+								let own = bModes[16 * m + 4 * j + i]
+								writeBlockMode(hdr, vp8BModeProb, (above[4 * mbx + i] * 10 + left[j]) * 9, own)
+								above[4 * mbx + i] = own
+								left[j] = own
+							}
+						}
+					} else {
+						if mode == vp8PredDC || mode == vp8PredVE {
+							hdr.put(156, false)
+							hdr.put(163, mode == vp8PredVE)
+						} else {
+							hdr.put(156, true)
+							hdr.put(128, mode == vp8PredTM)
+						}
+						for let i = 0; i < 4; i++ {
+							above[4 * mbx + i] = mode
+							left[i] = mode
+						}
+					}
+					writeChroma(hdr, uvModes[m], 142, 114, 183)
+					continue
+				}
+				hdr.put(probIntra, mode < 0)
+				if mode >= 0 {
+					if mode == vp8PredDC {
+						hdr.put(rec.yModeProb[0], false)
+					} else if mode == vp8PredTM || mode == vp8ModeB {
+						hdr.put(rec.yModeProb[0], true)
+						hdr.put(rec.yModeProb[1], true)
+						hdr.put(rec.yModeProb[3], mode == vp8ModeB)
+						for let n = 0; mode == vp8ModeB && n < 16; n++ {
+							writeBlockMode(hdr, vp8InterBModeProb, 0, bModes[16 * m + n])
+						}
+					} else {
+						hdr.put(rec.yModeProb[0], true)
+						hdr.put(rec.yModeProb[1], false)
+						hdr.put(rec.yModeProb[2], mode == vp8PredHE)
+					}
+					writeChroma(hdr, uvModes[m], rec.uvModeProb[0], rec.uvModeProb[1], rec.uvModeProb[2])
+					continue
+				}
+				let at = 4 * m
+				hdr.put(probLast, rec.mbRef[m] != vp8RefLast)
+				hdr.put(probGolden, rec.mbRef[m] == vp8RefAltRef) when rec.mbRef[m] != vp8RefLast
+				let named = naming[m]
+				hdr.put(vp8ModeContexts[contexts[at] * 4], named != vp8ModeZero)
+				continue when named == vp8ModeZero
+				hdr.put(vp8ModeContexts[contexts[at + 1] * 4 + 1], named != vp8ModeNearest)
+				continue when named == vp8ModeNearest
+				hdr.put(vp8ModeContexts[contexts[at + 2] * 4 + 2], named != vp8ModeNear)
+				continue when named == vp8ModeNear
+				hdr.put(vp8ModeContexts[contexts[at + 3] * 4 + 3], named == vp8ModeSplit)
+				if named == vp8ModeSplit {
+					writeSplit(hdr, m)
+					continue
+				}
+				vp8WriteMv(hdr, rec.mvProb, 0, deltaR[m])
+				vp8WriteMv(hdr, rec.mvProb, 19, deltaC[m])
+			}
+			return hdr.bytes()
+		}
+
+		// writeSplit writes the layout of a macroblock of several vectors
+		// and each partition's vector, as `Vp8Decoder.parseSplit` reads
+		// them.
+		internal def writeSplit(hdr Vp8BoolEncoder, m int) {
+			let part = layouts[m]
+			hdr.put(vp8MbSplitProb[0], part != 3)
+			if part != 3 {
+				hdr.put(vp8MbSplitProb[1], part != 2)
+				hdr.put(vp8MbSplitProb[2], part == 1) unless part == 2
+			}
+			for let n = 0; n < vp8MbSplitCount[part]; n++ {
+				let code = subCodes[16 * m + n]
+				let p = (code >> 2) * 3
+				let choice = code & 3
+				hdr.put(vp8SubMvProb[p], choice != 0)
+				continue when choice == 0
+				hdr.put(vp8SubMvProb[p + 1], choice != 1)
+				continue when choice == 1
+				hdr.put(vp8SubMvProb[p + 2], choice == 3)
+				continue unless choice == 3
+				vp8WriteMv(hdr, rec.mvProb, 0, subR[16 * m + n])
+				vp8WriteMv(hdr, rec.mvProb, 19, subC[16 * m + n])
+			}
+		}
+
+		// writeBlockMode writes the mode of a 4x4 block with the nine tree
+		// probabilities at `probs[at:]` (RFC 6386 §11.2).
+		internal def writeBlockMode(hdr Vp8BoolEncoder, probs int[], at int, mode int) {
+			hdr.put(probs[at], mode != vp8PredDC)
+			return when mode == vp8PredDC
+			hdr.put(probs[at + 1], mode != vp8PredTM)
+			return when mode == vp8PredTM
+			hdr.put(probs[at + 2], mode != vp8PredVE)
+			return when mode == vp8PredVE
+			let lower = mode := vp8PredHE || vp8PredRD || vp8PredVR
+			hdr.put(probs[at + 3], !lower)
+			if lower {
+				hdr.put(probs[at + 4], mode != vp8PredHE)
+				hdr.put(probs[at + 5], mode == vp8PredVR) unless mode == vp8PredHE
+				return
+			}
+			hdr.put(probs[at + 6], mode != vp8PredLD)
+			return when mode == vp8PredLD
+			hdr.put(probs[at + 7], mode != vp8PredVL)
+			hdr.put(probs[at + 8], mode == vp8PredHU) unless mode == vp8PredVL
+		}
+
+		internal def writeChroma(hdr Vp8BoolEncoder, mode int, p0 int, p1 int, p2 int) {
+			hdr.put(p0, mode != vp8PredDC)
+			return when mode == vp8PredDC
+			hdr.put(p1, mode != vp8PredVE)
+			hdr.put(p2, mode == vp8PredTM) when mode != vp8PredVE
+		}
+	}
+}

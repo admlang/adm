@@ -29,13 +29,22 @@ adm version
 Later, `adm update` installs the newest release over the current one, and `adm version` says
 when there is one.
 
-## IntelliJ plugin
+## Editor plugins
 
-`adm-intellij-<version>.zip`: syntax highlighting, code completion,
-navigation and diagnostics through the language server, and run, test and build actions in
-the editor gutter for applications, `check` suites and plugins. Install it from the file:
-Settings → Plugins → ⚙ → *Install Plugin from Disk…*, pick the zip, restart. The plugin
-finds `adm` on `PATH`.
+The plugins live in their own repository, [admlang/plugins](https://github.com/admlang/plugins).
+Both run the installed `adm` (`adm lsp` for language features), so install ADM first.
+
+- **IntelliJ IDEA, CLion and other JetBrains IDEs** (2025.2 and later): language features, run
+  and debug, and the ADM tool window (project info, libraries, documentation, tests with
+  coverage, audit, lint, live services). `adm-intellij.zip` is attached to each
+  [release](https://github.com/admlang/adm/releases/latest): Settings → Plugins → ⚙ →
+  *Install Plugin from Disk…*, pick the zip, restart.
+- **Visual Studio Code** (1.88 and later): language features, syntax colouring, `check` suites
+  in the Testing view, commands and tasks for `adm run`, `build`, `check`, `test`, `lint` and
+  `fmt`. Install it from the
+  [Marketplace](https://marketplace.visualstudio.com/items?itemName=admlang.adm)
+  (`code --install-extension admlang.adm`), or take `adm-vscode.vsix` from a release and use
+  *Extensions: Install from VSIX…*.
 
 ## First program
 

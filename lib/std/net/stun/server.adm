@@ -1,0 +1,1456 @@
+partial module std.net.stun {
+	use (
+		std.net.stun.wire::*
+		std.bytes::(Endian)
+		std.crypto::(rand, constantTimeEqual)
+		std.crypto.hash::(Hash, hmac)
+		std.data.encoding::(base64encode, base64decode)
+		std.metrics
+		std.net
+		std.net.proxy
+		std.net.tls
+		std.services.diagnostics::(metric)
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// How long a NONCE of this server stays good, in seconds; a request with
+	// an older one gets 438 and a fresh one (RFC 8489 §9.2.4).
+	internal const nonceLifetime = 3600
+	// How long a relayed TCP connection waits for its ConnectionBind, and an
+	// outgoing one for the peer to answer (RFC 6062 §5.2-5.3).
+	internal const connectionBindWait = 30s
+	// How long a port reserved with EVEN-PORT waits for the allocation that
+	// brings its token (RFC 8656 §7.2).
+	internal const reservationLifetime = 30000000000
+	// The last channel number a client may bind here: RFC 5766's range,
+	// which clients older than RFC 8656 (it stops at 0x4FFF) still use.
+	internal const lastLegacyChannel = 0x7FFF
+	// Ports tried for a relayed address before 508.
+	internal const relayPortTries = 64
+
+	// Server answers STUN Binding requests and, with `turn`, is a TURN
+	// server (RFC 8489, RFC 8656, RFC 6062): allocations with relayed UDP
+	// addresses, or relayed TCP addresses for clients that reach it over TCP
+	// or TLS, permissions, channels and the long-term credential mechanism
+	// with MD5 and SHA-256 keys, USERHASH and the REST-style shared secret.
+	// It listens on `addr` over UDP and TCP, and on `secureAddr` over TLS
+	// and DTLS when that is set. Implements `net.Server`.
+	//
+	// ```
+	// let server = new stun.Server(":3478")
+	// server.realm = "example.org"
+	// server.users["alice"] = "secret"
+	// server.turn = true
+	// try server.listenAndServe()
+	// ```
+	type Server {
+		addr string = ":3478"
+		// The TLS (TCP) and DTLS (UDP) address, "" for none; needs `tls`
+		// holding the server's certificate.
+		secureAddr string = ""
+		tls ?tls.Config = none
+		// The realm of the long-term credentials. With "" nothing is
+		// authenticated, which a relay refuses to start with.
+		realm string = ""
+		// Long-term credentials: username to password.
+		users map<string, string>
+		// The secret of the REST-style credentials (`restCredentials`): a
+		// username that is no key of `users` is one of them when this is set.
+		secret string = ""
+		// Authenticate Binding requests too, not only the TURN methods.
+		authenticateBinding bool = false
+		// Be a TURN server: serve allocations.
+		turn bool = false
+		// The IP addresses relayed addresses are bound on, "" for the
+		// address the server listens on (IPv4) and none (IPv6).
+		relayIPv4 string = ""
+		relayIPv6 string = ""
+		// The ports relayed addresses take.
+		minPort int = 49152
+		maxPort int = 65535
+		// The lifetime an allocation gets when it asks for none, and the
+		// longest it may ask for.
+		defaultLifetime duration = 10min
+		maxLifetime duration = 1h
+		// The most allocations at once, and per username.
+		maxAllocations int = 10000
+		userQuota int = 100
+		// Relay to loopback, link-local, unspecified and multicast peers.
+		// Off, a relay is no way into the server's own host.
+		allowLocalPeers bool = false
+		// What the server names itself in SOFTWARE, "" for nothing.
+		software string = "adm"
+		// A server that sends Binding and Allocate requests elsewhere
+		// (300 Try Alternate with this ALTERNATE-SERVER, "ip:port"), "" to
+		// serve them.
+		alternate string = ""
+		internal udp ?net.Socket = none
+		internal tcp ?net.Listener = none
+		internal secureTCP ?net.Listener = none
+		internal secureUDP ?tls.DTLSListener = none
+		internal atomic running bool = false
+		internal nonceKey byte[] = []
+		// USERHASH (hex) to username, for the users known by name.
+		internal hashes map<string, string>
+		internal relays RelayTable
+		@metric("net.stun.server.requests")
+		internal requests metrics.Counter
+		@metric("net.stun.server.allocations")
+		internal allocations metrics.Counter
+		@metric("net.stun.server.auth.failures")
+		internal authFailures metrics.Counter
+		@metric("net.stun.server.relayed")
+		internal relayed metrics.Counter
+
+		def new(addr string = ":3478") {
+			self.addr = addr
+			relays = new RelayTable()
+		}
+
+		// Binds the addresses and serves until `close`. Fails with
+		// PolicyDenied when the policy denies listening there, NetError when
+		// an address cannot be bound, StunError for a relay without a realm
+		// or a secure address without a certificate.
+		def listenAndServe() !none {
+			try start()
+			for running {
+				time.sleep(250ms)
+			}
+			return none
+		}
+
+		// Implements net.Server: binds and serves in the background. Fails
+		// as `listenAndServe` does.
+		def start() !none {
+			return none when running
+			fail stunError("a TURN server needs a realm: its requests are authenticated") when turn && realm == ""
+			fail stunError("secureAddr needs a certificate in tls") when secureAddr != "" && tls is none
+			nonceKey = try rand(32)
+			for let (name, _) in users {
+				hashes[(try userHash(name, realm)).hex()] = name
+			}
+			try bind()
+			running = true
+			let datagrams = udp
+			if !(datagrams is none) {
+				let task = async serveDatagrams(datagrams)
+				task.keepAlive()
+			}
+			let streams = tcp
+			if !(streams is none) {
+				let task = async serveStreams(streams, Transport.TCP)
+				task.keepAlive()
+			}
+			let secureStreams = secureTCP
+			if !(secureStreams is none) {
+				let task = async serveStreams(secureStreams, Transport.TLS)
+				task.keepAlive()
+			}
+			let secureDatagrams = secureUDP
+			if !(secureDatagrams is none) {
+				let task = async serveSecureDatagrams(secureDatagrams)
+				task.keepAlive()
+			}
+			let sweeper = async sweep()
+			sweeper.keepAlive()
+			return none
+		}
+
+		// bind opens the sockets; one that fails closes the ones before it.
+		internal def bind() !none {
+			try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "stun://" + addr)
+			let failure ?error = none
+			open() onerror (err error) {
+				failure = err
+				recover none
+			}
+			return none when failure is none
+			close() onerror recover none
+			fail failure
+		}
+
+		internal def open() !none {
+			let at = try net.parseAddress(addr)
+			let domain = at.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			// UDP and TCP share the port. With port 0 the system picks the
+			// UDP one, and TCP may have that one taken: then another is
+			// picked.
+			for let attempt = 0; tcp is none; attempt++ {
+				let datagrams = try net.socket(domain, net.SocketType.Datagram)
+				udp = datagrams
+				try datagrams.setReuseAddr(true)
+				try datagrams.bind(addr)
+				let streams = try net.socket(domain, net.SocketType.Stream)
+				try streams.setReuseAddr(true)
+				let taken = false
+				streams.bind(net.withPort(at.host, datagrams.localAddr().port)) onerror (err error) {
+					taken = at.port == 0 && attempt < 16 && err is net.NetError && err.kind == net.ErrorCode.AddrInUse
+					streams.close() onerror recover none
+					fail err unless taken
+					recover none
+				}
+				if taken {
+					datagrams.close() onerror recover none
+					udp = none
+					continue
+				}
+				tcp = try streams.listen(128)
+			}
+			return none when secureAddr == ""
+			try Policy.validate("adm.network.listen", "std.services.policy.EndpointSpec", "stuns://" + secureAddr)
+			let config = tls
+			fail stunError("secureAddr needs a certificate in tls") when config is none
+			let secureAt = try net.parseAddress(secureAddr)
+			let secureDomain = secureAt.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)
+			let secureDatagrams = try secureListener(secureAddr, config)
+			secureUDP = secureDatagrams
+			let secureStreams = try net.socket(secureDomain, net.SocketType.Stream)
+			try secureStreams.setReuseAddr(true)
+			try secureStreams.bind(net.withPort(secureAt.host, secureDatagrams.address().port))
+			secureTCP = try secureStreams.listen(128)
+			return none
+		}
+
+		// Implements net.Server: stops serving and deletes entries
+		// allocation. Never fails.
+		def close() !none {
+			running = false
+			for let relay in relays.all() {
+				relay.close()
+			}
+			let datagrams = udp
+			udp = none
+			if !(datagrams is none) {
+				datagrams.close() onerror recover none
+			}
+			let streams = tcp
+			tcp = none
+			if !(streams is none) {
+				streams.close() onerror recover none
+			}
+			let secureStreams = secureTCP
+			secureTCP = none
+			if !(secureStreams is none) {
+				secureStreams.close() onerror recover none
+			}
+			let secureDatagrams = secureUDP
+			secureUDP = none
+			if !(secureDatagrams is none) {
+				secureDatagrams.close() onerror recover none
+			}
+			return none
+		}
+
+		// Implements net.Server: the bound address (UDP and TCP share the
+		// port), or `addr` parsed before `start`.
+		def address() net.Address {
+			let datagrams = udp
+			return datagrams.localAddr() unless datagrams is none
+			return net.parseAddress(addr) onerror recover new net.Address()
+		}
+
+		// secureAddress is the bound TLS and DTLS address, empty without
+		// one.
+		def secureAddress() net.Address {
+			let datagrams = secureUDP
+			return datagrams.address() unless datagrams is none
+			return new net.Address()
+		}
+
+		// allocationCount is how many allocations exist now.
+		def allocationCount() int {
+			return relays.count()
+		}
+
+		// Stops the server when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// ---- Transports ----
+
+		// serveDatagrams reads the UDP socket: each datagram is a message of
+		// the client it came from.
+		internal def serveDatagrams(socket net.Socket) {
+			let local = socket.localAddr()
+			let buf byte[]
+			buf.len(65536)
+			for running {
+				let stopped = false
+				let (n, from) = socket.readFrom(buf, 500ms) onerror (err error) {
+					stopped = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover (0, new net.Address())
+				}
+				return when stopped
+				continue when n <= 0
+				let link = new ClientLink(Transport.UDP, from, local)
+				link.socket = socket
+				link.relay = relays.ofDatagramClient(from.raw)
+				// The buffer is read into again: the message gets its own bytes.
+				handle(link, buf[0:n].clone())
+			}
+		}
+
+		// serveStreams accepts TCP connections, wrapped in TLS on the secure
+		// port, and serves each on a task of its own.
+		internal def serveStreams(listener net.Listener, transport Transport) {
+			for running {
+				let stopped = false
+				let conn = acceptNext(listener) onerror (err error) {
+					stopped = true
+					recover none
+				}
+				return when stopped || conn is none
+				let task = async serveStream(conn, transport, listener.address())
+				task.keepAlive()
+			}
+		}
+
+		// serveStream reads STUN and ChannelData messages off one client
+		// connection until it closes, which ends its allocation; a
+		// connection bound to a peer with ConnectionBind carries only that
+		// peer's bytes from then on (RFC 6062 §5.4).
+		internal def serveStream(conn net.Connection, transport Transport, local net.Address) {
+			let link = new ClientLink(transport, conn.remoteAddr(), local)
+			let stream net.Stream = conn
+			let config = tls
+			stream = secureStream(conn, config) when transport == Transport.TLS && !(config is none)
+			link.stream = stream
+			let inbox byte[] = []
+			let buf byte[]
+			buf.len(65536)
+			for running && link.peerConnection is none {
+				let ended = false
+				let n = stream.read(buf, 500ms) onerror (err error) {
+					ended = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover 0
+				}
+				break when ended
+				continue when n <= 0 && stream.isOpen()
+				break when n <= 0
+				inbox = inbox + buf[0:n]
+				for inbox.len() >= 4 && link.peerConnection is none {
+					let size = frameSize(inbox)
+					if size < 0 {
+						ended = true
+						break
+					}
+					break when inbox.len() < size
+					handle(link, inbox[0:size])
+					inbox = inbox[size:]
+				}
+				break when ended
+			}
+			let bound = link.peerConnection
+			if !(bound is none) {
+				// What the client sent behind its ConnectionBind is the
+				// peer's already.
+				net.writeAll(bound, inbox, 30s) onerror recover none
+				proxy.relay(stream, bound)
+				return
+			}
+			let relay = link.relay
+			relay.close() unless relay is none
+			stream.close() onerror recover none
+		}
+
+		// serveSecureDatagrams accepts DTLS connections and serves each on a
+		// task of its own.
+		internal def serveSecureDatagrams(listener tls.DTLSListener) {
+			let local = listener.address()
+			for running {
+				let conn = acceptedSecure(listener) onerror recover none
+				continue when conn is none
+				let task = async serveSecureDatagram(conn, local)
+				task.keepAlive()
+			}
+		}
+
+		internal def acceptedSecure(listener tls.DTLSListener) !?tls.DTLSConn {
+			return try listener.accept(500ms)
+		}
+
+		internal def serveSecureDatagram(conn tls.DTLSConn, local net.Address) {
+			let link = new ClientLink(Transport.DTLS, conn.remoteAddr(), local)
+			link.datagram = conn
+			for running && conn.isOpen() {
+				let ended = false
+				let data = conn.receive(500ms) onerror (err error) {
+					ended = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover []
+				}
+				break when ended
+				handle(link, data) when data.len() > 0
+			}
+			let relay = link.relay
+			relay.close() unless relay is none
+			conn.close() onerror recover none
+		}
+
+		// ---- Messages ----
+
+		// handle takes one message of a client: ChannelData for its
+		// allocation, a request to answer, or a Send indication. Anything
+		// else is dropped, as is a message whose FINGERPRINT is wrong.
+		internal def handle(link ClientLink, data byte[]) {
+			if data.len() >= 4 && (int(data[0]) & 0xC0) == 0x40 {
+				let relay = link.relay
+				return when relay is none
+				let length = int(data[2]) << 8 | int(data[3])
+				return when data.len() < 4 + length
+				relay.sendOnChannel(int(data[0]) << 8 | int(data[1]), data[4:4 + length])
+				return
+			}
+			return unless isMessage(data)
+			let m = optionalMessage(data) onerror recover none
+			return when m is none
+			return when m.has(AttributeType.Fingerprint) && !m.checkFingerprint()
+			if m.class == MessageClass.Indication {
+				let relay = link.relay
+				return when relay is none || m.method != Method.Send
+				relay.sendIndicated(m)
+				return
+			}
+			return unless m.class == MessageClass.Request
+			requests.inc()
+			answer(link, m) onerror recover none
+		}
+
+		// answer answers one request. Fails when the answer cannot be built
+		// or sent, which leaves the client to retransmit.
+		internal def answer(link ClientLink, m Message) !none {
+			let binding = m.method == Method.Binding
+			return try refuse(link, m, ErrorCode.BadRequest, none) unless binding || (turn && (m.method := Method.Allocate || Method.Refresh || Method.CreatePermission || Method.ChannelBind || Method.Connect || Method.ConnectionBind))
+			let who ?Credential = none
+			if !binding || (authenticateBinding && realm != "") {
+				who = try authenticate(link, m)
+				return none when who is none
+			}
+			let unknown = m.comprehensionRequired()
+			if unknown.len() > 0 {
+				let refusal = response(m, false)
+				refusal.add(ErrorCode.UnknownAttribute)
+				let list byte[]
+				for let kind in unknown {
+					list = list + uint16(kind).bytes(Endian.Big)
+				}
+				refusal.add(AttributeType.UnknownAttributes, list)
+				return try reply(link, m, refusal, who)
+			}
+			if alternate != "" && (m.method := Method.Binding || Method.Allocate) {
+				let redirect = response(m, false)
+				redirect.add(ErrorCode.TryAlternate)
+				try redirect.add(AttributeType.AlternateServer, try net.parseAddress(alternate))
+				return try reply(link, m, redirect, who)
+			}
+			if binding {
+				let mapped = response(m, true)
+				try mapped.add(AttributeType.XorMappedAddress, link.client, true)
+				return try reply(link, m, mapped, who)
+			}
+			fail stunError("an authenticated request without credentials") when who is none
+			switch {
+				case m.method == Method.Allocate:
+					return try allocate(link, m, who)
+				case m.method == Method.ConnectionBind:
+					return try bindConnection(link, m, who)
+			}
+			let relay = link.relay
+			return try refuse(link, m, ErrorCode.AllocationMismatch, who) when relay is none || !relay.isOpen()
+			return try refuse(link, m, ErrorCode.WrongCredentials, who) unless relay.username == who.username
+			switch {
+				case m.method == Method.Refresh:
+					return try refresh(link, relay, m, who)
+				case m.method == Method.CreatePermission:
+					return try createPermission(link, relay, m, who)
+				case m.method == Method.ChannelBind:
+					return try bindChannel(link, relay, m, who)
+				case m.method == Method.Connect:
+					return try connect(link, relay, m, who)
+			}
+			return none
+		}
+
+		// reply sends a response: SOFTWARE, the integrity attribute of the
+		// kind the request was signed with when it was authenticated, and
+		// FINGERPRINT when the request carried one. Fails as the transport
+		// does.
+		internal def reply(link ClientLink, request Message, answer Message, who ?Credential) !none {
+			return try link.send(encoded(request, answer, who))
+		}
+
+		internal def encoded(request Message, answer Message, who ?Credential) byte[] {
+			answer.add(AttributeType.Software, software) when software != ""
+			let fingerprint = request.has(AttributeType.Fingerprint)
+			return answer.encode([], Integrity.None, fingerprint) when who is none
+			return answer.encode(who.key, who.integrity, fingerprint)
+		}
+
+		// refuse sends an error response. Fails as the transport does.
+		internal def refuse(link ClientLink, request Message, code ErrorCode, who ?Credential) !none {
+			let refusal = response(request, false)
+			refusal.add(code)
+			return try reply(link, request, refusal, who)
+		}
+
+		// ---- Long-term credentials (RFC 8489 §9.2.4) ----
+
+		// authenticate checks a request's long-term credentials and returns
+		// who sent it; none after it answered the request itself, with a
+		// challenge (401), a fresh nonce (438) or 400. Fails as the transport
+		// does.
+		internal def authenticate(link ClientLink, m Message) !?Credential {
+			let integrity = m.integrityUsed()
+			return try challenge(link, m, ErrorCode.Unauthenticated) when integrity == Integrity.None
+			let name = m.text(AttributeType.Username)
+			let hashed = m.get(AttributeType.UserHash)
+			let claimedRealm = m.text(AttributeType.Realm)
+			let nonce = m.text(AttributeType.Nonce)
+			if (name is none && hashed is none) || claimedRealm is none || nonce is none {
+				try refuse(link, m, ErrorCode.BadRequest, none)
+				return none
+			}
+			return try challenge(link, m, ErrorCode.StaleNonce) unless nonceIsFresh(nonce, link.client.host)
+			// The nonce announces password algorithms: the request names
+			// the list it was given and one of it, or neither for MD5.
+			let listed = m.get(AttributeType.PasswordAlgorithms)
+			let chosen = m.get(AttributeType.PasswordAlgorithm)
+			let algorithm = PasswordAlgorithm.MD5
+			if !(listed is none) || !(chosen is none) {
+				let offered = encodePasswordAlgorithms([PasswordAlgorithm.MD5, PasswordAlgorithm.SHA256])
+				let named = chosen is none || chosen.len() < 2 ?? (none, passwordAlgorithmOf(int(chosen[0]) << 8 | int(chosen[1])))
+				if listed is none || named is none || !listed.equals(offered) {
+					try refuse(link, m, ErrorCode.BadRequest, none)
+					return none
+				}
+				algorithm = named
+			}
+			let username = ""
+			if !(name is none) {
+				username = name
+			} else if !(hashed is none) {
+				let known = hashes.get(hashed.hex())
+				username = known unless known is none
+			}
+			let password = passwordOf(username)
+			if password is none {
+				authFailures.inc()
+				return try challenge(link, m, ErrorCode.Unauthenticated)
+			}
+			let key = try longTermKey(username, realm, password, algorithm)
+			if !m.checkIntegrity(key) {
+				authFailures.inc()
+				return try challenge(link, m, ErrorCode.Unauthenticated)
+			}
+			return Credential{username: username, key: key, integrity: integrity}
+		}
+
+		// challenge answers with 401 or 438: the realm, a nonce that
+		// announces the password algorithms and, when every user is known
+		// by name, username anonymity, and PASSWORD-ALGORITHMS.
+		internal def challenge(link ClientLink, m Message, code ErrorCode) !?Credential {
+			let refusal = response(m, false)
+			refusal.add(code)
+			refusal.add(AttributeType.Realm, realm)
+			refusal.add(AttributeType.Nonce, try freshNonce(link.client.host))
+			refusal.add(AttributeType.PasswordAlgorithms, encodePasswordAlgorithms([PasswordAlgorithm.MD5, PasswordAlgorithm.SHA256]))
+			try reply(link, m, refusal, none)
+			return none
+		}
+
+		// passwordOf is the password of a username: the one `users` holds,
+		// or the one the shared secret gives a REST username that has not
+		// expired.
+		internal def passwordOf(username string) ?string {
+			return none when username == ""
+			let known = users.get(username)
+			return known unless known is none
+			return none when secret == "" || restExpired(username)
+			return restPassword(secret, username)
+		}
+
+		// freshNonce is a nonce for a client: the time and a MAC over it and
+		// the client's IP address, behind the security feature bits. The
+		// port is left out: the data connections of a TCP relay come from
+		// other ports with the nonce of the control connection (RFC 6062
+		// §4.3).
+		internal def freshNonce(client string) !string {
+			let stamp = uint32(unixNow()).bytes(Endian.Big)
+			// USERHASH names only users known by name: with the shared
+			// secret in use any username may be one, so it is not offered.
+			let features = featurePasswordAlgorithms | (hashes.len() > 0 && secret == "" ?? (featureUsernameAnonymity, 0))
+			return nonceWithFeatures(features, base64encode(stamp + nonceMAC(stamp, client)))
+		}
+
+		internal def nonceMAC(stamp byte[], client string) byte[] {
+			return hmac(Hash.SHA256, nonceKey, stamp + client.bytes())[0:12]
+		}
+
+		// nonceIsFresh reports whether a nonce is one of this server's for
+		// the client address, not older than the nonce lifetime.
+		internal def nonceIsFresh(nonce string, client string) bool {
+			return false when nonceFeatures(nonce) is none
+			let value = base64decode(nonce[13:]) onerror recover []
+			return false unless value.len() == 16
+			return false unless constantTimeEqual(value[4:], nonceMAC(value[0:4], client))
+			let age = unixNow() - int(uint32(0).fromBytes(value[0:4], Endian.Big))
+			return age >= -5 && age <= nonceLifetime
+		}
+
+		// ---- TURN (RFC 8656) ----
+
+		// allocate answers an Allocate request (RFC 8656 §7.2, RFC 6062
+		// §5.1). Fails as the transport does.
+		internal def allocate(link ClientLink, m Message, who Credential) !none {
+			let existing = link.relay
+			if !(existing is none) && existing.isOpen() {
+				// The same request again gets the same answer.
+				return try link.send(existing.allocateResponse) when existing.allocateID.equals(m.transactionID)
+				return try refuse(link, m, ErrorCode.AllocationMismatch, who)
+			}
+			let requested = m.get(AttributeType.RequestedTransport)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when requested is none || requested.len() != 4
+			let protocol = int(requested[0])
+			let streamed = link.transport := Transport.TCP || Transport.TLS
+			return try refuse(link, m, ErrorCode.UnsupportedTransport, who) unless protocol == int(RelayProtocol.UDP) || (protocol == int(RelayProtocol.TCP) && streamed)
+			// This server cannot set the DF bit, so DONT-FRAGMENT is an
+			// attribute it does not understand (RFC 8656 §7.2).
+			if m.has(AttributeType.DontFragment) {
+				let refusal = response(m, false)
+				refusal.add(ErrorCode.UnknownAttribute)
+				refusal.add(AttributeType.UnknownAttributes, uint16(int(AttributeType.DontFragment)).bytes(Endian.Big))
+				return try reply(link, m, refusal, who)
+			}
+			let token = m.get(AttributeType.ReservationToken)
+			let even = m.get(AttributeType.EvenPort)
+			let family = m.get(AttributeType.RequestedAddressFamily)
+			let additional = m.get(AttributeType.AdditionalAddressFamily)
+			let tcpRelay = protocol == int(RelayProtocol.TCP)
+			let conflicting = (!(token is none) && (!(even is none) || !(family is none) || !(additional is none))) || (!(family is none) && !(additional is none))
+			let malformed = (!(token is none) && token.len() != 8) || (!(family is none) && family.len() != 4) || (!(additional is none) && (additional.len() != 4 || int(additional[0]) != familyIPv6)) || (!(even is none) && even.len() != 1)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when conflicting || malformed || (tcpRelay && (!(even is none) || !(token is none)))
+			let wanted = familyIPv4
+			wanted = int(family[0]) unless family is none
+			return try refuse(link, m, ErrorCode.AddressFamilyNotSupported, who) unless (wanted := familyIPv4 || familyIPv6) && relayHost(wanted) != ""
+			return try refuse(link, m, ErrorCode.AllocationQuotaReached, who) when relays.countOf(who.username) >= userQuota
+			return try refuse(link, m, ErrorCode.InsufficientCapacity, who) when relays.count() >= maxAllocations
+
+			let relay = new Relay(relays, link, who.username, tcpRelay ?? (RelayProtocol.TCP, RelayProtocol.UDP))
+			relay.minPort = minPort
+			relay.maxPort = maxPort
+			relay.relayed = relayed
+			let done = response(m, true)
+			let opened = false
+			if !(token is none) {
+				let reserved = relays.takeReservation(token.hex())
+				opened = !(reserved is none)
+				relay.adopt(reserved) unless reserved is none
+			} else {
+				let parity = even is none ?? (PortParity.Any, PortParity.Even)
+				let reserve = !(even is none) && (int(even[0]) & 0x80) != 0
+				opened = relay.open(relayHost(wanted), parity, reserve)
+				if opened && !(additional is none) {
+					// The second family is best effort (RFC 8656 §7.2).
+					let second = relayHost(familyIPv6) != "" && relay.open(relayHost(familyIPv6), PortParity.Any, false)
+					done.add(AttributeType.AddressErrorCode, byte[byte(familyIPv6), 0, byte(int(ErrorCode.AddressFamilyNotSupported) / 100), byte(int(ErrorCode.AddressFamilyNotSupported) % 100)]) unless second
+				}
+			}
+			if !opened {
+				relay.close()
+				return try refuse(link, m, ErrorCode.InsufficientCapacity, who)
+			}
+			let seconds = lifetimeOf(m, int(defaultLifetime) / 1000000000)
+			relay.extend(seconds)
+			for let address in relay.addresses {
+				try done.add(AttributeType.XorRelayedAddress, address, true)
+			}
+			done.add(AttributeType.Lifetime, uint32(seconds))
+			try done.add(AttributeType.XorMappedAddress, link.client, true)
+			let reservation = relay.reservationToken
+			done.add(AttributeType.ReservationToken, reservation) when reservation.len() > 0
+			relay.allocateID = m.transactionID
+			relay.allocateResponse = encoded(m, done, who)
+			link.relay = relay
+			relays.add(relay)
+			allocations.inc()
+			relay.start()
+			return try link.send(relay.allocateResponse)
+		}
+
+		// relayHost is the IP address relayed addresses of a family are
+		// bound on, "" when the server relays none of it.
+		internal def relayHost(family int) string {
+			return relayIPv6 when family == familyIPv6
+			return relayIPv4 when relayIPv4 != ""
+			let at = address()
+			return at.host == "" || at.isIPv6 ?? ("", at.host)
+		}
+
+		// lifetimeOf is the lifetime a request gets, in seconds: what it
+		// asks for up to the longest allowed, `absent` when it asks for none;
+		// 0 stays 0.
+		internal def lifetimeOf(m Message, absent int) int {
+			let asked = m.uint32(AttributeType.Lifetime)
+			return absent when asked is none
+			return asked.min(int(maxLifetime) / 1000000000)
+		}
+
+		// refresh answers a Refresh request (RFC 8656 §8.2): a lifetime of 0
+		// deletes the allocation.
+		internal def refresh(link ClientLink, relay Relay, m Message, who Credential) !none {
+			let family = m.get(AttributeType.RequestedAddressFamily)
+			if !(family is none) {
+				let held = false
+				for let address in relay.addresses {
+					held = true when family.len() == 4 && address.isIPv6 == (int(family[0]) == familyIPv6)
+				}
+				return try refuse(link, m, ErrorCode.PeerAddressFamilyMismatch, who) unless held
+			}
+			let seconds = lifetimeOf(m, int(defaultLifetime) / 1000000000)
+			let done = response(m, true)
+			done.add(AttributeType.Lifetime, uint32(seconds))
+			if seconds == 0 {
+				relay.close()
+				link.relay = none
+			} else {
+				relay.extend(seconds)
+			}
+			return try reply(link, m, done, who)
+		}
+
+		// createPermission answers a CreatePermission request (RFC 8656
+		// §10.2): entries peer or none.
+		internal def createPermission(link ClientLink, relay Relay, m Message, who Credential) !none {
+			let peers = m.xorAddresses(AttributeType.XorPeerAddress)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when peers.len() == 0 || peers.len() != m.all(AttributeType.XorPeerAddress).len()
+			for let peer in peers {
+				return try refuse(link, m, ErrorCode.PeerAddressFamilyMismatch, who) unless relay.relaysFamily(peer.isIPv6)
+				return try refuse(link, m, ErrorCode.Forbidden, who) unless peerAllowed(peer)
+			}
+			for let peer in peers {
+				relay.permit(peer.host)
+			}
+			return try reply(link, m, response(m, true), who)
+		}
+
+		// peerAllowed reports whether the server relays to a peer address:
+		// not to its own host or network unless `allowLocalPeers`.
+		internal def peerAllowed(peer net.Address) bool {
+			return true when allowLocalPeers
+			let ip = net.parseIPText(peer.host)
+			return false when ip is none
+			return !(ip[0] == 127 || ip[0] == 0 || ip[0] >= 224 || (ip[0] == 169 && ip[1] == 254)) when ip.len() == 4
+			let unspecifiedOrLoopback = true
+			for let i = 0; i < 15; i++ {
+				unspecifiedOrLoopback = false when ip[i] != 0
+			}
+			return false when unspecifiedOrLoopback && ip[15] <= 1
+			return !(ip[0] == 0xFF || (ip[0] == 0xFE && (ip[1] & 0xC0) == 0x80))
+		}
+
+		// bindChannel answers a ChannelBind request (RFC 8656 §12.2).
+		internal def bindChannel(link ClientLink, relay Relay, m Message, who Credential) !none {
+			let number = m.get(AttributeType.ChannelNumber)
+			let peer = m.xorAddress(AttributeType.XorPeerAddress)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when number is none || number.len() != 4 || peer is none || relay.protocol == RelayProtocol.TCP
+			let channel = int(number[0]) << 8 | int(number[1])
+			return try refuse(link, m, ErrorCode.BadRequest, who) unless channel >= firstChannel && channel <= lastLegacyChannel
+			return try refuse(link, m, ErrorCode.PeerAddressFamilyMismatch, who) unless relay.relaysFamily(peer.isIPv6)
+			return try refuse(link, m, ErrorCode.Forbidden, who) unless peerAllowed(peer)
+			return try refuse(link, m, ErrorCode.BadRequest, who) unless relay.bind(channel, peer)
+			return try reply(link, m, response(m, true), who)
+		}
+
+		// ---- TCP relays (RFC 6062) ----
+
+		// connect answers a Connect request (RFC 6062 §5.2): the connection
+		// to the peer is opened on a task of its own, and the response
+		// follows it.
+		internal def connect(link ClientLink, relay Relay, m Message, who Credential) !none {
+			let peer = m.xorAddress(AttributeType.XorPeerAddress)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when peer is none || relay.protocol != RelayProtocol.TCP
+			return try refuse(link, m, ErrorCode.Forbidden, who) unless peerAllowed(peer) && relay.relaysFamily(peer.isIPv6)
+			return try refuse(link, m, ErrorCode.ConnectionAlreadyExists, who) unless relay.claimPeer(peerKey(peer))
+			let task = async connectPeer(link, relay, m, who, peer)
+			task.keepAlive()
+			return none
+		}
+
+		internal def connectPeer(link ClientLink, relay Relay, m Message, who Credential, peer net.Address) {
+			let conn = dialed(relay, peer) onerror recover none
+			if conn is none {
+				relay.releasePeer(peerKey(peer))
+				refuse(link, m, ErrorCode.ConnectionTimeoutOrFailure, who) onerror recover none
+				return
+			}
+			let id = relay.keepConnection(new PeerConnection(relay, conn, peer))
+			let done = response(m, true)
+			done.add(AttributeType.ConnectionID, uint32(id))
+			reply(link, m, done, who) onerror recover none
+		}
+
+		// bindConnection answers a ConnectionBind request on a new client
+		// connection (RFC 6062 §5.4): the connection then carries the bytes
+		// of the peer connection it names.
+		internal def bindConnection(link ClientLink, m Message, who Credential) !none {
+			let id = m.uint32(AttributeType.ConnectionID)
+			let streamed = link.transport := Transport.TCP || Transport.TLS
+			return try refuse(link, m, ErrorCode.BadRequest, who) when id is none || !streamed || !(link.relay is none)
+			let pending = relays.take(id)
+			return try refuse(link, m, ErrorCode.BadRequest, who) when pending is none
+			if pending.relay.username != who.username {
+				pending.close()
+				return try refuse(link, m, ErrorCode.WrongCredentials, who)
+			}
+			try reply(link, m, response(m, true), who)
+			link.peerConnection = pending.conn
+			return none
+		}
+
+		// ---- Upkeep ----
+
+		// sweep deletes allocations past their lifetime, permissions and
+		// channels past theirs, peer connections nobody bound and
+		// reservations nobody claimed.
+		internal def sweep() {
+			for running {
+				time.sleep(1s)
+				let now = int(time.monoNs())
+				for let relay in relays.all() {
+					if relay.expired(now) {
+						relay.close()
+						continue
+					}
+					relay.expire(now)
+				}
+				relays.expire(now)
+			}
+		}
+	}
+
+	// Credential is who an authenticated request came from: the username,
+	// the long-term key and the integrity attribute it signed with, which
+	// the response uses too.
+	internal struct Credential {
+		username  string
+		key       byte[]
+		integrity Integrity
+	}
+
+	// PortParity is what an allocation asks of its relayed port.
+	internal enum PortParity {
+		Any,
+		Even
+	}
+
+	// ClientLink is the way back to a client: the UDP socket and its
+	// address, its TCP or TLS connection, or its DTLS connection; with the
+	// allocation made over it, which for a connection lives here.
+	internal type ClientLink {
+		transport      Transport
+		client         net.Address
+		local          net.Address
+		socket         ?net.Socket            = none
+		stream         ?net.Stream            = none
+		datagram       ?net.DatagramTransport = none
+		// The allocation made over the link; the server's table holds it.
+		weak relay     ?Relay
+		// The peer connection a ConnectionBind tied this connection to.
+		peerConnection ?net.Connection        = none
+
+		def new(transport Transport, client net.Address, local net.Address) {
+			self.transport = transport
+			self.client = client
+			self.local = local
+		}
+
+		// send sends one message to the client; messages over a stream go
+		// out whole, one after the other. Fails as the transport does.
+		atomic def send(data byte[]) !none {
+			let s = socket
+			if !(s is none) {
+				try s.writeTo(data, client.raw, 5s)
+				return none
+			}
+			let d = datagram
+			return try d.send(data, 5s) unless d is none
+			let to = stream
+			fail stunError("the client link has no transport") when to is none
+			return try net.writeAll(to, data, 30s)
+		}
+
+		// reliable reports whether the client is reached over a stream,
+		// where ChannelData is padded.
+		def reliable() bool {
+			return transport := Transport.TCP || Transport.TLS
+		}
+	}
+
+	// PeerConnection is a TCP connection between a relayed address and a
+	// peer that waits for the client's ConnectionBind (RFC 6062).
+	internal type PeerConnection {
+		relay    Relay
+		conn     net.Connection
+		peer     net.Address
+		deadline int
+
+		def new(relay Relay, conn net.Connection, peer net.Address) {
+			self.relay = relay
+			self.conn = conn
+			self.peer = peer
+			deadline = int(time.monoNs()) + int(connectionBindWait)
+		}
+
+		// close drops the connection and lets the allocation connect to the
+		// peer again.
+		def close() {
+			conn.close() onerror recover none
+			relay.releasePeer(peerKey(peer))
+		}
+	}
+
+	// Reservation is a relayed UDP socket kept for the allocation that
+	// brings its token (EVEN-PORT with the R bit).
+	internal struct Reservation {
+		socket   net.Socket
+		address  net.Address
+		deadline int
+	}
+
+	// RelayTable is a server's allocations: those of UDP clients by client
+	// address, all of them for the quotas and the sweeper, the peer
+	// connections waiting for a ConnectionBind and the reserved ports. Safe
+	// from many tasks.
+	internal type RelayTable {
+		byClient     map<string, Relay>
+		entries      Relay[]                  = []
+		connections  map<int, PeerConnection>
+		reservations map<string, Reservation>
+		nextID       int                      = 0
+
+		def new() {}
+
+		atomic def ofDatagramClient(client string) ?Relay {
+			return byClient.get(client)
+		}
+
+		atomic def add(relay Relay) {
+			entries.push(relay)
+			byClient[relay.link.client.raw] = relay when relay.link.transport == Transport.UDP
+		}
+
+		atomic def remove(relay Relay) {
+			entries.pull(relay)
+			if relay.link.transport == Transport.UDP {
+				let held = byClient.get(relay.link.client.raw)
+				byClient.delete(relay.link.client.raw) when !(held is none) && held == relay
+			}
+		}
+
+		atomic def all() Relay[] {
+			return entries.clone()
+		}
+
+		atomic def count() int {
+			return entries.len()
+		}
+
+		atomic def countOf(username string) int {
+			let n = 0
+			for let relay in entries {
+				n++ when relay.username == username
+			}
+			return n
+		}
+
+		// keep holds a peer connection until its ConnectionBind and returns
+		// the CONNECTION-ID that names it.
+		atomic def keep(pending PeerConnection) int {
+			nextID = (nextID + 1) & 0x7FFFFFFF
+			connections[nextID] = pending
+			return nextID
+		}
+
+		atomic def take(id int) ?PeerConnection {
+			let pending = connections.get(id)
+			connections.delete(id) unless pending is none
+			return pending
+		}
+
+		atomic def reserve(token string, reservation Reservation) {
+			reservations[token] = reservation
+		}
+
+		atomic def takeReservation(token string) ?Reservation {
+			let reserved = reservations.get(token)
+			reservations.delete(token) unless reserved is none
+			return reserved
+		}
+
+		// expire closes what waited too long.
+		atomic def expire(now int) {
+			for let id in connections.keys() {
+				let pending = connections.get(id)
+				continue when pending is none || pending.deadline > now
+				connections.delete(id)
+				pending.close()
+			}
+			for let token in reservations.keys() {
+				let reserved = reservations.get(token)
+				continue when reserved is none || reserved.deadline > now
+				reservations.delete(token)
+				reserved.socket.close() onerror recover none
+			}
+		}
+
+		// dropOf closes the peer connections of an allocation that still
+		// wait.
+		atomic def dropOf(relay Relay) {
+			for let id in connections.keys() {
+				let pending = connections.get(id)
+				continue when pending is none || pending.relay != relay
+				connections.delete(id)
+				pending.conn.close() onerror recover none
+			}
+		}
+	}
+
+	// Relay is one allocation on a server: the client it belongs to, its
+	// relayed sockets (UDP) or listener (TCP), its permissions and channels.
+	// Each relayed socket is read on a task of its own.
+	internal type Relay {
+		weak table            ?RelayTable
+		link                  ClientLink
+		username              string
+		protocol              RelayProtocol
+		// The relayed addresses, one per family, and their UDP sockets in
+		// step.
+		addresses             net.Address[]         = []
+		sockets               net.Socket[]          = []
+		listener              ?net.Listener         = none
+		reservationToken      byte[]                = []
+		// The Allocate request that made it and the answer it got.
+		allocateID            byte[]                = []
+		allocateResponse      byte[]                = []
+		// Peer IP addresses with a permission, and when each lapses
+		// (monotonic ns).
+		internal permits      map<string, int>
+		// Channels to peers ("ip:port") and back, and when each lapses.
+		internal peerOf       map<int, string>
+		internal addressOf    map<int, net.Address>
+		internal channelOf    map<string, int>
+		internal lapses       map<int, int>
+		// Peers with a TCP connection through this allocation.
+		internal connected    map<string, bool>
+		internal expiresAt    int                   = 0
+		internal atomic alive bool                  = true
+		// The ports relayed addresses take, and the server's count of
+		// datagrams relayed.
+		minPort               int                   = 49152
+		maxPort               int                   = 65535
+		relayed               ?metrics.Counter      = none
+
+		def new(table RelayTable, link ClientLink, username string, protocol RelayProtocol) {
+			self.table = table
+			self.link = link
+			self.username = username
+			self.protocol = protocol
+		}
+
+		def isOpen() bool {
+			return alive
+		}
+
+		// open binds a relayed address on the host: a UDP socket, or a TCP
+		// listener for a TCP allocation; with `reserve`, the next port is
+		// bound too and kept for its token. false when no port is free.
+		def open(host string, parity PortParity, reserve bool) bool {
+			let span = maxPort - minPort + 1
+			return false when span <= 0
+			let seed = rand(4) onerror recover byte[0, 0, 0, 0]
+			let first = int(uint32(0).fromBytes(seed, Endian.Big)) % span
+			for let i = 0; i < relayPortTries; i++ {
+				let port = minPort + (first + i * 2) % span
+				port = port & 0xFFFE when parity == PortParity.Even
+				continue when port < minPort || (reserve && port + 1 > maxPort)
+				let taken = bindAt(host, port) onerror recover false
+				continue unless taken
+				return true unless reserve
+				let next = boundSocket(host, port + 1) onerror recover none
+				if next is none {
+					// The pair is not free: give the first back and look on.
+					let last = sockets.pop()
+					last.close() onerror recover none
+					addresses.pop()
+					continue
+				}
+				reservationToken = rand(8) onerror recover []
+				keepReservation(reservationToken.hex(), Reservation{socket: next, address: next.localAddr(), deadline: int(time.monoNs()) + reservationLifetime})
+				return true
+			}
+			return false
+		}
+
+		// bindAt takes one port: true when it was free. Fails when the
+		// socket cannot be made.
+		internal def bindAt(host string, port int) !bool {
+			if protocol == RelayProtocol.TCP {
+				let socket = try streamSocket(host)
+				let bound = true
+				socket.bind(net.withPort(host, port)) onerror (err error) {
+					bound = false
+					recover none
+				}
+				if !bound {
+					socket.close() onerror recover none
+					return false
+				}
+				let accepting = try socket.listen(64)
+				listener = accepting
+				addresses.push(accepting.address())
+				return true
+			}
+			let socket = try boundSocket(host, port)
+			return false when socket is none
+			sockets.push(socket)
+			addresses.push(socket.localAddr())
+			return true
+		}
+
+		// boundSocket is a UDP socket on the port, none when it is taken.
+		internal def boundSocket(host string, port int) !?net.Socket {
+			let socket = try net.socket(host.contains(":") ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+			let bound = true
+			socket.bind(net.withPort(host, port)) onerror (err error) {
+				bound = false
+				recover none
+			}
+			return socket when bound
+			socket.close() onerror recover none
+			return none
+		}
+
+		// streamSocket is a TCP socket that may share the relayed address:
+		// the listener and the connections made from it use one port
+		// (RFC 6062 §5.2).
+		internal def streamSocket(host string) !net.Socket {
+			let socket = try net.socket(host.contains(":") ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Stream)
+			try socket.setReuseAddr(true)
+			try socket.setReusePort(true)
+			return socket
+		}
+
+		internal def keepReservation(token string, reservation Reservation) {
+			let owner = table
+			owner.reserve(token, reservation) unless owner is none
+		}
+
+		// keepConnection holds a peer connection for its ConnectionBind and
+		// returns the CONNECTION-ID that names it.
+		def keepConnection(pending PeerConnection) int {
+			let owner = table
+			return 0 when owner is none
+			return owner.keep(pending)
+		}
+
+		// adopt takes over a reserved socket as this allocation's relayed
+		// address.
+		def adopt(reserved Reservation) {
+			sockets.push(reserved.socket)
+			addresses.push(reserved.address)
+		}
+
+		// start reads the relayed sockets, or accepts on the listener.
+		def start() {
+			for let socket in sockets {
+				let task = async pump(socket)
+				task.keepAlive()
+			}
+			let accepting = listener
+			if !(accepting is none) {
+				let task = async accept(accepting)
+				task.keepAlive()
+			}
+		}
+
+		// extend makes the allocation last `seconds` from now.
+		atomic def extend(seconds int) {
+			expiresAt = int(time.monoNs()) + seconds * 1000000000
+		}
+
+		atomic def expired(now int) bool {
+			return now >= expiresAt
+		}
+
+		// relaysFamily reports whether the allocation has a relayed address
+		// of the family.
+		def relaysFamily(ipv6 bool) bool {
+			for let address in addresses {
+				return true when address.isIPv6 == ipv6
+			}
+			return false
+		}
+
+		// permit installs or refreshes the permission of a peer IP address.
+		atomic def permit(host string) {
+			permits[ipKey(host)] = int(time.monoNs()) + permissionLifetime
+		}
+
+		atomic def permitted(host string, now int) bool {
+			let until = permits.get(ipKey(host))
+			return !(until is none) && until > now
+		}
+
+		// bind binds a channel to a peer and installs its permission; false
+		// when the channel is bound to another peer or the peer to another
+		// channel (RFC 8656 §12.2).
+		atomic def bind(channel int, peer net.Address) bool {
+			let key = peerKey(peer)
+			let held = peerOf.get(channel)
+			let other = channelOf.get(key)
+			return false when (!(held is none) && held != key) || (!(other is none) && other != channel)
+			peerOf[channel] = key
+			addressOf[channel] = peer
+			channelOf[key] = channel
+			let now = int(time.monoNs())
+			lapses[channel] = now + channelLifetime
+			permits[ipKey(peer.host)] = now + permissionLifetime
+			return true
+		}
+
+		atomic def channelTo(peer string) int {
+			let channel = channelOf.get(peer)
+			return channel is none ?? (0, channel)
+		}
+
+		atomic def boundPeer(channel int) ?net.Address {
+			return addressOf.get(channel)
+		}
+
+		// expire forgets the permissions and channels past their time.
+		atomic def expire(now int) {
+			for let host in permits.keys() {
+				let until = permits.get(host)
+				permits.delete(host) when !(until is none) && until <= now
+			}
+			for let channel in lapses.keys() {
+				let until = lapses.get(channel)
+				continue when until is none || until > now
+				let key = peerOf.get(channel)
+				channelOf.delete(key) unless key is none
+				peerOf.delete(channel)
+				addressOf.delete(channel)
+				lapses.delete(channel)
+			}
+		}
+
+		// sendOnChannel relays ChannelData from the client to the peer its
+		// channel is bound to.
+		def sendOnChannel(channel int, data byte[]) {
+			let peer = boundPeer(channel)
+			return when peer is none
+			sendTo(peer, data)
+		}
+
+		// sendIndicated relays the DATA of a Send indication to its peer,
+		// when the peer has a permission (RFC 8656 §11.2).
+		def sendIndicated(m Message) {
+			let peer = m.xorAddress(AttributeType.XorPeerAddress)
+			let data = m.get(AttributeType.Data)
+			return when peer is none || data is none
+			return unless permitted(peer.host, int(time.monoNs()))
+			sendTo(peer, data)
+		}
+
+		// sendTo sends a datagram from the relayed address of the peer's
+		// family.
+		internal def sendTo(peer net.Address, data byte[]) {
+			for let (i, address) in addresses {
+				continue unless address.isIPv6 == peer.isIPv6 && i < sockets.len()
+				sockets[i].writeTo(data, peer.str(), 5s) onerror recover 0
+				count()
+				return
+			}
+		}
+
+		internal def count() {
+			let counter = relayed
+			counter.inc() unless counter is none
+		}
+
+		// pump hands what peers send to a relayed socket to the client: as
+		// ChannelData when the peer has a channel, else in a Data
+		// indication; from a peer without a permission, nowhere (RFC 8656
+		// §11.3). The datagram is read behind room for the ChannelData
+		// header, so a channel sends it without a copy.
+		internal def pump(socket net.Socket) {
+			let buf byte[]
+			buf.len(65536 + 8)
+			for alive {
+				let stopped = false
+				let (n, from) = socket.readFrom(buf[4:], 500ms) onerror (err error) {
+					stopped = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover (0, new net.Address())
+				}
+				return when stopped
+				continue when n <= 0
+				let channel = routeFrom(from)
+				continue when channel < 0
+				if channel > 0 {
+					buf[0] = byte(channel >> 8)
+					buf[1] = byte(channel & 0xFF)
+					buf[2] = byte(n >> 8)
+					buf[3] = byte(n & 0xFF)
+					let size = 4 + n
+					// Over a stream ChannelData is padded to four bytes.
+					for link.reliable() && size % 4 != 0 {
+						buf[size] = 0
+						size++
+					}
+					link.send(buf[0:size]) onerror recover none
+				} else {
+					let failed = false
+					let m = indication(Method.Data) onerror (err error) {
+						failed = true
+						recover new Message(MessageClass.Indication, Method.Data, [])
+					}
+					continue when failed
+					m.add(AttributeType.XorPeerAddress, from, true) onerror recover none
+					m.add(AttributeType.Data, buf[4:4 + n])
+					link.send(m.encode()) onerror recover none
+				}
+				count()
+			}
+		}
+
+		// routeFrom is how a datagram from a peer goes to the client: the
+		// channel bound to the peer, 0 for a Data indication, -1 when the
+		// peer has no permission. An IPv4 sender is looked up by the text
+		// the socket reports, which is the canonical one.
+		internal atomic def routeFrom(from net.Address) int {
+			let until = permits.get(from.isIPv6 ?? (ipKey(from.host), from.host))
+			return -1 when until is none || until <= int(time.monoNs())
+			let channel = channelOf.get(from.isIPv6 ?? (peerKey(from), from.raw))
+			return channel is none ?? (0, channel)
+		}
+
+		// accept takes the TCP connections of peers to the relayed address:
+		// one from a peer with a permission is announced to the client with
+		// a ConnectionAttempt indication and waits for its ConnectionBind
+		// (RFC 6062 §5.3); others are closed.
+		internal def accept(accepting net.Listener) {
+			for alive {
+				let conn = acceptNext(accepting) onerror recover none
+				return when conn is none
+				let peer = conn.remoteAddr()
+				if !permitted(peer.host, int(time.monoNs())) || !claimPeer(peerKey(peer)) {
+					conn.close() onerror recover none
+					continue
+				}
+				let id = keepConnection(new PeerConnection(self, conn, peer))
+				let failed = false
+				let m = indication(Method.ConnectionAttempt) onerror (err error) {
+					failed = true
+					recover new Message(MessageClass.Indication, Method.ConnectionAttempt, [])
+				}
+				continue when failed
+				m.add(AttributeType.ConnectionID, uint32(id))
+				m.add(AttributeType.XorPeerAddress, peer, true) onerror recover none
+				link.send(m.encode()) onerror recover none
+			}
+		}
+
+		// dial opens a TCP connection from the relayed address to a peer.
+		// Fails with NetError when the peer does not answer in time or
+		// refuses.
+		def dial(peer net.Address) !net.Connection {
+			for let address in addresses {
+				continue unless address.isIPv6 == peer.isIPv6
+				let socket = try streamSocket(address.host)
+				socket.bind(address.str()) onerror (err error) {
+					socket.close() onerror recover none
+					fail err
+				}
+				return socket.connect(peer.str(), connectionBindWait) onerror (err error) {
+					socket.close() onerror recover none
+					fail err
+				}
+			}
+			fail net.errorOf(net.ErrorCode.AddrNotAvail, "dial", peer.str(), "the allocation has no relayed address of the peer's family")
+		}
+
+		// claimPeer notes a TCP connection to a peer; false when there is
+		// one already (RFC 6062 §5.2).
+		atomic def claimPeer(peer string) bool {
+			return false when connected.hasKey(peer)
+			connected[peer] = true
+			return true
+		}
+
+		atomic def releasePeer(peer string) {
+			connected.delete(peer)
+		}
+
+		// close deletes the allocation: its sockets close, and the tasks
+		// reading them end.
+		def close() {
+			return unless alive
+			alive = false
+			for let socket in sockets {
+				socket.close() onerror recover none
+			}
+			let accepting = listener
+			if !(accepting is none) {
+				accepting.close() onerror recover none
+			}
+			let owner = table
+			if !(owner is none) {
+				owner.dropOf(self)
+				owner.remove(self)
+			}
+		}
+	}
+
+	// acceptNext is a listener's next connection. Fails once the listener is
+	// closed.
+	internal def acceptNext(listener net.Listener) !?net.Connection {
+		return try listener.accept()
+	}
+
+	// dialed is the TCP connection an allocation opens to a peer. Fails as
+	// `Relay.dial` does.
+	internal def dialed(relay Relay, peer net.Address) !?net.Connection {
+		return try relay.dial(peer)
+	}
+
+	// secureStream is a client connection under TLS, the server's side.
+	internal def secureStream(conn net.Connection, config tls.Config) net.Stream {
+		return tls.server(conn, config)
+	}
+
+	// secureListener listens for DTLS on a UDP address. Fails as
+	// `tls.dtlsListen` does.
+	internal def secureListener(address string, config tls.Config) !tls.DTLSListener {
+		return try tls.dtlsListen(address, tls.DTLSConfig{tls: config})
+	}
+
+	// ipKey is an IP address in the one spelling permissions are kept
+	// under; text that is no IP address stays as it is.
+	internal def ipKey(host string) string {
+		let ip = net.parseIPText(host)
+		return host when ip is none
+		return net.ipText(ip)
+	}
+
+	// peerKey is a peer's transport address in the one spelling channels
+	// are kept under.
+	internal def peerKey(peer net.Address) string {
+		return net.withPort(ipKey(peer.host), peer.port)
+	}
+
+	// unixNow is the time in Unix seconds.
+	internal def unixNow() int {
+		return int(time.now().unixNs() / 1000000000)
+	}
+}

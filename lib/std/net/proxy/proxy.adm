@@ -1,0 +1,288 @@
+// Reaching a host through a proxy, and serving as one.
+//
+//     let via = new proxy.Dialer(try url.parse("socks5://user:secret@10.0.0.1:1080"))
+//     let stream = try via.dial("example.com:443")
+//     let secured = tls.client(stream, tls.Config{serverName: "example.com"})
+//
+// A proxy URL names the protocol by its scheme: `socks5` and `socks5h`
+// (RFC 1928, the proxy resolves host names; username and password as RFC
+// 1929), `socks4` (host names resolved here), `socks4a` (resolved by the
+// proxy), `http` and `https` (a `CONNECT` tunnel, RFC 9110 §9.3.6, the
+// `https` proxy itself reached over TLS). User information in the URL
+// authenticates: the SOCKS5 pair, the SOCKS4 user id, or
+// `Proxy-Authorization: Basic`.
+partial module std.net.proxy {
+	use (
+		std.data.encoding
+		std.errors
+		std.net
+		std.net.proxy.wire::*
+		std.net.tls
+		std.net.url::(URL)
+		std.services.policy::(Policy)
+	)
+
+	// ErrorKind names why a proxy operation failed.
+	enum ErrorKind {
+		// The proxy URL names a protocol this module does not speak.
+		Scheme,
+		// The target does not parse, or the protocol cannot carry it.
+		Target,
+		// The peer did not answer as the protocol says.
+		Protocol,
+		// The proxy wants credentials, or rejected the ones given.
+		Auth,
+		// The proxy answered and said no; `reply` holds its code.
+		Refused,
+		// The proxy protocol has no such operation.
+		Unsupported,
+	}
+
+	// ProxyError is the payload of every failure a proxy handshake
+	// reports. A socket failure on the way stays a `net.NetError`.
+	struct ProxyError {
+		message      string
+		code         string            = "proxy"
+		cause        ?error
+		stack        errors.StackTrace
+		kind         ErrorKind
+		// The proxy, `scheme://host:port` without credentials.
+		proxy        string            = ""
+		// The address asked for, "" when the failure came before it.
+		target       string            = ""
+		// What the proxy answered: a SOCKS reply code or an HTTP status;
+		// 0 when the failure is not an answer.
+		reply        int               = 0
+		// The `Proxy-Authenticate` challenge of an HTTP 407.
+		authenticate string            = ""
+	}
+
+	// connect asks the proxy at the other end of an open stream for a
+	// tunnel to target ("host:port"); once it returns, the stream carries
+	// the target's bytes. The stream to an `https` proxy must already be
+	// the TLS connection.
+	// Fails with ProxyError as the kinds say, NetError when the stream
+	// does.
+	def connect(stream net.Stream, server URL, target string, timeout duration = 30s) !none {
+		let (host, port) = try splitTarget(target)
+		let via = describe(server)
+		let (user, password) = credentials(server)
+		let scheme = server.scheme.lower()
+		if scheme := "socks5" || "socks5h" || "socks" {
+			try socks5Greet(stream, user, password, via, timeout)
+			try socks5Command(stream, commandConnect, host, port, via, timeout)
+			return none
+		}
+		if scheme := "socks4" || "socks4a" {
+			try socks4Command(stream, commandConnect, host, port, user, scheme == "socks4a", via, timeout)
+			return none
+		}
+		if scheme := "http" || "https" {
+			let authorization = user == "" ?? ("", "Basic " + encoding.base64encode((user + ":" + password).bytes()))
+			return try httpConnect(stream, joinTarget(host, port), authorization, via, timeout)
+		}
+		fail ProxyError{message: "no proxy protocol for the scheme {server.scheme}", kind: ErrorKind.Scheme, proxy: via, target: target}
+	}
+
+	// Dialer reaches hosts through one proxy. Safe from many tasks: each
+	// call opens its own connection to the proxy.
+	type Dialer {
+		// The proxy, as the module comment describes.
+		server    URL
+		// TLS settings for an `https` proxy; none verifies its
+		// certificate against the system roots under the URL's host name.
+		tlsConfig ?tls.Config = none
+		// How the proxy itself is reached: none connects to it directly,
+		// another dialer chains through that proxy first.
+		via       ?Dialer     = none
+
+		def new(server URL, via ?Dialer = none) {
+			self.server = server
+			self.via = via
+		}
+
+		// dial opens a tunnel to target ("host:port") and returns it.
+		// Fails with PolicyDenied when the policy denies connecting to the
+		// proxy or to the target, NetError when the proxy cannot be reached, ProxyError
+		// when it refuses, TLSError or CertificateError from an `https`
+		// proxy's handshake.
+		def dial(target string, timeout duration = 30s) !net.Stream {
+			// The proxy is the address dialed; the policy also rules on
+			// the host behind it.
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "tcp://" + target)
+			let stream = try open(timeout)
+			let failure ?error = none
+			connect(stream, server, target, timeout) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return stream when failure is none
+			stream.close() onerror recover none
+			fail failure
+		}
+
+		// listen asks the proxy to accept one connection on this side's
+		// behalf (SOCKS `BIND`), as active FTP needs: `expected` is the
+		// peer that will connect, "host:port". The proxy's listening
+		// address is in the result at once; `accept` waits for the peer.
+		// Fails as `dial` does, and with ProxyError (Unsupported) for an
+		// HTTP proxy.
+		def listen(expected string, timeout duration = 30s) !Binding {
+			let (host, port) = try splitTarget(expected)
+			let about = describe(server)
+			let scheme = server.scheme.lower()
+			fail ProxyError{message: "an HTTP proxy accepts no connections for its clients", kind: ErrorKind.Unsupported, proxy: about, target: expected} when scheme := "http" || "https"
+			let stream = try open(timeout)
+			let failure ?error = none
+			let bound = bindOn(stream, server, host, port, timeout) onerror (err error) {
+				failure = err
+				recover ("", 0)
+			}
+			if !(failure is none) {
+				stream.close() onerror recover none
+				fail failure
+			}
+			let (boundHost, boundPort) = bound
+			return new Binding(stream, joinTarget(reachable(boundHost, server), boundPort), expected, about, scheme.startsWith("socks4") ?? (4, 5))
+		}
+
+		// associate opens a UDP relay through a SOCKS5 proxy (`UDP
+		// ASSOCIATE`); the relay lasts until the association closes.
+		// Fails as `dial` does, and with ProxyError (Unsupported) for any
+		// other proxy protocol.
+		def associate(timeout duration = 30s) !Association {
+			let about = describe(server)
+			let scheme = server.scheme.lower()
+			fail ProxyError{message: "only a SOCKS5 proxy relays UDP", kind: ErrorKind.Unsupported, proxy: about} unless scheme := "socks5" || "socks5h" || "socks"
+			let stream = try open(timeout)
+			let failure ?error = none
+			let made = tryAssociate(stream, server, timeout) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				stream.close() onerror recover none
+				fail failure
+			}
+			fail ProxyError{message: "no association was made", kind: ErrorKind.Protocol, proxy: about} when made is none
+			return made
+		}
+
+		// open connects to the proxy, through `via` when set, and runs
+		// the TLS handshake of an `https` proxy.
+		internal def open(timeout duration) !net.Stream {
+			let host = server.hostname()
+			let address = joinTarget(host, serverPort(server))
+			let stream = try reach(via, address, describe(server), timeout)
+			return stream unless server.scheme.lower() == "https"
+			return try secured(stream, host, tlsConfig, timeout)
+		}
+	}
+
+	// Binding is a connection a SOCKS proxy is waiting for on this side's
+	// behalf, from `Dialer.listen`.
+	type Binding {
+		// Where the proxy listens, "host:port": the address to hand the
+		// peer that will connect.
+		address           string
+		// The peer that connected, "host:port"; "" before `accept`.
+		peer              string     = ""
+		internal stream   net.Stream
+		internal expected string
+		internal about    string
+		internal version  int
+
+		def new(stream net.Stream, address string, expected string, about string, version int) {
+			self.stream = stream
+			self.address = address
+			self.expected = expected
+			self.about = about
+			self.version = version
+		}
+
+		// accept waits for the peer to connect to the proxy and returns
+		// the stream to it; call it once.
+		// Fails with ProxyError (Refused) when the proxy gives up or the
+		// wrong peer connected, NetError (TimedOut) when nobody came in
+		// time.
+		def accept(timeout duration = 30s) !net.Stream {
+			let (host, port) = version == 4 ?? (try socks4Reply(stream, expected, about, timeout), try socks5Reply(stream, expected, about, timeout))
+			peer = joinTarget(host, port)
+			return stream
+		}
+
+		// close gives the binding up, and closes the connection when one
+		// was accepted. Fails when the stream refuses to close.
+		def close() !none {
+			return try stream.close()
+		}
+	}
+
+	// describe is the proxy URL without credentials, for messages.
+	internal def describe(server URL) string {
+		return "{server.scheme.lower()}://" + joinTarget(server.hostname(), serverPort(server))
+	}
+
+	// serverPort is the proxy's port: the one in the URL, else 1080 for
+	// SOCKS, 80 for http and 443 for https.
+	internal def serverPort(server URL) int {
+		let given = server.port()
+		return given when given != 0
+		let scheme = server.scheme.lower()
+		return 80 when scheme == "http"
+		return 443 when scheme == "https"
+		return 1080
+	}
+
+	// credentials is the user and password of the proxy URL, "" for each
+	// one it lacks.
+	internal def credentials(server URL) (string, string) {
+		let info = server.user
+		return ("", "") when info is none
+		let secret = info.password
+		return (info.username, secret is none ?? ("", secret))
+	}
+
+	// reachable is the host a client connects to for an address the proxy
+	// bound: the proxy's own host when it reports the unspecified address.
+	internal def reachable(host string, server URL) string {
+		return server.hostname() when host := "0.0.0.0" || "::" || ""
+		return host
+	}
+
+	// reach opens the stream to a proxy: directly once the policy allows
+	// the endpoint, or through the outer dialer.
+	internal def reach(outer ?Dialer, address string, about string, timeout duration) !net.Stream {
+		return try outer.dial(address, timeout) unless outer is none
+		try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", about)
+		return try net.dialStream(address, timeout)
+	}
+
+	// secured runs a TLS client handshake over the stream to an `https`
+	// proxy; the stream is closed when it fails.
+	internal def secured(stream net.Stream, host string, config ?tls.Config, timeout duration) !net.Stream {
+		let given = tls.Config{}
+		given = config unless config is none
+		let conn = tls.client(stream, tls.withServerName(given, given.serverName == "" ?? (host, given.serverName)))
+		let failure ?error = none
+		conn.handshake(timeout) onerror (err error) {
+			failure = err
+			recover none
+		}
+		return conn when failure is none
+		stream.close() onerror recover none
+		fail failure
+	}
+
+	// bindOn sends the BIND request and reads the first reply: where the
+	// proxy listens.
+	internal def bindOn(stream net.Stream, server URL, host string, port int, timeout duration) !(string, int) {
+		let about = describe(server)
+		let (user, password) = credentials(server)
+		let scheme = server.scheme.lower()
+		return try socks4Command(stream, commandBind, host, port, user, scheme == "socks4a", about, timeout) when scheme := "socks4" || "socks4a"
+		fail ProxyError{message: "no proxy protocol for the scheme {server.scheme}", kind: ErrorKind.Scheme, proxy: about} unless scheme := "socks5" || "socks5h" || "socks"
+		try socks5Greet(stream, user, password, about, timeout)
+		return try socks5Command(stream, commandBind, host, port, about, timeout)
+	}
+}

@@ -1,0 +1,695 @@
+// DTLS 1.2 (RFC 6347) and DTLS 1.3 (RFC 9147): TLS over datagrams, with
+// DTLS-SRTP (RFC 5764) and connection IDs (RFC 9146).
+//
+//     let conn = try tls.dtlsDial("example.com:4433", tls.DTLSConfig{tls: tls.Config{serverName: "example.com"}})
+//     try conn.send("hello".bytes(), 5s)
+//     let answer = try conn.receive(5s)
+//
+// A server listens on a UDP address and accepts connections, each after the
+// client proved its address with a cookie:
+//
+//     let listener = try tls.dtlsListen("0.0.0.0:4433", tls.DTLSConfig{tls: serverTLS})
+//     let conn = try listener.accept()
+//
+// Over a transport of its own (an ICE path, a TURN relay), a side runs
+// `dtlsClient` or `dtlsServer` on it.
+partial module std.net.tls {
+	use (
+		std.io
+		std.net
+		std.net.udp
+		std.crypto::(rand, constantTimeEqual)
+		std.crypto.hash::(Hash, hmac)
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// SRTPProfile names the SRTP protection profiles DTLS-SRTP negotiates
+	// (RFC 5764 §4.1.2, RFC 7714 §14.2), the value being the code on the
+	// wire.
+	enum SRTPProfile {
+		AES128CMHMACSHA1Tag80 = 0x0001,
+		AES128CMHMACSHA1Tag32 = 0x0002,
+		NullHMACSHA1Tag80 = 0x0005,
+		NullHMACSHA1Tag32 = 0x0006,
+		AEADAES128GCM = 0x0007,
+		AEADAES256GCM = 0x0008,
+	}
+
+	// srtpProfileOf maps a wire code to its profile, none for one this
+	// module does not name.
+	def srtpProfileOf(code int) ?SRTPProfile {
+		return none unless SRTPProfile.values().includes(code)
+		return SRTPProfile(code)
+	}
+
+	// srtpKeyLength is the master key length of a profile in bytes.
+	def srtpKeyLength(profile SRTPProfile) int {
+		return 0 when profile := SRTPProfile.NullHMACSHA1Tag80 || SRTPProfile.NullHMACSHA1Tag32
+		return 32 when profile == SRTPProfile.AEADAES256GCM
+		return 16
+	}
+
+	// srtpSaltLength is the master salt length of a profile in bytes.
+	def srtpSaltLength(profile SRTPProfile) int {
+		return 0 when profile := SRTPProfile.NullHMACSHA1Tag80 || SRTPProfile.NullHMACSHA1Tag32
+		return 12 when profile := SRTPProfile.AEADAES128GCM || SRTPProfile.AEADAES256GCM
+		return 14
+	}
+
+	// SRTPKeys is what DTLS-SRTP hands to SRTP (RFC 5764 §4.2): the profile,
+	// the master key and salt this side protects its packets with and the
+	// ones it checks the peer's with, and the MKI both agreed on, empty for
+	// none.
+	struct SRTPKeys {
+		profile    SRTPProfile
+		localKey   byte[]
+		localSalt  byte[]
+		remoteKey  byte[]
+		remoteSalt byte[]
+		mki        byte[]      = []
+	}
+
+	// DTLSConfig steers a DTLS connection: the TLS settings (certificates,
+	// roots, ALPN, versions, suites, session tickets; the versions stand
+	// for the DTLS ones), the SRTP profiles to offer or take in preference
+	// order with the MKI, the connection IDs, the largest datagram, the
+	// timers, and on a server whether a client proves its address first.
+	struct DTLSConfig {
+		tls                Config
+		// DTLS-SRTP: when set, the handshake must agree on one of these or
+		// it fails; application data still flows besides.
+		srtpProfiles       SRTPProfile[] = []
+		srtpMKI            byte[]        = []
+		// Negotiate connection IDs (RFC 9146): offered by a client, answered
+		// by a server. `connectionIDLength` is the length of the ID this
+		// side wants records to it to carry; 0 asks for none while still
+		// using the peer's.
+		connectionIDs      bool          = true
+		connectionIDLength int           = 0
+		// The largest datagram sent, records and headers included.
+		mtu                int           = 1200
+		// The first retransmission timer; it doubles each time, up to 60s.
+		// 400ms suits DTLS-SRTP (RFC 9147 §5.8.2).
+		retransmitTimeout  duration      = 1s
+		// How long the handshake waits for the peer to move.
+		handshakeTimeout   duration      = 30s
+		// Server: answer a ClientHello with a cookie the client must
+		// return, so nothing is spent on a spoofed address (RFC 6347
+		// §4.2.1, RFC 9147 §5.1). An ICE-checked path may turn it off.
+		cookieExchange     bool          = true
+	}
+
+	// DTLSParameters is what a DTLS handshake negotiates beyond TLS: the
+	// SRTP profiles and MKI offered or accepted as wire codes, whether
+	// connection IDs are offered and the one this side wants, on a server
+	// the cookie key and what the cookie binds to (the client's address);
+	// then what was agreed.
+	struct DTLSParameters {
+		srtpProfiles       int[]  = []
+		srtpMKI            byte[] = []
+		connectionIDs      bool   = true
+		ownConnectionID    byte[] = []
+		cookieSecret       byte[] = []
+		peerContext        byte[] = []
+		srtpProfile        int    = 0
+		agreedMKI          byte[] = []
+		connectionIDAgreed bool   = false
+		peerConnectionID   byte[] = []
+	}
+
+	// The most connection IDs this side issues on request (RFC 9147 §9).
+	internal const dtlsMaxIssuedIDs = 8
+	// The most requests for connection IDs this side answers; one more
+	// ends the connection with too_many_cids_requested.
+	internal const dtlsMaxIDRequests = 16
+	// The most spare connection IDs of the peer's this side keeps.
+	internal const dtlsMaxSpareIDs = 8
+	// How long a cookie stays good, in seconds.
+	internal const dtlsCookieLife = 60
+
+	// DTLSConn is a DTLS connection, client or server side, over a datagram
+	// transport. The handshake runs on the first send or receive, or on
+	// `handshake()`; then each `send` is one record in one datagram and each
+	// `receive` one record's data. Retransmissions and acknowledgments are
+	// handled inside these calls, so a connection should be read while it
+	// is in use. One task receives at a time; any number may send beside
+	// it. Implements net.DatagramTransport.
+	type DTLSConn {
+		config            DTLSConfig
+		transport         net.DatagramTransport
+		layer             DatagramLayer
+		records           RecordLayer
+		isClient          bool
+		params            DTLSParameters
+		state             ConnectionState
+		suite             CipherSuite           = CipherSuite.AES128GCMSHA256
+		hash              Hash                  = Hash.SHA256
+		readSecret        byte[]                = []
+		writeSecret       byte[]                = []
+		resumptionSecret  byte[]                = []
+		exporterSecret    byte[]                = []
+		randoms12         byte[]                = []
+		atomic closed     bool                  = false
+		atomic peerClosed bool                  = false
+		// One task runs the handshake; the others that need it wait here.
+		gate              HandshakeGate
+		// Server: the key of the cookies a client must return. A listener
+		// sets its own; a server on a transport makes one for the
+		// handshake when the config asks for the cookie exchange.
+		cookieSecret      byte[]                = []
+		// Connection IDs issued after the handshake, and how often the
+		// peer asked for some.
+		issuedIDs         int                   = 0
+		idRequests        int                   = 0
+		// This side asked the peer for connection IDs and has no answer
+		// yet.
+		cidRequested      bool                  = false
+
+		def new(transport net.DatagramTransport, config DTLSConfig, isClient bool = true) {
+			self.transport = transport
+			self.config = config
+			self.isClient = isClient
+			layer = new DatagramLayer(transport, isClient)
+			layer.mtu = config.mtu
+			layer.initialTimeout = config.retransmitTimeout
+			layer.timeout = config.retransmitTimeout
+			records = new RecordLayer(layer)
+			records.timeout = config.handshakeTimeout
+			params = parametersOf(config, [], [])
+			layer.params = params
+			gate = new HandshakeGate()
+		}
+
+		// handshake runs the handshake of this side once; later calls do
+		// nothing, and calls made while it runs wait for it. On failure this
+		// side sends the matching alert and the connection is unusable.
+		// Fails with TLSError, NetError from the transport (TimedOut when
+		// the peer stops answering for the handshake timeout), or the x509
+		// CertificateError of a rejected chain.
+		def handshake() !none {
+			return none when state.handshakeComplete
+			return try gate.run(() => runHandshake())
+		}
+
+		// runHandshake is the handshake itself, run under the gate. Fails
+		// as `handshake` does.
+		internal def runHandshake() !none {
+			return none when state.handshakeComplete
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			params.ownConnectionID = try rand(config.connectionIDLength) when config.connectionIDLength > 0 && params.ownConnectionID.len() == 0
+			cookieSecret = try rand(32) when !isClient && config.cookieExchange && cookieSecret.len() == 0
+			layer.acceptConnectionID(params.ownConnectionID) when params.ownConnectionID.len() > 0
+			let failure ?error = none
+			if isClient {
+				runClient() onerror (err error) {
+					failure = err
+					recover none
+				}
+			} else {
+				runServer() onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			try abort(failure) unless failure is none
+			return none
+		}
+
+		internal def runClient() !none {
+			let hs = new ClientHandshake(config.tls, records)
+			hs.dtls = params
+			hs.schedule.framer = layer
+			try hs.run()
+			suite = hs.suite
+			hash = hs.hash
+			readSecret = hs.schedule.serverTrafficSecret
+			writeSecret = hs.schedule.clientTrafficSecret
+			resumptionSecret = hs.schedule.resumptionMasterSecret
+			exporterSecret = hs.randoms12.len() > 0 ?? (hs.master12, hs.schedule.exporterMasterSecret)
+			randoms12 = hs.randoms12
+			state = hs.state
+			try layer.finishHandshake()
+			return none
+		}
+
+		internal def runServer() !none {
+			let hs = new ServerHandshake(config.tls, records)
+			hs.dtls = params
+			hs.schedule.framer = layer
+			params.cookieSecret = cookieSecret
+			try hs.run()
+			suite = hs.suite
+			hash = hs.hash
+			readSecret = hs.schedule.clientTrafficSecret
+			writeSecret = hs.schedule.serverTrafficSecret
+			resumptionSecret = hs.schedule.resumptionMasterSecret
+			exporterSecret = hs.randoms12.len() > 0 ?? (hs.master12, hs.schedule.exporterMasterSecret)
+			randoms12 = hs.randoms12
+			state = hs.state
+			try layer.finishHandshake()
+			return none
+		}
+
+		// send sends data as one record in one datagram. Fails with TLSError
+		// when the connection is closed or the data is longer than a record
+		// holds (2^14 bytes), NetError from the transport (TimedOut when a
+		// datagram does not leave within the timeout). With several tasks
+		// sending at once, a call sends whatever is queued: its failure may
+		// be about a datagram of another task's, whose own call then
+		// succeeds.
+		def send(data byte[], timeout duration) !none {
+			try handshake()
+			fail tlsError(Alert.InternalError, "connection is closed") when closed
+			fail net.errorOf(net.ErrorCode.Closed, "send", "", "the peer closed the connection") when peerClosed
+			fail tlsError(Alert.InternalError, "{data.len()} bytes do not fit in one record") when data.len() > maxPlaintext
+			return try layer.sendApplication(data, timeout)
+		}
+
+		// receive waits for the next record of application data, copies it
+		// into buf and returns its length; 0s or less waits without end.
+		// Session tickets, key updates and connection IDs the peer sends on
+		// the way are taken care of. Fails with NetError: TimedOut when the
+		// timeout passes, Closed once the peer closed the connection;
+		// TLSError for a fatal alert or a protocol violation, or when the
+		// record is longer than buf.
+		def receive(buf byte[], timeout duration) !int {
+			let data = try receive(timeout)
+			fail tlsError(Alert.InternalError, "a record of {data.len()} bytes does not fit in {buf.len()}") when data.len() > buf.len()
+			data.copy(buf)
+			return data.len()
+		}
+
+		// receive waits for the next record of application data and returns
+		// it. Fails as the form with a buffer does, but for the buffer.
+		def receive(timeout duration = 30s) !byte[] {
+			try handshake()
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				fail tlsError(Alert.InternalError, "connection is closed") when closed
+				fail net.errorOf(net.ErrorCode.Closed, "receive", "", "the peer closed the connection") when peerClosed
+				let data = try nextData(deadline)
+				return data unless data is none
+				let handled = handlePeer() onerror (err error) {
+					layer.drain() onerror recover none
+					fail err
+				}
+				continue when handled
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "no data before the timeout") when deadline > 0 && int(time.monoNs()) >= deadline
+			}
+			fail tlsError(Alert.InternalError, "unreachable")
+		}
+
+		// nextData is the layer's next application data, none when
+		// something else arrived or the deadline passed. A failure of the
+		// layer closes the connection, with its alert sent.
+		internal def nextData(deadline int) !?byte[] {
+			let failure ?error = none
+			let data = layer.receive(deadline) onerror (err error) {
+				failure = err
+				recover none
+			}
+			try abort(failure) unless failure is none
+			return data
+		}
+
+		// handlePeer takes the alerts and post-handshake messages that
+		// arrived; true when there was one. What it has to send is queued in
+		// the layer.
+		internal atomic def handlePeer() !bool {
+			let alert = layer.takeAlert()
+			if !(alert is none) {
+				try handleAlert(alert)
+				return true
+			}
+			let message = layer.takeHandshake()
+			return false when message is none
+			try handlePostHandshake(message)
+			return true
+		}
+
+		internal def handleAlert(payload byte[]) !none {
+			let alert = alertOf(int(payload[1]))
+			if alert == Alert.CloseNotify {
+				peerClosed = true
+				layer.shut()
+				return none
+			}
+			// DTLS 1.2 has warnings a connection outlives; DTLS 1.3 only
+			// close_notify and user_canceled (RFC 8446 §6).
+			return none when state.version == Version.DTLS12 && payload[0] == 1
+			return none when alert == Alert.UserCanceled
+			closed = true
+			fail peerAlert(alert)
+		}
+
+		// handlePostHandshake handles one handshake message after the
+		// handshake: a DTLS 1.2 renegotiation is declined with a warning;
+		// DTLS 1.3 session tickets are cached, key updates followed and
+		// answered, connection IDs taken and served (RFC 9147 §8-9).
+		internal def handlePostHandshake(message byte[]) !none {
+			let kind = int(message[0])
+			let body = message[4:]
+			if state.version == Version.DTLS12 {
+				let asks = kind == (isClient ?? (handshakeHelloRequest, handshakeClientHello))
+				try violation(Alert.UnexpectedMessage, "unexpected handshake message {kind} after the handshake") unless asks
+				layer.queueAlert(Alert.NoRenegotiation, false) onerror recover none
+				return none
+			}
+			switch {
+				case kind == handshakeNewSessionTicket:
+					try violation(Alert.UnexpectedMessage, "client sent a NewSessionTicket") unless isClient
+					try cacheSession(config.tls, try parseNewSessionTicket(body), hash, resumptionSecret, suite, state, labelDTLS13)
+				case kind == handshakeKeyUpdate:
+					let requested = try parseKeyUpdate(body)
+					readSecret = try nextTrafficSecret(hash, readSecret, labelDTLS13)
+					try layer.updateReadKeys(suite, hash, readSecret)
+					try queueKeyUpdate(false) when requested && !layer.keyUpdating()
+				case kind == handshakeNewConnectionID:
+					try takeConnectionIDs(body)
+				case kind == handshakeRequestConnectionID:
+					try serveConnectionIDs(body)
+				default:
+					try violation(Alert.UnexpectedMessage, "unexpected handshake message {kind} after the handshake")
+			}
+			return none
+		}
+
+		// takeConnectionIDs takes a NewConnectionId: IDs to use from now on
+		// (cid_immediate) or to keep for a path change (cid_spare), of which
+		// this side keeps a few. Only a peer that receives a connection ID
+		// sends one (RFC 9147 §9).
+		internal def takeConnectionIDs(body byte[]) !none {
+			try violation(Alert.UnexpectedMessage, "NewConnectionId without a connection ID agreed") unless params.connectionIDAgreed && params.peerConnectionID.len() > 0
+			let c = new Cursor(body)
+			let list = new Cursor(try c.vec16())
+			let usage = try c.u8()
+			try violation(Alert.DecodeError, "NewConnectionId has trailing bytes") unless c.done()
+			try violation(Alert.IllegalParameter, "NewConnectionId with usage {usage}") when usage > 1
+			cidRequested = false
+			let immediate = usage == 0
+			for !list.done() {
+				let id = try list.vec8()
+				continue when id.len() == 0
+				if immediate {
+					layer.usePeerConnectionID(id)
+					immediate = false
+					continue
+				}
+				layer.keepSpareID(id, dtlsMaxSpareIDs)
+			}
+			return none
+		}
+
+		// serveConnectionIDs answers a RequestConnectionId with fresh IDs of
+		// this side's length, as spares: as many as asked for, up to the
+		// number this side issues over the connection, none beyond it. A
+		// peer that keeps asking is refused with too_many_cids_requested.
+		internal def serveConnectionIDs(body byte[]) !none {
+			let c = new Cursor(body)
+			let wanted = try c.u8()
+			try violation(Alert.DecodeError, "RequestConnectionId has trailing bytes") unless c.done()
+			try violation(Alert.UnexpectedMessage, "RequestConnectionId without a connection ID of this side") unless params.connectionIDAgreed && params.ownConnectionID.len() > 0
+			idRequests++
+			try violation(Alert.TooManyCIDsRequested, "the peer asked for connection IDs {idRequests} times") when idRequests > dtlsMaxIDRequests
+			let count = wanted.min(dtlsMaxIssuedIDs - issuedIDs)
+			let list byte[]
+			for let i = 0; i < count; i++ {
+				let id = try rand(params.ownConnectionID.len())
+				layer.acceptConnectionID(id)
+				let peer = transport
+				if peer is ListenerPeer {
+					let served ListenerPeer = peer
+					served.addConnectionID(id)
+				}
+				list = list + vec8(id)
+			}
+			issuedIDs += count
+			try layer.queueRecord(recordHandshake, handshakeMessage(handshakeNewConnectionID, vec16(list) + u8(1)), false)
+			return try layer.queueFlights()
+		}
+
+		// requestConnectionIDs asks the peer for `count` more connection
+		// IDs (RFC 9147 §9), for a later path change. Fails before the
+		// handshake, on DTLS 1.2, without a connection ID from the peer, or
+		// while an earlier request is unanswered.
+		def requestConnectionIDs(count int) !none {
+			try handshake()
+			try queueIDRequest(count)
+			return try layer.drain()
+		}
+
+		internal atomic def queueIDRequest(count int) !none {
+			fail tlsError(Alert.InternalError, "connection IDs are requested only over DTLS 1.3") unless state.version == Version.DTLS13
+			fail tlsError(Alert.InternalError, "no connection ID agreed") unless params.connectionIDAgreed && params.peerConnectionID.len() > 0
+			fail tlsError(Alert.InternalError, "{count} connection IDs") unless count > 0 && count < 256
+			fail tlsError(Alert.InternalError, "a request for connection IDs is still unanswered") when cidRequested
+			cidRequested = true
+			try layer.queueRecord(recordHandshake, handshakeMessage(handshakeRequestConnectionID, u8(count)), false)
+			return try layer.queueFlights()
+		}
+
+		// switchConnectionID makes records carry the next spare connection
+		// ID of the peer's, as on a new path (RFC 9147 §9). false when there
+		// is none.
+		def switchConnectionID() bool {
+			return layer.useSpareID()
+		}
+
+		// updateKeys sends a DTLS 1.3 KeyUpdate, asking the peer to update
+		// too when `requestPeer`; this side's records move to the new keys
+		// once the peer acknowledged it (RFC 9147 §8). Fails before the
+		// handshake, on DTLS 1.2, or while an earlier update is unanswered.
+		def updateKeys(requestPeer bool = false) !none {
+			try handshake()
+			try queueKeyUpdate(requestPeer)
+			return try layer.drain()
+		}
+
+		internal atomic def queueKeyUpdate(requestPeer bool) !none {
+			fail tlsError(Alert.InternalError, "key updates exist only in DTLS 1.3") unless state.version == Version.DTLS13
+			fail tlsError(Alert.InternalError, "a key update is still unanswered") when layer.keyUpdating()
+			writeSecret = try nextTrafficSecret(hash, writeSecret, labelDTLS13)
+			return try layer.queueKeyUpdate(marshalKeyUpdate(requestPeer), writeSecret)
+		}
+
+		// violation sends the alert of a protocol violation found here,
+		// closes the connection and fails with it.
+		internal def violation(alert Alert, message string) !none {
+			return try failWith(tlsError(alert, message))
+		}
+
+		// failWith closes the connection over a failure, queues the alert
+		// that goes with one found here, and fails with it.
+		internal def failWith(err error) !none {
+			closed = true
+			if err is TLSError {
+				if !err.fromPeer {
+					layer.queueAlert(err.alert, true) onerror recover none
+				}
+			}
+			fail err
+		}
+
+		// abort is `failWith` with the alert sent, for a caller outside the
+		// connection's lock.
+		internal def abort(err error) !none {
+			failWith(err) onerror (failure error) {
+				layer.drain() onerror recover none
+				fail failure
+			}
+			return none
+		}
+
+		// close sends close_notify when the handshake completed and closes
+		// the transport. Closing twice does nothing. Fails when the transport
+		// refuses to close.
+		def close() !none {
+			let notify = !closed && state.handshakeComplete
+			closed = true
+			if notify {
+				layer.sendAlert(Alert.CloseNotify, false) onerror recover none
+			}
+			layer.shut()
+			return none unless transport.isOpen()
+			return try transport.close()
+		}
+
+		// isOpen reports whether the connection can still carry data.
+		def isOpen() bool {
+			return !closed && !peerClosed
+		}
+
+		// connectionState is the negotiated state, `handshakeComplete` false
+		// until the handshake ran.
+		def connectionState() ConnectionState {
+			return state
+		}
+
+		// remoteAddr is the peer's address when the connection runs over
+		// UDP (`dtlsDial`, a listener's connection); empty over another
+		// transport.
+		def remoteAddr() net.Address {
+			let over = transport
+			if over is udp.Peer {
+				let peer udp.Peer = over
+				return peer.remoteAddr()
+			}
+			if over is ListenerPeer {
+				let peer ListenerPeer = over
+				return net.parseAddress(peer.remote) onerror recover new net.Address()
+			}
+			return new net.Address()
+		}
+
+		// maxPayload is the most data one `send` carries without the
+		// datagram exceeding the MTU.
+		def maxPayload() int {
+			let room = config.mtu - layer.overhead()
+			return room > 0 ?? (room, 0)
+		}
+
+		// exportKeyingMaterial derives `length` bytes both ends, and nobody
+		// else, can compute (RFC 5705 for DTLS 1.2, RFC 8446 §7.5 under the
+		// "dtls13" labels for DTLS 1.3). Fails before the handshake.
+		def exportKeyingMaterial(label string, context ?byte[], length int) !byte[] {
+			fail tlsError(Alert.InternalError, "no keying material before the handshake") unless state.handshakeComplete && exporterSecret.len() > 0
+			return try exportKeying(hash, exporterSecret, randoms12, label, context, length, labelDTLS13)
+		}
+
+		// srtpProfile is the SRTP profile agreed, none without DTLS-SRTP.
+		def srtpProfile() ?SRTPProfile {
+			return none unless state.handshakeComplete
+			return srtpProfileOf(params.srtpProfile)
+		}
+
+		// srtpKeys exports the SRTP master keys and salts of both directions
+		// under "EXTRACTOR-dtls_srtp" (RFC 5764 §4.2). Fails before the
+		// handshake or when no profile was agreed.
+		def srtpKeys() !SRTPKeys {
+			let profile = srtpProfile()
+			fail tlsError(Alert.InternalError, "no SRTP profile agreed") when profile is none
+			let keySize = srtpKeyLength(profile)
+			let saltSize = srtpSaltLength(profile)
+			let block = try exportKeyingMaterial("EXTRACTOR-dtls_srtp", none, 2 * (keySize + saltSize))
+			let clientKey = block[0:keySize]
+			let serverKey = block[keySize:2 * keySize]
+			let clientSalt = block[2 * keySize:2 * keySize + saltSize]
+			let serverSalt = block[2 * keySize + saltSize:]
+			return SRTPKeys{profile: profile, localKey: clientKey, localSalt: clientSalt, remoteKey: serverKey, remoteSalt: serverSalt, mki: params.agreedMKI} when isClient
+			return SRTPKeys{profile: profile, localKey: serverKey, localSalt: serverSalt, remoteKey: clientKey, remoteSalt: clientSalt, mki: params.agreedMKI}
+		}
+
+		// Closes the transport when the last reference is released.
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+
+	// HandshakeGate serializes the handshake of a connection: its lock is
+	// held while one task runs it, so a second task that needs the
+	// handshake waits for the first.
+	internal type HandshakeGate {
+		def new() {}
+
+		// run runs the handshake unless another task is at it, which it
+		// waits for first. Fails as the handshake does.
+		atomic def run(handshake def () !none) !none {
+			return try handshake()
+		}
+	}
+
+	// dtlsClient wraps a datagram transport as a DTLS client without running
+	// the handshake; the first send, receive or `handshake()` does.
+	def dtlsClient(transport net.DatagramTransport, config DTLSConfig) DTLSConn {
+		return new DTLSConn(transport, config)
+	}
+
+	// dtlsServer wraps a datagram transport as a DTLS server without running
+	// the handshake. The config needs a certificate. With `cookieExchange`,
+	// the client proves it receives on the transport before the server
+	// does any work: the cookie is bound to the transport, not to an
+	// address.
+	def dtlsServer(transport net.DatagramTransport, config DTLSConfig) DTLSConn {
+		return new DTLSConn(transport, config, false)
+	}
+
+	// dtlsDial opens a UDP socket to "host:port" and runs the handshake.
+	// When the config names no server, the host is verified and sent as
+	// SNI. Fails with PolicyDenied when the policy denies the endpoint,
+	// NetError when the name does not resolve, the socket fails or the
+	// server does not answer, TLSError or CertificateError when the
+	// handshake fails.
+	def dtlsDial(address string, config DTLSConfig) !DTLSConn {
+		try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "dtls://" + address)
+		let cfg = config
+		if config.tls.serverName == "" {
+			let at = net.parseAddress(address) onerror recover new net.Address()
+			cfg = DTLSConfig{...config, tls: withServerName(config.tls, at.host)}
+		}
+		let peer = try udp.dial(address)
+		let conn = new DTLSConn(peer, cfg)
+		let failure ?error = none
+		conn.handshake() onerror (err error) {
+			failure = err
+			recover none
+		}
+		return conn when failure is none
+		peer.close() onerror recover none
+		fail failure
+	}
+
+	// cookie12 is a DTLS 1.2 cookie for a ClientHello (RFC 6347 §4.2.1):
+	// the time it was made, and a MAC over it, what the cookie binds to and
+	// the fields the second ClientHello must repeat.
+	internal def cookie12(secret byte[], context byte[], hello ClientHello, now int) byte[] {
+		let stamp = u32(now & 0xFFFFFFFF)
+		return stamp + cookieMAC12(secret, context, hello, stamp)
+	}
+
+	internal def cookieMAC12(secret byte[], context byte[], hello ClientHello, stamp byte[]) byte[] {
+		let input = "dtls12 cookie".bytes() + stamp + vec8(context) + hello.random + vec8(hello.sessionID) + u16ListBytes(hello.cipherSuites)
+		return hmac(Hash.SHA256, secret, input)[0:16]
+	}
+
+	// verifyCookie12 reports whether a ClientHello returns a cookie this
+	// secret made for the context within the cookie lifetime.
+	internal def verifyCookie12(secret byte[], context byte[], hello ClientHello, now int) bool {
+		let cookie = hello.dtlsCookie
+		return false unless cookie.len() == 20
+		let issued = int(cookie[0]) << 24 | int(cookie[1]) << 16 | int(cookie[2]) << 8 | int(cookie[3])
+		let age = (now & 0xFFFFFFFF) - issued
+		return false when age < -5 || age > dtlsCookieLife
+		return constantTimeEqual(cookie[4:], cookieMAC12(secret, context, hello, cookie[0:4]))
+	}
+
+	// sealCookie13 is the cookie of a DTLS 1.3 HelloRetryRequest that lets
+	// the server forget the first ClientHello (RFC 8446 §4.2.2): the time,
+	// the suite, the group asked for (0 for none), the hash of the first
+	// ClientHello, and a MAC over them and what the cookie binds to.
+	internal def sealCookie13(secret byte[], context byte[], suite CipherSuite, group int, helloHash byte[], now int) byte[] {
+		let body = u32(now & 0xFFFFFFFF) + u16(int(suite)) + u16(group) + vec8(helloHash)
+		return body + hmac(Hash.SHA256, secret, "dtls13 cookie".bytes() + body + vec8(context))[0:16]
+	}
+
+	// openCookie13 checks a cookie this secret made for the context within
+	// its lifetime and returns (suite, group, hash of the first
+	// ClientHello), none when it does not verify.
+	internal def openCookie13(secret byte[], context byte[], cookie byte[], now int) ?(CipherSuite, int, byte[]) {
+		return none when cookie.len() < 4 + 2 + 2 + 1 + 16
+		let body = cookie[0:cookie.len() - 16]
+		let mac = hmac(Hash.SHA256, secret, "dtls13 cookie".bytes() + body + vec8(context))[0:16]
+		return none unless constantTimeEqual(cookie[cookie.len() - 16:], mac)
+		let c = new Cursor(body)
+		let issued = c.u32() onerror recover -1
+		let code = c.u16() onerror recover 0
+		let group = c.u16() onerror recover 0
+		let helloHash = c.vec8() onerror recover []
+		return none unless c.done() && helloHash.len() > 0
+		let age = (now & 0xFFFFFFFF) - issued
+		return none when age < -5 || age > dtlsCookieLife
+		let suite = cipherSuiteOf(code)
+		return none when suite is none
+		return (suite, group, helloHash)
+	}
+}

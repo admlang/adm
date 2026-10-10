@@ -1,0 +1,320 @@
+// A QUIC endpoint: one UDP socket and the connections it carries.
+internal partial module std.net.quic.core {
+	use (
+		std.crypto::(rand)
+		std.crypto.cipher::(newAES, newGCM)
+		std.crypto.hash::(Hash, hmac)
+		std.data.encoding::(hexencode)
+		std.net
+		std.net.quic.wire::*
+		std.net.quic::*
+		std.time
+	)
+
+	// How long a Retry token stays good.
+	const retryTokenLife = 30000000
+
+	// Endpoint owns a UDP socket: it routes datagrams to connections by
+	// destination connection ID, starts server connections for Initial
+	// packets, and answers what belongs to none (version negotiation,
+	// Retry, stateless reset). Implements PacketSink.
+	type Endpoint {
+		socket       net.Socket
+		isServer     bool
+		settings     Settings
+		// A server answers the first Initial with a Retry, so a
+		// connection costs it nothing before the client's address is
+		// proven (RFC 9000 §8.1.2).
+		requireRetry bool              = false
+		running      bool              = true
+		atomic conns map<string, Conn>
+		// Connections whose handshake finished, for `accept`.
+		atomic ready Conn[]            = []
+		readySignal  channel<none>
+		resetKey     byte[]            = []
+		tokenKey     byte[]            = []
+		// Stateless resets sent in the current second, to bound them.
+		resetsSent   int               = 0
+		resetsSince  int               = 0
+
+		def new(socket net.Socket, isServer bool, settings Settings) {
+			self.socket = socket
+			self.isServer = isServer
+			self.settings = settings
+			readySignal = new channel<none>(1)
+			resetKey = rand(32) onerror recover []
+			tokenKey = rand(16) onerror recover []
+		}
+
+		// Implements PacketSink.
+		def sendDatagram(data byte[], to string) {
+			socket.writeTo(data, to, 1s) onerror recover 0
+		}
+
+		// Implements PacketSink.
+		atomic def bindID(id byte[], conn Conn) {
+			conns[hexencode(id)] = conn
+		}
+
+		// Implements PacketSink.
+		atomic def unbindID(id byte[]) {
+			conns.delete(hexencode(id))
+		}
+
+		// Implements PacketSink.
+		def resetTokenFor(id byte[]) byte[] {
+			return hmac(Hash.SHA256, resetKey, id)[:16]
+		}
+
+		// Implements PacketSink.
+		def established(conn Conn) {
+			return unless isServer
+			enqueueReady(conn)
+			readySignal.offer(none)
+		}
+
+		atomic def enqueueReady(conn Conn) {
+			ready.push(conn)
+		}
+
+		// takeReady is the next established connection, none when none
+		// waits.
+		atomic def takeReady() ?Conn {
+			return none when ready.len() == 0
+			let first = ready[0]
+			ready = ready[1:].clone()
+			return first
+		}
+
+		atomic def lookup(key string) ?Conn {
+			return conns.get(key)
+		}
+
+		atomic def connections() Conn[] {
+			let out Conn[] = []
+			for let (_, c) in conns {
+				out.push(c) unless out.includes(c)
+			}
+			return out
+		}
+
+		// forget removes every route to a connection.
+		atomic def forget(conn Conn) {
+			let gone string[] = []
+			for let (key, c) in conns {
+				gone.push(key) when c == conn
+			}
+			for let key in gone {
+				conns.delete(key)
+			}
+		}
+
+		// receiveLoop reads datagrams until the endpoint stops.
+		def receiveLoop() {
+			let buf byte[] = []
+			buf.len(65536)
+			for running {
+				let closed = false
+				let (n, from) = socket.readFrom(buf, 500ms) onerror (err error) {
+					closed = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover (0, new net.Address())
+				}
+				return when closed
+				continue when n <= 0
+				dispatch(buf[:n].clone(), from.str())
+			}
+		}
+
+		// dispatch routes one datagram.
+		def dispatch(datagram byte[], from string) {
+			let h = parseHeader(datagram, 0, localIDLength)
+			return when h.dcid.len() == 0 && h.kind == packetShort
+			let conn = lookup(hexencode(h.dcid))
+			if !(conn is none) {
+				conn.receive(datagram, from)
+				conn.wakeDriver()
+				return
+			}
+			return unless isServer
+			if h.kind == packetShort {
+				sendStatelessReset(datagram, h.dcid, from)
+				return
+			}
+			return unless h.ok || h.version != version1
+			// A first packet must be large enough to answer safely (RFC
+			// 9000 §14.1).
+			return when datagram.len() < baseDatagram
+			if h.version != version1 {
+				sendVersionNegotiation(h, from)
+				return
+			}
+			return unless h.kind == packetInitial && h.dcid.len() >= 8
+			startConnection(datagram, h, from) onerror recover none
+		}
+
+		// startConnection answers a client's first Initial: with a Retry
+		// when the endpoint demands one and the packet has no token, else
+		// with a new connection.
+		def startConnection(datagram byte[], h Header, from string) !none {
+			let first = h.dcid
+			let retriedWith byte[] = []
+			if requireRetry {
+				return try sendRetry(h, from) when h.token.len() == 0
+				let original = openToken(h.token, from)
+				// A token that does not verify gets no answer.
+				return none when original.len() == 0
+				first = original
+				retriedWith = h.dcid
+			}
+			let conn = new Conn(false, settings, self, from)
+			try conn.startServer(h.dcid.clone(), first.clone(), h.scid.clone(), retriedWith.clone())
+			// The client keeps sending to the ID it chose until it learns
+			// the server's.
+			bindID(h.dcid, conn)
+			let driver = async drive(conn)
+			driver.keepAlive()
+			let handshake = async conn.runHandshake()
+			handshake.keepAlive()
+			conn.receive(datagram, from)
+			conn.wakeDriver()
+			return none
+		}
+
+		// drive is a connection's driver task: it sends what is due and
+		// sleeps until the next deadline or a wake-up, to the end of the
+		// connection.
+		def drive(conn Conn) {
+			for {
+				let (out, to) = conn.assemble()
+				for let i = 0; i < out.len(); i++ {
+					sendDatagram(out[i], to[i])
+				}
+				break when conn.state == stateClosed
+				let at = conn.nextDeadline()
+				if at < 0 {
+					select {
+						case conn.driverSignal:
+							conn.driverSignal.flush()
+					}
+				} else {
+					let left = at - nowMicros()
+					if left > 0 {
+						let sleep = time.sleepChan(duration(left * 1000))
+						select {
+							case conn.driverSignal:
+								conn.driverSignal.flush()
+							case sleep:
+						}
+					}
+				}
+				conn.onTimeout(nowMicros())
+			}
+			forget(conn)
+			conn.wakeAll()
+			// A client's endpoint lives for its one connection.
+			stop() unless isServer
+		}
+
+		// stop ends the endpoint: its socket closes and its connections
+		// end without a word.
+		def stop() {
+			return unless running
+			running = false
+			socket.close() onerror recover none
+			readySignal.offer(none)
+		}
+
+		// sendVersionNegotiation lists the versions this endpoint speaks
+		// (RFC 9000 §6.1), with the client's connection IDs swapped.
+		def sendVersionNegotiation(h Header, from string) {
+			let packet byte[] = [0xC0, 0, 0, 0, 0]
+			packet.push(byte(h.scid.len()))
+			packet.push(...h.scid)
+			packet.push(byte(h.dcid.len()))
+			packet.push(...h.dcid)
+			putUint32(packet, version1)
+			sendDatagram(packet, from)
+		}
+
+		// sendStatelessReset answers a packet for a connection this
+		// endpoint does not know (RFC 9000 §10.3): random bytes that look
+		// like a short header packet, ending in the token of the
+		// connection ID. Smaller than what it answers, and at most ten a
+		// second.
+		def sendStatelessReset(datagram byte[], id byte[], from string) {
+			return when datagram.len() < 43
+			let second = nowMicros() / 1000000
+			if second != resetsSince {
+				resetsSince = second
+				resetsSent = 0
+			}
+			return when resetsSent >= 10
+			resetsSent++
+			let packet = rand(25) onerror recover []
+			return when packet.len() == 0
+			packet[0] = 0x40 | (packet[0] & 0x3F)
+			packet.push(...resetTokenFor(id))
+			sendDatagram(packet, from)
+		}
+
+		// sendRetry answers an Initial without a token (RFC 9000 §8.1.2):
+		// the token binds the client's address and its first destination
+		// ID, and the new source ID is what the next Initial is keyed by.
+		def sendRetry(h Header, from string) !none {
+			let newID = try rand(localIDLength)
+			let token = try sealToken(h.dcid, from)
+			let packet byte[] = [0xF0]
+			putUint32(packet, version1)
+			packet.push(byte(h.scid.len()))
+			packet.push(...h.scid)
+			packet.push(byte(newID.len()))
+			packet.push(...newID)
+			packet.push(...token)
+			packet.push(...(try retryTag(h.dcid, packet)))
+			sendDatagram(packet, from)
+			return none
+		}
+
+		// sealToken encrypts the time, the client's address and its first
+		// destination ID under the endpoint's token key.
+		def sealToken(original byte[], from string) !byte[] {
+			let plain byte[] = []
+			let now = nowMicros()
+			for let i = 7; i >= 0; i-- {
+				plain.push(byte((now >> (8 * i)) & 0xFF))
+			}
+			let address = from.bytes()
+			plain.push(byte(address.len()))
+			plain.push(...address)
+			plain.push(...original)
+			let nonce = try rand(12)
+			let aead = try newGCM(try newAES(tokenKey), 12, 16)
+			let token = nonce.clone()
+			token.push(...aead.seal(nonce, plain, []))
+			return token
+		}
+
+		// openToken returns the first destination ID a Retry token holds;
+		// empty when the token is not this endpoint's, is for another
+		// address, or is too old.
+		def openToken(token byte[], from string) byte[] {
+			return [] when token.len() < 12 + 16 + 9
+			let plain = tokenPlain(token) onerror recover []
+			return [] when plain.len() < 9
+			let issued = 0
+			for let i = 0; i < 8; i++ {
+				issued = (issued << 8) | int(plain[i])
+			}
+			let size = int(plain[8])
+			return [] when plain.len() < 9 + size
+			return [] unless string(plain[9:9 + size]) == from
+			return [] when nowMicros() - issued > retryTokenLife
+			return plain[9 + size:]
+		}
+
+		def tokenPlain(token byte[]) !byte[] {
+			let aead = try newGCM(try newAES(tokenKey), 12, 16)
+			return try aead.open(token[:12], token[12:], [])
+		}
+	}
+}

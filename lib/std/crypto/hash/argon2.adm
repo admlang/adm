@@ -1,0 +1,342 @@
+partial module std.crypto.hash {
+	use std.simd
+
+	// The three Argon2 functions of RFC 9106: `Argon2d` indexes memory by the
+	// data (fastest, open to side channels), `Argon2i` independently of it,
+	// `Argon2id` the first half of the first pass independently and the rest
+	// by the data, which is the one to use for passwords and keys.
+	enum Argon2Kind {
+		Argon2d,
+		Argon2i,
+		Argon2id,
+	}
+
+	// argon2id derives `length` bytes from a password with Argon2id (RFC
+	// 9106): `memoryKiB` kibibytes of memory filled `passes` times by `lanes`
+	// lanes that run in parallel; `secret` (a key) and `associated` data are
+	// mixed in when given. 64 MiB, 3 passes and 1 lane is a sound default
+	// for a key derived once per program; a server checking passwords picks
+	// what its time allows. Fails for a salt under 8 bytes, a length under
+	// 4, no passes, no lanes, or less memory than 8 KiB a lane.
+	def argon2id(password, salt byte[], memoryKiB int, passes int, lanes int, length int, secret byte[] = [], associated byte[] = []) !byte[] {
+		return try argon2(Argon2Kind.Argon2id, password, salt, memoryKiB, passes, lanes, length, secret, associated)
+	}
+
+	// argon2 is `argon2id` for any of the three kinds. Fails as it does.
+	def argon2(kind Argon2Kind, password, salt byte[], memoryKiB int, passes int, lanes int, length int, secret byte[] = [], associated byte[] = []) !byte[] {
+		expects {
+			assert salt.len() >= 8 onerror fail "argon2: the salt needs at least 8 bytes"
+			assert length >= 4 onerror fail "argon2: the length needs at least 4 bytes"
+			assert passes >= 1 onerror fail "argon2: at least one pass"
+			assert lanes >= 1 && lanes <= 0xFFFFFF onerror fail "argon2: between 1 and 16777215 lanes"
+			assert memoryKiB >= 8 * lanes onerror fail "argon2: at least 8 KiB of memory a lane"
+		}
+		let kindCode = kind == Argon2Kind.Argon2d ?? (0, kind == Argon2Kind.Argon2i ?? (1, 2))
+		// m' = 4p * floor(m / 4p): whole segments in every lane.
+		let blocks = 4 * lanes * (memoryKiB / (4 * lanes))
+		let laneLength = blocks / lanes
+		let segmentLength = laneLength / 4
+
+		// H0 binds every parameter and input.
+		let h0Input byte[]
+		argon2PutLE32(h0Input, lanes)
+		argon2PutLE32(h0Input, length)
+		argon2PutLE32(h0Input, memoryKiB)
+		argon2PutLE32(h0Input, passes)
+		argon2PutLE32(h0Input, 0x13)
+		argon2PutLE32(h0Input, kindCode)
+		argon2PutLE32(h0Input, password.len())
+		h0Input = h0Input + password
+		argon2PutLE32(h0Input, salt.len())
+		h0Input = h0Input + salt
+		argon2PutLE32(h0Input, secret.len())
+		h0Input = h0Input + secret
+		argon2PutLE32(h0Input, associated.len())
+		h0Input = h0Input + associated
+		let h0 = blake2b(64, h0Input)
+
+		let memory uint64[]
+		memory.len(blocks * argon2BlockWords)
+		for let lane = 0; lane < lanes; lane++ {
+			for let column = 0; column < 2; column++ {
+				let seed = h0.clone()
+				argon2PutLE32(seed, column)
+				argon2PutLE32(seed, lane)
+				argon2LoadBlock(memory, (lane * laneLength + column) * argon2BlockWords, argon2Long(argon2BlockBytes, seed))
+			}
+		}
+
+		let state = Argon2State{kind: kindCode, passes: passes, lanes: lanes, blocks: blocks, laneLength: laneLength, segmentLength: segmentLength, memory: memory}
+		for let pass = 0; pass < passes; pass++ {
+			for let slice = 0; slice < 4; slice++ {
+				if lanes == 1 {
+					argon2FillSegment(state, pass, 0, slice)
+				} else {
+					// The lanes of one slice depend only on the slices before it:
+					// each lane fills its segment on a task of its own.
+					let done = new channel<bool>(size = lanes)
+					for let lane = 0; lane < lanes; lane++ {
+						async argon2SegmentTask(state, pass, lane, slice, done)
+					}
+					for let lane = 0; lane < lanes; lane++ {
+						<-done
+					}
+				}
+			}
+		}
+
+		// The tag: the last blocks of every lane folded together.
+		let final uint64[]
+		final.len(argon2BlockWords)
+		for let lane = 0; lane < lanes; lane++ {
+			let at = (lane * laneLength + laneLength - 1) * argon2BlockWords
+			for let i = 0; i < argon2BlockWords; i++ {
+				final[i] = final[i] ^ memory[at + i]
+			}
+		}
+		memory.fill(0)
+		let tag = argon2Long(length, argon2StoreBlock(final, 0))
+		final.fill(0)
+		return tag
+	}
+
+	internal const argon2BlockBytes = 1024
+	internal const argon2BlockWords = 128
+	internal const argon2AddressesPerBlock = 128
+
+	// What a fill shares between the tasks of a slice.
+	internal struct Argon2State {
+		kind          int
+		passes        int
+		lanes         int
+		blocks        int
+		laneLength    int
+		segmentLength int
+		memory        uint64[]
+	}
+
+	// One lane's segment of a slice, on a task of its own.
+	internal async def argon2SegmentTask(state Argon2State, pass int, lane int, slice int, done channel<bool>) {
+		argon2FillSegment(state, pass, lane, slice)
+		done <- true
+	}
+
+	// argon2FillSegment computes the blocks of one segment: each from the
+	// block before it in the lane and a reference block chosen by the
+	// indexing rule, folded into the old block from the second pass on.
+	internal def argon2FillSegment(state Argon2State, pass int, lane int, slice int) {
+		let memory = state.memory
+		let laneLength = state.laneLength
+		let segmentLength = state.segmentLength
+		// Data-independent addressing: Argon2i always, Argon2id in the first
+		// two slices of the first pass.
+		let independent = state.kind == 1 || (state.kind == 2 && pass == 0 && slice < 2)
+		let addresses uint64[]
+		let input uint64[]
+		let zero uint64[]
+		let scratch uint64[]
+		scratch.len(3 * argon2BlockWords)
+		if independent {
+			addresses.len(argon2BlockWords)
+			input.len(argon2BlockWords)
+			zero.len(argon2BlockWords)
+			input[0] = uint64(pass)
+			input[1] = uint64(lane)
+			input[2] = uint64(slice)
+			input[3] = uint64(state.blocks)
+			input[4] = uint64(state.passes)
+			input[5] = uint64(state.kind)
+		}
+		let start = 0
+		if pass == 0 && slice == 0 {
+			// The first two blocks of a lane are the seeds.
+			start = 2
+			if independent {
+				input[6] = input[6] + 1
+				argon2Addresses(zero, input, addresses, scratch)
+			}
+		}
+		let current = lane * laneLength + slice * segmentLength + start
+		for let index = start; index < segmentLength; index++ {
+			let previous = current - 1
+			previous = current + laneLength - 1 when slice == 0 && index == 0
+			let pseudoRandom uint64 = 0
+			if independent {
+				if index % argon2AddressesPerBlock == 0 {
+					input[6] = input[6] + 1
+					argon2Addresses(zero, input, addresses, scratch)
+				}
+				pseudoRandom = addresses[index % argon2AddressesPerBlock]
+			} else {
+				pseudoRandom = memory[previous * argon2BlockWords]
+			}
+			let referenceLane = int((pseudoRandom >> 32) % uint64(state.lanes))
+			referenceLane = lane when pass == 0 && slice == 0
+			// The reference area: what the reference lane holds that is
+			// older than this block, by the rule of RFC 9106 §3.4.
+			let same = referenceLane == lane
+			let area = 0
+			if pass == 0 {
+				area = same ?? (slice * segmentLength + index - 1, slice * segmentLength - (index == 0 ?? (1, 0)))
+			} else {
+				area = same ?? (laneLength - segmentLength + index - 1, laneLength - segmentLength - (index == 0 ?? (1, 0)))
+			}
+			let j1 = pseudoRandom & 0xFFFFFFFF
+			let x = (j1 * j1) >> 32
+			let y = (uint64(area) * x) >> 32
+			let z = uint64(area) - 1 - y
+			let startPosition = 0
+			startPosition = (slice + 1) * segmentLength when pass != 0 && slice != 3
+			let position = (startPosition + int(z)) % laneLength
+			let reference = referenceLane * laneLength + position
+			argon2Fill(memory, previous * argon2BlockWords, reference * argon2BlockWords, current * argon2BlockWords, pass != 0, scratch)
+			current++
+		}
+	}
+
+	// argon2Addresses computes a block of 128 pseudo-random addresses from
+	// the input block: G(0, G(0, input)).
+	internal def argon2Addresses(zero uint64[], input uint64[], addresses uint64[], scratch uint64[]) {
+		argon2Compress(zero, 0, input, 0, addresses, 0, false, scratch)
+		argon2Compress(zero, 0, addresses, 0, addresses, 0, false, scratch)
+	}
+
+	// argon2Fill writes the block at `to` from the previous and the
+	// reference block; `fold` keeps the old block folded in (second pass on).
+	internal def argon2Fill(memory uint64[], previous int, reference int, to int, fold bool, scratch uint64[]) {
+		argon2Compress(memory, previous, memory, reference, memory, to, fold, scratch)
+	}
+
+	// argon2Compress is the compression function G(X, Y): R = X xor Y, the
+	// permutation P over R's eight rows then its eight columns, and the result
+	// Z xor R, written to `out` (xor'ed into it when `fold`). `scratch` holds
+	// three blocks: R, Q and the column being permuted. The word moves are
+	// vector loads and stores; the vectors stay inside this function.
+	internal def argon2Compress(x uint64[], xAt int, y uint64[], yAt int, out uint64[], outAt int, fold bool, scratch uint64[]) {
+		let r = 0
+		let q = argon2BlockWords
+		let column = 2 * argon2BlockWords
+		for let i = 0; i < argon2BlockWords; i += 4 {
+			let v = simd.load4<uint64>(x, xAt + i) ^ simd.load4<uint64>(y, yAt + i)
+			simd.store4<uint64>(scratch, r + i, v)
+			simd.store4<uint64>(scratch, q + i, v)
+		}
+		// Rows: sixteen words in a row.
+		for let row = 0; row < 8; row++ {
+			argon2Permute(scratch, q + row * 16)
+		}
+		// Columns: the words 2j and 2j + 1 of every row, gathered, permuted
+		// and put back.
+		for let j = 0; j < 8; j++ {
+			for let row = 0; row < 8; row++ {
+				simd.store2<uint64>(scratch, column + row * 2, simd.load2<uint64>(scratch, q + row * 16 + j * 2))
+			}
+			argon2Permute(scratch, column)
+			for let row = 0; row < 8; row++ {
+				simd.store2<uint64>(scratch, q + row * 16 + j * 2, simd.load2<uint64>(scratch, column + row * 2))
+			}
+		}
+		if fold {
+			for let i = 0; i < argon2BlockWords; i += 4 {
+				simd.store4<uint64>(out, outAt + i, simd.load4<uint64>(out, outAt + i) ^ simd.load4<uint64>(scratch, q + i) ^ simd.load4<uint64>(scratch, r + i))
+			}
+		} else {
+			for let i = 0; i < argon2BlockWords; i += 4 {
+				simd.store4<uint64>(out, outAt + i, simd.load4<uint64>(scratch, q + i) ^ simd.load4<uint64>(scratch, r + i))
+			}
+		}
+	}
+
+	// The lane orders that turn the column step of P into its diagonal step
+	// and back: lanes 1, 2 and 3 places on.
+	internal const argon2Turn1 = byte[1, 2, 3, 0]
+	internal const argon2Turn2 = byte[2, 3, 0, 1]
+	internal const argon2Turn3 = byte[3, 0, 1, 2]
+
+	// argon2Permute is P (RFC 9106 §3.6) on the sixteen words at `at`: the
+	// BLAKE2b round with the multiplication added, on the four columns at
+	// once (four 64-bit lanes), then on the four diagonals by turning the
+	// lanes. The vectors stay inside this function.
+	internal def argon2Permute(v uint64[], at int) {
+		let low = simd.splat4<uint64>(uint64(0xFFFFFFFF))
+		let turn1 = simd.load4<byte>(argon2Turn1, 0)
+		let turn2 = simd.load4<byte>(argon2Turn2, 0)
+		let turn3 = simd.load4<byte>(argon2Turn3, 0)
+		let a = simd.load4<uint64>(v, at)
+		let b = simd.load4<uint64>(v, at + 4)
+		let c = simd.load4<uint64>(v, at + 8)
+		let d = simd.load4<uint64>(v, at + 12)
+		for let step = 0; step < 2; step++ {
+			a = a + b + ((a & low) * (b & low) << 1)
+			d = simd.rotr(d ^ a, 32)
+			c = c + d + ((c & low) * (d & low) << 1)
+			b = simd.rotr(b ^ c, 24)
+			a = a + b + ((a & low) * (b & low) << 1)
+			d = simd.rotr(d ^ a, 16)
+			c = c + d + ((c & low) * (d & low) << 1)
+			b = simd.rotr(b ^ c, 63)
+			if step == 0 {
+				b = simd.shuffle(b, turn1)
+				c = simd.shuffle(c, turn2)
+				d = simd.shuffle(d, turn3)
+			} else {
+				b = simd.shuffle(b, turn3)
+				c = simd.shuffle(c, turn2)
+				d = simd.shuffle(d, turn1)
+			}
+		}
+		simd.store4<uint64>(v, at, a)
+		simd.store4<uint64>(v, at + 4, b)
+		simd.store4<uint64>(v, at + 8, c)
+		simd.store4<uint64>(v, at + 12, d)
+	}
+
+	// argon2Long is H'(length, data) of RFC 9106 §3.3: one BLAKE2b for 64
+	// bytes or fewer, else a chain of 64-byte digests of which 32 bytes each
+	// are kept.
+	internal def argon2Long(length int, data byte[]) byte[] {
+		let input byte[]
+		argon2PutLE32(input, length)
+		input = input + data
+		return blake2b(length, input) when length <= 64
+		let out byte[]
+		let rounds = (length + 31) / 32 - 2
+		let v = blake2b(64, input)
+		for let i = 0; i < rounds; i++ {
+			out = out + v[0:32]
+			// The last digest kept whole is of V_r itself, not of its successor.
+			v = blake2b(64, v) when i + 1 < rounds
+		}
+		return out + blake2b(length - 32 * rounds, v)
+	}
+
+	internal def argon2PutLE32(to byte[], value int) {
+		to.push(byte(value & 0xFF))
+		to.push(byte((value >> 8) & 0xFF))
+		to.push(byte((value >> 16) & 0xFF))
+		to.push(byte((value >> 24) & 0xFF))
+	}
+
+	// A 1024-byte block as little-endian words at `at`.
+	internal def argon2LoadBlock(memory uint64[], at int, bytes byte[]) {
+		for let i = 0; i < argon2BlockWords; i++ {
+			let w uint64 = 0
+			for let s = 0; s < 8; s++ {
+				w = w | (uint64(bytes[i * 8 + s]) << (s * 8))
+			}
+			memory[at + i] = w
+		}
+	}
+
+	internal def argon2StoreBlock(memory uint64[], at int) byte[] {
+		let out byte[]
+		out.len(argon2BlockBytes)
+		for let i = 0; i < argon2BlockWords; i++ {
+			let w = memory[at + i]
+			for let s = 0; s < 8; s++ {
+				out[i * 8 + s] = byte((w >> (s * 8)) & 0xFF)
+			}
+		}
+		return out
+	}
+}

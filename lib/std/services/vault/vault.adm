@@ -1,64 +1,389 @@
 partial module std.services.vault {
 	use (
-		std.services::(Dependencies, Lifecycle, RestartMode, StartMode)
+		std.crypto::(ECDSAPrivateKey, Ed25519PrivateKey, PrivateKey, PublicKey, RSAPadding, RSAPrivateKey, X25519PrivateKey, X25519PublicKey, generateECDSAKey, generateEd25519Key, generateRSAKey, generateX25519Key, marshalPKCS8PrivateKey, p256, p384, parsePKCS8PrivateKey, publicKeyOf)
+		std.crypto.hash::(Hash, digest)
+		std.errors
+		std.services::(Application, Dependencies, Lifecycle, RestartMode, StartMode)
+		std.services.ipc::(pack, unpack)
 		std.services.policy::(Policy)
-		std.services.storage::(Storage)
+		std.services.vault.store::*
 	)
 
-	// Secure, integrity-protected persistent storage for trusted application state.
+	// Settings for the Vault service.
+	struct VaultConfig {
+		// The file the vault lives in; empty: `vault/vault.bin` under the
+		// application's home folder.
+		path      string = ""
+		// The cost of deriving the vault's key when it starts (Argon2id):
+		// memory in kibibytes and passes over it. The defaults take about a
+		// fifth of a second; a new file records what it was made with, so a
+		// later change still opens it. At least 8 KiB and one pass.
+		memoryKiB int    = 65536
+		passes    int    = 3
+	}
+
+	// The kinds of key the vault generates (`generateKey`).
+	enum KeyKind {
+		Ed25519,
+		EcdsaP256,
+		EcdsaP384,
+		Rsa2048,
+		Rsa3072,
+		X25519,
+	}
+
+	// What an entry's kind is called in a message.
+	internal def kindName(kind int) string {
+		return kind == entrySecret ?? ("a secret", kind == entryValue ?? ("a value", "a key"))
+	}
+
+	// The error a vault call fails with: the vault is not started, its file is
+	// damaged or belongs to another machine, user or application, a name is
+	// not one, or an entry's value does not decode as the type asked for.
+	// `name` is the entry concerned, empty for the vault as a whole.
+	struct VaultError {
+		message string
+		code    string            = "vault.error"
+		cause   ?error
+		stack   errors.StackTrace
+		name    string            = ""
+	}
+
+	// The application's encrypted key/value store: credentials, tokens, keys,
+	// settings, anything kept between runs that must not be readable on disk.
+	// One file under the application's home folder (`app-home.md`), bound to
+	// the application, the user and the machine: no password is asked, and the
+	// file copied to another machine, user or application does not open.
+	//
+	// Secrets go in and come out as `Secret<T>` (`put`/`get`), so every read is
+	// a `reveal()`; values (`store`/`load`) come back plain. Both are encrypted
+	// alike; the kind an entry was written as is part of the entry. Values are
+	// of every type that crosses a process link (`docs/requirements/ipc.md`),
+	// stored in the IPC wire encoding. A private key (`generateKey`,
+	// `importKey`) never comes out: the vault signs, decrypts and agrees with
+	// it (`sign`, `decrypt`, `agree`) and gives its public key.
+	//
+	// Example: A token kept between runs
+	// ```example
+	// try Vault.put("api.token", token)
+	// let kept = try Vault.get<string>("api.token")
+	// let header = "Bearer {kept.reveal()}" unless kept is none
+	// ```
+	//
+	// Example: A window's placement
+	// ```example
+	// try Vault.store("window.main", placement)
+	// let last = try Vault.load<WindowPlacement>("window.main")
+	// ```
+	//
+	// Design: `docs/requirements/vault.md`.
 	service Vault {
-		description               = ""
+		description               = "The application's encrypted key/value store"
+		// The file is written with the filesystem intrinsics, as `Application`
+		// writes its home: it is the service's own, not the program's data,
+		// so no `Storage` permission stands in front of it.
 		dependencies              = Dependencies{
-			hard: [Storage, Policy],
+			hard: [Application, Policy],
 			soft: []
 		}
 		lifecycle                 = Lifecycle{
 			start: StartMode.Manual,
 			restart: RestartMode.Always,
 		}
-		permissions  Permission[]
+		permissions  Permission[] = [
+			Permission{name: "read", description: "Read the application's vault"},
+			Permission{name: "write", description: "Write the application's vault"},
+			Permission{name: "keys", description: "Sign, decrypt and agree with the keys the vault holds"},
+		]
 
-		// Applies the service's settings. There are none yet, and it does not fail.
-		def config<T>(val T) !none {}
+		// The file's path once configured or started; the open file and its
+		// data key while started.
+		path    string      = ""
+		cost    VaultConfig = VaultConfig{}
+		file    ?VaultFile  = none
+		dataKey byte[]      = []
+		started bool        = false
 
-		// Starts the service. Does not fail today.
+		// Applies the settings. Fails when the service is started (the file is
+		// chosen before `start`) or the cost is under the floor.
+		def config(val VaultConfig) !none {
+			fail VaultError{message: "vault: the settings are applied before start"} when started
+			fail VaultError{message: "vault: the key derivation needs at least 8 KiB and one pass"} when val.memoryKiB < 8 || val.passes < 1
+			path = val.path
+			cost = val
+			return none
+		}
+
+		// Opens the vault, creating the file on first use, and derives its key
+		// from the machine, the user and the application. Fails when the home
+		// folder cannot be used, the file is damaged or belongs elsewhere, or
+		// the platform gives no machine identity.
 		async def start() !none {
-			// Secrets are scoped to `__app_id__`, which the compiler always fills:
-			// from `adm.toml` when present, else from the application name.
+			return none when started
+			let home = try Application.home()
+			if path == "" {
+				let dir = home + "/vault"
+				let there = __fs_exists(dir) onerror recover false
+				try __fs_mkdir(dir) unless there
+				path = dir + "/vault.bin"
+			}
+			let binding = bindingBytes(try machineIdentity(), home, __app_id__)
+			let exists = __fs_exists(path) onerror recover false
+			if exists {
+				let opened = try parseVaultFile(try __fs_read_all(path))
+				dataKey = try openVaultFile(binding, opened)
+				file = opened
+			} else {
+				let (made, key) = try newVaultFile(binding, cost.memoryKiB, cost.passes)
+				try writeWhole(path, made.encode())
+				file = made
+				dataKey = key
+			}
+			started = true
 			return none
 		}
 
-		// Stops the service. Does not fail today.
+		// Closes the vault and forgets its key. Does not fail.
 		async def stop() !none {
+			dataKey.fill(0)
+			dataKey = []
+			file = none
+			started = false
 			return none
 		}
 
-		// Stops the service and starts it again. Does not fail today.
+		// Closes and opens the vault again. Fails as `start` does.
 		async def restart() !none {
+			try await stop()
+			try await start()
 			return none
+		}
+
+		// The open file, or the failure every call before `start` gives.
+		def opened() !VaultFile {
+			let held = file
+			fail VaultError{message: "vault: not started"} when held is none
+			return held
+		}
+
+		// Writes `plain` as the entry `name` of `kind` and saves the file.
+		def write(name string, kind int, plain byte[]) !none {
+			let held = try opened()
+			fail VaultError{message: "vault: \"{name}\" is not a name: letters, digits, '.', '_' and '-', up to 255", name: name} unless validName(name)
+			let entry = try sealEntry(dataKey, name, kind, plain)
+			let at = held.find(name)
+			if at < 0 {
+				held.entries.push(entry)
+			} else {
+				held.entries[at] = entry
+			}
+			try writeWhole(path, held.encode())
+			return none
+		}
+
+		// The plain bytes of the entry `name` when it is there and of `kind`;
+		// none when there is no such entry.
+		def read(name string, kind int) !?byte[] {
+			let held = try opened()
+			let at = held.find(name)
+			return none when at < 0
+			let entry = held.entries[at]
+			fail VaultError{message: "vault: \"{name}\" was stored as {kindName(entry.kind)}, not read as one", name: name} when entry.kind != kind
+			return try openEntry(dataKey, entry)
+		}
+
+		// The wire encoding of a value, the vault's one serialisation
+		// (`std.services.ipc.pack`).
+		def packed<T>(name string, value T) !byte[] {
+			let data = pack<T>(value) onerror (err error) {
+				fail VaultError{message: "vault: \"{name}\" holds a value that cannot be stored: {err.message}", name: name, cause: err}
+			}
+			return data
+		}
+
+		def unpacked<T>(name string, data byte[]) !T {
+			let value = unpack<T>(data) onerror (err error) {
+				fail VaultError{message: "vault: \"{name}\" does not read as the type asked for", name: name, cause: err}
+			}
+			return value
+		}
+
+		// Keeps `value` as the secret `name`, replacing what was there. Fails
+		// when the vault is not started, the name is not one, or the file
+		// cannot be written.
+		@commit(policy = "write")
+		def put<T>(name string, value Secret<T>) !none {
+			return try write(name, entrySecret, try packed<T>(name, value.reveal()))
+		}
+
+		// The secret `name`, none when there is none. Fails when the vault is
+		// not started, the entry was stored as a value, or it does not decode
+		// as `T`.
+		@commit(policy = "read")
+		def get<T>(name string) !?Secret<T> {
+			let plain = try read(name, entrySecret)
+			return none when plain is none
+			let value = try unpacked<T>(name, plain)
+			plain.fill(0)
+			return new Secret<T>(value)
+		}
+
+		// Keeps `value` under `name`, replacing what was there. Fails as `put`
+		// does.
+		@commit(policy = "write")
+		def store<T>(name string, value T) !none {
+			return try write(name, entryValue, try packed<T>(name, value))
+		}
+
+		// The value `name`, none when there is none. Fails when the vault is not
+		// started, the entry was stored as a secret, or it does not decode as
+		// `T`.
+		@commit(policy = "read")
+		def load<T>(name string) !?T {
+			let plain = try read(name, entryValue)
+			return none when plain is none
+			return try unpacked<T>(name, plain)
+		}
+
+		// Removes the entry `name`; nothing happens for a name that is not
+		// there. Fails when the vault is not started or the file cannot be
+		// written.
+		@commit(policy = "write")
+		def remove(name string) !none {
+			let held = try opened()
+			let at = held.find(name)
+			return none when at < 0
+			held.entries.remove(at)
+			try writeWhole(path, held.encode())
+			return none
+		}
+
+		// Whether an entry called `name` is there. Fails when the vault is not
+		// started.
+		@query(policy = "read")
+		def has(name string) !bool {
+			return (try opened()).find(name) >= 0
+		}
+
+		// The names that start with `prefix`, sorted; every name for "".
+		// Fails when the vault is not started.
+		@query(policy = "read")
+		def list(prefix string = "") !string[] {
+			let names string[]
+			for let entry in (try opened()).entries {
+				names.push(entry.name) when entry.name.startsWith(prefix)
+			}
+			names.sort((a, b string) => a < b)
+			return names
+		}
+
+		// Makes a new key of `kind` and keeps it as `name`, replacing what was
+		// there. Fails as `put` does.
+		@commit(policy = "write")
+		def generateKey(name string, kind KeyKind) !none {
+			let made PrivateKey = try generateEd25519Key()
+			match kind {
+				case KeyKind.Ed25519:
+					made = try generateEd25519Key()
+				case KeyKind.EcdsaP256:
+					made = try generateECDSAKey(p256)
+				case KeyKind.EcdsaP384:
+					made = try generateECDSAKey(p384)
+				case KeyKind.Rsa2048:
+					made = try generateRSAKey(2048)
+				case KeyKind.Rsa3072:
+					made = try generateRSAKey(3072)
+				case KeyKind.X25519:
+					made = try generateX25519Key()
+			}
+			return try write(name, entryKey, marshalPKCS8PrivateKey(made))
+		}
+
+		// Keeps `key` as `name`, replacing what was there. Fails as `put` does.
+		@commit(policy = "write")
+		def importKey(name string, key PrivateKey) !none {
+			return try write(name, entryKey, marshalPKCS8PrivateKey(key))
+		}
+
+		// Removes the key `name`; nothing happens for a name that is not there.
+		// Fails as `remove` does.
+		@commit(policy = "write")
+		def removeKey(name string) !none {
+			return try remove(name)
+		}
+
+		// The key `name`, parsed from its entry. Fails when the vault is not
+		// started or `name` is not a key.
+		def keyNamed(name string) !PrivateKey {
+			let der = try read(name, entryKey)
+			fail VaultError{message: "vault: no key called \"{name}\"", name: name} when der is none
+			let key = parsePKCS8PrivateKey(der) onerror (err error) {
+				fail VaultError{message: "vault: the key \"{name}\" does not read back", name: name, cause: err}
+			}
+			der.fill(0)
+			return key
+		}
+
+		// The public half of the key `name`. Fails when the vault is not
+		// started or `name` is not a key.
+		@query(policy = "read")
+		def publicKey(name string) !PublicKey {
+			return publicKeyOf(try keyNamed(name))
+		}
+
+		// Signs `message` with the key `name`: Ed25519 signs the message
+		// itself; ECDSA signs its `hash` digest and gives the ASN.1 signature;
+		// RSA signs the digest with PKCS#1 v1.5. Fails when the vault is not
+		// started, `name` is not a key, or the key's kind does not sign (X25519).
+		@commit(policy = "keys")
+		def sign(name string, message byte[], hash Hash = Hash.SHA256) !byte[] {
+			let key = try keyNamed(name)
+			match key {
+				case Ed25519PrivateKey:
+					return key.sign(message)
+				case ECDSAPrivateKey:
+					return try key.signASN1(digest(hash, message))
+				case RSAPrivateKey:
+					return try key.signPKCS1v15(hash, digest(hash, message))
+				default:
+					fail VaultError{message: "vault: the key \"{name}\" does not sign (an agreement key)", name: name}
+			}
+		}
+
+		// Decrypts `ciphertext` with the RSA key `name` (OAEP over `hash`).
+		// Fails when the vault is not started, `name` is not a key, the key is
+		// not RSA, or the ciphertext does not open.
+		@commit(policy = "keys")
+		def decrypt(name string, ciphertext byte[], hash Hash = Hash.SHA256) !byte[] {
+			let key = try keyNamed(name)
+			match key {
+				case RSAPrivateKey:
+					let plain = key.decrypt(ciphertext, RSAPadding.OAEP, hash) onerror (err error) {
+						fail VaultError{message: "vault: the ciphertext does not open with \"{name}\"", name: name, cause: err}
+					}
+					return plain
+				default:
+					fail VaultError{message: "vault: the key \"{name}\" does not decrypt (not RSA)", name: name}
+			}
+		}
+
+		// The shared secret of the X25519 key `name` and `peer`. Fails when the
+		// vault is not started, `name` is not a key, or either key is not
+		// X25519.
+		@commit(policy = "keys")
+		def agree(name string, peer PublicKey) !byte[] {
+			let key = try keyNamed(name)
+			match key {
+				case X25519PrivateKey:
+					match peer {
+						case X25519PublicKey:
+							return try key.sharedSecret(peer)
+						default:
+							fail VaultError{message: "vault: the peer's key is not X25519", name: name}
+					}
+				default:
+					fail VaultError{message: "vault: the key \"{name}\" does not agree (not X25519)", name: name}
+			}
 		}
 	}
-	/*
-	    credentials
-	    tokens
-	    private keys
-	    secrets
-	    encryption keys
-	    permissions
-	    user approvals
-	
-	
-	    secret value
-	    encrypted secret value
-	    decrypted secret value
-	    encrypted / decrypted secret value
-	
-	    secret value
-	        encrypted + authenticated
-	
-	    trusted value
-	        authenticated / integrity protected
-	        encryption optional
-	
-	*/
 }

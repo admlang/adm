@@ -1,0 +1,392 @@
+// SRTP and SRTCP (RFC 3711) with the AES counter mode and HMAC-SHA1
+// profiles, the NULL cipher ones, and AES-GCM (RFC 7714), keyed from
+// DTLS-SRTP.
+partial module std.net.rtp {
+	use (
+		std.crypto::(constantTimeEqual)
+		std.crypto.cipher::(AES, AEAD, newAES, newGCM)
+		std.crypto.hash::(Hash, HMAC)
+		std.net.sequence::(ReplayWindow, expand)
+		std.net.tls::(SRTPProfile, SRTPKeys)
+		std.net.rtp.wire::*
+	)
+
+	// SrtpSession protects what one side of a DTLS-SRTP association sends
+	// and opens what it receives, RTP and RTCP, each packet in the buffer
+	// it lies in. Sources are told apart by SSRC; each has its rollover
+	// counter and replay window. One task protects and one unprotects at a
+	// time.
+	//
+	//     let session = try rtp.srtp(try conn.srtpKeys())
+	//     let size = try session.protect(buffer, length)      // buffer has room for the tag
+	//     let plain = try session.unprotect(datagram, n)
+	type SrtpSession {
+		internal sending   SrtpDirection
+		internal receiving SrtpDirection
+
+		def new(sending SrtpDirection, receiving SrtpDirection) {
+			self.sending = sending
+			self.receiving = receiving
+		}
+
+		// overhead is how many bytes `protect` adds to an RTP packet: the
+		// authentication tag.
+		def overhead() int {
+			return sending.tagSize
+		}
+
+		// rtcpOverhead is how many bytes `protectRtcp` adds: the index word
+		// and the tag.
+		def rtcpOverhead() int {
+			return 4 + sending.rtcpTagSize
+		}
+
+		// protect turns the RTP packet in the first `length` bytes of
+		// `packet` into an SRTP packet in place and returns its length;
+		// `packet` must have `overhead()` bytes of room behind it. Fails
+		// with RtpError when it has not, or the bytes are no RTP packet.
+		def protect(packet byte[], length int) !int {
+			return try sending.protect(packet, length)
+		}
+
+		// unprotect checks and decrypts the SRTP packet in the first
+		// `length` bytes of `packet` in place and returns the length of the
+		// RTP packet. Fails with RtpError when the packet is too short,
+		// does not authenticate, or was seen before.
+		def unprotect(packet byte[], length int) !int {
+			return try receiving.unprotect(packet, length)
+		}
+
+		// protectRtcp turns a compound RTCP packet into an SRTCP packet in
+		// place and returns its length; `packet` must have `rtcpOverhead()`
+		// bytes of room behind it. Fails as `protect` does.
+		def protectRtcp(packet byte[], length int) !int {
+			return try sending.protectRtcp(packet, length)
+		}
+
+		// unprotectRtcp checks and decrypts an SRTCP packet in place and
+		// returns the length of the RTCP packet. Fails as `unprotect` does.
+		def unprotectRtcp(packet byte[], length int) !int {
+			return try receiving.unprotectRtcp(packet, length)
+		}
+	}
+
+	// srtp makes a session from the keys a DTLS-SRTP handshake exported
+	// (`DTLSConn.srtpKeys()`). Fails with RtpError for keys of the wrong
+	// length or with an MKI, which this module does not write.
+	def srtp(keys SRTPKeys) !SrtpSession {
+		fail rtpError("SRTP with an MKI is not supported") when keys.mki.len() > 0
+		return new SrtpSession(try newDirection(keys.profile, keys.localKey, keys.localSalt), try newDirection(keys.profile, keys.remoteKey, keys.remoteSalt))
+	}
+
+	// SourceState is what SRTP keeps per SSRC in one direction: the newest
+	// packet index (rollover counter and sequence number, -1 before the
+	// first) with the replay window over the indices, and the replay
+	// window over SRTCP indices.
+	internal type SourceState {
+		window     ReplayWindow
+		rtcpWindow ReplayWindow
+
+		def new() {
+			window = new ReplayWindow()
+			rtcpWindow = new ReplayWindow()
+		}
+	}
+
+	// SrtpDirection is the session keys of one direction and the state of
+	// its sources.
+	internal type SrtpDirection {
+		gcm         bool                  = false
+		encrypts    bool                  = true
+		tagSize     int                   = 10
+		rtcpTagSize int                   = 10
+		block       ?AES                  = none
+		rtcpBlock   ?AES                  = none
+		aead        ?AEAD                 = none
+		rtcpAead    ?AEAD                 = none
+		mac         ?HMAC                 = none
+		rtcpMac     ?HMAC                 = none
+		salt        byte[]                = []
+		rtcpSalt    byte[]                = []
+		rtcpIndex   int                   = 0
+		sources     map<int, SourceState>
+		// The counter block and keystream block of AES counter mode, and
+		// the 12-byte nonce of GCM: reused for every packet.
+		counter     byte[]
+		stream      byte[]
+		nonce       byte[]
+		word        byte[]
+
+		def new() {
+			counter.len(16)
+			stream.len(16)
+			nonce.len(12)
+			word.len(4)
+		}
+
+		internal def source(ssrc int) SourceState {
+			let known = sources.get(ssrc)
+			return known unless known is none
+			let fresh = new SourceState()
+			sources[ssrc] = fresh
+			return fresh
+		}
+
+		def protect(packet byte[], length int) !int {
+			let header = try headerLength(packet, length)
+			fail rtpError("no room for the SRTP tag behind a packet of {length} bytes") when packet.len() < length + tagSize
+			let ssrc = get32(packet, 8)
+			let state = source(ssrc)
+			let index = expand(state.window.highest + 1, get16(packet, 2), 16)
+			state.window.mark(index)
+			if gcm {
+				let cipher = aead
+				fail rtpError("no SRTP cipher") when cipher is none
+				setNonce(salt, ssrc, index >> 16, index & 0xFFFF, false)
+				let sealed = cipher.seal(nonce, packet[header:length], packet[0:header])
+				sealed.copy(packet[header:])
+				return header + sealed.len()
+			}
+			crypt(block, salt, ssrc, index, packet, header, length) when encrypts
+			put32(word, 0, index >> 16)
+			writeTag(mac, packet, length, word, tagSize)
+			return length + tagSize
+		}
+
+		def unprotect(packet byte[], length int) !int {
+			let header = try headerLength(packet, length)
+			fail rtpError("an SRTP packet of {length} bytes is shorter than its tag") when length < header + tagSize
+			let ssrc = get32(packet, 8)
+			let state = source(ssrc)
+			let index = expand(state.window.highest + 1, get16(packet, 2), 16)
+			fail rtpError("an SRTP packet was replayed") when state.window.seen(index)
+			let end = length - tagSize
+			if gcm {
+				let cipher = aead
+				fail rtpError("no SRTP cipher") when cipher is none
+				setNonce(salt, ssrc, index >> 16, index & 0xFFFF, false)
+				let plain = cipher.open(nonce, packet[header:length], packet[0:header]) onerror fail rtpError("an SRTP packet failed authentication")
+				plain.copy(packet[header:])
+				state.window.mark(index)
+				return end
+			}
+			put32(word, 0, index >> 16)
+			fail rtpError("an SRTP packet failed authentication") unless checkTag(mac, packet, end, word, tagSize)
+			crypt(block, salt, ssrc, index, packet, header, end) when encrypts
+			state.window.mark(index)
+			return end
+		}
+
+		def protectRtcp(packet byte[], length int) !int {
+			fail rtpError("an RTCP packet of {length} bytes") when length < 8 || length > packet.len()
+			fail rtpError("no room for the SRTCP trailer behind a packet of {length} bytes") when packet.len() < length + 4 + rtcpTagSize
+			let ssrc = get32(packet, 4)
+			let index = rtcpIndex
+			rtcpIndex = (rtcpIndex + 1) & 0x7FFFFFFF
+			let flagged = index | (encrypts ?? (0x80000000, 0))
+			if gcm {
+				let cipher = rtcpAead
+				fail rtpError("no SRTCP cipher") when cipher is none
+				setNonce(rtcpSalt, ssrc, 0, index, true)
+				let additional byte[]
+				additional.len(12)
+				packet[0:8].copy(additional)
+				put32(additional, 8, flagged)
+				let sealed = cipher.seal(nonce, packet[8:length], additional)
+				sealed.copy(packet[8:])
+				put32(packet, 8 + sealed.len(), flagged)
+				return 8 + sealed.len() + 4
+			}
+			crypt(rtcpBlock, rtcpSalt, ssrc, index, packet, 8, length) when encrypts
+			put32(packet, length, flagged)
+			writeTag(rtcpMac, packet, length + 4, [], rtcpTagSize)
+			return length + 4 + rtcpTagSize
+		}
+
+		def unprotectRtcp(packet byte[], length int) !int {
+			fail rtpError("an SRTCP packet of {length} bytes is shorter than its trailer") when length < 8 + 4 + rtcpTagSize || length > packet.len()
+			let ssrc = get32(packet, 4)
+			let state = source(ssrc)
+			if gcm {
+				let cipher = rtcpAead
+				fail rtpError("no SRTCP cipher") when cipher is none
+				let flagged = get32(packet, length - 4)
+				let index = flagged & 0x7FFFFFFF
+				fail rtpError("an SRTCP packet was replayed") when state.rtcpWindow.seen(index)
+				setNonce(rtcpSalt, ssrc, 0, index, true)
+				let additional byte[]
+				additional.len(12)
+				packet[0:8].copy(additional)
+				put32(additional, 8, flagged)
+				let plain = cipher.open(nonce, packet[8:length - 4], additional) onerror fail rtpError("an SRTCP packet failed authentication")
+				plain.copy(packet[8:])
+				state.rtcpWindow.mark(index)
+				return 8 + plain.len()
+			}
+			let end = length - rtcpTagSize
+			let flagged = get32(packet, end - 4)
+			let index = flagged & 0x7FFFFFFF
+			fail rtpError("an SRTCP packet was replayed") when state.rtcpWindow.seen(index)
+			fail rtpError("an SRTCP packet failed authentication") unless checkTag(rtcpMac, packet, end, [], rtcpTagSize)
+			crypt(rtcpBlock, rtcpSalt, ssrc, index, packet, 8, end - 4) when (flagged & 0x80000000) != 0
+			state.rtcpWindow.mark(index)
+			return end - 4
+		}
+
+		// crypt XORs the AES counter mode keystream of a packet index into
+		// the bytes from `from` up to `to` (RFC 3711 §4.1.1): the same
+		// operation encrypts and decrypts.
+		internal def crypt(cipher ?AES, salt byte[], ssrc int, index int, packet byte[], from int, to int) {
+			return when cipher is none
+			for let i = 0; i < 14; i++ {
+				counter[i] = salt[i]
+			}
+			counter[14] = 0
+			counter[15] = 0
+			for let i = 0; i < 4; i++ {
+				counter[4 + i] = counter[4 + i] ^ byte((ssrc >> (24 - 8 * i)) & 0xFF)
+			}
+			for let i = 0; i < 6; i++ {
+				counter[8 + i] = counter[8 + i] ^ byte((index >> (40 - 8 * i)) & 0xFF)
+			}
+			let at = from
+			for at < to {
+				cipher.encryptBlock(stream, counter)
+				counter[15] = counter[15] + byte(1)
+				counter[14] = counter[14] + byte(1) when counter[15] == byte(0)
+				let n = (to - at).min(16)
+				for let i = 0; i < n; i++ {
+					packet[at + i] = packet[at + i] ^ stream[i]
+				}
+				at += n
+			}
+		}
+
+		// setNonce is the GCM nonce of a packet (RFC 7714 §8.1, §9.1): the
+		// salt XORed with two zero bytes, the SSRC, and for RTP the
+		// rollover counter and sequence number, for RTCP two more zero
+		// bytes and the SRTCP index.
+		internal def setNonce(salt byte[], ssrc int, roc int, low int, rtcp bool) {
+			for let i = 0; i < 12; i++ {
+				nonce[i] = salt[i]
+			}
+			for let i = 0; i < 4; i++ {
+				nonce[2 + i] = nonce[2 + i] ^ byte((ssrc >> (24 - 8 * i)) & 0xFF)
+			}
+			if rtcp {
+				for let i = 0; i < 4; i++ {
+					nonce[8 + i] = nonce[8 + i] ^ byte((low >> (24 - 8 * i)) & 0xFF)
+				}
+				return
+			}
+			for let i = 0; i < 4; i++ {
+				nonce[6 + i] = nonce[6 + i] ^ byte((roc >> (24 - 8 * i)) & 0xFF)
+			}
+			nonce[10] = nonce[10] ^ byte((low >> 8) & 0xFF)
+			nonce[11] = nonce[11] ^ byte(low & 0xFF)
+		}
+
+		// tagOf is the HMAC over the first `length` bytes of a packet and a
+		// trailer (the rollover counter for RTP).
+		internal def tagOf(keyed ?HMAC, packet byte[], length int, trailer byte[]) byte[] {
+			return [] when keyed is none
+			keyed.reset()
+			keyed.write(packet[0:length])
+			return keyed.hash(trailer)
+		}
+
+		internal def writeTag(keyed ?HMAC, packet byte[], length int, trailer byte[], size int) {
+			let tag = tagOf(keyed, packet, length, trailer)
+			for let i = 0; i < size && i < tag.len(); i++ {
+				packet[length + i] = tag[i]
+			}
+		}
+
+		internal def checkTag(keyed ?HMAC, packet byte[], length int, trailer byte[], size int) bool {
+			let tag = tagOf(keyed, packet, length, trailer)
+			return tag.len() >= size && constantTimeEqual(tag[0:size], packet[length:length + size])
+		}
+	}
+
+	// headerLength is the length of the header of the RTP packet in the
+	// first `length` bytes of a buffer: the fixed part, the CSRCs and the
+	// header extension. Fails with RtpError when the bytes are no RTP
+	// packet.
+	internal def headerLength(packet byte[], length int) !int {
+		fail rtpError("a packet of {length} bytes is shorter than an RTP header") when length < 12 || length > packet.len()
+		let first = int(packet[0])
+		fail rtpError("RTP version {first >> 6}") unless first >> 6 == 2
+		let header = 12 + 4 * (first & 0x0F)
+		if (first & 0x10) != 0 {
+			fail rtpError("the packet ends inside its header extension") when length < header + 4
+			header += 4 + 4 * get16(packet, header + 2)
+		}
+		fail rtpError("the packet ends inside its header") when length < header
+		return header
+	}
+
+	// newDirection derives the session keys of one direction from its
+	// master key and salt (RFC 3711 §4.3.1, RFC 7714 §11). Fails with
+	// RtpError for a key or salt of the wrong length.
+	internal def newDirection(profile SRTPProfile, masterKey byte[], masterSalt byte[]) !SrtpDirection {
+		let direction = new SrtpDirection()
+		direction.gcm = profile := SRTPProfile.AEADAES128GCM || SRTPProfile.AEADAES256GCM
+		direction.encrypts = !(profile := SRTPProfile.NullHMACSHA1Tag80 || SRTPProfile.NullHMACSHA1Tag32)
+		let keySize = profile == SRTPProfile.AEADAES256GCM ?? (32, 16)
+		let saltSize = direction.gcm ?? (12, 14)
+		// The NULL profiles still derive their authentication keys from a
+		// 128-bit master key and a 112-bit salt (RFC 3711 §8.2).
+		fail rtpError("an SRTP master key of {masterKey.len()} bytes and salt of {masterSalt.len()}") unless masterKey.len() == keySize && masterSalt.len() == saltSize
+		let master = newAES(masterKey) onerror fail rtpError("the SRTP master key was refused")
+		let padded byte[]
+		padded.len(14)
+		masterSalt.copy(padded)
+		if direction.gcm {
+			direction.tagSize = 16
+			direction.rtcpTagSize = 16
+			direction.aead = try sessionAEAD(deriveKey(master, padded, 0, keySize))
+			direction.salt = deriveKey(master, padded, 2, 12)
+			direction.rtcpAead = try sessionAEAD(deriveKey(master, padded, 3, keySize))
+			direction.rtcpSalt = deriveKey(master, padded, 5, 12)
+			return direction
+		}
+		direction.tagSize = (profile := SRTPProfile.AES128CMHMACSHA1Tag32 || SRTPProfile.NullHMACSHA1Tag32) ?? (4, 10)
+		direction.block = newAES(deriveKey(master, padded, 0, 16)) onerror fail rtpError("a derived SRTP key was refused")
+		direction.mac = new HMAC(Hash.SHA1, deriveKey(master, padded, 1, 20))
+		direction.salt = deriveKey(master, padded, 2, 14)
+		direction.rtcpBlock = newAES(deriveKey(master, padded, 3, 16)) onerror fail rtpError("a derived SRTCP key was refused")
+		direction.rtcpMac = new HMAC(Hash.SHA1, deriveKey(master, padded, 4, 20))
+		direction.rtcpSalt = deriveKey(master, padded, 5, 14)
+		return direction
+	}
+
+	internal def sessionAEAD(key byte[]) !AEAD {
+		let block = newAES(key) onerror fail rtpError("a derived SRTP key was refused")
+		return newGCM(block) onerror fail rtpError("AES-GCM refused a derived SRTP key")
+	}
+
+	// deriveKey is the SRTP key derivation function with a key derivation
+	// rate of zero (RFC 3711 §4.3.1): `length` bytes of AES counter mode
+	// keystream under the master key, from the master salt XORed with the
+	// label.
+	internal def deriveKey(master AES, salt byte[], label int, length int) byte[] {
+		let counter byte[]
+		counter.len(16)
+		salt.copy(counter)
+		counter[7] = counter[7] ^ byte(label)
+		let stream byte[]
+		stream.len(16)
+		let out byte[]
+		out.len(length)
+		let at = 0
+		for at < length {
+			master.encryptBlock(stream, counter)
+			counter[15] = counter[15] + byte(1)
+			for let i = 0; i < 16 && at < length; i++ {
+				out[at] = stream[i]
+				at++
+			}
+		}
+		return out
+	}
+}

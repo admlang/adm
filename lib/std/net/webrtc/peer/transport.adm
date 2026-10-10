@@ -1,0 +1,324 @@
+// The transport of a peer connection: one path found by the ICE agent
+// carries DTLS and SRTP side by side (RFC 7983). The agent's reading task
+// hands each datagram here; SRTP is opened in place and handed on, on that
+// task, and DTLS records go to the DTLS connection, which carries SCTP.
+internal std.net.webrtc partial module std.net.webrtc.peer {
+	use (
+		std.net
+		std.net.rtp
+		std.net.sdp
+		std.net.tls
+		std.net.waiting::(Signal, awaitSignal)
+		std.net.webrtc::*
+		std.net.webrtc.ice::(Agent)
+		std.time
+	)
+
+	// The largest DTLS record datagram kept.
+	const recordSize = 2048
+	// DTLS datagrams held for the connection before the oldest is dropped.
+	const recordBacklog = 64
+
+	def transportError(message string) WebRtcError {
+		return WebRtcError{message: "webrtc: {message}", code: "webrtc.transport"}
+	}
+
+	// DtlsPath is the DTLS connection's side of the path: what it sends
+	// goes to the agent, what the demultiplexer finds to be DTLS waits here
+	// for it. Implements net.DatagramTransport.
+	type DtlsPath {
+		agent        Agent
+		atomic queue byte[][] = []
+		atomic spare byte[][] = []
+		// Raised by the agent's reading task for a datagram and by
+		// whoever closes the path.
+		signal       Signal
+		closed       bool     = false
+
+		def new(agent Agent) {
+			self.agent = agent
+			signal = new Signal()
+		}
+
+		def send(data byte[], timeout duration) !none {
+			fail net.errorOf(net.ErrorCode.Closed, "send", "", "the transport is closed") when closed
+			return try agent.send(data, timeout)
+		}
+
+		// push keeps a copy of a DTLS datagram for `receive`.
+		def push(data byte[]) {
+			keep(data)
+			signal.raise()
+		}
+
+		internal atomic def keep(data byte[]) {
+			let slot byte[]
+			if spare.len() > 0 {
+				slot = spare.pop()
+			} else {
+				slot.cap(recordSize)
+			}
+			slot.len(data.len())
+			data.copy(slot)
+			spare.push(queue.shift()) when queue.len() >= recordBacklog
+			queue.push(slot)
+		}
+
+		internal atomic def take(buf byte[]) int {
+			return -1 when queue.len() == 0
+			let datagram = queue.shift()
+			let n = datagram.len().min(buf.len())
+			datagram.len(n)
+			datagram.copy(buf)
+			spare.push(datagram) when spare.len() < 16
+			return n
+		}
+
+		def receive(buf byte[], timeout duration) !int {
+			let deadline = timeout > 0s ?? (int(time.monoNs()) + int(timeout), 0)
+			for {
+				let n = take(buf)
+				return n when n >= 0
+				fail net.errorOf(net.ErrorCode.Closed, "receive", "", "the transport is closed") when closed
+				fail net.errorOf(net.ErrorCode.TimedOut, "receive", "", "timed out") unless signal.wait(deadline)
+			}
+			fail "unreachable"
+		}
+
+		// close ends the DTLS connection's use of the path; the agent
+		// stays open. Never fails.
+		def close() !none {
+			closed = true
+			signal.raise()
+			return none
+		}
+
+		def isOpen() bool {
+			return !closed
+		}
+	}
+
+	// Transport is DTLS and SRTP over the path of an ICE agent.
+	type Transport {
+		agent    Agent
+		path     DtlsPath
+		conn     ?tls.DTLSConn    = none
+		session  ?rtp.SrtpSession = none
+		// Called on the agent's reading task with each RTP and each RTCP
+		// packet after it was opened; the array is the reader's and holds
+		// the packet only during the call.
+		rtpSink  ?def (byte[])    = none
+		rtcpSink ?def (byte[])    = none
+		// A task reads the DTLS connection while nothing else does
+		// (`serve`), until `data` claims the connection.
+		serving  bool             = false
+		claimed  bool             = false
+		released channel<none>
+
+		def new(agent Agent) {
+			self.agent = agent
+			path = new DtlsPath(agent)
+			released = new channel<none>(1)
+			agent.deliverTo(take)
+		}
+
+		// connect runs the DTLS handshake over the agent's path, as the
+		// client (the "a=setup:active" side) or the server, with the
+		// certificate of this side, and checks the peer's certificate
+		// against the fingerprints its description gave (RFC 8827 §6.5);
+		// then SRTP is keyed from the handshake (RFC 5764). Fails with
+		// TLSError or NetError as the handshake does, WebRtcError when the
+		// peer shows no certificate, one with another fingerprint, or no
+		// SRTP profile was agreed.
+		def connect(active bool, identity tls.KeyPair, fingerprints sdp.Fingerprint[], timeout duration = 30s) !none {
+			let config = tls.DTLSConfig{tls: tls.Config{insecureSkipVerify: true, certificates: [identity], clientAuth: tls.ClientAuthType.RequireAnyClientCert}, srtpProfiles: [tls.SRTPProfile.AEADAES128GCM, tls.SRTPProfile.AEADAES256GCM, tls.SRTPProfile.AES128CMHMACSHA1Tag80], connectionIDs: false, cookieExchange: false, retransmitTimeout: 400ms, handshakeTimeout: timeout}
+			let made = active ?? (tls.dtlsClient(path, config), tls.dtlsServer(path, config))
+			try made.handshake()
+			let shown = made.connectionState().peerCertificates
+			if shown.len() == 0 || !matches(shown[0].raw, fingerprints) {
+				made.close() onerror recover none
+				fail transportError(shown.len() == 0 ?? ("the peer showed no certificate", "the peer's certificate does not have the fingerprint of its description"))
+			}
+			let keyed = try rtp.srtp(try made.srtpKeys())
+			established(made, keyed)
+			return none
+		}
+
+		internal atomic def established(made tls.DTLSConn, keyed rtp.SrtpSession) {
+			conn = made
+			session = keyed
+		}
+
+		// take sorts a datagram by its first byte (RFC 7983 §7): 128 to 191
+		// is RTP or RTCP, opened in place and handed on; 20 to 63 is DTLS.
+		// What does not authenticate, and anything else, is dropped.
+		def take(data byte[]) {
+			return when data.len() < 2
+			let first = int(data[0])
+			if first >= 128 && first <= 191 {
+				let keyed = session
+				return when keyed is none
+				if rtp.isRtcp(data) {
+					let size = keyed.unprotectRtcp(data, data.len()) onerror recover 0
+					let handler = rtcpSink
+					return when size == 0 || handler is none
+					data.len(size)
+					handler(data)
+					return
+				}
+				let size = keyed.unprotect(data, data.len()) onerror recover 0
+				let handler = rtpSink
+				return when size == 0 || handler is none
+				data.len(size)
+				handler(data)
+				return
+			}
+			path.push(data) when first >= 20 && first <= 63
+		}
+
+		// sendRtp protects the RTP packet in the first `length` bytes of
+		// `packet` in place, sends it and returns its protected length;
+		// `packet` needs `rtpOverhead()` bytes of room behind it. One
+		// sender at a time. Fails with WebRtcError before `connect`,
+		// RtpError when the packet has no room or is no RTP, as the
+		// agent's `send` does otherwise.
+		atomic def sendRtp(packet byte[], length int) !int {
+			let keyed = session
+			fail transportError("the transport is not connected") when keyed is none
+			let size = try keyed.protect(packet, length)
+			try sendSized(packet, size)
+			return size
+		}
+
+		// sendAgain sends the first `size` bytes of a packet that was
+		// protected before, as they are: a retransmission. Fails as the
+		// agent's `send` does.
+		atomic def sendAgain(packet byte[], size int) !none {
+			return try sendSized(packet, size)
+		}
+
+		// sendRtcp is `sendRtp` for a compound RTCP packet, with
+		// `rtcpOverhead()` bytes of room.
+		atomic def sendRtcp(packet byte[], length int) !none {
+			let keyed = session
+			fail transportError("the transport is not connected") when keyed is none
+			return try sendSized(packet, try keyed.protectRtcp(packet, length))
+		}
+
+		// sendSized sends the first `size` bytes of an array and leaves the
+		// array as long as it was.
+		internal def sendSized(packet byte[], size int) !none {
+			let whole = packet.len()
+			let failure ?error = none
+			packet.len(size)
+			agent.send(packet, 5s) onerror (err error) {
+				failure = err
+				recover none
+			}
+			packet.len(whole)
+			fail failure unless failure is none
+			return none
+		}
+
+		// rtpOverhead and rtcpOverhead are the room `sendRtp` and
+		// `sendRtcp` need behind a packet; 0 before `connect`.
+		def rtpOverhead() int {
+			let keyed = session
+			return 0 when keyed is none
+			return keyed.overhead()
+		}
+
+		def rtcpOverhead() int {
+			let keyed = session
+			return 0 when keyed is none
+			return keyed.rtcpOverhead()
+		}
+
+		// serve keeps the DTLS connection read while no data channel reads
+		// it. A DTLS connection answers its peer only while it is read:
+		// when the last flight of this side's handshake is lost, the peer
+		// repeats its own and waits for the answer, and so does a flight
+		// this side still has to repeat. Without a reader the peer never
+		// finishes its handshake. What the peer sends as data is dropped.
+		// `data` ends the task.
+		def serve() {
+			return unless startServing()
+			let task = async idle()
+			task.keepAlive()
+		}
+
+		internal atomic def startServing() bool {
+			return false when serving || conn is none
+			serving = true
+			claimed = false
+			return true
+		}
+
+		internal def idle() {
+			let made = conn
+			if made is none {
+				stopServing()
+				return
+			}
+			for !isClaimed() {
+				let over = false
+				made.receive(200ms) onerror (err error) {
+					over = !(err is net.NetError && err.kind == net.ErrorCode.TimedOut)
+					recover []
+				}
+				break when over
+			}
+			stopServing()
+		}
+
+		internal atomic def isClaimed() bool {
+			return claimed
+		}
+
+		internal atomic def stopServing() {
+			serving = false
+			released.offer(none)
+		}
+
+		// isServing reports whether the task of `serve` still reads the
+		// connection.
+		atomic def isServing() bool {
+			return serving
+		}
+
+		internal atomic def claim() bool {
+			return false unless serving
+			claimed = true
+			return true
+		}
+
+		// data is the DTLS connection, for SCTP to run over; the task of
+		// `serve` has stopped reading it when this returns. Fails with
+		// WebRtcError before `connect`, and when that task does not leave
+		// its read within two seconds.
+		def data() !tls.DTLSConn {
+			let made = conn
+			fail transportError("the transport is not connected") when made is none
+			if claim() {
+				// A wait returns after 200 ms at most: until the task is out
+				// of its read.
+				let until = int(time.monoNs()) + 2000000000
+				for isServing() && awaitSignal(released, until) {}
+				// Two readers of one connection would each lose what the
+				// other takes.
+				fail transportError("the task that reads the DTLS connection did not let go of it") when isServing()
+			}
+			return made
+		}
+
+		// close ends the DTLS connection (the peer is told) and this side
+		// of the path; the agent is the caller's to close. Never fails.
+		def close() !none {
+			let made = conn
+			if !(made is none) {
+				made.close() onerror recover none
+			}
+			return try path.close()
+		}
+	}
+}
