@@ -1,39 +1,1233 @@
 partial module std.services.telemetry {
 	use (
-		std.services::(Dependencies, Lifecycle, RestartMode, StartMode)
+		std.services::(Application, Dependencies, Lifecycle, RestartMode, StartMode)
 		std.services.diagnostics::(Diagnostics)
+		std.services.vault::(Vault)
+		std.services.logging::(Logging, LogLevel, LogRecord)
+		std.services.logging.redaction::(loggable)
+		std.services.logging.tracing
+		std.reflection
+		std.reflection::(FunctionMetaContext, MethodMetaContext)
+		std.metrics::(Counter, Distribution, Gauge, Histogram, Toggle)
+		std.data.encoding::(JSON, hexencode)
+		std.crypto
+		std.crypto.hash::(SHA256)
+		std.errors
+		std.os
+		std.time
 	)
 
-	// open telemetry
+	// The vault entry of the user's answer (a bool).
+	internal const consentEntry = "telemetry.consent"
 
-	// Telemetry service is used to ship logs/metrics/errorReports to a remote server you configure
+	// What the Telemetry service sends, each kind on its own switch in `TelemetryConfig`.
+	enum TelemetrySignal {
+		// The metrics the Diagnostics service holds, read every `TelemetryConfig.interval`.
+		Metrics,
+		// The records the Logging service accepts.
+		Logs,
+		// Errors given to `Telemetry.report`, and every record written with `Logging.fatal`.
+		Errors,
+		// What the user did, as given to `Telemetry.event`.
+		Events,
+		// Timed operations: `@span` functions and `Telemetry.span`.
+		Spans,
+	}
+
+	// One metric as read from the Diagnostics service.
+	struct MetricSample {
+		// The name the metric is registered under.
+		name         string
+		// `counter`, `gauge`, `histogram` or `toggle`.
+		kind         string
+		// When it was read, in wall-clock nanoseconds since the Unix epoch.
+		time         int64
+		// A counter's count, a gauge's value, 1 or 0 for a toggle, a histogram's mean.
+		value        float64
+		// A histogram's counts by range; none for the other kinds.
+		distribution ?Distribution
+		// A counter's count, exact where `value` rounds it (above 2^53); 0 for the other
+		// kinds.
+		count        uint64
+		// What tells the series of one name apart: `{"route": "/orders"}`.
+		labels       map<string, string>
+		// What the value counts (`ms`, `By`) and what the metric means, "" when it was
+		// registered without.
+		unit         string
+		description  string
+	}
+
+	// An error as the Telemetry service sends it.
+	struct ErrorReport {
+		// The error's message.
+		message string
+		// The error's code, "" when it has none.
+		code    string
+		// The name of the error's type: `error`, or the struct it was raised with.
+		kind    string
+		// Where the error was raised.
+		stack   errors.StackTrace
+		// What the caller of `report` added.
+		fields  map<string, any>
+		// When it was reported, in wall-clock nanoseconds since the Unix epoch.
+		time    int64
+		// Whether it ended the program: set for a record written with `Logging.fatal`.
+		fatal   bool
+		// The span the error was reported in; none outside any span.
+		span    ?SpanContext
+	}
+
+	// Something the user did, as given to `Telemetry.event`.
+	struct UsageEvent {
+		// What happened, in the application's own words: `export.finished`.
+		name       string
+		// Details of it.
+		properties map<string, any>
+		// When it happened, in wall-clock nanoseconds since the Unix epoch.
+		time       int64
+	}
+
+	// Names one span among those of all the programs a request passed through: what
+	// the `traceparent` header carries (W3C Trace Context).
+	struct SpanContext {
+		// The trace the span belongs to: 32 hexadecimal digits.
+		trace   string
+		// The span: 16 hexadecimal digits.
+		span    string
+		// Whether the trace is being recorded (`TelemetryConfig.sampling`).
+		sampled bool
+	}
+
+	// Something that happened at one moment inside a span.
+	struct SpanEvent {
+		name       string
+		attributes map<string, any>
+		// Wall-clock nanoseconds since the Unix epoch.
+		time       int64
+	}
+
+	// A finished span as the Telemetry service sends it.
+	struct SpanRecord {
+		context    SpanContext
+		// The span it ran inside, "" for the first span of a trace.
+		parent     string
+		// What the operation was: the function's qualified name for `@span`.
+		name       string
+		// When it began and ended, in wall-clock nanoseconds since the Unix epoch.
+		start      int64
+		end        int64
+		attributes map<string, any>
+		events     SpanEvent[]
+		// Whether the operation failed, and the error's message when it did.
+		failed     bool
+		error      string
+	}
+
+	// The span each task is inside of.
+	internal let currentSpan = new TaskLocal<Span>()
+
+	// Makes span the running task's current one, none for no span, and tells the Logging
+	// service, which writes the trace and span into each record of the task.
+	internal def enter(span ?Span) {
+		currentSpan.set(span)
+		if span is none {
+			tracing.link.set(none)
+			return
+		}
+		let within = span.context()
+		tracing.link.set(within.trace + "-" + within.span)
+	}
+
+	// One timed operation, from `Telemetry.span` until `end`.
+	//
+	// From when it begins until it ends, the span is the current one of its task
+	// (`Telemetry.current`): spans begun meanwhile, there or in tasks started with `async`,
+	// are its children, and errors reported and log records written meanwhile name it. End a span on the task that
+	// began it, and the spans begun inside it first.
+	//
+	// ```
+	// let work = Telemetry.span("import", {"rows": rows.len()})
+	// defer work.end()
+	// ```
+	type Span {
+		internal record SpanRecord
+		internal done   bool
+		// The task's current span when this one began, current again when it ends.
+		internal outer  ?Span      = none
+
+		def new(record SpanRecord) {
+			self.record = record
+		}
+
+		// The span's identity, to pass as the parent of another span.
+		def context() SpanContext {
+			return record.context
+		}
+
+		// Adds or replaces an attribute. Does nothing once the span has ended.
+		def set(key string, value any) {
+			return when done
+			record.attributes[key] = value
+		}
+
+		// Records that something happened now, inside the span.
+		def event(name string, attributes map<string, any> = {}) {
+			return when done
+			record.events.push(SpanEvent{name: name, attributes: loggable(attributes), time: time.wallNs()})
+		}
+
+		// Marks the span as failed with err. The span still has to be ended.
+		def error(err error) {
+			return when done
+			record.failed = true
+			record.error = err.message
+		}
+
+		// Ends the span and hands it to the Telemetry service. A second call does nothing.
+		def end() {
+			return when done
+			done = true
+			record.end = time.wallNs()
+			record.attributes = loggable(record.attributes)
+			// On another task, or with a span begun inside still open, the current span
+			// is not this one and stays.
+			let current = currentSpan.get()
+			enter(outer) when !(current is none) && current == self
+			outer = none
+			Telemetry.record(record)
+		}
+
+		// The value of a `traceparent` header that makes the receiver's spans children of
+		// this one.
+		def traceparent() string {
+			return "00-{record.context.trace}-{record.context.span}-{sampledFlag(record.context.sampled)}"
+		}
+	}
+
+	// What goes to the exporters in one go.
+	struct TelemetryBatch {
+		// What describes the program: `service.name`, `service.version`, `os.type`,
+		// `host.arch`, the installation and session ids, `TelemetryConfig.resource` and
+		// what `Telemetry.set` added.
+		resource map<string, string>
+		metrics  MetricSample[]
+		logs     LogRecord[]
+		errors   ErrorReport[]
+		events   UsageEvent[]
+		spans    SpanRecord[]
+	}
+
+	// Takes batches somewhere: a collector, a file, the terminal.
+	//
+	// `OTLPExporter`, `FileExporter` and `ConsoleExporter` are the ones this module has.
+	interface Exporter {
+		// Names the exporter among those configured, the same on every run: batches kept
+		// for it, in memory or on disk, return to the exporter of that name.
+		def name() string
+
+		// Sends one batch. A failure keeps the batch for another try, and on disk when
+		// `TelemetryConfig.spool` is on; failing with an `ExportFailure` says which part of
+		// it to keep.
+		def export(batch TelemetryBatch) !none
+
+		// Releases what the exporter holds. Called when the service stops or the exporter
+		// leaves the configuration.
+		def close() !none
+	}
+
+	// What an exporter fails with when "try all of it again" is the wrong answer: part of
+	// the batch arrived, the receiver refused records for good, or it asked for a pause.
+	// An exporter that fails with any other error has the whole batch kept.
+	struct ExportFailure {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		// The records to try again; none when there are none.
+		rest       ?TelemetryBatch   = none
+		// How many records the receiver refused for good. They are dropped and counted
+		// (`Telemetry.dropped`).
+		rejected   int
+		// How long the receiver asked to be left alone. Until then the exporter is given
+		// nothing and its batches are kept.
+		retryAfter duration
+	}
+
+	// A batch an exporter did not take, or took part of.
+	struct TelemetryFailure {
+		// Position of the exporter in `TelemetryConfig.exporters`.
+		exporter int
+		// How many records were not taken.
+		records  int
+		// How many of them the receiver refused for good; these are dropped.
+		rejected int
+		// What the exporter reported.
+		cause    error
+		// Whether the others were kept for another try; false when they were dropped.
+		kept     bool
+	}
+
+	// What a test can make the Telemetry service do (`Telemetry.lab.conditions`). The
+	// defaults change nothing.
+	struct TelemetryConditions {
+		// No exporter takes a batch, as if no receiver could be reached.
+		unreachable bool     = false
+		// The share of batches an exporter does not take.
+		lossRate    float    = 0.0
+		// How much longer handing a batch to an exporter takes.
+		sendDelay   duration = 0s
+		// Kept batches cannot be written to disk; they wait in memory instead.
+		spoolFails  bool     = false
+	}
+
+	// Settings of the Telemetry service.
+	struct TelemetryConfig {
+		// Where batches go. With none, nothing is collected.
+		exporters Exporter[]
+
+		// What is sent. An absent signal is not collected at all.
+		signals TelemetrySignal[] = [TelemetrySignal.Metrics, TelemetrySignal.Logs, TelemetrySignal.Errors, TelemetrySignal.Events, TelemetrySignal.Spans]
+
+		// Whether the user has to agree first (`Telemetry.consent`). While true and no
+		// consent is given, nothing is collected and nothing is sent. A program that runs on
+		// its owner's machines, a server, sets it to false.
+		requireConsent bool = true
+
+		// The program's name and version as the collector sees them; the application's own
+		// when empty.
+		name    string = ""
+		version string = ""
+
+		// More about the program, added to every batch: `{"deployment.environment": "staging"}`.
+		resource map<string, string>
+
+		// How often metrics are read and waiting records are sent.
+		interval duration = 10s
+
+		// The most records in one batch. A batch is also sent as soon as that many wait.
+		batch int = 512
+
+		// How many records may wait in memory. One more is dropped and counted
+		// (`Telemetry.dropped`).
+		capacity int = 8192
+
+		// The share of traces recorded, from 0.0 to 1.0. A trace is kept or left out whole,
+		// and one that arrives with a `traceparent` follows what its sender decided.
+		sampling float = 1.0
+
+		// Whether batches no exporter took are kept in the application's home folder and
+		// sent later, also after a restart.
+		spool bool = true
+
+		// The most the kept batches may take on disk, in bytes; the oldest go first.
+		spoolSize int = 16777216
+
+		// Called with each batch before any exporter sees it; what it returns is what is
+		// sent. For dropping or editing what must not leave the machine. Fields marked
+		// `@sensitive()` are already `***`.
+		scrub ?def (TelemetryBatch) TelemetryBatch = none
+	}
+
+	// Sends what the program knows about itself to a server its developer configures:
+	// metrics, log records, errors, what the user did, and timed operations.
+	//
+	// Nothing is collected until the service is configured with an exporter and started,
+	// and, unless `TelemetryConfig.requireConsent` is off, until the user has agreed.
+	//
+	// ```
+	// try Telemetry.config(TelemetryConfig{
+	// 	exporters: [new OTLPExporter("https://telemetry.example.com:4318")],
+	// })
+	// try await Telemetry.start()
+	//
+	// Telemetry.consent(true)                              // the user said yes
+	// Telemetry.event("export.finished", {"format": "pdf"})
+	// Telemetry.report(err, {"order": order.id})
+	// ```
+	//
 	service Telemetry {
-		description               = ""
+		description               = "Sends metrics, logs, errors, usage events and spans to a configured server"
 		dependencies              = Dependencies{
-			hard: [Diagnostics]
+			hard: [Diagnostics, Logging, Application, Vault]
 		}
 		lifecycle                 = Lifecycle{
 			start: StartMode.Manual,
 			restart: RestartMode.Always,
 		}
-		permissions  Permission[]
+		permissions  Permission[] = [
+			Permission{name: "send", description: "Send telemetry about the program and its use"},
+		]
 
-		// Applies the service's settings. There are none yet, and it does not fail.
-		def config<T>(val T) !none {}
+		lab = new ServiceLab<TelemetryConditions>()
 
-		// Starts the service. Does not fail today.
+		cfg       TelemetryConfig     = TelemetryConfig{}
+		sinks     Sink[]
+		// Exporters a change of configuration replaced, closed by the sending task.
+		retired   Exporter[]
+		// Bit `TelemetrySignal.ordinal` is set for each signal collected.
+		mask      int                 = 31
+		running   bool
+		// Counts the starts, so the timer task of an earlier run ends.
+		epoch     int
+		wake      ?channel<none>      = none
+		// Signalled by the sending task once it has closed the exporters.
+		ended     ?channel<none>      = none
+		// What waits to be sent, and how many records that is.
+		pending   TelemetryBatch      = TelemetryBatch{}
+		waiting   int
+		// The monotonic time the next batch is due at.
+		nextSend  int64
+		// Set by flush: the next batch is sent at once.
+		forced    bool
+		// The calls of flush that wait for the next batch, and for the one being sent.
+		waiters   channel<bool>[]
+		serving   channel<bool>[]
+		// What `set` added.
+		labels    map<string, string> = map<string, string>{}
+		// The user's answer, and whether it was read from the vault yet.
+		answer    ?bool               = none
+		recalled  bool
+		installed string
+		sessionId string
+		// The service's folder in the application's home, "" until it is needed.
+		folder    string
+		// Names the next file of a kept batch.
+		spoolSeq  uint64
+		lost      uint64
+
+		// The service's folder, made on first use.
+		def home() !string {
+			return folder unless folder.isEmpty()
+			let made = os.join(try Application.home(), "telemetry")
+			try os.mkdir(made, true)
+			folder = made
+			return made
+		}
+
+		// Reads the user's answer the vault keeps, and the vault's id when the answer
+		// is yes, opening the vault when it is not open yet.
+		def recall() !none {
+			return none when recalled
+			try await Vault.start()
+			answer = try Vault.load<bool>(consentEntry)
+			let given = answer
+			installed = ""
+			installed = try Vault.id() when !(given is none) && given
+			recalled = true
+			return none
+		}
+
+		// Whether records of the signal are collected now.
+		def collects(signal TelemetrySignal) bool {
+			return false unless running && sinks.len() > 0 && mask & (1 << signal.ordinal) != 0
+			return true unless cfg.requireConsent
+			let given = answer
+			return false when given is none
+			return given
+		}
+
+		// Counts one more waiting record; false when the queue is full and the record is lost.
+		def admit() bool {
+			if waiting >= cfg.capacity {
+				lost++
+				return false
+			}
+			waiting++
+			if waiting >= cfg.batch {
+				let signal = wake
+				signal.offer(none) unless signal is none
+			}
+			return true
+		}
+
+		// What describes the program in every batch.
+		def resource() map<string, string> {
+			let described = map<string, string>{
+				"service.name":    cfg.name.isEmpty() ?? (Application.name(), cfg.name),
+				"service.version": cfg.version.isEmpty() ?? (Application.version(), cfg.version),
+				"os.type":         __os__,
+				"host.arch":       __arch__,
+				"session.id":      sessionId,
+			}
+			described["app.installation.id"] = installed unless installed.isEmpty()
+			for let (key, value) in cfg.resource {
+				described[key] = value
+			}
+			for let (key, value) in labels {
+				described[key] = value
+			}
+			return described
+		}
+
+		// Reads every metric the Diagnostics service holds.
+		def readMetrics(into MetricSample[]) {
+			let now = time.wallNs()
+			for let (_, held) in Diagnostics.series() {
+				let sample = MetricSample{name: held.name, time: now, labels: held.labels, unit: held.unit, description: held.description}
+				let metric = held.metric
+				match metric {
+					case Counter:
+						sample.kind = metric.kind()
+						sample.count = metric.value()
+						sample.value = float64(metric.value())
+					case Gauge:
+						sample.kind = metric.kind()
+						sample.value = metric.value()
+					case Toggle:
+						sample.kind = metric.kind()
+						sample.value = metric.value() ?? (1.0, 0.0)
+					case Histogram:
+						sample.kind = metric.kind()
+						let spread = metric.distribution()
+						sample.value = spread.count == 0 ?? (0.0, spread.sum / float64(spread.count))
+						sample.distribution = spread
+				}
+				into.push(sample)
+			}
+		}
+
+		// What the sending task works on next: the waiting records when a batch is due,
+		// nothing otherwise.
+		atomic def take() Work {
+			let work = Work{sinks: sinks, retired: retired, last: !running, spool: cfg.spool, folder: folder, limit: cfg.spoolSize, capacity: cfg.capacity, scrub: cfg.scrub}
+			retired = Exporter[]
+			let now = time.monoNs()
+			return work unless work.last || forced || waiting >= cfg.batch || now >= nextSend
+			readMetrics(pending.metrics) when collects(TelemetrySignal.Metrics) || (work.last && sinks.len() > 0 && mask & (1 << TelemetrySignal.Metrics.ordinal) != 0 && consentGiven())
+			work.due = true
+			work.batch = pending
+			work.batch.resource = resource()
+			pending = TelemetryBatch{}
+			waiting = 0
+			forced = false
+			nextSend = now + int64(cfg.interval)
+			serving = waiters
+			waiters = channel<bool>[]
+			return work
+		}
+
+		// Whether sending is allowed as far as the user's answer goes.
+		def consentGiven() bool {
+			return true unless cfg.requireConsent
+			let given = answer
+			return false when given is none
+			return given
+		}
+
+		// Ends a round of sending: counts what was lost and answers the flush calls it served.
+		atomic def settle(dropped int, taken bool) {
+			lost += uint64(dropped)
+			for let (_, waiter) in serving {
+				waiter.offer(taken)
+			}
+			serving = channel<bool>[]
+		}
+
+		// The next name for a kept batch of count records that belongs to the exporter with
+		// key.
+		atomic def spoolName(key string, count int) string {
+			spoolSeq++
+			return spoolFile(spoolSeq, key, count)
+		}
+
+		// The sending task: sends each due batch to every exporter until the service stops.
+		def pump(signal channel<none>, done channel<none>) {
+			for {
+				let work = take()
+				if work.due {
+					let dropped = 0
+					let taken = true
+					let batch = work.batch
+					let edit = work.scrub
+					batch = edit(batch) unless edit is none
+					for let (_, sink) in work.sinks {
+						let outcome = send(sink, batch, work)
+						dropped += outcome.dropped
+						taken = false unless outcome.taken
+					}
+					settle(dropped, taken)
+				}
+				for let (_, exporter) in work.retired {
+					exporter.close() onerror recover none
+				}
+				if work.last {
+					for let (_, sink) in work.sinks {
+						sink.exporter.close() onerror recover none
+					}
+					done.offer(none)
+					return
+				}
+				<-signal
+			}
+		}
+
+		// Gives one exporter what it is owed: the batches kept for it, oldest first, then
+		// this one. After a failure, and while the receiver asked for a pause, the rest is
+		// kept without another try.
+		def send(sink Sink, batch TelemetryBatch, work Work) Outcome {
+			let outcome = Outcome{taken: true}
+			let blocked = time.monoNs() < sink.notBefore
+			for !blocked && sink.backlog.len() > 0 {
+				let before = records(sink.backlog[0])
+				let tried = attempt(sink, sink.backlog[0])
+				outcome.dropped += refused(sink, tried)
+				let rest = tried.rest
+				if rest is none {
+					sink.backlog.remove(0)
+					sink.held -= before
+				} else {
+					sink.held -= before - records(rest)
+					sink.backlog[0] = rest
+					blocked = true
+				}
+			}
+			if !blocked && sink.spooled > 0 && !work.folder.isEmpty() {
+				let sent = resend(sink, os.join(work.folder, "spool"))
+				outcome.dropped += sent.dropped
+				blocked = !sent.taken
+			}
+			let size = records(batch)
+			return outcome when size == 0
+			if blocked {
+				outcome.taken = false
+				outcome.dropped += size unless keep(sink, batch, work)
+				return outcome
+			}
+			let tried = attempt(sink, batch)
+			let failure = tried.failure
+			return outcome when failure is none
+			outcome.taken = false
+			outcome.dropped += tried.rejected
+			let rest = tried.rest
+			let left = 0
+			let kept = false
+			if !(rest is none) {
+				left = records(rest)
+				kept = keep(sink, rest, work)
+				outcome.dropped += left unless kept
+			}
+			exportFailed(TelemetryFailure{exporter: sink.index, records: left + tried.rejected, rejected: tried.rejected, cause: failure, kept: kept})
+			return outcome
+		}
+
+		// Sends one batch and reads how it went: taken whole, to be tried again whole (any
+		// error), or as the exporter's ExportFailure says.
+		def attempt(sink Sink, batch TelemetryBatch) Attempt {
+			let slower = lab.conditions.sendDelay
+			time.sleep(slower) when slower > 0s
+			return Attempt{failure: Error{message: "telemetry: no receiver (lab)"}, rest: batch} when lab.conditions.unreachable || lab.chance(lab.conditions.lossRate)
+			sink.exporter.export(batch) onerror (err error) {
+				if err is ExportFailure {
+					sink.notBefore = time.monoNs() + int64(err.retryAfter) when err.retryAfter > 0s
+					let again = err.rest
+					return Attempt{failure: err, rejected: err.rejected} when again is none || records(again) == 0
+					return Attempt{failure: err, rest: again, rejected: err.rejected}
+				}
+				return Attempt{failure: err, rest: batch}
+			}
+			return Attempt{}
+		}
+
+		// Tells of the records a receiver refused while a kept batch was sent again; how
+		// many they were.
+		def refused(sink Sink, tried Attempt) int {
+			let failure = tried.failure
+			return 0 when failure is none || tried.rejected == 0
+			exportFailed(TelemetryFailure{exporter: sink.index, records: tried.rejected, rejected: tried.rejected, cause: failure, kept: false})
+			return tried.rejected
+		}
+
+		// Keeps a batch an exporter did not take: on disk when the spool is on, else in
+		// memory while fewer than `capacity` records wait there. False when it is dropped.
+		def keep(sink Sink, batch TelemetryBatch, work Work) bool {
+			let held = records(batch)
+			if work.spool && !work.folder.isEmpty() {
+				let dir = os.join(work.folder, "spool")
+				let stored = store(dir, spoolName(sink.key, held), batch) onerror recover false
+				if stored {
+					sink.spooled++
+					trim(dir, work.limit, work.sinks)
+					return true
+				}
+			}
+			return false when sink.held + held > work.capacity
+			sink.backlog.push(batch)
+			sink.held += held
+			return true
+		}
+
+		// Writes a batch to the spool folder.
+		def store(dir string, name string, batch TelemetryBatch) !bool {
+			fail "telemetry: the spool cannot be written (lab)" when lab.conditions.spoolFails
+			try os.mkdir(dir, true)
+			try os.writeFile(os.join(dir, name), (new JSON()).encode(batch))
+			return true
+		}
+
+		// Sends the batches kept on disk for the exporter, oldest first. Not taken when one
+		// fails, which leaves what is left of it and the later ones in place.
+		def resend(sink Sink, dir string) Outcome {
+			let outcome = Outcome{taken: true}
+			for let (_, name) in spooled(dir) {
+				let kept = spoolEntry(name)
+				continue unless kept.key == sink.key
+				let path = os.join(dir, name)
+				let batch = TelemetryBatch{}
+				let readable = true
+				let data = os.readFile(path) onerror recover byte[]
+				(new JSON()).decode(data, batch) onerror (err error) {
+					readable = false
+					recover none
+				}
+				if readable && records(batch) > 0 {
+					let tried = attempt(sink, batch)
+					outcome.dropped += refused(sink, tried)
+					let rest = tried.rest
+					if !(rest is none) {
+						// What arrived leaves the file, so it is not sent twice.
+						let left = records(rest)
+						if left != records(batch) {
+							let stored = store(dir, spoolFile(kept.seq, kept.key, left), rest) onerror recover false
+							if stored {
+								os.remove(path, false) onerror recover none
+							}
+						}
+						outcome.taken = false
+						return outcome
+					}
+				}
+				// A file that does not read back as a batch is one nothing can send.
+				os.remove(path, false) onerror recover none
+				sink.spooled-- when sink.spooled > 0
+			}
+			sink.spooled = 0
+			return outcome
+		}
+
+		// The names of the kept batches, oldest first.
+		def spooled(dir string) string[] {
+			let names = string[]
+			let entries = os.readDir(dir, 0) onerror recover os.DirEntry[]
+			for let (_, entry) in entries {
+				let name = os.base(entry.path)
+				names.push(name) when name.endsWith(".json")
+			}
+			return names.sort((a, b) => a < b)
+		}
+
+		// Removes the oldest kept batches until the rest fits in limit bytes, and counts
+		// their records as lost.
+		def trim(dir string, limit int, owners Sink[]) {
+			let names = spooled(dir)
+			let sizes = int[]
+			let total = 0
+			for let (_, name) in names {
+				let info = os.stat(os.join(dir, name), true) onerror recover os.FileInfo{}
+				sizes.push(int(info.size))
+				total += int(info.size)
+			}
+			for let at = 0; at < names.len() && total > limit; at++ {
+				os.remove(os.join(dir, names[at]), false) onerror recover none
+				total -= sizes[at]
+				let gone = spoolEntry(names[at])
+				for let (_, sink) in owners {
+					sink.spooled-- when sink.key == gone.key && sink.spooled > 0
+				}
+				forget(gone.count)
+			}
+		}
+
+		// Counts batches lost outside a round of sending.
+		atomic def forget(count int) {
+			lost += uint64(count)
+		}
+
+		// The timer task: wakes the sending task every interval until the run ends.
+		def tick(signal channel<none>, started int) {
+			for {
+				let pause = pace(started)
+				return when pause <= 0s
+				time.sleep(pause)
+				signal.offer(none)
+			}
+		}
+
+		// How long the timer task of the run started sleeps next; 0s when that run is over.
+		atomic def pace(started int) duration {
+			return 0s unless running && epoch == started
+			return cfg.interval
+		}
+
+		// Applies the settings. Exporters that left the configuration are closed once the
+		// batch being sent has reached them, and what waited for an exporter stays with the
+		// exporter of the same name.
+		//
+		// Fails when a setting is out of range: `sampling` outside 0.0 to 1.0, an `interval`
+		// that is not positive, a `batch`, `capacity` or `spoolSize` below 1. Fails when two
+		// exporters have the same name, and when the policy refuses `adm.telemetry.send`.
+		@commit(policy = "send")
+		atomic def config(val TelemetryConfig) !none {
+			fail "telemetry: sampling must be between 0.0 and 1.0" when val.sampling < 0.0 || val.sampling > 1.0
+			fail "telemetry: interval must be positive" unless val.interval > 0s
+			fail "telemetry: batch must be at least 1" when val.batch < 1
+			fail "telemetry: capacity must be at least 1" when val.capacity < 1
+			fail "telemetry: spoolSize must be at least 1" when val.spoolSize < 1
+			let wired = Sink[]
+			for let (index, exporter) in val.exporters {
+				let sink = new Sink(index, exporter)
+				for let (_, other) in wired {
+					fail "telemetry: two exporters are named {sink.name}" when other.name == sink.name
+				}
+				for let (_, old) in sinks {
+					continue unless old.name == sink.name
+					sink.backlog = old.backlog
+					sink.held = old.held
+					sink.notBefore = old.notBefore
+				}
+				wired.push(sink)
+			}
+			count(wired, spooled(os.join(folder, "spool"))) unless folder.isEmpty()
+			for let (_, old) in sinks {
+				let stays = false
+				for let (_, exporter) in val.exporters {
+					stays = true when exporter == old.exporter
+				}
+				retired.push(old.exporter) unless stays
+			}
+			sinks = wired
+			cfg = val
+			mask = 0
+			for let (_, signal) in val.signals {
+				mask |= 1 << signal.ordinal
+			}
+			let signal = wake
+			signal.offer(none) unless signal is none
+			return none
+		}
+
+		// Starts collecting and sending. Batches kept on disk by an earlier run are sent
+		// first.
+		//
+		// Fails when the vault, which keeps the user's answer and the installation id,
+		// cannot be opened or read (permission `adm.vault.read`), and when `spool` is on
+		// and the service's folder in the application's home cannot be made.
 		async def start() !none {
+			try open()
 			return none
 		}
 
-		// Stops the service. Does not fail today.
+		atomic def open() !none {
+			return none when running
+			// Each start reads the user's answer and the installation id again.
+			recalled = false
+			try recall()
+			try install() when !cfg.requireConsent && installed.isEmpty()
+			try home() when cfg.spool
+			if !folder.isEmpty() {
+				let kept = spooled(os.join(folder, "spool"))
+				count(sinks, kept)
+				for let (_, name) in kept {
+					let seq = spoolEntry(name).seq
+					spoolSeq = seq when seq > spoolSeq
+				}
+			}
+			running = true
+			epoch++
+			sessionId = (new crypto.UUID()).str()
+			nextSend = time.monoNs() + int64(cfg.interval)
+			let signal = new channel<none>(1)
+			let done = new channel<none>(1)
+			wake = signal
+			ended = done
+			async pump(signal, done)
+			async tick(signal, epoch)
+			return none
+		}
+
+		// Sets how many of the kept batches named belong to each exporter.
+		def count(owners Sink[], names string[]) {
+			for let (_, sink) in owners {
+				sink.spooled = 0
+			}
+			for let (_, name) in names {
+				let kept = spoolEntry(name)
+				for let (_, sink) in owners {
+					sink.spooled++ when sink.key == kept.key
+				}
+			}
+		}
+
+		// Takes the vault's id as the installation id.
+		def install() !none {
+			installed = try Vault.id()
+			return none
+		}
+
+		// Sends what waits, then closes the exporters. What an exporter did not take is
+		// kept on disk when `spool` is on. Does not fail.
 		async def stop() !none {
+			let done = close()
+			<-done unless done is none
 			return none
 		}
 
-		// Stops the service and starts it again. Does not fail today.
+		atomic def close() ?channel<none> {
+			return none unless running
+			running = false
+			let done = ended
+			let signal = wake
+			wake = none
+			ended = none
+			signal.offer(none) unless signal is none
+			return done
+		}
+
+		// Stops the service and starts it again. Fails like start.
 		async def restart() !none {
+			try await stop()
+			try await start()
 			return none
 		}
+
+		// Records the user's answer to "may this program send telemetry" and keeps it across
+		// runs. From then on what is sent carries the installation id. Withdrawing drops
+		// what waits, in memory and on disk; the id stays in the vault, where other
+		// services rely on it, and Telemetry no longer sends it.
+		//
+		// The answer is kept in the vault as `telemetry.consent`. Fails when the vault
+		// cannot be opened or written (permission `adm.vault.write`).
+		@commit()
+		atomic def consent(granted bool) !none {
+			try recall()
+			try Vault.store<bool>(consentEntry, granted)
+			answer = granted
+			if granted {
+				try install() when installed.isEmpty()
+				return none
+			}
+			pending = TelemetryBatch{}
+			waiting = 0
+			for let (_, sink) in sinks {
+				sink.backlog = TelemetryBatch[]
+				sink.held = 0
+				sink.spooled = 0
+			}
+			let spool = os.join(try home(), "spool")
+			for let (_, name) in spooled(spool) {
+				os.remove(os.join(spool, name), false) onerror recover none
+			}
+			installed = "" when cfg.requireConsent
+			return none
+		}
+
+		// The user's answer: none when they were never asked.
+		@query()
+		atomic def consented() ?bool {
+			recall() onerror recover none
+			return answer
+		}
+
+		// The id sent with every batch as `app.installation.id`: the vault's id
+		// (`Vault.id`), which names the installation, not the user or the machine. Empty
+		// while the user has not agreed, unless `requireConsent` is off.
+		@query()
+		atomic def installation() string {
+			recall() onerror recover none
+			return installed
+		}
+
+		// Whether records of the signal are collected now: the service runs with an
+		// exporter, the signal is one of `TelemetryConfig.signals`, and the user agreed
+		// unless `requireConsent` is off. Other services ask before they count on what
+		// the program sends being measured.
+		@query()
+		atomic def collecting(signal TelemetrySignal = TelemetrySignal.Events) bool {
+			return collects(signal)
+		}
+
+		// A random id made each time the service starts; empty before the first start.
+		@query()
+		def session() string {
+			return sessionId
+		}
+
+		// Adds a value to everything sent from now on: `set("experiment.checkout", "B")`.
+		// An empty value takes the key away.
+		@commit()
+		atomic def set(key string, value string) {
+			if value.isEmpty() {
+				labels.delete(key)
+				return
+			}
+			labels[key] = value
+		}
+
+		// Sends an error with where it was raised, and the calling task's current span.
+		@commit()
+		atomic def report(err error, fields map<string, any> = {}) {
+			return unless collects(TelemetrySignal.Errors)
+			return unless admit()
+			let within = currentSpan.get()
+			let inside ?SpanContext = none
+			inside = within.context() unless within is none
+			pending.errors.push(ErrorReport{
+				span:    inside,
+				message: err.message,
+				code:    err.code,
+				kind:    reflection.typeName(err),
+				stack:   err.stack,
+				fields:  loggable(fields),
+				time:    time.wallNs(),
+			})
+		}
+
+		// Sends something the user did.
+		@commit()
+		atomic def event(name string, properties map<string, any> = {}) {
+			return unless collects(TelemetrySignal.Events)
+			return unless admit()
+			pending.events.push(UsageEvent{name: name, properties: loggable(properties), time: time.wallNs()})
+		}
+
+		// Begins a timed operation and makes it the calling task's current span; `end` on
+		// the result finishes it.
+		//
+		// The span is a child of parent, and without one of the task's current span. With
+		// neither it starts a new trace, recorded or not by `TelemetryConfig.sampling`; a
+		// child follows its parent.
+		@query()
+		def span(name string, attributes map<string, any> = {}, parent ?SpanContext = none) Span {
+			let id = (new crypto.UUID()).str().replace("-", "")[16:32]
+			let made = SpanRecord{name: name, start: time.wallNs(), attributes: attributes.clone()}
+			let outer = currentSpan.get()
+			let above = parent
+			above = outer.context() when above is none && !(outer is none)
+			if above is none {
+				let trace = (new crypto.UUID()).str().replace("-", "")
+				made.context = SpanContext{trace: trace, span: id, sampled: sampled(trace)}
+			} else {
+				made.context = SpanContext{trace: above.trace, span: id, sampled: above.sampled}
+				made.parent = above.span
+			}
+			let begun = new Span(made)
+			begun.outer = outer
+			enter(begun)
+			return begun
+		}
+
+		// The calling task's current span: the last one begun on it, or inherited from the
+		// task that started it, that has not ended. None outside any span.
+		@query()
+		def current() ?Span {
+			return currentSpan.get()
+		}
+
+		// Whether a new trace is recorded: the same answer for one trace id wherever it is
+		// asked, so the programs a request passes through agree.
+		def sampled(trace string) bool {
+			return true when cfg.sampling >= 1.0
+			return false when cfg.sampling <= 0.0
+			let draw = trace[0:8].toInt<uint32>(16)
+			return float(draw) / 4294967296.0 < cfg.sampling
+		}
+
+		// Sends a finished span built by the caller: what `Span.end` does. A span whose
+		// trace is not recorded is left out.
+		@commit()
+		atomic def record(span SpanRecord) {
+			return unless span.context.sampled
+			return unless collects(TelemetrySignal.Spans)
+			return unless admit()
+			pending.spans.push(span)
+		}
+
+		// Takes each record the Logging service accepted. A record at level Fatal is sent
+		// as an error that ended the program too.
+		@on(Logging.recorded)
+		def logged(evt Event<LogRecord>) {
+			keepLog(evt.result)
+		}
+
+		atomic def keepLog(entry LogRecord) {
+			pending.logs.push(entry) when collects(TelemetrySignal.Logs) && admit()
+			let level = entry.level
+			return when level is none || level != LogLevel.Fatal
+			return unless collects(TelemetrySignal.Errors)
+			return unless admit()
+			pending.errors.push(ErrorReport{message: entry.message, kind: "fatal", fields: entry.fields, time: entry.time, fatal: true})
+		}
+
+		// Registers a call of flush; false when the service is not running.
+		atomic def expect(waiter channel<bool>) bool {
+			return false unless running
+			forced = true
+			waiters.push(waiter)
+			let signal = wake
+			signal.offer(none) unless signal is none
+			return true
+		}
+
+		// Sends what waits and returns once every exporter took it.
+		//
+		// Fails when timeout passes first, and when an exporter did not take the batch,
+		// which is then kept for another try.
+		@query()
+		def flush(timeout duration = 5s) !none {
+			let waiter = new channel<bool>(1)
+			return none unless expect(waiter)
+			let limit = time.sleepChan(timeout)
+			select {
+				case waiter:
+					let taken = <-waiter
+					fail "telemetry: an exporter did not take the batch" unless taken
+				case limit:
+					fail "telemetry: not sent within {timeout}"
+			}
+			return none
+		}
+
+		// How many records were lost: written while `TelemetryConfig.capacity` waited
+		// already, refused for good by a receiver, in a batch an exporter did not take and
+		// nothing could keep, or in a kept batch removed to stay within `spoolSize`.
+		@query()
+		def dropped() int {
+			return int(lost)
+		}
+
+		// Emitted when an exporter does not take a batch, or takes only part of it.
+		@emit()
+		def exportFailed(failure TelemetryFailure) TelemetryFailure {
+			return failure
+		}
+	}
+
+	// An exporter in use, with what waits for it.
+	internal type Sink {
+		index     int
+		exporter  Exporter
+		// The exporter's name, and the name's place in the file names of its kept batches.
+		name      string
+		key       string
+		// Batches it did not take, kept in memory, and how many records they hold.
+		backlog   TelemetryBatch[]
+		held      int
+		// How many batches are kept for it on disk.
+		spooled   int
+		// The monotonic time its receiver asked to be left alone until.
+		notBefore int64
+
+		def new(index int, exporter Exporter) {
+			self.index = index
+			self.exporter = exporter
+			name = exporter.name()
+			key = hexencode((new SHA256()).hash(name.bytes())[0:8])
+		}
+	}
+
+	// How one try of an exporter went.
+	internal struct Attempt {
+		// What the exporter reported; none when it took the batch.
+		failure  ?error          = none
+		// The records to try again; none when there are none.
+		rest     ?TelemetryBatch = none
+		// How many records the receiver refused for good.
+		rejected int
+	}
+
+	// What the name of a kept batch says.
+	internal struct SpoolEntry {
+		seq   uint64
+		// The owner's Sink.key.
+		key   string
+		// How many records the batch holds.
+		count int
+	}
+
+	// The file name of a kept batch: in the order kept, then whose it is, then its size.
+	internal def spoolFile(seq uint64, key string, count int) string {
+		return "%016u-%s-%d.json".format(seq, key, count)
+	}
+
+	// Reads a name made by spoolFile. Another name reads as a batch of nobody's.
+	internal def spoolEntry(name string) SpoolEntry {
+		let parts = name.trimSuffix(".json").split("-")
+		return SpoolEntry{} unless parts.len() == 3 && /^[0-9]+$/.test(parts[0]) && /^[0-9]+$/.test(parts[2])
+		return SpoolEntry{seq: parts[0].toInt<uint64>(), key: parts[1], count: parts[2].toInt<int>()}
+	}
+
+	// What the sending task takes in one go.
+	internal struct Work {
+		// Whether a batch is to be sent now.
+		due      bool
+		batch    TelemetryBatch
+		sinks    Sink[]
+		retired  Exporter[]
+		// The service stopped: send, close every exporter and end.
+		last     bool
+		spool    bool
+		folder   string
+		limit    int
+		capacity int
+		scrub    ?def (TelemetryBatch) TelemetryBatch
+	}
+
+	// How sending one batch to one exporter went.
+	internal struct Outcome {
+		taken   bool
+		dropped int
+	}
+
+	// How many records a batch holds.
+	internal def records(batch TelemetryBatch) int {
+		return batch.metrics.len() + batch.logs.len() + batch.errors.len() + batch.events.len() + batch.spans.len()
+	}
+
+	// The flags of a `traceparent` header.
+	internal def sampledFlag(sampled bool) string {
+		return sampled ?? ("01", "00")
+	}
+
+	// Whether text is count hexadecimal digits, not all of them zero.
+	internal def hexId(text string, count int) bool {
+		return false unless text.len() == count
+		return false unless /^[0-9a-f]+$/.test(text)
+		return /[1-9a-f]/.test(text)
+	}
+
+	// Reads a `traceparent` header (W3C Trace Context), to continue the trace of the
+	// program that sent it: `Telemetry.span("handle", parent = parseTraceparent(header))`.
+	// Returns none when the header is not a valid one.
+	def parseTraceparent(header string) ?SpanContext {
+		let parts = header.trim().lower().split("-")
+		return none unless parts.len() >= 4
+		return none unless /^[0-9a-f]{2}$/.test(parts[0]) && parts[0] != "ff"
+		return none unless hexId(parts[1], 32) && hexId(parts[2], 16)
+		return none unless /^[0-9a-f]{2}$/.test(parts[3])
+		return SpanContext{trace: parts[1], span: parts[2], sampled: parts[3].toInt<int>(16) & 1 == 1}
+	}
+
+	// Times each call of the function as a span, failed when the call fails. The span is
+	// the current one while the function runs, so the spans of what it calls are its
+	// children.
+	//
+	// name is the span's name; the function's qualified name when empty.
+	//
+	// ```
+	// @span()
+	// def checkout(cart Cart) !Receipt {
+	// ```
+	meta def span(target FunctionMetaContext, name string = "") {
+		let timed = Telemetry.span(name.isEmpty() ?? (target.descriptor.node.qualifiedName, name))
+		target.invoke()
+		timed.record.failed = true when target.failed()
+		timed.end()
+	}
+
+	// Times each call of the method as a span, as the function form does.
+	meta def span(target MethodMetaContext, name string = "") {
+		let timed = Telemetry.span(name.isEmpty() ?? (target.descriptor.node.qualifiedName, name))
+		target.invoke()
+		timed.record.failed = true when target.failed()
+		timed.end()
 	}
 }

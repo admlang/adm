@@ -1,0 +1,666 @@
+partial module std.services.features {
+	use (
+		std.crypto::(Ed25519PublicKey)
+		std.data.encoding::(JSON)
+		std.net.features::(Assignment, Assignments, FeaturesError, FeaturesErrorKind, GroupAssignment, Subject, digestOf, verify)
+		std.net.http
+		std.net.tls
+		std.services::(Application, Dependencies, Lifecycle, RestartMode, StartMode)
+		std.services.i18n::(I18n)
+		std.services.telemetry::(Telemetry, TelemetrySignal)
+		std.services.vault::(Vault)
+		std.time
+	)
+
+	// The vault entry of the last replies the server signed.
+	internal const keptEntry = "features.assignments"
+
+	// Settings of the Features service.
+	struct FeaturesConfig {
+		// Where the feature server answers: the URL the subject is posted to.
+		url string = ""
+
+		// The public half of the key the server signs with. A reply that does
+		// not verify with it is dropped.
+		key ?Ed25519PublicKey = none
+
+		// How long to wait before the first reply says how often to ask, and
+		// after a request that failed; a request that fails again waits twice
+		// as long each time, up to the last interval the server gave.
+		retry duration = 1min
+
+		// How long one request may take.
+		timeout duration = 10s
+
+		// TLS settings for an https server: the roots that vouch for it, a
+		// client certificate it asks for. None trusts the system's roots.
+		tls ?tls.Config = none
+
+		// Sent with every request: an API key the server asks for.
+		headers map<string, string>
+
+		// The program's name and version as the server sees them; the
+		// application's own when empty.
+		name    string = ""
+		version string = ""
+
+		// The user's locale (`fr-FR`), for rules on locales; the language
+		// the `I18n` service has in use when empty (the program's, else the
+		// system's).
+		locale string = ""
+	}
+
+	// What a test can make the Features service meet
+	// (`Features.lab.conditions`). The defaults change nothing.
+	struct FeaturesConditions {
+		// No request reaches the server.
+		unreachable  bool     = false
+		// Every reply fails verification, as if signed by another key.
+		badSignature bool     = false
+		// What the service holds counts as past its validity.
+		stale        bool     = false
+		// How much longer a request takes.
+		fetchDelay   duration = 0s
+	}
+
+	// Which assignments a reply changed.
+	struct FeaturesChange {
+		// The names of the features and of the groups that were added,
+		// removed, or given something else.
+		features string[]
+		groups   string[]
+	}
+
+	// The replies kept between runs, as the server sent them: the last
+	// whole one, and the last `unchanged` one that extends it, "" for none.
+	internal struct KeptReplies {
+		whole   string
+		renewal string
+	}
+
+	// What the service answers reads from, replaced as a whole when a reply
+	// or an override changes it.
+	internal type Held {
+		features         map<string, Assignment>
+		groups           map<string, GroupAssignment>
+		// Seconds since the Unix epoch after which the reply no longer
+		// holds; 0 with no reply.
+		expires          int64
+		featureOverrides map<string, Assignment>
+		groupOverrides   map<string, GroupAssignment>
+
+		def new() {}
+	}
+
+	// The names whose first read was reported, since the last reply that
+	// changed something.
+	internal type Reported {
+		names map<string, bool>
+
+		def new() {}
+
+		// True the first time it is asked for the name.
+		atomic def first(name string) bool {
+			return false when names.hasKey(name)
+			names[name] = true
+			return true
+		}
+	}
+
+	// A typed field to read a value of any type from JSON into.
+	internal struct Boxed<T> {
+		value T
+	}
+
+	// The value as a `T`: itself when it is one, else read from its JSON (a
+	// float from a whole number, a struct from an object, a typed array
+	// from an array); the fallback when there is none or it does not read
+	// as a `T`.
+	internal def typed<T>(held ?any, fallback T) T {
+		return fallback when held is none
+		return held when held is T
+		let box = Boxed<T>{}
+		let codec = new JSON()
+		let read = true
+		codec.decode("\{\"value\":" + string(codec.encode(held)) + "\}", box) onerror (err error) {
+			read = false
+			recover none
+		}
+		return read ?? (box.value, fallback)
+	}
+
+	// What one request needs, taken under the service's lock.
+	internal struct Asking {
+		// The service's generation when the request was made.
+		generation int
+		url        string
+		key        Ed25519PublicKey
+		timeout    duration
+		tls        ?tls.Config
+		headers    map<string, string>
+		subject    Subject
+	}
+
+	// Asks a server which features this installation gets, and answers from
+	// memory: kill switches, gradual rollouts, attribute gates and A/B
+	// groups, decided by the server (`std.net.features.FeatureServer`, or
+	// any server that speaks its exchange).
+	//
+	// ```
+	// try Features.config(FeaturesConfig{url: "https://features.example.com/", key: serverKey})
+	// try await Features.start()
+	//
+	// Features.set("plan", "pro")
+	// if Features.enabled("new-checkout") { ... }
+	// let limit = Features.value<int>("upload.limit", 10)
+	// let color = Features.value<string>("login-page", "button-color", "blue")
+	// ```
+	//
+	// Reads never wait for the server and never fail: a name the server did not mention, a
+	// program that has no reply yet, and a reply past its validity all give
+	// the fallback written in the code. The last reply is kept in the vault,
+	// so a program that starts offline has what it had.
+	//
+	// The request carries the vault's id (`Vault.id`), the program's name,
+	// version, system and processor, the locale and whatever `set` added;
+	// what personal data goes into `set` is the program's choice. A
+	// telemetry collector and a feature server run by the same operator can
+	// join what they receive on that id.
+	//
+	// The service asks whether or not the user agreed to telemetry: kill
+	// switches and rollouts reach everyone. A/B groups take only users who
+	// did, unless the group is for everyone, so their results describe
+	// consenting users only. The first read of a feature or of a group is
+	// reported to Telemetry as a usage event (`feature` or `group`), sent
+	// under Telemetry's own consent.
+	service Features {
+		description               = "Asks a server which features this installation gets"
+		dependencies              = Dependencies{
+			hard: [Application, Vault],
+			soft: [Telemetry, I18n]
+		}
+		lifecycle                 = Lifecycle{
+			start: StartMode.Manual,
+			restart: RestartMode.Always,
+		}
+		permissions  Permission[] = [
+			Permission{name: "fetch", description: "Ask a server which features this installation gets"},
+		]
+
+		lab = new ServiceLab<FeaturesConditions>()
+
+		cfg        FeaturesConfig      = FeaturesConfig{}
+		running    bool
+		// Counts the starts, so the asking task of an earlier run ends.
+		epoch      int
+		// Counts the starts, stops and changes of settings: a reply to a
+		// request made before the last of them is dropped.
+		generation int
+		wake       ?channel<none>      = none
+		// The vault's id, read at start.
+		id         string
+		// What `set` added.
+		attributes map<string, string> = map<string, string>{}
+		held       Held                = new Held()
+		reported   Reported            = new Reported()
+		// The digest of the reply held, "" for none, and the replies as kept
+		// in the vault.
+		known      string
+		kept       KeptReplies         = KeptReplies{}
+		// How long the server said to wait, 0s before its first reply, and
+		// how many requests in a row failed.
+		interval   duration            = 0s
+		failures   int
+
+		// Applies the settings. On a started service the next request, made
+		// at once, goes to the new server. A reply held from a server with
+		// another key is dropped.
+		//
+		// Fails when `retry` or `timeout` is not positive, when the service
+		// is started and the settings have no `url` or no `key`, and when
+		// the policy refuses `adm.features.fetch`.
+		@commit(policy = "fetch")
+		atomic def config(val FeaturesConfig) !none {
+			fail "features: retry must be positive" unless val.retry > 0s
+			fail "features: timeout must be positive" unless val.timeout > 0s
+			fail "features: a started service needs the server's url and key" when running && (val.url == "" || val.key is none)
+			cfg = val
+			generation++
+			return none unless running
+			recall(kept)
+			let signal = wake
+			signal.offer(none) unless signal is none
+			return none
+		}
+
+		// Reads the vault's id and the reply kept from an earlier run, then
+		// asks the server in the background: `start` does not wait for the
+		// answer, and reads give what was kept until it arrives.
+		//
+		// Fails when the settings have no `url` or no `key`, and when the
+		// vault cannot be opened or read (permission `adm.vault.read`).
+		async def start() !none {
+			return none unless try startable()
+			try await Vault.start()
+			let installation = try Vault.id()
+			try open(installation, try Vault.load<KeptReplies>(keptEntry))
+			return none
+		}
+
+		// Whether `start` has anything to do; fails when it cannot start.
+		atomic def startable() !bool {
+			return false when running
+			fail "features: no server: give FeaturesConfig a url and the server's key" when cfg.url == "" || cfg.key is none
+			return true
+		}
+
+		atomic def open(installation string, stored ?KeptReplies) !none {
+			return none when running
+			fail "features: no server: give FeaturesConfig a url and the server's key" when cfg.url == "" || cfg.key is none
+			id = installation
+			recall(stored)
+			running = true
+			epoch++
+			generation++
+			failures = 0
+			let signal = new channel<none>(1)
+			wake = signal
+			async ask(epoch, signal)
+			return none
+		}
+
+		// Stops asking. What is held stays readable. Does not fail.
+		async def stop() !none {
+			close()
+			return none
+		}
+
+		atomic def close() {
+			return unless running
+			running = false
+			generation++
+			let signal = wake
+			wake = none
+			signal.offer(none) unless signal is none
+		}
+
+		// Stops the service and starts it again. Fails like start.
+		async def restart() !none {
+			try await stop()
+			try await start()
+			return none
+		}
+
+		// Takes the kept replies when they verify with the configured key
+		// and are for this installation; drops what is held otherwise.
+		def recall(stored ?KeptReplies) {
+			let key = cfg.key
+			let next = new Held()
+			next.featureOverrides = held.featureOverrides
+			next.groupOverrides = held.groupOverrides
+			known = ""
+			kept = KeptReplies{}
+			if !(stored is none || key is none) {
+				let whole = verified(stored.whole.bytes(), key) onerror recover none
+				if !(whole is none) && whole.subject == id && !whole.unchanged {
+					let digest = digestOf(whole) onerror recover ""
+					next.features = whole.features
+					next.groups = whole.groups
+					next.expires = whole.expires
+					known = digest
+					kept = KeptReplies{whole: stored.whole}
+					let renewal = verified(stored.renewal.bytes(), key) onerror recover none
+					if !(renewal is none) && renewal.subject == id && renewal.unchanged && renewal.known == digest && renewal.expires > whole.expires {
+						next.expires = renewal.expires
+						kept.renewal = stored.renewal
+					}
+				}
+			}
+			held = next
+		}
+
+		// The asking task: asks, then waits as long as the server said, or
+		// until a setting or an attribute changes, until the run ends.
+		def ask(started int, signal channel<none>) {
+			for {
+				return when pace(started) <= 0s
+				refresh() onerror recover none
+				let pause = pace(started)
+				return when pause <= 0s
+				let due = time.sleepChan(pause)
+				select {
+					case due:
+					case signal:
+				}
+			}
+		}
+
+		// How long the asking task of the run started waits next; 0s when
+		// that run is over.
+		atomic def pace(started int) duration {
+			return 0s unless running && epoch == started
+			if failures == 0 {
+				return cfg.retry unless interval > 0s
+				return interval
+			}
+			let pause = cfg.retry
+			for let i = 1; i < failures && pause < interval; i++ {
+				pause = pause + pause
+			}
+			return interval when interval > 0s && pause > interval
+			return pause
+		}
+
+		// What the next request sends, and where.
+		atomic def asking() !Asking {
+			let key = cfg.key
+			fail FeaturesError{message: "features: not started", kind: FeaturesErrorKind.Transport} unless running
+			fail FeaturesError{message: "features: no server key", kind: FeaturesErrorKind.Transport} when key is none
+			let subject = Subject{
+				id:         id,
+				app:        cfg.name.isEmpty() ?? (Application.name(), cfg.name),
+				version:    cfg.version.isEmpty() ?? (Application.version(), cfg.version),
+				os:         __os__,
+				arch:       __arch__,
+				locale:     cfg.locale.isEmpty() ?? (I18n.language().str(), cfg.locale),
+				attributes: attributes.clone(),
+				known:      known,
+				measured:   Telemetry.collecting(TelemetrySignal.Events),
+			}
+			return Asking{generation: generation, url: cfg.url, key: key, timeout: cfg.timeout, tls: cfg.tls, headers: cfg.headers, subject: subject}
+		}
+
+		// Asks the server now and takes its reply. The service asks by
+		// itself as often as the server says; call this where waiting for
+		// that is too long (after a login that changed an attribute).
+		//
+		// Fails with a FeaturesError, and keeps what it held: `Transport`
+		// when the service is not started, the server cannot be reached or
+		// answers with an error; `Reply` and `Signature` as
+		// `std.net.features.verify` does; `Subject` when the reply is for
+		// another installation; `Expired` when it is already past its
+		// validity. Each failure is also emitted as `failed`.
+		@query()
+		def refresh() !none {
+			let want = try asking()
+			let reply = fetch(want) onerror (err error) {
+				fail noted(err)
+			}
+			let keep = take(reply, want) onerror (err error) {
+				fail noted(err)
+			}
+			// A reply that cannot be kept still decides for this run.
+			return none when keep is none
+			Vault.store<KeptReplies>(keptEntry, keep) onerror recover none
+			return none
+		}
+
+		// One request: the reply's bytes.
+		def fetch(want Asking) !byte[] {
+			let slower = lab.conditions.fetchDelay
+			time.sleep(slower) when slower > 0s
+			fail FeaturesError{message: "features: the server cannot be reached (lab)", kind: FeaturesErrorKind.Transport} when lab.conditions.unreachable
+			// One request per interval: a connection of its own, closed after
+			// the reply, instead of one kept idle in the shared pool.
+			let client = new http.Client("", want.timeout)
+			let transport = new http.Transport()
+			transport.disableKeepAlives = true
+			let secured = want.tls
+			transport.tls = secured unless secured is none
+			client.transport = transport
+			let request = http.newRequest(http.Method.POST, want.url, (new JSON()).encode(want.subject)) onerror (err error) {
+				fail FeaturesError{message: "features: {want.url} is not a URL: {err.message}", kind: FeaturesErrorKind.Transport, cause: err}
+			}
+			request.headers.set("Content-Type", "application/json")
+			for let (name, value) in want.headers {
+				request.headers.set(name, value)
+			}
+			let response = client.do(request) onerror (err error) {
+				fail FeaturesError{message: "features: {want.url}: {err.message}", kind: FeaturesErrorKind.Transport, cause: err}
+			}
+			let body = response.bytes() onerror (err error) {
+				fail FeaturesError{message: "features: {want.url}: {err.message}", kind: FeaturesErrorKind.Transport, cause: err}
+			}
+			fail FeaturesError{message: "features: {want.url} answered {response.status}", kind: FeaturesErrorKind.Transport} unless response.status == 200
+			return body
+		}
+
+		// `verify`, under the lab's conditions.
+		def verified(reply byte[], key Ed25519PublicKey) !?Assignments {
+			fail FeaturesError{message: "features: the reply's signature is not the server's (lab)", kind: FeaturesErrorKind.Signature} when lab.conditions.badSignature
+			return try verify(reply, key)
+		}
+
+		// Checks a reply and makes it what the service answers from; what to
+		// keep in the vault for the next run. A reply to a request made
+		// before the service was stopped, given other settings or another
+		// attribute is dropped: none.
+		atomic def take(reply byte[], want Asking) !?KeptReplies {
+			return none unless running && want.generation == generation
+			let given = try verified(reply, want.key)
+			fail FeaturesError{message: "features: the reply does not read", kind: FeaturesErrorKind.Reply} when given is none
+			fail FeaturesError{message: "features: the reply is for another installation", kind: FeaturesErrorKind.Subject} unless given.subject == id
+			fail FeaturesError{message: "features: the reply is past its validity", kind: FeaturesErrorKind.Expired} unless given.expires > time.wallNs() / 1000000000
+			let next = new Held()
+			next.featureOverrides = held.featureOverrides
+			next.groupOverrides = held.groupOverrides
+			next.expires = given.expires
+			let change = FeaturesChange{}
+			if given.unchanged {
+				if known == "" || given.known != known {
+					// The server answered for a reply this installation
+					// does not hold: ask for the whole one next.
+					known = ""
+					fail FeaturesError{message: "features: the server says unchanged for a reply that is not held", kind: FeaturesErrorKind.Reply}
+				}
+				next.features = held.features
+				next.groups = held.groups
+				kept.renewal = string(reply)
+			} else {
+				change = differences(held, given)
+				next.features = given.features
+				next.groups = given.groups
+				known = try digestOf(given)
+				kept = KeptReplies{whole: string(reply)}
+			}
+			held = next
+			interval = duration(given.refresh * 1000000000)
+			interval = 1s when interval < 1s
+			failures = 0
+			if change.features.len() + change.groups.len() > 0 {
+				reported = new Reported()
+				changed(change)
+			}
+			return KeptReplies{whole: kept.whole, renewal: kept.renewal}
+		}
+
+		// Counts a failed request and emits it; the failure as a
+		// FeaturesError.
+		atomic def noted(err error) FeaturesError {
+			failures++
+			let failure = FeaturesError{message: err.message, kind: FeaturesErrorKind.Transport, cause: err}
+			failure = err when err is FeaturesError
+			failed(failure)
+			return failure
+		}
+
+		// Adds an attribute to every request from now on, for the server's
+		// rules to match (`set("plan", "pro")`), and asks the server again
+		// in the background. An empty value takes the attribute away.
+		@commit()
+		atomic def set(key string, value string) {
+			let before = attributes.get(key)
+			if value.isEmpty() {
+				return when before is none
+				attributes.delete(key)
+			} else {
+				return when !(before is none) && before == value
+				attributes[key] = value
+			}
+			generation++
+			let signal = wake
+			signal.offer(none) unless signal is none
+		}
+
+		// What is held when it still holds; none for a reply past its
+		// validity.
+		def current() ?Held {
+			let now = held
+			return none when lab.conditions.stale || now.expires <= time.wallNs() / 1000000000
+			return now
+		}
+
+		// Tells Telemetry of the first read of a feature or a group.
+		def report(kind string, name string, properties map<string, any>) {
+			return unless reported.first("{kind}/{name}")
+			Telemetry.event(kind, properties)
+		}
+
+		// Whether the feature is on for this installation; `fallback` when
+		// the server did not mention it, no reply has arrived yet, or the
+		// reply held is past its validity.
+		@query()
+		atomic def enabled(name string, fallback bool = false) bool {
+			let forced = held.featureOverrides.get(name)
+			return forced.enabled unless forced is none
+			let now = current()
+			return fallback when now is none
+			let given = now.features.get(name)
+			return fallback when given is none
+			report("feature", name, {"feature": name, "enabled": given.enabled})
+			return given.enabled
+		}
+
+		// The feature's value for this installation as a `T`: a number, a
+		// text, a bool, a struct read from an object, an array. `fallback`
+		// when the server gave the feature no value or one that is not a
+		// `T`, and whenever `enabled` would give its fallback.
+		@query()
+		atomic def value<T>(name string, fallback T) T {
+			let forced = held.featureOverrides.get(name)
+			return typed<T>(forced.value, fallback) unless forced is none
+			let now = current()
+			return fallback when now is none
+			let given = now.features.get(name)
+			return fallback when given is none
+			report("feature", name, {"feature": name, "enabled": given.enabled})
+			return typed<T>(given.value, fallback)
+		}
+
+		// The arm of the group this installation is in; "" outside the
+		// test, for a group the server did not mention, and without a reply
+		// that holds.
+		@query()
+		atomic def arm(group string) string {
+			let forced = held.groupOverrides.get(group)
+			return forced.arm unless forced is none
+			let now = current()
+			return "" when now is none
+			let given = now.groups.get(group)
+			return "" when given is none
+			report("group", group, {"group": group, "arm": given.arm})
+			return given.arm
+		}
+
+		// The value of one key of a group for this installation, as `value`
+		// reads a feature's: what the installation's arm gives the key, the
+		// group's default outside the test, `fallback` for a group or a key
+		// the server did not mention and without a reply that holds.
+		@query()
+		atomic def value<T>(group string, key string, fallback T) T {
+			let forced = held.groupOverrides.get(group)
+			return typed<T>(forced.values.get(key), fallback) when !(forced is none) && forced.values.hasKey(key)
+			let now = current()
+			return fallback when now is none
+			let given = now.groups.get(group)
+			return fallback when given is none
+			report("group", group, {"group": group, "arm": given.arm}) when forced is none
+			return typed<T>(given.values.get(key), fallback)
+		}
+
+		// Makes this run answer `enabled` and `value` for the feature as
+		// given, whatever the server says: for a developer's switch, a
+		// command-line flag, a test. Overrides are not kept between runs
+		// and not reported to Telemetry.
+		@commit()
+		atomic def override(name string, enabled bool, value ?any = none) {
+			let next = copied()
+			next.featureOverrides[name] = Assignment{enabled: enabled, value: value}
+			held = next
+		}
+
+		// Makes this run answer `arm` for the group as given, and `value`
+		// for the keys in `values`; the other keys stay as the server gave
+		// them.
+		@commit()
+		atomic def override(group string, arm string, values map<string, any> = {}) {
+			let next = copied()
+			next.groupOverrides[group] = GroupAssignment{arm: arm, values: values}
+			held = next
+		}
+
+		// Takes back the overrides of the feature and of the group of that
+		// name; every override for "".
+		@commit()
+		atomic def restore(name string = "") {
+			let next = copied()
+			if name == "" {
+				next.featureOverrides = map<string, Assignment>{}
+				next.groupOverrides = map<string, GroupAssignment>{}
+			} else {
+				next.featureOverrides.delete(name)
+				next.groupOverrides.delete(name)
+			}
+			held = next
+		}
+
+		// What is held with overrides of its own, so tasks that read the
+		// old one are not disturbed.
+		def copied() Held {
+			let next = new Held()
+			next.features = held.features
+			next.groups = held.groups
+			next.expires = held.expires
+			next.featureOverrides = held.featureOverrides.clone()
+			next.groupOverrides = held.groupOverrides.clone()
+			return next
+		}
+
+		// Emitted when a reply gives a feature or a group something else
+		// than the reply before it, with the names concerned.
+		@emit()
+		def changed(change FeaturesChange) FeaturesChange {
+			return change
+		}
+
+		// Emitted when a request fails or its reply is refused; what was
+		// held stays.
+		@emit()
+		def failed(failure FeaturesError) FeaturesError {
+			return failure
+		}
+	}
+
+	// The names a new reply gives something else than what was held.
+	internal def differences(before Held, given Assignments) FeaturesChange {
+		let change = FeaturesChange{}
+		let codec = new JSON()
+		for let (name, now) in given.features {
+			let was = before.features.get(name)
+			change.features.push(name) when was is none || string(codec.encode(was)) != string(codec.encode(now))
+		}
+		for let name in before.features.keys() {
+			change.features.push(name) unless given.features.hasKey(name)
+		}
+		for let (name, now) in given.groups {
+			let was = before.groups.get(name)
+			change.groups.push(name) when was is none || string(codec.encode(was)) != string(codec.encode(now))
+		}
+		for let name in before.groups.keys() {
+			change.groups.push(name) unless given.groups.hasKey(name)
+		}
+		change.features.sort((a, b string) => a < b)
+		change.groups.sort((a, b string) => a < b)
+		return change
+	}
+}

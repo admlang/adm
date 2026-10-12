@@ -1,0 +1,426 @@
+partial module std.services.telemetry {
+	use (
+		std.services.telemetry.otlp
+		std.services.logging::(LogLevel, LogRecord)
+		std.metrics::(Distribution)
+		std.data.encoding::(JSON, ProtoWriter, hexencode)
+		std.crypto.x509::(CertPool)
+		std.net.tls
+		std.data.compress.gzip
+		std.bytes::(Buffer)
+		std.net.grpc
+		std.net.http
+		std.net.http.httptest
+		std.testing
+		std.time
+		std.io
+	)
+
+	// What a collector was sent in one request.
+	internal struct Received {
+		path     string
+		kind     string
+		encoding string
+		token    string
+		body     byte[]
+	}
+
+	// An OTLP/HTTP collector for the suite: keeps each request and answers with `status`,
+	// or with what `statuses` has for the request's path.
+	internal type TestCollector {
+		received   Received[]
+		status     int              = 200
+		statuses   map<string, int> = map<string, int>{}
+		// The body of every answer, and the `Retry-After` header of one that is not success.
+		answer     byte[]
+		retryAfter string
+
+		// Serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			let kind = ctx.request.headers.get("Content-Type")
+			received.push(Received{
+				path:     ctx.request.url.path,
+				kind:     kind,
+				encoding: ctx.request.headers.get("Content-Encoding"),
+				token:    ctx.request.headers.get("Authorization"),
+				body:     body,
+			})
+			let code = statuses.hasKey(ctx.request.url.path) ?? (statuses[ctx.request.url.path], status)
+			ctx.setHeader("Retry-After", retryAfter) unless retryAfter.isEmpty() || code < 300
+			return try ctx.blob(code, kind, answer)
+		}
+
+		// The paths requested, in order.
+		def paths() string {
+			return received.mapElem(got => got.path).join(",")
+		}
+	}
+
+	// What an export failed with; fails when it did not fail with an ExportFailure.
+	internal def failureOf(exporter OTLPExporter, batch TelemetryBatch) !ExportFailure {
+		exporter.export(batch) onerror (err error) {
+			return err when err is ExportFailure
+			fail "export failed with a plain error: {err.message}"
+		}
+		fail "export did not fail"
+	}
+
+	// How many records a failure wants tried again.
+	internal def restOf(failure ExportFailure) int {
+		let rest = failure.rest
+		return 0 when rest is none
+		return records(rest)
+	}
+
+	// An Export*ServiceResponse that reports count records left out.
+	internal def partialSuccess(count int, why string) byte[] {
+		let part = new ProtoWriter()
+		part.write(1, count)
+		part.write(2, why)
+		let whole = new ProtoWriter()
+		whole.write(1, part)
+		return whole.bytes()
+	}
+
+	// A google.rpc.Status whose details hold a RetryInfo of the seconds given.
+	internal def retryInfo(seconds int) byte[] {
+		let length = new ProtoWriter()
+		length.write(1, seconds)
+		let info = new ProtoWriter()
+		info.write(1, length)
+		let packed = new ProtoWriter()
+		packed.write(1, "type.googleapis.com/google.rpc.RetryInfo")
+		packed.write(2, info)
+		let status = new ProtoWriter()
+		status.write(1, 8)
+		status.write(2, "slow down")
+		status.write(3, packed)
+		return status.bytes()
+	}
+
+	// A gRPC codec for the suite's server: keeps the bytes of the last request.
+	internal type CaptureCodec {
+		last byte[]
+
+		def encode(obj any) byte[] {
+			match obj {
+				case byte[]:
+					return obj
+				default:
+					return byte[]
+			}
+		}
+
+		def decode(input byte[], target any) !none {
+			last = input
+			return none
+		}
+	}
+
+	// A batch with one record of every kind and fixed ids and times, so it always encodes
+	// the same.
+	internal def sampleBatch() TelemetryBatch {
+		let trace = "4bf92f3577b34da6a3ce929d0e0e4736"
+		return TelemetryBatch{
+			resource: {"service.name": "shop", "session.id": "s1"},
+			metrics:  [
+				MetricSample{name: "http.requests", kind: "counter", time: 2000, value: 42.0, count: 42, labels: {"route": "/orders"}, unit: "1", description: "Requests served"},
+				MetricSample{name: "queue.depth", kind: "gauge", time: 2000, value: 3.5},
+				MetricSample{name: "http.requests", kind: "counter", time: 2000, value: 8.0, count: 8, labels: {"route": "/carts"}, unit: "1", description: "Requests served"},
+				MetricSample{name: "cache.warm", kind: "toggle", time: 2000, value: 1.0},
+				MetricSample{name: "http.duration", kind: "histogram", time: 2000, value: 10.0, distribution: Distribution{bounds: [8.0, 16.0], counts: [uint64(1), uint64(1), uint64(0)], sum: 20.0, count: 2}},
+			],
+			logs:   [LogRecord{level: LogLevel.Warning, message: "slow", fields: {"ms": 250}, time: 3000}],
+			errors: [ErrorReport{message: "card declined", code: "E42", kind: "billing.CardError", fields: {"order": 7}, time: 4000, span: SpanContext{trace: trace, span: "00f067aa0ba902b7", sampled: true}}],
+			events: [UsageEvent{name: "export.finished", properties: {"format": "pdf", "pages": 12, "draft": false, "ratio": 0.5, "tags": ["a", "b"]}, time: 5000}],
+			spans:  [
+				SpanRecord{context: SpanContext{trace: trace, span: "00f067aa0ba902b7", sampled: true}, name: "checkout", start: 6000, end: 9000, attributes: {"cart": 3}, events: [SpanEvent{name: "card.read", time: 7000}]},
+				SpanRecord{context: SpanContext{trace: trace, span: "1111111111111111", sampled: true}, parent: "00f067aa0ba902b7", name: "charge", start: 7000, end: 8000, failed: true, error: "declined"},
+			],
+		}
+	}
+
+	check "Telemetry OTLP" {
+		@test()
+		def protobufBodies() !none {
+			let batch = sampleBatch()
+			try testing.expectEqual(goldenMetrics, hexencode(otlp.metricsRequest(batch, true, 1000)), "ExportMetricsServiceRequest")
+			try testing.expectEqual(goldenLogs, hexencode(otlp.logsRequest(batch, true)), "ExportLogsServiceRequest")
+			try testing.expectEqual(goldenTraces, hexencode(otlp.tracesRequest(batch, true)), "ExportTraceServiceRequest")
+			try testing.expectEqual(0, otlp.logsRequest(TelemetryBatch{}, true).len(), "nothing to send is no request")
+			return none
+		}
+
+		@test()
+		def jsonBodies() !none {
+			let batch = sampleBatch()
+			let codec = new JSON()
+			let traces = string(otlp.tracesRequest(batch, false))
+			try codec.parse(traces)
+			for let (_, part) in ["\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\"", "\"startTimeUnixNano\":\"6000\"", "\"parentSpanId\":\"00f067aa0ba902b7\"", "\"status\":\u007B\"message\":\"declined\",\"code\":2\u007D", "\"events\":[\u007B\"timeUnixNano\":\"7000\",\"name\":\"card.read\"\u007D]"] {
+				try testing.expectTrue(traces.contains(part), "traces hold {part}")
+			}
+			let logs = string(otlp.logsRequest(batch, false))
+			try codec.parse(logs)
+			for let (_, part) in ["\"severityNumber\":13", "\"body\":\u007B\"stringValue\":\"slow\"\u007D", "\"eventName\":\"export.finished\"", "\"key\":\"exception.type\",\"value\":\u007B\"stringValue\":\"billing.CardError\"\u007D", "\"doubleValue\":0.5", "\"arrayValue\":\u007B\"values\":[\u007B\"stringValue\":\"a\"\u007D", "\"intValue\":\"12\"", "\"boolValue\":false"] {
+				try testing.expectTrue(logs.contains(part), "logs hold {part}")
+			}
+			let traced = string(otlp.logsRequest(TelemetryBatch{logs: [LogRecord{message: "in a span", time: 1, trace: "4bf92f3577b34da6a3ce929d0e0e4736", span: "00f067aa0ba902b7"}]}, false))
+			try testing.expectTrue(traced.contains("\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"spanId\":\"00f067aa0ba902b7\""), "a record written in a span names it")
+			let plain = string(otlp.logsRequest(TelemetryBatch{logs: [LogRecord{message: "no level", time: 1}]}, false))
+			try testing.expectTrue(plain.contains("\"stringValue\":\"no level\""), "an entry without a level is sent")
+			try testing.expectFalse(plain.contains("severity"), "with no severity")
+			try testing.expectFalse(plain.contains("traceId"), "and no trace outside a span")
+			let metrics = string(otlp.metricsRequest(batch, false, 1000))
+			try codec.parse(metrics)
+			for let (_, part) in ["\"isMonotonic\":true", "\"aggregationTemporality\":2", "\"asDouble\":3.5", "\"asInt\":\"42\"", "\"asInt\":\"8\"", "\"asInt\":\"1\"", "\"unit\":\"1\"", "\"description\":\"Requests served\"", "\"key\":\"route\",\"value\":\u007B\"stringValue\":\"/carts\"\u007D", "\"count\":\"2\"", "\"bucketCounts\":[\"1\",\"1\",\"0\"]", "\"explicitBounds\":[8,16]", "\"startTimeUnixNano\":\"1000\""] {
+				try testing.expectTrue(metrics.contains(part), "metrics hold {part}")
+			}
+			try testing.expectEqual(1, metrics.split("\"name\":\"http.requests\"").len() - 1, "the series of one name are the data points of one metric")
+			return none
+		}
+
+		@test()
+		def aBatchReadBackEncodesTheSame() !none {
+			let codec = new JSON()
+			let kept = TelemetryBatch{}
+			try codec.decode(codec.encode(sampleBatch()), kept)
+			try testing.expectEqual(goldenMetrics, hexencode(otlp.metricsRequest(kept, true, 1000)), "metrics, with labels and histogram ranges")
+			try testing.expectEqual(goldenLogs, hexencode(otlp.logsRequest(kept, true)), "log records with their level, errors with their span, events")
+			try testing.expectEqual(goldenTraces, hexencode(otlp.tracesRequest(kept, true)), "spans")
+			return none
+		}
+
+		@test()
+		def answers() !none {
+			let incomplete = otlp.answerOf(partialSuccess(3, "too old"), true)
+			try testing.expectEqual(3, incomplete.rejected, "a partial success names how many were left out")
+			try testing.expectEqual("too old", incomplete.message, "and why")
+			try testing.expectEqual(0, otlp.answerOf(byte[], true).rejected, "an empty answer took everything")
+			try testing.expectEqual(0, otlp.answerOf("not a message".bytes(), false).rejected, "as does one that does not read")
+			let quoted = otlp.answerOf("\u007B\"partialSuccess\":\u007B\"rejectedSpans\":\"2\",\"errorMessage\":\"bad ids\"\u007D\u007D".bytes(), false)
+			try testing.expectEqual(2, quoted.rejected, "JSON carries the count as a string")
+			try testing.expectEqual("bad ids", quoted.message, "with its message")
+			let plain = otlp.answerOf("\u007B\"partialSuccess\":\u007B\"rejectedLogRecords\":4\u007D\u007D".bytes(), false)
+			try testing.expectEqual(4, plain.rejected, "or as a number")
+			try testing.expectEqual(0, otlp.answerOf("\u007B\u007D".bytes(), false).rejected, "an empty object took everything")
+
+			try testing.expectEqual("slow down", otlp.refusalOf(retryInfo(5), true), "a refusal's status carries its message")
+			try testing.expectEqual("no", otlp.refusalOf("\u007B\"code\":3,\"message\":\"no\"\u007D".bytes(), false), "in JSON too")
+			try testing.expectEqual("<html>", otlp.refusalOf("<html>".bytes(), false), "a body that is no status is its own text")
+			let pause = otlp.retryDelayOf(retryInfo(5))
+			fail "a RetryInfo among the details is read" when pause is none
+			try testing.expectEqual(5s, pause, "as the pause it asks for")
+			try testing.expectNone(otlp.retryDelayOf(byte[]), "no details, no pause")
+
+			try testing.expectEqual(120s, pauseOf(" 120 "), "Retry-After in seconds")
+			try testing.expectEqual(1h, pauseOf("999999"), "bounded to an hour")
+			try testing.expectEqual(0s, pauseOf("soon"), "anything else is no pause")
+			try testing.expectEqual(0s, pauseOf("Wed, 21 Oct 2015 07:28:00 GMT"), "a date in the past is no pause")
+			let ahead = pauseOf(time.formatHTTPDate(time.now() + 90s))
+			try testing.expectTrue(ahead > 80s && ahead <= 90s, "a date ahead is the time until it")
+			return none
+		}
+
+		@test()
+		def partFailures() !none {
+			let collector = new TestCollector()
+			let server = try httptest.Server.start(collector)
+			let batch = sampleBatch()
+			let exporter = new OTLPExporter(server.url)
+			exporter.compress = false
+
+			// The collector takes the metrics and is busy for the logs.
+			collector.statuses = {"/v1/logs": 503}
+			collector.retryAfter = "7"
+			let busy = try failureOf(exporter, batch)
+			try testing.expectEqual("/v1/metrics,/v1/logs", collector.paths(), "a busy collector is not asked for the next kind")
+			try testing.expectEqual(0, busy.rejected, "nothing is refused for good")
+			try testing.expectEqual(7s, busy.retryAfter, "the pause it asked for")
+			let again = busy.rest
+			fail "a busy collector's records are tried again" when again is none
+			try testing.expectEqual(0, again.metrics.len(), "the metrics arrived and are not sent again")
+			try testing.expectEqual(3, again.logs.len() + again.errors.len() + again.events.len(), "the logs are")
+			try testing.expectEqual(2, again.spans.len(), "and the spans that were not sent")
+			try testing.expectEqual("shop", again.resource["service.name"], "with the batch's resource")
+			try testing.expectTrue(busy.message.contains("503"), "the answer is in the message")
+
+			// It refuses the logs for good and takes the rest.
+			collector.received = Received[]
+			collector.statuses = {"/v1/logs": 400}
+			collector.answer = "\u007B\"code\":3,\"message\":\"bad attribute\"\u007D".bytes()
+			exporter.protocol = OTLPProtocol.HttpJson
+			let refused = try failureOf(exporter, batch)
+			try testing.expectEqual("/v1/metrics,/v1/logs,/v1/traces", collector.paths(), "a refusal does not stop the other kinds")
+			try testing.expectEqual(3, refused.rejected, "every record of the refused request is dropped")
+			try testing.expectEqual(0, restOf(refused), "and nothing is tried again")
+			try testing.expectTrue(refused.message.contains("bad attribute"), "the status message is in the error")
+
+			// It takes every request and leaves one span out.
+			collector.received = Received[]
+			collector.statuses = map<string, int>{}
+			collector.answer = partialSuccess(1, "span too old")
+			exporter.protocol = OTLPProtocol.HttpProtobuf
+			let incomplete = try failureOf(exporter, TelemetryBatch{spans: batch.spans})
+			try testing.expectEqual(1, incomplete.rejected, "a partial success drops what the collector left out")
+			try testing.expectEqual(0, restOf(incomplete), "and tries nothing again")
+			try testing.expectTrue(incomplete.message.contains("span too old"), "with the collector's reason")
+
+			// It cannot be reached.
+			try server.close()
+			let away = try failureOf(exporter, batch)
+			try testing.expectEqual(records(batch), restOf(away), "everything is kept for a collector that is away")
+			try testing.expectEqual(0, away.rejected, "and nothing dropped")
+			try exporter.close()
+			return none
+		}
+
+		@test()
+		def overTls() !none {
+			let collector = new TestCollector()
+			let server = new httptest.Server(collector)
+			try server.startTLS()
+			let batch = TelemetryBatch{spans: sampleBatch().spans}
+
+			let distrustful = new OTLPExporter(server.url)
+			let unknown = try failureOf(distrustful, batch)
+			try testing.expectEqual(2, restOf(unknown), "a collector the system's roots do not vouch for gets nothing")
+			try testing.expectEqual(0, collector.received.len(), "not even a request")
+
+			let certificate = server.certificate()
+			fail "a TLS server has a certificate" when certificate is none
+			let roots = new CertPool()
+			roots.addCert(certificate)
+			let trusting = new OTLPExporter(server.url)
+			trusting.tls = tls.Config{serverName: "localhost", rootCAs: roots}
+			try trusting.export(batch)
+			try testing.expectEqual("/v1/traces", collector.paths(), "with its certificate among the roots it does")
+			try distrustful.close()
+			try trusting.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def overHttp() !none {
+			let collector = new TestCollector()
+			let server = try httptest.Server.start(collector)
+			let batch = sampleBatch()
+
+			let plain = new OTLPExporter(server.url + "/")
+			plain.compress = false
+			plain.headers = {"Authorization": "Bearer t"}
+			try plain.export(batch)
+			try testing.expectEqual("/v1/metrics,/v1/logs,/v1/traces", collector.received.mapElem(got => got.path).join(","), "one request per kind of record")
+			try testing.expectEqual("application/x-protobuf", collector.received[0].kind, "Protocol Buffers by default")
+			try testing.expectEqual("Bearer t", collector.received[1].token, "the configured headers")
+			try testing.expectEqual(goldenLogs, hexencode(collector.received[1].body), "the body as encoded")
+
+			collector.received = Received[]
+			let packed = new OTLPExporter(server.url)
+			packed.protocol = OTLPProtocol.HttpJson
+			try packed.export(TelemetryBatch{spans: batch.spans})
+			try testing.expectEqual(1, collector.received.len(), "only the kinds the batch holds")
+			try testing.expectEqual("application/json", collector.received[0].kind, "JSON when asked")
+			try testing.expectEqual("gzip", collector.received[0].encoding, "compressed by default")
+			let unpacked = try io.readAll(new gzip.Reader(new Buffer(collector.received[0].body)))
+			try testing.expectEqual(string(otlp.tracesRequest(TelemetryBatch{spans: batch.spans}, false)), string(unpacked), "which unpacks to the body")
+
+			collector.status = 503
+			let refused = false
+			packed.export(batch) onerror (err error) {
+				refused = err.message.contains("503")
+				recover none
+			}
+			try testing.expectTrue(refused, "an answer that is not success fails the export")
+			try testing.expectEqual("otlp {server.url}", plain.name(), "an exporter is named after its endpoint")
+			try plain.close()
+			try packed.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def overGrpc() !none {
+			let got = map<string, byte[]>{}
+			let capture = new CaptureCodec()
+			let rpc = new grpc.Server()
+			rpc.codec = capture
+			for let (_, method) in ["/opentelemetry.proto.collector.metrics.v1.MetricsService/Export", "/opentelemetry.proto.collector.logs.v1.LogsService/Export", "/opentelemetry.proto.collector.trace.v1.TraceService/Export"] {
+				rpc.unary(method, def (call grpc.ServerCall) !any {
+					try call.receive(capture)
+					got[method] = capture.last
+					return byte[]
+				})
+			}
+			let server = try httptest.Server.start(rpc)
+			let exporter = new OTLPExporter(server.url)
+			exporter.protocol = OTLPProtocol.Grpc
+			exporter.compress = false
+			try exporter.export(sampleBatch())
+			try testing.expectEqual(3, got.len(), "the three export services are called")
+			let logs = got["/opentelemetry.proto.collector.logs.v1.LogsService/Export"]
+			try testing.expectEqual(goldenLogs, hexencode(logs), "with the encoded request as the message")
+			try exporter.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def grpcFailures() !none {
+			let spans = TelemetryBatch{spans: sampleBatch().spans}
+			let outcome = "incomplete"
+			let rpc = new grpc.Server()
+			rpc.codec = new CaptureCodec()
+			rpc.unary("/opentelemetry.proto.collector.trace.v1.TraceService/Export", def (call grpc.ServerCall) !any {
+				try call.receive(new CaptureCodec())
+				switch outcome {
+					case "invalid":
+						fail grpc.errorOf(grpc.Code.InvalidArgument, "bad span")
+					case "away":
+						fail grpc.errorOf(grpc.Code.Unavailable, "restarting")
+					case "full":
+						fail grpc.errorOf(grpc.Code.ResourceExhausted, "over quota")
+					case "throttled":
+						fail grpc.errorOf(grpc.Code.ResourceExhausted, "slow down", retryInfo(5))
+					default:
+						return partialSuccess(1, "span too old")
+				}
+			})
+			let server = try httptest.Server.start(rpc)
+			let exporter = new OTLPExporter(server.url)
+			exporter.protocol = OTLPProtocol.Grpc
+			exporter.compress = false
+
+			let incomplete = try failureOf(exporter, spans)
+			try testing.expectEqual(1, incomplete.rejected, "a partial success drops what the collector left out")
+			try testing.expectEqual(0, restOf(incomplete), "and tries nothing again")
+			outcome = "invalid"
+			let invalid = try failureOf(exporter, spans)
+			try testing.expectEqual(2, invalid.rejected, "InvalidArgument refuses the records for good")
+			try testing.expectTrue(invalid.message.contains("bad span"), "with the status message")
+			outcome = "away"
+			let away = try failureOf(exporter, spans)
+			try testing.expectEqual(2, restOf(away), "Unavailable has them tried again")
+			try testing.expectEqual(0, away.rejected, "and none dropped")
+			outcome = "full"
+			let full = try failureOf(exporter, spans)
+			try testing.expectEqual(2, full.rejected, "ResourceExhausted without a pause is for good")
+			outcome = "throttled"
+			let throttled = try failureOf(exporter, spans)
+			try testing.expectEqual(2, restOf(throttled), "with a RetryInfo it is tried again")
+			try testing.expectEqual(5s, throttled.retryAfter, "after the pause it names")
+			try exporter.close()
+			try server.close()
+			return none
+		}
+	}
+
+	// The Protocol Buffers bodies of sampleBatch. The official messages of
+	// opentelemetry-proto 1.45.1 read each of them with no unknown field and the values
+	// sampleBatch holds.
+	internal const goldenMetrics = "0a88030a2c0a160a0c736572766963652e6e616d6512060a0473686f700a120a0a73657373696f6e2e696412040a02733112d7020a180a167374642e73657276696365732e74656c656d65747279128a010a0d687474702e7265717565737473120f5265717565737473207365727665641a01313a650a2f11e80300000000000019d007000000000000312a000000000000003a120a05726f75746512090a072f6f72646572730a2e11e80300000000000019d0070000000000003108000000000000003a110a05726f75746512080a062f63617274731002180112230a0b71756575652e64657074682a140a1219d007000000000000210000000000000c4012220a0a63616368652e7761726d2a140a1219d00700000000000031010000000000000012650a0d687474702e6475726174696f6e4a540a5011e80300000000000019d00700000000000021020000000000000029000000000000344032180100000000000000010000000000000000000000000000003a10000000000000204000000000000030401002"
+	internal const goldenLogs = "0ad5030a2c0a160a0c736572766963652e6e616d6512060a0473686f700a120a0a73657373696f6e2e696412040a02733112a4030a180a167374642e73657276696365732e74656c656d65747279123009b80b000000000000100d1a075741524e494e472a060a04736c6f7732090a026d73120318fa0159b80b00000000000012b70109a00f00000000000010111a054552524f522a0f0a0d63617264206465636c696e656432130a0a6572726f722e636f646512050a0345343232240a11657863657074696f6e2e6d657373616765120f0a0d63617264206465636c696e656432250a0e657863657074696f6e2e7479706512130a1162696c6c696e672e436172644572726f72320b0a056f72646572120218074a104bf92f3577b34da6a3ce929d0e0e4736520800f067aa0ba902b759a00f000000000000129b010988130000000000001009320b0a05647261667412021000321f0a0a6576656e742e6e616d6512110a0f6578706f72742e66696e6973686564320f0a06666f726d617412050a03706466320b0a0570616765731202180c32120a05726174696f120921000000000000e03f32140a0474616773120c2a0a0a030a01610a030a0162598813000000000000620f6578706f72742e66696e6973686564"
+	internal const goldenTraces = "0a87020a2c0a160a0c736572766963652e6e616d6512060a0473686f700a120a0a73657373696f6e2e696412040a02733112d6010a180a167374642e73657276696365732e74656c656d6574727912620a104bf92f3577b34da6a3ce929d0e0e4736120800f067aa0ba902b72a08636865636b6f757430013970170000000000004128230000000000004a0a0a0463617274120218035a1409581b0000000000001209636172642e7265616485010100000012560a104bf92f3577b34da6a3ce929d0e0e473612081111111111111111220800f067aa0ba902b72a06636861726765300139581b00000000000041401f0000000000007a0c12086465636c696e65641802850101000000"
+}

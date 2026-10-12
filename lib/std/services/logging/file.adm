@@ -1,0 +1,252 @@
+partial module std.services.logging {
+	use (
+		std.data.compress.gzip
+		std.io
+		std.os
+		std.time
+	)
+
+	// When a FileWriter starts a new file and what it keeps of the old ones.
+	//
+	// A rotated file keeps the log's name with the UTC time of the rotation after it:
+	// `app.log` becomes `app.log.20261012T140509Z` (`-1`, `-2` after it when several rotate
+	// within one second, `.gz` when compressed).
+	struct LogRotation {
+		// The size in bytes the file may reach: a record that would take it past that starts
+		// a new file. 0 never rotates by size.
+		maxSize  int64    = 0
+		// How long a file is written to. The periods are counted from midnight (`24h` is a
+		// file per day, `1h` one per hour), so a file holds the records of one period.
+		// 0s never rotates by time.
+		period   duration = 0s
+		// How far east of UTC the midnight of `period` is: `2h` rotates a daily file at
+		// 22:00 UTC.
+		offset   duration = 0s
+		// How many rotated files are kept, the newest ones. 0 keeps them all.
+		keep     int      = 0
+		// Rotated files last written longer ago than this are removed. 0s keeps them all.
+		maxAge   duration = 0s
+		// Whether rotated files are compressed with gzip.
+		compress bool     = false
+	}
+
+	// Appends each record as one line to a file, starting a new file as `LogRotation` says.
+	//
+	// The file is opened on the first record, and created with the folders above it when
+	// missing. Compressing and removing old files runs on a task of its own, which `close`
+	// and the next rotation wait for. Writing needs the `adm.storage.write` permission for
+	// the path.
+	//
+	// ```
+	// LogWriterConfig{
+	// 	writer:  new FileWriter("logs/app.log", LogRotation{period: 24h, keep: 14, compress: true}),
+	// 	encoder: new TextEncoder(),
+	// }
+	// ```
+	type FileWriter {
+		internal path     string
+		internal rotation LogRotation
+		internal file     ?os.File       = none
+		internal size     int64
+		// The period of `rotation.period` the open file belongs to.
+		internal slot     int64
+		// Signalled by the task that tidies up after a rotation, while one runs.
+		internal tidying  ?channel<none> = none
+
+		def new(path string, rotation LogRotation = LogRotation{}) {
+			self.path = path
+			self.rotation = rotation
+		}
+
+		// Implements `io.Writer`: appends data and a line break, and returns the length of
+		// data.
+		//
+		// Fails when the file cannot be opened, rotated or written, and when the policy
+		// denies the path.
+		def write(data byte[]) !int {
+			try ready()
+			let line = data + '\n'
+			try rotate() when due(int64(line.len()), time.wallNs())
+			let target = file
+			fail "logging: {path} is not open" when target is none
+			try target.write(line)
+			size += int64(line.len())
+			return data.len()
+		}
+
+		// Starts a new file now: the current one takes its rotated name, and the old files
+		// are compressed and removed as `LogRotation` says. A file that is missing or empty
+		// is left as it is.
+		//
+		// Fails when the file cannot be renamed or the new one cannot be opened.
+		def rotate() !none {
+			settle()
+			let current = file
+			if !(current is none) {
+				try current.close()
+				file = none
+			}
+			let info = os.stat(path) onerror recover os.FileInfo{}
+			try retire() when info.size > 0
+			return try ready()
+		}
+
+		// Implements `io.Closer`: waits for the tidying of the last rotation and closes the
+		// file; the next record opens it again. Fails when the operating system reports an
+		// error for the close.
+		def close() !none {
+			settle()
+			let current = file
+			return none when current is none
+			file = none
+			return try current.close()
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Opens the file when it is not open, rotating first one left from an earlier period.
+		internal def ready() !none {
+			return none unless file is none
+			let folder = os.dir(path)
+			if folder != "" && folder != "." {
+				let there = os.exists(folder) onerror recover false
+				try os.mkdir(folder, true) unless there
+			}
+			let now = time.wallNs()
+			let info = os.stat(path) onerror recover os.FileInfo{}
+			if rotation.period > 0s && info.size > 0 && periodOf(info.modTime.unixNs()) < periodOf(now) {
+				try retire()
+				info = os.FileInfo{}
+			}
+			file = try os.open(path, "a")
+			size = info.size
+			slot = periodOf(now)
+			return none
+		}
+
+		// Whether a record of that many bytes written at `now` belongs in a new file.
+		internal def due(length int64, now int64) bool {
+			return true when rotation.maxSize > 0 && size > 0 && size + length > rotation.maxSize
+			return rotation.period > 0s && periodOf(now) > slot
+		}
+
+		// Which period of `rotation.period` a wall-clock time falls in.
+		internal def periodOf(at int64) int64 {
+			return 0 unless rotation.period > 0s
+			return (at + int64(rotation.offset)) / int64(rotation.period)
+		}
+
+		// Gives the closed file its rotated name and starts the tidying task.
+		internal def retire() !none {
+			settle()
+			let moved = try freeName()
+			try os.rename(path, moved)
+			let done = new channel<none>(1)
+			tidying = done
+			async tidy(moved, done)
+			return none
+		}
+
+		// The rotated name of the file being closed: the time, and a number after it when
+		// the log already rotated within that second.
+		internal def freeName() !string {
+			let now = time.wallNs()
+			let stamp = time.fromUnixNs(now - now % 1000000000).str(time.TimeFormat.ISO8601Basic)
+			let next = 0
+			for let (_, old) in try rotatedFiles() {
+				next = old.number + 1 when old.stamp == stamp && old.number >= next
+			}
+			return "{path}.{stamp}" when next == 0
+			return "{path}.{stamp}-{next}"
+		}
+
+		// Waits for the tidying task of the last rotation.
+		internal def settle() {
+			let done = tidying
+			return when done is none
+			<-done
+			tidying = none
+		}
+
+		// Runs after a rotation: compresses the rotated file and removes the files past
+		// `keep` and `maxAge`. A failure is reported on standard error, since no record
+		// depends on it.
+		internal def tidy(rotated string, done channel<none>) {
+			tidyUp(rotated) onerror (err error) {
+				os.stderr.write("logging: {path}: {err.message}\n".bytes()) onerror recover 0
+				recover none
+			}
+			done.offer(none)
+		}
+
+		internal def tidyUp(rotated string) !none {
+			if rotation.compress {
+				try pack(rotated)
+			}
+			return none unless rotation.keep > 0 || rotation.maxAge > 0s
+			let old = try rotatedFiles()
+			let oldest = time.wallNs() - int64(rotation.maxAge)
+			for let (i, entry) in old {
+				let extra = rotation.keep > 0 && i < old.len() - rotation.keep
+				let aged = rotation.maxAge > 0s && entry.modified < oldest
+				try os.remove(entry.path) when extra || aged
+			}
+			return none
+		}
+
+		// Replaces a rotated file by its gzip form.
+		internal def pack(rotated string) !none {
+			let source = try os.open(rotated)
+			let target = try os.open(rotated + ".gz", "w")
+			let packer = new gzip.Writer(target)
+			let failure ?error = none
+			io.copy(source, packer) onerror (err error) {
+				failure = err
+				recover int64(0)
+			}
+			packer.close() onerror (err error) {
+				failure = err
+				recover none
+			}
+			source.close() onerror recover none
+			target.close() onerror recover none
+			if !(failure is none) {
+				os.remove(rotated + ".gz") onerror recover none
+				fail failure
+			}
+			return try os.remove(rotated)
+		}
+
+		// The rotated files of this log, in the order they were rotated.
+		internal def rotatedFiles() !Rotated[] {
+			let folder = os.dir(path)
+			let prefix = os.base(path) + "."
+			let found = Rotated[]
+			let listed = os.readDir(folder == "" ?? (".", folder)) onerror recover os.DirEntry[]
+			for let (_, entry) in listed {
+				let name = entry.info.name
+				continue unless name.startsWith(prefix)
+				let rest = name[prefix.len():]
+				continue unless /^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?(\.gz)?$/.test(rest)
+				let plain = rest.endsWith(".gz") ?? (rest[:rest.len() - 3], rest)
+				let number = plain.len() > 17 ?? (plain[17:].toInt<int>(), 0)
+				found.push(Rotated{path: entry.path, stamp: plain[:16], number: number, modified: entry.info.modTime.unixNs()})
+			}
+			found.sort((a, b) => a.stamp < b.stamp || (a.stamp == b.stamp && a.number < b.number))
+			return found
+		}
+	}
+
+	// A rotated file of a log, as its name tells.
+	internal struct Rotated {
+		path     string
+		// `20261012T140509Z`.
+		stamp    string
+		// The number after the stamp, 0 when there is none.
+		number   int
+		// When it was last written, in wall-clock nanoseconds.
+		modified int64
+	}
+}

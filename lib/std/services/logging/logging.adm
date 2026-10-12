@@ -4,7 +4,12 @@ partial module std.services.logging {
 		std.services.storage::(Storage)
 		std.reflection
 		std.io::WriteCloser
+		std.os
 		std.services.debugger::(trackCaller)
+		std.time
+		std.ide::(ide, IdeKind, IdeLog, IdeTable)
+		std.services.logging.redaction::*
+		std.services.logging.tracing
 	)
 
 	// How important a log entry is, from Debug up to Fatal.
@@ -25,17 +30,31 @@ partial module std.services.logging {
 
 	// Represents a structured log entry.
 	struct LogRecord {
-		// Severity level of the log entry.
-		level   LogLevel
+		// Severity level of the log entry; none for a plain entry (`Logging.log(message)`),
+		// which no level filters and every writer gets.
+		level   ?LogLevel        = none
 		// Human-readable log message.
 		message string
 		// Structured fields associated with the log entry.
 		fields  map<string, any>
+		// When the entry was written, in wall-clock nanoseconds since the Unix epoch.
+		//
+		// `time.fromUnixNs(record.time)` is the instant. 0 in a record built by hand.
+		time    int64
+		// Where the entry was written from: the file, line, module and function of the call.
+		caller  CallerLocation
+		// The trace the entry was written in, as 32 hex digits; empty outside a span of
+		// `Telemetry`. Set by the service from the task that writes the entry.
+		trace   string           = ""
+		// The span of that trace the entry was written in, as 16 hex digits; empty outside one.
+		span    string           = ""
 	}
 
 	// Encodes a structured log record into its output representation.
 	//
-	// Implementations may encode records as text, JSON, or any other supported format.
+	// Implementations may encode records as text, JSON, or any other supported format. The
+	// result is one record with no line break after it: the writer separates records the way
+	// its transport needs.
 	interface LogEncoder {
 		def encode(record LogRecord) !byte[]
 	}
@@ -44,15 +63,17 @@ partial module std.services.logging {
 	struct LogWriterConfig {
 		// Writer receiving encoded log records.
 		//
-		// The Logging service closes the writer when the service stops or the
-		// writer is removed from configuration.
+		// Each `write` is one whole encoded record, and the writer separates records itself: a
+		// line break in a file or on a TCP stream, a datagram over UDP. The Logging service
+		// closes the writer when the service stops or the writer is removed from
+		// configuration.
 		writer  WriteCloser
 		// Encoder used to serialize records before they are passed to the writer.
 		encoder LogEncoder
 		// Log levels routed to this writer.
 		//
 		// Only records whose level is explicitly included are written.
-		levels  LogLevel[]
+		levels  LogLevel[]  = [LogLevel.Debug, LogLevel.Info, LogLevel.Warning, LogLevel.Error, LogLevel.Fatal]
 	}
 
 	// Configures the Logging service.
@@ -64,8 +85,15 @@ partial module std.services.logging {
 
 		// Writers receiving log records.
 		//
-		// Each writer independently defines its encoding and accepted log levels.
+		// Each writer independently defines its encoding and accepted log levels. With none,
+		// records go to standard error as console lines (`ConsoleWriter`, `ConsoleEncoder`):
+		// colored on a terminal, plain when standard error is redirected.
 		writers LogWriterConfig[]
+
+		// How many records may wait to be written.
+		//
+		// A record written while that many wait is dropped and counted (`Logging.dropped`).
+		capacity int = 8192
 	}
 
 	// Provides a structured representation of a value for logging.
@@ -79,10 +107,72 @@ partial module std.services.logging {
 		def logValue() any
 	}
 
-	// Writes log entries to the configured sinks, with the fields @logContext attaches and
+	// A record a writer did not take.
+	struct LogWriteFailure {
+		// Position of the writer in `LogConfig.writers`.
+		writer int
+		// The record that was lost for that writer.
+		record LogRecord
+		// What the encoder or the writer reported.
+		cause  error
+	}
+
+	// A writer in use, with what the service tracks about it.
+	internal type Sink {
+		index    int
+		settings LogWriterConfig
+		// Bit `LogLevel.ordinal` is set for each routed level.
+		levels   int
+		// Whether its last record failed, so one failure is reported once.
+		failing  bool
+
+		def new(index int, settings LogWriterConfig) {
+			self.index = index
+			self.settings = settings
+			for let (_, level) in settings.levels {
+				levels |= 1 << level.ordinal
+			}
+		}
+	}
+
+	// What the writer task takes in one go.
+	internal struct Batch {
+		records LogRecord[]
+		sinks   Sink[]
+		// Writers a change of configuration replaced, closed after the records.
+		retired Sink[]
+		// The service stopped: write the records, close every writer and end.
+		last    bool
+		// Nothing was waiting when the batch was taken, so the task may sleep after it.
+		idle    bool
+	}
+
+	// Writes log entries to the configured writers, with the fields @logContext attaches and
 	// entries below the configured level dropped.
+	//
+	// A write call puts the record in a queue and returns; one task encodes the records and
+	// hands them to the writers in the order they were written, so a slow disk or collector
+	// never holds the caller. `flush` waits for that task, `fatal` does so itself, and `stop`
+	// writes what is still waiting before it closes the writers.
+	//
+	// ```
+	// try Logging.config(
+	// 	LogConfig{
+	// 		level:   LogLevel.Debug,
+	// 		writers: [
+	// 			LogWriterConfig{writer: new ConsoleWriter(), encoder: new ConsoleEncoder()},
+	// 			LogWriterConfig{
+	// 				writer:  new FileWriter("logs/app.log", LogRotation{maxSize: 10000000, keep: 5}),
+	// 				encoder: new JSONEncoder(),
+	// 				levels:  [LogLevel.Warning, LogLevel.Error, LogLevel.Fatal],
+	// 			},
+	// 		],
+	// 	}
+	// )
+	// Logging.info("user signed in", {"user": user.id})
+	// ```
 	service Logging {
-		description               = ""
+		description               = "Leveled, structured logging to configurable writers"
 		dependencies              = Dependencies{
 			hard: [Storage]
 		}
@@ -92,76 +182,363 @@ partial module std.services.logging {
 		}
 		permissions  Permission[]
 
-		cfg LogConfig = LogConfig{}
+		cfg      LogConfig                     = LogConfig{}
+		sinks    Sink[]
+		// Records written before a change of configuration, with the writers they go to.
+		earlier  Batch[]
+		// Whether sinks holds the writers of cfg (the default one when cfg names none).
+		wired    bool
+		queue    LogRecord[]
+		running  bool
+		// Set by stop, so records written after it are dropped instead of waiting forever.
+		closed   bool
+		wake     ?channel<none>                = none
+		// Signalled by the writer task once it has closed the writers.
+		ended    ?channel<none>                = none
+		// The calls of flush that wait.
+		waiters  channel<none>[]
+		// The fields @logContext attaches, by the qualified name of the annotated function,
+		// method or type.
+		contexts map<string, map<string, any>> = map<string, map<string, any>>{}
+		// Whether the types annotated with @logContext have been looked up.
+		surveyed bool
+		accepted uint64
+		written  uint64
+		lost     uint64
+		// The latest accepted records, kept for the IDE service panel once it asked for them.
+		recent   LogRecord[]
+		watched  bool
 
-		// Applies the level and the sinks. Does not fail today.
-		def config<T>(val T) !none {}
+		// Makes sinks from the configured writers, the default writer when there are none.
+		def wire() {
+			return when wired
+			wired = true
+			let list = cfg.writers
+			list = [LogWriterConfig{writer: new ConsoleWriter(), encoder: new ConsoleEncoder()}] when list.len() == 0
+			for let (i, settings) in list {
+				sinks.push(new Sink(i, settings))
+			}
+		}
 
-		// Starts the service. Does not fail today.
+		// Queues a record, unless its level is below the configured one or the queue is full.
+		def enqueue(level ?LogLevel, message string, fields map<string, any>, caller CallerLocation) {
+			write(LogRecord{level: level, message: message, fields: fields, caller: caller})
+		}
+
+		// What the writer task works on next; an empty batch when nothing waits.
+		atomic def take() Batch {
+			if earlier.len() > 0 {
+				let first = earlier[0]
+				earlier = earlier[1:]
+				return first
+			}
+			let batch = Batch{records: queue, sinks: sinks, last: !running, idle: queue.len() == 0}
+			queue = LogRecord[]
+			return batch
+		}
+
+		// Counts the records of a finished batch and wakes the flush calls.
+		atomic def settle(count int) {
+			written += uint64(count)
+			return unless written >= accepted
+			for let (_, waiter) in waiters {
+				waiter.offer(none)
+			}
+			waiters.len(0)
+		}
+
+		// The writer task: writes the queued records until the service stops.
+		def pump(signal channel<none>, done channel<none>) {
+			for {
+				let batch = take()
+				for let (_, record) in batch.records {
+					deliver(record, batch.sinks)
+				}
+				for let (_, sink) in batch.retired {
+					sink.settings.writer.close() onerror recover none
+				}
+				settle(batch.records.len())
+				if batch.last {
+					for let (_, sink) in batch.sinks {
+						sink.settings.writer.close() onerror recover none
+					}
+					done.offer(none)
+					return
+				}
+				continue unless batch.idle
+				<-signal
+			}
+		}
+
+		// Hands a record to every writer that routes its level.
+		def deliver(record LogRecord, targets Sink[]) {
+			recorded(record)
+			// A plain record has no level to route by: every writer gets it.
+			let level = record.level
+			let bit = level is none ?? (-1, 1 << level.ordinal)
+			for let (_, sink) in targets {
+				continue when sink.levels & bit == 0
+				let failure = send(record, sink)
+				if failure is none {
+					sink.failing = false
+					continue
+				}
+				writeFailed(LogWriteFailure{writer: sink.index, record: record, cause: failure})
+				continue when sink.failing
+				sink.failing = true
+				os.stderr.write("logging: writer {sink.index} failed: {failure.message}\n".bytes()) onerror recover 0
+			}
+		}
+
+		// Encodes and writes one record; the error when either step fails.
+		def send(record LogRecord, sink Sink) ?error {
+			let data = sink.settings.encoder.encode(record) onerror (err error) {
+				return err
+			}
+			sink.settings.writer.write(data) onerror (err error) {
+				return err
+			}
+			return none
+		}
+
+		// Registers a call of flush that waits; false when nothing is waiting to be written.
+		atomic def expect(waiter channel<none>) bool {
+			return false when written >= accepted
+			waiters.push(waiter)
+			return true
+		}
+
+		// Applies the level, the writers and the queue's capacity. The writers in use until
+		// now are closed once the records already written have reached them; one that is
+		// listed again is written to again after that.
+		//
+		// Fails when capacity is below 1 or a writer routes no level.
+		atomic def config(val LogConfig) !none {
+			expects {
+				assert val.capacity >= 1 onerror fail "logging: capacity must be at least 1"
+			}
+			for let (i, settings) in val.writers {
+				fail "logging: writer {i} routes no level" when settings.levels.len() == 0
+			}
+			earlier.push(Batch{records: queue, sinks: sinks, retired: sinks})
+			queue = LogRecord[]
+			sinks = Sink[]
+			wired = false
+			cfg = val
+			wire()
+			let signal = wake
+			signal.offer(none) unless signal is none
+			return none
+		}
+
+		// Starts the service and its writer task. Records written before the start are
+		// written now. Does not fail.
 		async def start() !none {
+			open()
 			return none
 		}
 
-		// Stops the service. Does not fail today.
+		atomic def open() {
+			return when running
+			running = true
+			closed = false
+			wire()
+			let signal = new channel<none>(1)
+			let done = new channel<none>(1)
+			wake = signal
+			ended = done
+			async pump(signal, done)
+		}
+
+		// Stops the service: the records still waiting are written, then every writer is
+		// closed. Records written after that are dropped. Does not fail.
 		async def stop() !none {
+			let done = close()
+			<-done unless done is none
 			return none
 		}
 
-		// Stops the service and starts it again. Does not fail today.
+		atomic def close() ?channel<none> {
+			return none unless running
+			running = false
+			closed = true
+			let done = ended
+			let signal = wake
+			wake = none
+			ended = none
+			signal.offer(none) unless signal is none
+			return done
+		}
+
+		// Stops the service and starts it again with the same configuration: the writers are
+		// closed and then written to again, which the writers of this module allow. Does not
+		// fail.
 		async def restart() !none {
+			try await stop()
+			try await start()
 			return none
 		}
 
 		// Writes a log entry at debug level.
-		//
-		// Fails when a sink cannot be written.
 		@trackCaller()
 		@commit()
-		def debug(message string, fields map<string, any> = {}) !none {
-			return none
+		def debug(message string, fields map<string, any> = {}) {
+			enqueue(LogLevel.Debug, message, fields, here())
 		}
 
 		// Writes a log entry at info level.
-		//
-		// Fails when a sink cannot be written.
 		@trackCaller()
 		@commit()
-		def info(message string, fields map<string, any> = {}) !none {
-			return none
+		def info(message string, fields map<string, any> = {}) {
+			enqueue(LogLevel.Info, message, fields, here())
 		}
 
 		// Writes a log entry at warning level.
-		//
-		// Fails when a sink cannot be written.
 		@trackCaller()
 		@commit()
-		def warning(message string, fields map<string, any> = {}) !none {
-			return none
+		def warning(message string, fields map<string, any> = {}) {
+			enqueue(LogLevel.Warning, message, fields, here())
 		}
 
 		// Writes a log entry at error level.
 		@trackCaller()
 		@commit()
-		def error(message string, fields map<string, any> = {}) !none {
-			return none
+		def error(message string, fields map<string, any> = {}) {
+			enqueue(LogLevel.Error, message, fields, here())
 		}
 
-		// Writes a log entry at fatal level.
-		//
-		// Fails when a sink cannot be written.
+		// Writes a log entry at fatal level and waits up to `wait` for the writers to have
+		// it, with everything written before it. The program goes on: ending it is the
+		// caller's decision.
 		@trackCaller()
-		@commit()
-		def fatal(message string, fields map<string, any> = {}) !none {
-			return none
+		@query()
+		def fatal(message string, fields map<string, any> = {}, wait duration = 5s) {
+			record(LogLevel.Fatal, message, fields, here())
+			flush(wait) onerror recover none
 		}
 
 		// Writes a log entry at the given level.
-		//
-		// Fails when a sink cannot be written.
 		@trackCaller()
 		@commit()
-		def log(level LogLevel, message string, fields map<string, any> = {}) !none {
-			return none
+		def log(level LogLevel, message string, fields map<string, any> = {}) {
+			enqueue(level, message, fields, here())
+		}
+
+		// Writes a plain log entry, one without a level: it is written whatever the
+		// configured level is, every writer gets it, and the encoders write `LOG` where the
+		// level stands.
+		@trackCaller()
+		@commit()
+		def log(message string, fields map<string, any> = {}) {
+			enqueue(none, message, fields, here())
+		}
+
+		// Writes a record built by the caller, for code that passes on entries made
+		// elsewhere: the level, message, fields and call site are taken as they are, and the
+		// time too unless it is 0, which stands for now. A record with no `trace` takes the
+		// one the calling task runs in. A record with no level is a plain entry.
+		@commit()
+		def write(record LogRecord) {
+			let level = record.level
+			return when !(level is none) && level.ordinal < cfg.level.ordinal
+			if closed || accepted - written >= uint64(cfg.capacity) {
+				lost++
+				return
+			}
+			let at = record.time == 0 ?? (time.wallNs(), record.time)
+			survey() unless surveyed
+			let fields = loggable(record.fields)
+			if contexts.len() > 0 {
+				// The type's fields first, then the function's or method's, then the call's:
+				// the closer one wins on a shared name.
+				let caller = record.caller
+				let home = caller.owner == "" ?? (caller.moduleName, caller.owner)
+				let near = contexts.get(home + "." + caller.name)
+				fields = near + fields unless near is none
+				if caller.owner != "" {
+					let far = contexts.get(caller.owner)
+					fields = far + fields unless far is none
+				}
+			}
+			// A record that names its trace keeps it; the others take the writing task's.
+			let (trace, span) = record.trace == "" ?? (tracing.current(), (record.trace, record.span))
+			let entry = LogRecord{level: record.level, message: record.message, fields: fields, time: at, caller: record.caller, trace: trace, span: span}
+			queue.push(entry)
+			if watched {
+				recent.push(entry)
+				recent = recent[recent.len() - panelEntries:] when recent.len() >= 2 * panelEntries
+			}
+			accepted++
+			let signal = wake
+			signal.offer(none) unless signal is none
+		}
+
+		atomic def record(level LogLevel, message string, fields map<string, any>, caller CallerLocation) {
+			enqueue(level, message, fields, caller)
+		}
+
+		// The call site a write method was called from.
+		@trackCaller()
+		def here() CallerLocation {
+			return CallerLocation{
+				fileName:   __file_name__,
+				filePath:   __file_path__,
+				dir:        __dir__,
+				fileHash:   __file_hash__,
+				line:       __line__,
+				moduleName: __module__,
+				name:       __name__,
+				owner:      __owner__,
+			}
+		}
+
+		// Attaches fields to every entry written from scope, the qualified name of a
+		// function (`billing.charge`), a method (`billing.Till.ring`) or a type
+		// (`billing.Till`, for all its methods): what `@logContext` does. A method's fields
+		// win over its type's, and a field passed to the write call itself over both. Empty
+		// fields take the scope's away.
+		@commit()
+		def context(scope string, fields map<string, any>) {
+			if fields.len() == 0 {
+				contexts.delete(scope)
+				return
+			}
+			contexts[scope] = loggable(fields)
+		}
+
+		// Registers the fields of every type annotated with @logContext. A type has no call
+		// for the annotation to run on, so its fields are read from the annotation once,
+		// before the first record.
+		def survey() {
+			surveyed = true
+			for let (_, hit) in reflection.attrs(logContext) {
+				continue unless hit.node.kind == reflection.ReflectionKind.Type
+				let literal = hit.attr.arguments.get("fields")
+				continue when literal is none
+				contexts[hit.node.qualifiedName] = loggable(literalFields(literal))
+			}
+		}
+
+		// Waits until every record written so far has been handed to the writers.
+		//
+		// Fails when that takes longer than timeout.
+		@query()
+		def flush(timeout duration = 5s) !none {
+			let waiter = new channel<none>(1)
+			return none unless expect(waiter)
+			select {
+				case waiter:
+					return none
+				case time.sleepChan(timeout):
+			}
+			fail "logging: flush timed out after {timeout}"
+		}
+
+		// Reports whether an entry at level would be written, for code that builds costly
+		// fields only when they are used.
+		@query()
+		def enabled(level LogLevel) bool {
+			return level.ordinal >= cfg.level.ordinal
 		}
 
 		// The lowest level that is written.
@@ -177,41 +554,287 @@ partial module std.services.logging {
 		def setLevel(level LogLevel) {
 			cfg.level = level
 		}
+
+		// How many records were dropped because the queue was full or the service stopped.
+		@query()
+		def dropped() int {
+			return int(lost)
+		}
+
+		// IDE service panel: the level below which entries are discarded.
+		@ide(kind = IdeKind.Value, label = "Level", refresh = 1s)
+		def ideLevel() string {
+			return cfg.level.name
+		}
+
+		// IDE service panel: the writers, where each writes, its encoder and its levels.
+		@ide(kind = IdeKind.Table, label = "Writers", refresh = 1s)
+		atomic def ideWriters() IdeTable {
+			wire()
+			return writersTable(sinks)
+		}
+
+		// IDE service panel: the latest entries, kept from the first time the panel asks.
+		@ide(kind = IdeKind.Log, label = "Entries", refresh = 1s)
+		atomic def ideEntries() IdeLog {
+			watched = true
+			let from = recent.len() > panelEntries ?? (recent.len() - panelEntries, 0)
+			return panelLog(recent[from:])
+		}
+
+		// IDE service panel: records handed to the writers, graphed over time.
+		@ide(kind = IdeKind.Series, label = "Written", refresh = 1s)
+		def ideWritten() int {
+			return int(written)
+		}
+
+		// IDE service panel: records waiting for the writer task.
+		@ide(kind = IdeKind.Value, label = "Waiting", refresh = 1s)
+		def ideWaiting() int {
+			return int(accepted - written)
+		}
+
+		// IDE service panel: records dropped.
+		@ide(kind = IdeKind.Value, label = "Dropped", refresh = 1s)
+		def ideDropped() int {
+			return int(lost)
+		}
+
+		// Emitted for each record the service accepted, as the writers get it: past the level
+		// filter, with its time and call site, the `@logContext` fields merged in and the
+		// `LogValue` and `@sensitive` values replaced. It is emitted by the writer task in the
+		// order the records were written, before the record goes to the writers, so a
+		// handler that waits holds the writers back, not the code that logs.
+		@emit()
+		def recorded(record LogRecord) LogRecord {
+			return record
+		}
+
+		// Emitted for each record a writer did not take, because its encoder or the writer
+		// failed. The first failure of a writer is also reported on standard error.
+		@emit()
+		def writeFailed(failure LogWriteFailure) LogWriteFailure {
+			return failure
+		}
 	}
 
 	// Attaches fields to every log entry written from the type's methods.
 	//
-	// A closer @logContext or a field passed to the call itself wins on the same key.
+	// A closer @logContext or a field passed to the call itself wins on the same key. The
+	// fields are written as literals: text, numbers, `true` and `false`, and maps of those.
+	//
+	// ```
+	// @logContext({"component": "billing"})
+	// type Till {
+	// 	def ring(amount int) {
+	// 		Logging.info("rung", {"amount": amount})   // component=billing amount=12
+	// ```
 	meta def logContext(target reflection.TypeMetaContext, fields map<string, any>) {}
 
-	// Attaches fields to every log entry written from the method.
-	meta def logContext(target reflection.MethodMetaContext, fields map<string, any>) {}
+	// Attaches fields to every log entry written from the method: the write calls in its
+	// body, and its own `@log`, `@logErrors` and `@logSlow` entries. They win over the
+	// fields of its type's @logContext, and a field passed to the call itself wins over
+	// both.
+	meta def logContext(target reflection.MethodMetaContext, fields map<string, any>) {
+		if target.slot() is none {
+			Logging.context(target.descriptor.node.qualifiedName, fields)
+			target.slot(true)
+		}
+		target.invoke()
+	}
 
-	// Attaches fields to every log entry written from the function.
-	meta def logContext(target reflection.FunctionMetaContext, fields map<string, any>) {}
-
-	// Writes a log entry each time the function is called.
+	// Attaches fields to every log entry written from the function: the write calls in its
+	// body, and its own `@log`, `@logErrors` and `@logSlow` entries. A field passed to the
+	// call itself wins on the same key. Functions of one module that share a name share
+	// the fields.
 	//
-	// The arguments go in as fields.
-	meta def log(target reflection.FunctionMetaContext, level LogLevel = LogLevel.Debug) {}
+	// ```
+	// @logContext({"component": "billing"})
+	// def charge(order Order) !none {
+	// 	Logging.info("charging", {"order": order.id})   // component=billing order=17
+	// ```
+	meta def logContext(target reflection.FunctionMetaContext, fields map<string, any>) {
+		if target.slot() is none {
+			Logging.context(target.descriptor.node.qualifiedName, fields)
+			target.slot(true)
+		}
+		target.invoke()
+	}
 
-	// Writes a log entry each time the method is called.
+	// The fields of an annotation as reflection keeps them, each value the text of a
+	// literal, turned into the values the literals stand for.
+	internal def literalFields(written any) map<string, any> {
+		let out = map<string, any>{}
+		for let (_, name) in reflection.keysOf(written) {
+			let value = reflection.entryOf(written, name)
+			continue when value is none
+			if reflection.kindOf(value) == reflection.FieldKind.Map {
+				out[name] = literalFields(value)
+			} else {
+				out[name] = literalValue("{value}".trim())
+			}
+		}
+		return out
+	}
+
+	// The value a literal's text stands for: quoted text without its quotes, `true` and
+	// `false`, a whole number, a number with a fraction; anything else as its text.
+	internal def literalValue(text string) any {
+		return text[1:text.len() - 1] when text.len() >= 2 && text.startsWith("\"") && text.endsWith("\"")
+		return true when text == "true"
+		return false when text == "false"
+		return text.toInt<int>() when /^-?[0-9]+$/.test(text)
+		return parseFloat<float>(text) when /^-?[0-9]+\.[0-9]+$/.test(text)
+		return text
+	}
+
+	// Writes a log entry each time the function is called, before its body runs.
 	//
-	// The arguments go in as fields.
-	meta def log(target reflection.MethodMetaContext, level LogLevel = LogLevel.Debug) {}
+	// The message is the function's qualified name and the arguments go in as fields under
+	// the parameters' names, one marked `@sensitive()` as `***`. The entry names the
+	// function's module and file as where it was written from.
+	//
+	// ```
+	// @log(LogLevel.Info)
+	// def login(username string, @sensitive() password string) !Session {
+	// ```
+	meta def log(target reflection.FunctionMetaContext, level LogLevel = LogLevel.Debug) {
+		Logging.write(callRecord(target.descriptor, target.args(), level, "")) when Logging.enabled(level)
+		target.invoke()
+	}
+
+	// Writes a log entry each time the method is called, before its body runs.
+	//
+	// The message is the method's qualified name and the arguments go in as fields under
+	// the parameters' names, one marked `@sensitive()` as `***`.
+	meta def log(target reflection.MethodMetaContext, level LogLevel = LogLevel.Debug) {
+		Logging.write(callRecord(target.descriptor, target.args(), level, "")) when Logging.enabled(level)
+		target.invoke()
+	}
+
+	// Writes a log entry each time the function fails.
+	//
+	// The message is the function's qualified name followed by `failed`; the fields are the
+	// arguments, as `@log` writes them, and `error`, the failure's message. The error itself
+	// goes on to the caller unchanged.
+	//
+	// ```
+	// @logErrors()
+	// def charge(order Order) !Receipt {
+	// ```
+	meta def logErrors(target reflection.FunctionMetaContext, level LogLevel = LogLevel.Error) {
+		target.invoke()
+		return unless target.failed() && Logging.enabled(level)
+		Logging.write(failureRecord(target.descriptor, target.args(), level, target.result()))
+	}
+
+	// Writes a log entry each time the method fails; see the function form.
+	meta def logErrors(target reflection.MethodMetaContext, level LogLevel = LogLevel.Error) {
+		target.invoke()
+		return unless target.failed() && Logging.enabled(level)
+		Logging.write(failureRecord(target.descriptor, target.args(), level, target.result()))
+	}
+
+	// Writes a log entry each time a call of the function takes longer than threshold.
+	//
+	// The message is the function's qualified name followed by `was slow`; the fields are
+	// the arguments, as `@log` writes them, and `duration`, how long the call took.
+	//
+	// ```
+	// @logSlow(250ms)
+	// def search(query string) Result[] {
+	// ```
+	meta def logSlow(target reflection.FunctionMetaContext, threshold duration, level LogLevel = LogLevel.Warning) {
+		let started = time.monoNs()
+		target.invoke()
+		let took = duration(time.monoNs() - started)
+		return unless took > threshold && Logging.enabled(level)
+		Logging.write(slowRecord(target.descriptor, target.args(), level, took))
+	}
+
+	// Writes a log entry each time a call of the method takes longer than threshold; see
+	// the function form.
+	meta def logSlow(target reflection.MethodMetaContext, threshold duration, level LogLevel = LogLevel.Warning) {
+		let started = time.monoNs()
+		target.invoke()
+		let took = duration(time.monoNs() - started)
+		return unless took > threshold && Logging.enabled(level)
+		Logging.write(slowRecord(target.descriptor, target.args(), level, took))
+	}
+
+	// The record of a call: the qualified name with suffix as the message, the arguments as
+	// fields under the parameters' names (`***` for a `@sensitive` one), and the function
+	// as the place it was written from.
+	internal def callRecord(called reflection.FunctionDescriptor, arguments any[], level LogLevel, suffix string) LogRecord {
+		let fields = map<string, any>{}
+		for let (i, parameter) in called.signature.parameters {
+			break when i >= arguments.len()
+			let hidden = false
+			for let (_, attribute) in parameter.attributes {
+				hidden = true when attribute.name == sensitiveMeta
+			}
+			if hidden {
+				fields[parameter.node.name] = redactedText
+			} else {
+				fields[parameter.node.name] = arguments[i]
+			}
+		}
+		return LogRecord{
+			level:   level,
+			message: called.node.qualifiedName + suffix,
+			fields:  fields,
+			caller:  CallerLocation{
+				fileName:   os.base(called.node.span.file),
+				filePath:   called.node.span.file,
+				line:       called.node.span.start.line,
+				moduleName: called.moduleNode.qualifiedName,
+				name:       called.node.name,
+				owner:      ownerOf(called),
+			},
+		}
+	}
+
+	// The qualified name of the type a method belongs to; empty for a function.
+	internal def ownerOf(called reflection.FunctionDescriptor) string {
+		return "" unless called.node.kind == reflection.ReflectionKind.Method
+		return called.node.parentNode.qualifiedName
+	}
+
+	// The record of a failed call, with what it failed with.
+	internal def failureRecord(called reflection.FunctionDescriptor, arguments any[], level LogLevel, outcome ?any) LogRecord {
+		let made = callRecord(called, arguments, level, " failed")
+		return made when outcome is none
+		match outcome {
+			case error:
+				made.fields["error"] = outcome.message
+			default:
+		}
+		return made
+	}
+
+	// The record of a slow call, with how long it took.
+	internal def slowRecord(called reflection.FunctionDescriptor, arguments any[], level LogLevel, took duration) LogRecord {
+		let made = callRecord(called, arguments, level, " was slow")
+		made.fields["duration"] = took
+		return made
+	}
 
 	// Marks a value that must not show up in developer output.
 	//
 	// Logs, traces, watches, crash reports and the IDE inspector print it redacted.
 	//
-	// struct Credentials { username string @sensitive() password string }
+	// ```
+	// struct Credentials {
+	// 	username string
+	// 	@sensitive()
+	// 	password string
+	// }
 	//
-	// @log() def login(username string, @sensitive() password string) {}
+	// @log()
+	// def login(username string, @sensitive() password string) {}
+	// ```
 	meta def sensitive(target reflection.ParameterMetaContext) {}
 
 	// Marks a field that must not show up in developer output.
 	meta def sensitive(target reflection.FieldMetaContext) {}
-
-	// Marks a property that must not show up in developer output.
-	meta def sensitive(target reflection.PropertyMetaContext) {}
 }

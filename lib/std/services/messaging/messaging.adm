@@ -2,48 +2,977 @@ partial module std.services.messaging {
 	use (
 		std.services::(Dependencies, Lifecycle, RestartMode, StartMode)
 		std.services.runtime::(Runtime)
+		std.reflection
+		std.reflection::(DiscoveryMetaContext, FunctionMetaContext, MethodMetaContext, TypeMetaContext)
+		std.data.collections::(Heap)
+		std.glob::Glob
+		std.errors
+		std.time
+		std.ide::(ide, IdeKind, IdeTable)
 	)
 
-	// Publishes and subscribes to messages between parts of the application.
+	// Identifies a published message. Every delivery of one message carries the same id.
+	type MessageId = uint64
+
+	// Identifies a subscription. Every subscribe method returns one and unsubscribe takes one.
+	type SubscriptionId = uint64
+
+	// A message as a consumer receives it.
+	struct Message {
+		// The id publish returned.
+		id           MessageId
+		// The topic it was published on.
+		topic        string
+		// What was published.
+		payload      any
+		// The headers given to publish.
+		headers      map<string, string>
+		// Higher priorities are delivered first; messages of one priority in the order published.
+		priority     int
+		// When it was published.
+		time         time.Time
+		// Which delivery this is to its subscription: 1 the first time, one more after each failure.
+		attempt      int
+		// The subscription it was delivered to.
+		subscription SubscriptionId
+	}
+
+	// A message no consumer could handle, as published on the dead-letter topic `messaging.dead`.
 	//
-	// Not implemented yet.
+	// A message goes there once it has failed `MessagingConfig.maxAttempts` times on one
+	// subscription. A dead letter that fails in turn is dropped.
+	@topic("messaging.dead")
+	struct DeadLetter {
+		// The message as last delivered.
+		message Message
+		// Why the last delivery failed: the handler's error, or `rejected` after a nack.
+		reason  string
+	}
+
+	// Settings of the Messaging service.
+	struct MessagingConfig {
+		// How many times a message is delivered to one subscription before it becomes a dead letter.
+		maxAttempts   int      = 5
+		// The wait before the second delivery; it doubles before each later one.
+		retryDelay    duration = 100ms
+		// The longest wait between two deliveries.
+		maxRetryDelay duration = 30s
+		// How many messages may wait on one subscription; 0 for no limit.
+		capacity      int      = 0
+	}
+
+	// What a MessagingError is about.
+	enum MessagingErrorKind {
+		// The service is not running.
+		Stopped,
+		// A topic is empty, or a topic to publish on holds `*`, `?` or `\`.
+		InvalidTopic,
+		// A subscription the message goes to holds `MessagingConfig.capacity` messages.
+		Full,
+		// No subscription has that id.
+		UnknownSubscription,
+		// The message is not waiting for an ack on its subscription.
+		NotPending,
+		// A `@subscribe` function has a shape the service cannot call.
+		InvalidHandler,
+		// A setting is out of range.
+		InvalidConfig,
+	}
+
+	// The failure of a Messaging call. `code` is the name of `kind`.
+	struct MessagingError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    MessagingErrorKind
+	}
+
+	// One subscription as `Messaging.subscriptions` lists it.
+	struct Subscription {
+		id        SubscriptionId
+		// The topic or pattern subscribed to.
+		topic     string
+		// The consumer group, "" when the subscription has its own queue.
+		group     string
+		// The payload type it takes, "" for every payload.
+		payload   string
+		// Messages waiting to be delivered, the delayed ones included.
+		pending   int
+		// Messages handed out and not settled yet.
+		inFlight  int
+		// Deliveries that succeeded.
+		delivered uint64
+		// Deliveries that failed.
+		failed    uint64
+	}
+
+	// One message on its way to one queue.
+	internal type Delivery {
+		message Message
+		// Publication order; a retry keeps it, so it returns to its place.
+		seq     uint64
+		// The monotonic time the delivery becomes visible at.
+		due     int64
+
+		def new(message Message, seq uint64, due int64) {
+			self.message = message
+			self.seq = seq
+			self.due = due
+		}
+	}
+
+	// The messages waiting for one subscription, or for the subscriptions of one group.
+	internal type Queue {
+		key       string
+		topic     string
+		// Set when topic is a pattern.
+		selector  ?Glob
+		group     string
+		// The payload type the queue takes, "" for every payload.
+		payload   string
+		ready     Heap<Delivery>
+		delayed   Heap<Delivery>
+		// Holds a token while messages may be ready; every member waits on it.
+		wake      channel<none>
+		members   int
+		inFlight  int
+		delivered uint64
+		failed    uint64
+		closed    bool
+
+		def new(key string, topic string, group string, payload string) {
+			self.key = key
+			self.topic = topic
+			self.group = group
+			self.payload = payload
+			selector = new Glob(topic) when topic.contains("*") || topic.contains("?")
+			ready = new Heap<Delivery>(def (a Delivery, b Delivery) bool {
+				return a.message.priority > b.message.priority when a.message.priority != b.message.priority
+				return a.seq < b.seq
+			})
+			delayed = new Heap<Delivery>(def (a Delivery, b Delivery) bool {
+				return a.due < b.due
+			})
+			wake = new channel<none>(1)
+		}
+
+		// How many messages wait, the delayed ones included.
+		def pending() int {
+			return ready.len() + delayed.len()
+		}
+
+		// Adds a delivery: to the ready ones when it is due at now, else to the delayed ones.
+		// Reports whether it is ready.
+		def add(delivery Delivery, now int64) bool {
+			if delivery.due > now {
+				delayed.push(delivery)
+				return false
+			}
+			ready.push(delivery)
+			wake.offer(none)
+			return true
+		}
+
+		// Moves the delayed deliveries due at now to the ready ones.
+		def promote(now int64) {
+			let moved = false
+			for {
+				let next = delayed.peek()
+				break when next is none
+				break when next.due > now
+				delayed.pop()
+				ready.push(next)
+				moved = true
+			}
+			wake.offer(none) when moved
+		}
+
+		// When the first delayed delivery is due, 0 when none is delayed.
+		def nextDue() int64 {
+			let next = delayed.peek()
+			return 0 when next is none
+			return next.due
+		}
+	}
+
+	// One subscription: a handler with its worker tasks, or a caller of `receive`.
+	internal type Consumer {
+		id      SubscriptionId
+		queue   Queue
+		// The function given to subscribe.
+		handler ?def (Message) !none
+		// The `@subscribe` function, called on target.
+		method  ?reflection.FunctionDescriptor
+		target  any
+		// Whether method takes the Message instead of its payload.
+		whole   bool
+		workers int
+		// Closed when the subscription ends.
+		quit    channel<none>
+		closed  bool
+		// What receive handed out and nobody settled yet.
+		leased  map<MessageId, Delivery>
+
+		def new(id SubscriptionId, queue Queue) {
+			self.id = id
+			self.queue = queue
+			workers = 1
+			quit = new channel<none>()
+			leased = map<MessageId, Delivery>{}
+		}
+
+		// Whether messages are taken with receive.
+		def pulls() bool {
+			return handler is none && method is none
+		}
+	}
+
+	// A `receive` call waiting with a timeout.
+	internal type Waiter {
+		deadline int64
+		signal   channel<none>
+
+		def new(deadline int64) {
+			self.deadline = deadline
+			signal = new channel<none>(1)
+		}
+	}
+
+	// Queues of messages by topic, inside the program.
+	//
+	// A message is published on a topic and goes to every subscription whose topic matches.
+	// A subscription names one topic, or a pattern: `*` matches any run of characters and `?`
+	// one character, so `orders.*` takes `orders.created` and `orders.eu.paid`. Subscriptions
+	// that share a topic and a group share one queue, and each message goes to one of them;
+	// a subscription without a group has a queue of its own. A message published on a topic
+	// nobody subscribes to is dropped.
+	//
+	// A handler that fails gets the message again after a wait that doubles each time
+	// (`MessagingConfig`). After the last attempt the message is published as a `DeadLetter`.
+	// Messages live in memory: stopping the service drops them and every subscription.
+	//
+	// ```
+	// @topic("orders.created")
+	// struct OrderCreated {
+	// 	id int
+	// }
+	//
+	// @subscribe()
+	// def confirm(order OrderCreated) !none {
+	// 	try mail.send(order.id)
+	// }
+	//
+	// @subscribe("orders.*", group = "audit")
+	// def audit(message Message) {
+	// 	println(message.topic)
+	// }
+	//
+	// try Messaging.publish(OrderCreated{id: 7})
+	// ```
 	service Messaging {
-		description               = ""
+		description               = "In-memory message queues with topics, consumer groups, retries and dead letters"
 		dependencies              = Dependencies{
 			hard: [Runtime]
 		}
 		lifecycle                 = Lifecycle{
-			start: StartMode.Manual,
+			start: StartMode.Automatic,
 			restart: RestartMode.Always,
 		}
 		permissions  Permission[]
 
-		// Applies the service's settings. There are none yet, and it does not fail.
-		def config<T>(val T) !none {}
+		settings         MessagingConfig               = MessagingConfig{}
+		running          bool
+		// Counts the starts, so the alarm tasks of an earlier run do nothing.
+		epoch            int
+		queues           map<string, Queue>            = map<string, Queue>{}
+		// The queues of each topic subscribed to by name.
+		named            map<string, Queue[]>          = map<string, Queue[]>{}
+		// The queues subscribed to a pattern.
+		patterns         Queue[]
+		// The queues a published topic goes to, kept until a queue is added or removed.
+		routes           map<string, Queue[]>          = map<string, Queue[]>{}
+		consumers        map<SubscriptionId, Consumer> = map<SubscriptionId, Consumer>{}
+		// The topic of each type annotated with @topic, by the type's qualified name.
+		topicNames       map<string, string>           = map<string, string>{}
+		waiters          Waiter[]
+		// When the earliest alarm task wakes, 0 when none is needed.
+		armed            int64
+		lastMessage      uint64
+		lastSubscription uint64
+		lastSeq          uint64
+		published        uint64
+		dead             uint64
 
-		// Starts the service. Does not fail today.
+		def fault(kind MessagingErrorKind, message string) MessagingError {
+			return MessagingError{message: message, code: "{kind}", kind: kind}
+		}
+
+		// The topic values of the type are published on: its @topic, else its qualified name.
+		def topicOf(typeName string) string {
+			let name = topicNames.get(typeName)
+			return typeName when name is none
+			return name
+		}
+
+		// The queues a message published on topic goes to.
+		def routesOf(topic string) Queue[] {
+			let known = routes.get(topic)
+			return known unless known is none
+			let found = Queue[]
+			let direct = named.get(topic)
+			found.push(...direct) unless direct is none
+			for let (_, queue) in patterns {
+				let selector = queue.selector
+				continue when selector is none
+				found.push(queue) when selector.matches(topic)
+			}
+			routes = map<string, Queue[]>{} when routes.len() >= 4096
+			routes[topic] = found
+			return found
+		}
+
+		// Starts an alarm task for due unless an earlier one is already waiting.
+		def arm(due int64) {
+			return when armed != 0 && armed <= due
+			armed = due
+			async alarm(due, epoch)
+		}
+
+		// Sleeps until due, then moves what is due.
+		def alarm(due int64, started int) {
+			let pause = due - time.monoNs()
+			time.sleep(duration(pause)) when pause > 0
+			fire(due, started)
+		}
+
+		// Makes the delayed deliveries that are due ready, ends the receive calls whose time is
+		// up, and arms the next alarm.
+		atomic def fire(due int64, started int) {
+			return unless running && started == epoch
+			let now = time.monoNs()
+			for let (_, queue) in queues {
+				queue.promote(now)
+			}
+			let at = 0
+			for at < waiters.len() {
+				if waiters[at].deadline <= now {
+					waiters[at].signal.offer(none)
+					waiters.remove(at)
+				} else {
+					at++
+				}
+			}
+			armed = 0 when armed == due
+			return unless armed == 0
+			let next = int64(0)
+			for let (_, queue) in queues {
+				let queued = queue.nextDue()
+				next = queued when queued != 0 && (next == 0 || queued < next)
+			}
+			for let (_, waiter) in waiters {
+				next = waiter.deadline when next == 0 || waiter.deadline < next
+			}
+			arm(next) unless next == 0
+		}
+
+		// Puts one message on every queue its topic and payload reach.
+		def enqueue(topic string, payload any, priority int, delay duration, headers map<string, string>) !MessageId {
+			let targets = routesOf(topic)
+			let kind = ""
+			kind = reflection.typeName(payload) when targets.len() > 0
+			if settings.capacity > 0 {
+				for let (_, queue) in targets {
+					continue unless queue.payload == "" || queue.payload == kind
+					fail fault(MessagingErrorKind.Full, "the subscription to \"{queue.topic}\" holds {queue.pending()} messages, the most MessagingConfig.capacity allows") when queue.pending() >= settings.capacity
+				}
+			}
+			lastMessage++
+			let id = MessageId(lastMessage)
+			let stamp = time.now()
+			let now = time.monoNs()
+			let due = now + int64(delay)
+			for let (_, queue) in targets {
+				continue unless queue.payload == "" || queue.payload == kind
+				lastSeq++
+				let message = Message{id: id, topic: topic, payload: payload, headers: headers, priority: priority, time: stamp, attempt: 1}
+				arm(due) unless queue.add(new Delivery(message, lastSeq, due), now)
+			}
+			published++
+			return id
+		}
+
+		// The wait before delivery number attempt.
+		def backoff(attempt int) duration {
+			let wait = int64(settings.retryDelay)
+			let most = int64(settings.maxRetryDelay)
+			for let step = 2; step < attempt && wait < most; step++ {
+				wait *= 2
+			}
+			return duration(most) when wait > most
+			return duration(wait)
+		}
+
+		// Takes a failed delivery back: for another attempt after wait (the backoff when none),
+		// or as a dead letter when it has had them all.
+		def reject(queue Queue, delivery Delivery, reason string, wait ?duration) {
+			queue.failed++
+			let last = delivery.message
+			if last.attempt >= settings.maxAttempts {
+				dead++
+				return when last.topic == deadLetterTopic
+				// A full dead-letter subscription loses the letter: there is nowhere left to put it.
+				enqueue(deadLetterTopic, DeadLetter{message: last, reason: reason}, last.priority, 0s, map<string, string>{}) onerror recover MessageId(0)
+				return
+			}
+			return when queue.closed
+			let pause = backoff(last.attempt + 1)
+			pause = wait unless wait is none
+			// The consumer may still hold the message of the failed attempt: the next one is a copy.
+			let again = Message{id: last.id, topic: last.topic, payload: last.payload, headers: last.headers, priority: last.priority, time: last.time, attempt: last.attempt + 1}
+			let now = time.monoNs()
+			let retry = new Delivery(again, delivery.seq, now + int64(pause))
+			arm(retry.due) unless queue.add(retry, now)
+		}
+
+		// The queue with that key, made when there is none.
+		def queueFor(key string, topic string, group string, payload string) Queue {
+			let known = queues.get(key)
+			return known unless known is none
+			let made = new Queue(key, topic, group, payload)
+			queues[key] = made
+			if made.selector is none {
+				let listed = named.get(topic)
+				if listed is none {
+					named[topic] = [made]
+				} else {
+					listed.push(made)
+				}
+			} else {
+				patterns.push(made)
+			}
+			routes = map<string, Queue[]>{}
+			return made
+		}
+
+		// Adds a subscription to the queue of its topic, group and payload type.
+		def join(topic string, group string, payload string) !Consumer {
+			fail fault(MessagingErrorKind.Stopped, "the Messaging service is not running") unless running
+			fail fault(MessagingErrorKind.InvalidTopic, "a subscription needs a topic") when topic.isEmpty()
+			lastSubscription++
+			let id = SubscriptionId(lastSubscription)
+			let key = group.isEmpty() ?? ("#{id}", "{topic}\n{group}\n{payload}")
+			let queue = queueFor(key, topic, group, payload)
+			queue.members++
+			let consumer = new Consumer(id, queue)
+			consumers[id] = consumer
+			return consumer
+		}
+
+		// Ends a subscription. What it held without settling goes back to its group; the queue
+		// of the last member goes with it.
+		def leave(consumer Consumer) {
+			consumer.closed = true
+			consumer.quit.close()
+			consumers.delete(consumer.id)
+			let queue = consumer.queue
+			queue.members--
+			if queue.members > 0 {
+				let now = time.monoNs()
+				for let (_, delivery) in consumer.leased {
+					queue.inFlight--
+					delivery.due = now
+					queue.add(delivery, now)
+				}
+				consumer.leased = map<MessageId, Delivery>{}
+				return
+			}
+			queue.closed = true
+			queues.delete(queue.key)
+			if queue.selector is none {
+				let listed = named.get(queue.topic)
+				if !(listed is none) {
+					listed.remove(listed.indexOf(queue))
+					named.delete(queue.topic) when listed.len() == 0
+				}
+			} else {
+				patterns.remove(patterns.indexOf(queue))
+			}
+			routes = map<string, Queue[]>{}
+		}
+
+		// Starts the worker tasks of a subscription with a handler.
+		def launch(consumer Consumer) {
+			for let _ in 0..consumer.workers {
+				async work(consumer)
+			}
+		}
+
+		// Subscribes a `@subscribe` function, called on target when it is a method.
+		def bind(hit reflection.AttrHit, fn reflection.FunctionDescriptor, target any) !SubscriptionId {
+			let name = fn.node.qualifiedName
+			let parameters = fn.signature.parameters
+			fail fault(MessagingErrorKind.InvalidHandler, "{name}: a @subscribe function takes one parameter, the Message or its payload") unless parameters.len() == 1
+			fail fault(MessagingErrorKind.InvalidHandler, "{name}: a @subscribe function cannot be async, it already runs on a task of its own") when fn.modifiers.isAsync || fn.signature.result.future
+			let taken = parameters[0].paramType.typeName
+			let whole = taken == messageTypeName
+			let topic = annotationArgument(hit, "topic", 0)
+			let payload = ""
+			if !whole && taken != "any" {
+				payload = taken
+				topic = topicOf(taken) when topic.isEmpty()
+			}
+			fail fault(MessagingErrorKind.InvalidTopic, "{name}: @subscribe needs a topic when the function takes a Message or any") when topic.isEmpty()
+			let workers = 1
+			let asked = annotationArgument(hit, "workers", 2)
+			workers = asked.toInt<int>() unless asked.isEmpty()
+			fail fault(MessagingErrorKind.InvalidHandler, "{name}: @subscribe needs at least one worker") when workers < 1
+			let consumer = try join(topic, annotationArgument(hit, "group", 1), payload)
+			consumer.method = fn
+			consumer.target = target
+			consumer.whole = whole
+			consumer.workers = workers
+			launch(consumer)
+			return consumer.id
+		}
+
+		// Subscribes the annotated functions and the annotated methods of services.
+		def discover() !none {
+			for let (_, hit) in reflection.attrs(topic) {
+				topicNames[hit.node.qualifiedName] = annotationArgument(hit, "name", 0)
+			}
+			for let (_, hit) in annotatedFunctions() {
+				let fn = reflection.asFunction(hit.node)
+				continue when fn is none
+				let owner = ownerOf(fn)
+				let target any = none
+				if !owner.isEmpty() {
+					// A method of a type waits for `subscribe(consumer)` to name the value it runs on.
+					target = reflection.serviceInstance(owner)
+					continue when target is none
+				}
+				try bind(hit, fn, target)
+			}
+			return none
+		}
+
+		// Runs the subscription's handler on one message; the failure, or none.
+		def deliver(consumer Consumer, message Message) ?error {
+			let failure ?error = none
+			let handler = consumer.handler
+			if !(handler is none) {
+				handler(message) onerror (err error) {
+					failure = err
+					recover none
+				}
+				return failure
+			}
+			let method = consumer.method
+			return none when method is none
+			let argument any = message
+			argument = message.payload unless consumer.whole
+			let result = reflection.invoke(method, consumer.target, [argument])
+			failure = result when result is error
+			return failure
+		}
+
+		// The next ready message of the subscription's queue, none when there is none.
+		atomic def take(consumer Consumer) ?Delivery {
+			return none when consumer.closed
+			let queue = consumer.queue
+			let delivery = queue.ready.pop()
+			return none when delivery is none
+			queue.inFlight++
+			delivery.message.subscription = consumer.id
+			queue.wake.offer(none) unless queue.ready.isEmpty()
+			return delivery
+		}
+
+		// Records how a handler's delivery ended and returns the next ready message, none when
+		// there is none: one turn at the service for both.
+		atomic def advance(consumer Consumer, delivery Delivery, failure ?error) ?Delivery {
+			let queue = consumer.queue
+			queue.inFlight--
+			if failure is none {
+				queue.delivered++
+			} else {
+				reject(queue, delivery, failure.message, none)
+			}
+			return take(consumer)
+		}
+
+		// A worker task: delivers the queue's messages to the handler until the subscription ends.
+		def work(consumer Consumer) {
+			let queue = consumer.queue
+			let current = take(consumer)
+			for {
+				if current is none {
+					return when consumer.closed
+					select {
+						case queue.wake:
+							queue.wake.flush()
+						case consumer.quit:
+							return
+					}
+					current = take(consumer)
+				} else {
+					current = advance(consumer, current, deliver(consumer, current.message))
+				}
+			}
+		}
+
+		// Applies the settings; messages already waiting keep the attempts they have had.
+		//
+		// Fails when maxAttempts is below 1, a delay is negative or capacity is negative.
+		atomic def config(val MessagingConfig) !none {
+			fail fault(MessagingErrorKind.InvalidConfig, "maxAttempts must be at least 1") when val.maxAttempts < 1
+			fail fault(MessagingErrorKind.InvalidConfig, "retryDelay and maxRetryDelay cannot be negative") when val.retryDelay < 0s || val.maxRetryDelay < 0s
+			fail fault(MessagingErrorKind.InvalidConfig, "capacity cannot be negative") when val.capacity < 0
+			settings = val
+			return none
+		}
+
+		// Starts the service and subscribes every function annotated with @subscribe, and every
+		// annotated method of a service.
+		//
+		// Fails when an annotated function cannot be subscribed: it takes no parameter or
+		// several, it is async, or it takes a Message without naming a topic.
 		async def start() !none {
+			try open()
 			return none
 		}
 
-		// Stops the service. Does not fail today.
+		atomic def open() !none {
+			return none when running
+			running = true
+			epoch++
+			discover() onerror (err error) {
+				close()
+				return err
+			}
+			return none
+		}
+
+		// Stops the service: every subscription ends and the messages still waiting are dropped.
+		// Does not fail.
 		async def stop() !none {
+			close()
 			return none
 		}
 
-		// Stops the service and starts it again. Does not fail today.
+		atomic def close() {
+			running = false
+			for let (_, consumer) in consumers.values() {
+				consumer.leased = map<MessageId, Delivery>{}
+				leave(consumer)
+			}
+			for let (_, waiter) in waiters {
+				waiter.signal.offer(none)
+			}
+			waiters = Waiter[]
+			armed = 0
+		}
+
+		// Stops the service and starts it again. Subscriptions made in code are gone; the
+		// annotated ones are made again. Fails like start.
 		async def restart() !none {
+			try await stop()
+			try await start()
 			return none
+		}
+
+		// Publishes payload and returns the message's id.
+		//
+		// Without a topic the message goes to the topic of the payload's type: the name its
+		// `@topic` gives, else the type's qualified name. priority orders the messages waiting
+		// on a subscription, higher first. delay keeps the message back for that long. A
+		// message nobody subscribes to is dropped, and the call still succeeds.
+		//
+		// Fails when the service is stopped, when topic holds `*`, `?` or `\`, when no topic is
+		// given and the payload is not a struct, a type or an enum, and when a subscription
+		// the message goes to is full (`MessagingConfig.capacity`); then no subscription gets it.
+		@commit()
+		atomic def publish(payload any, topic string = "", priority int = 0, delay duration = 0s, headers map<string, string> = {}) !MessageId {
+			fail fault(MessagingErrorKind.Stopped, "the Messaging service is not running") unless running
+			fail fault(MessagingErrorKind.InvalidTopic, "a message cannot wait a negative time") when delay < 0s
+			let target = topic
+			if target.isEmpty() {
+				let kind = reflection.kindOf(payload)
+				fail fault(MessagingErrorKind.InvalidTopic, "a {reflection.typeName(payload)} has no topic of its own: publish(payload, topic)") unless kind == reflection.FieldKind.Struct || kind == reflection.FieldKind.Enum
+				target = topicOf(reflection.typeName(payload))
+			}
+			fail fault(MessagingErrorKind.InvalidTopic, "\"{target}\" is a pattern, a message is published on one topic") when target.contains("*") || target.contains("?") || target.contains("\\")
+			return try enqueue(target, payload, priority, delay, headers)
+		}
+
+		// Subscribes handler to topic and returns the subscription's id.
+		//
+		// The handler runs on workers tasks of its own, one message at a time on each. A message
+		// it fails on is delivered again, as `MessagingConfig` says. Subscriptions with the same
+		// topic and group share the messages; "" gives this one its own copy of each.
+		//
+		// Fails when the service is stopped, when topic is empty and when workers is below 1.
+		@commit()
+		atomic def subscribe(topic string, handler def (Message) !none, group string = "", workers int = 1) !SubscriptionId {
+			fail fault(MessagingErrorKind.InvalidHandler, "a subscription needs at least one worker") when workers < 1
+			let consumer = try join(topic, group, "")
+			consumer.handler = handler
+			consumer.workers = workers
+			launch(consumer)
+			return consumer.id
+		}
+
+		// Subscribes to topic without a handler and returns the subscription's id: the messages
+		// wait until `receive` takes them, and each one is settled with `ack` or `nack`.
+		//
+		// Fails when the service is stopped and when topic is empty.
+		@commit()
+		atomic def subscribe(topic string, group string = "") !SubscriptionId {
+			let consumer = try join(topic, group, "")
+			return consumer.id
+		}
+
+		// Subscribes every `@subscribe` method of consumer's type, each run on consumer, and
+		// returns their subscriptions. The service keeps consumer until they end.
+		//
+		// Fails when the service is stopped, when the type has no such method, and when one
+		// cannot be subscribed (see start); then none of them is.
+		@commit()
+		atomic def attach(consumer any) !SubscriptionId[] {
+			let owner = reflection.typeName(consumer)
+			let made = SubscriptionId[]
+			for let (_, hit) in annotatedFunctions() {
+				let fn = reflection.asFunction(hit.node)
+				continue when fn is none
+				continue unless ownerOf(fn) == owner
+				let id = bind(hit, fn, consumer) onerror (err error) {
+					for let (_, earlier) in made {
+						let joined = consumers.get(earlier)
+						leave(joined) unless joined is none
+					}
+					return err
+				}
+				made.push(id)
+			}
+			fail fault(MessagingErrorKind.InvalidHandler, "{owner} has no @subscribe method") when made.len() == 0
+			return made
+		}
+
+		// Ends the subscription. Its handler finishes the message it is on; a `receive` waiting
+		// on it returns none. Messages it took and did not settle go back to its group.
+		//
+		// Fails when there is no such subscription.
+		@commit()
+		atomic def unsubscribe(id SubscriptionId) !none {
+			let consumer = consumers.get(id)
+			fail fault(MessagingErrorKind.UnknownSubscription, "no subscription {id}") when consumer is none
+			leave(consumer)
+			return none
+		}
+
+		// The subscription receive takes from.
+		atomic def puller(id SubscriptionId) !Consumer {
+			let consumer = consumers.get(id)
+			fail fault(MessagingErrorKind.UnknownSubscription, "no subscription {id}") when consumer is none
+			fail fault(MessagingErrorKind.InvalidHandler, "subscription {id} has a handler, which takes its messages") unless consumer.pulls()
+			return consumer
+		}
+
+		// Takes the next ready message for a receive call and keeps it until it is settled.
+		atomic def lease(consumer Consumer) ?Delivery {
+			let delivery = take(consumer)
+			return none when delivery is none
+			consumer.leased[delivery.message.id] = delivery
+			return delivery
+		}
+
+		// Registers a receive call that gives up at deadline.
+		atomic def expect(waiter Waiter) {
+			waiters.push(waiter)
+			arm(waiter.deadline)
+		}
+
+		// Forgets a receive call that has returned.
+		atomic def forget(waiter Waiter) {
+			let at = waiters.indexOf(waiter)
+			waiters.remove(at) when at >= 0
+		}
+
+		// Returns the next message of a subscription made without a handler, waiting for one up
+		// to timeout: forever when none, not at all when 0s. Returns none when the time is up
+		// and when the subscription or the service ends. The message stays with the caller
+		// until `ack` or `nack`.
+		//
+		// Fails when there is no such subscription and when it has a handler.
+		@query()
+		def receive(id SubscriptionId, timeout ?duration = none) !?Message {
+			let consumer = try puller(id)
+			let queue = consumer.queue
+			let waiter = new Waiter(0)
+			waiter.deadline = time.monoNs() + int64(timeout) unless (timeout is none)
+			let listed = false
+			for {
+				let delivery = lease(consumer)
+				if !(delivery is none) {
+					forget(waiter) when listed
+					return delivery.message
+				}
+				break when consumer.closed
+				break when waiter.deadline != 0 && time.monoNs() >= waiter.deadline
+				if waiter.deadline != 0 && !listed {
+					listed = true
+					expect(waiter)
+				}
+				select {
+					case queue.wake:
+						queue.wake.flush()
+					case consumer.quit:
+					case waiter.signal:
+				}
+			}
+			forget(waiter) when listed
+			return none
+		}
+
+		// The delivery the caller of receive holds for message.
+		def held(message Message) !Delivery {
+			let consumer = consumers.get(message.subscription)
+			fail fault(MessagingErrorKind.UnknownSubscription, "no subscription {message.subscription}") when consumer is none
+			let delivery = consumer.leased.get(message.id)
+			fail fault(MessagingErrorKind.NotPending, "message {message.id} is not waiting for an ack on subscription {message.subscription}") when delivery is none
+			consumer.leased.delete(message.id)
+			consumer.queue.inFlight--
+			return delivery
+		}
+
+		// Settles a message taken with `receive`: it was handled.
+		//
+		// Fails when its subscription is gone and when the message is not waiting for an ack.
+		@commit()
+		atomic def ack(message Message) !none {
+			let delivery = try held(message)
+			let consumer = consumers.get(message.subscription)
+			consumer.queue.delivered++ unless consumer is none
+			return none
+		}
+
+		// Settles a message taken with `receive`: it was not handled. It is delivered again
+		// after delay (the usual wait when none), or becomes a dead letter when that was its
+		// last attempt.
+		//
+		// Fails when its subscription is gone and when the message is not waiting for an ack.
+		@commit()
+		atomic def nack(message Message, delay ?duration = none) !none {
+			let delivery = try held(message)
+			let consumer = consumers.get(message.subscription)
+			reject(consumer.queue, delivery, "rejected", delay) unless consumer is none
+			return none
+		}
+
+		// Every subscription, in the order made.
+		@query()
+		atomic def subscriptions() Subscription[] {
+			let all = Subscription[]
+			for let (_, consumer) in consumers {
+				let queue = consumer.queue
+				all.push(Subscription{
+					id:        consumer.id,
+					topic:     queue.topic,
+					group:     queue.group,
+					payload:   queue.payload,
+					pending:   queue.pending(),
+					inFlight:  queue.inFlight,
+					delivered: queue.delivered,
+					failed:    queue.failed,
+				})
+			}
+			return all
+		}
+
+		// IDE service panel: the subscriptions with what waits on each.
+		@ide(kind = IdeKind.Table, label = "Subscriptions", refresh = 1s)
+		atomic def ideSubscriptions() IdeTable {
+			let rows = string[][]
+			for let (_, consumer) in consumers {
+				let queue = consumer.queue
+				rows.push(["{consumer.id}", queue.topic, queue.group, queue.payload, "{queue.pending()}", "{queue.inFlight}", "{queue.delivered}", "{queue.failed}"])
+			}
+			return IdeTable{
+				columns: ["Id", "Topic", "Group", "Payload", "Pending", "In flight", "Delivered", "Failed"],
+				rows:    rows,
+			}
+		}
+
+		// IDE service panel: messages published, graphed over time.
+		@ide(kind = IdeKind.Series, label = "Published", refresh = 1s)
+		def idePublished() int {
+			return int(published)
+		}
+
+		// IDE service panel: messages that became dead letters.
+		@ide(kind = IdeKind.Value, label = "Dead letters", refresh = 1s)
+		def ideDead() int {
+			return int(dead)
 		}
 	}
-	/*
-	    queues
-	    topics
-	    publish
-	    consume
-	    ack/nack
-	    retry
-	    dead-letter
-	    delivery guarantees
-	*/
+
+	// The topic dead letters are published on.
+	internal const deadLetterTopic = "messaging.dead"
+
+	// The name reflection gives the Message type.
+	internal const messageTypeName = "std.services.messaging.Message"
+
+	// Subscribes the function to a topic: the Messaging service calls it with each message.
+	//
+	// The function takes one parameter. A `Message` gets every message of the topic. Any
+	// other type gets the payload of the messages that carry one of that type, and the topic
+	// may then be left out: it is the topic of the type (its `@topic`, else its qualified name).
+	//
+	//     topic    a topic, or a pattern (`*` any run of characters, `?` one character)
+	//     group    subscriptions with the same topic and group share the messages, each
+	//              going to one of them; "" gives the function its own copy of each
+	//     workers  how many tasks call the function at once
+	//
+	// A function that fails gets the message again, as `MessagingConfig` says; returning
+	// settles it. The service subscribes the annotated functions when it starts.
+	//
+	// ```
+	// @subscribe("orders.*", group = "billing", workers = 4)
+	// def bill(message Message) !none {
+	// 	try charge(message.payload)
+	// }
+	// ```
+	meta def subscribe(ctx DiscoveryMetaContext<FunctionMetaContext>, topic string = "", group string = "", workers int = 1) {}
+
+	// Subscribes the method to a topic, as the function form does.
+	//
+	// A method of a service is subscribed when the Messaging service starts. A method of a
+	// type is subscribed for each value given to `Messaging.attach`.
+	meta def subscribe(ctx DiscoveryMetaContext<MethodMetaContext>, topic string = "", group string = "", workers int = 1) {}
+
+	// Names the topic the values of a type are published on, for `Messaging.publish(value)`
+	// and for `@subscribe` functions that take the type. Without it the topic is the type's
+	// qualified name.
+	meta def topic(ctx DiscoveryMetaContext<TypeMetaContext>, name string) {}
+
+	// Every function and method the program annotates with @subscribe.
+	internal def annotatedFunctions() reflection.AttrHit[] {
+		return reflection.attrs(subscribe)
+	}
+
+	// The qualified name of the type or service a method belongs to, "" for a function.
+	internal def ownerOf(fn reflection.FunctionDescriptor) string {
+		return "" unless fn.node.kind == reflection.ReflectionKind.Method
+		return fn.ownerType.typeName
+	}
+
+	// The annotation argument by parameter name or position, without the quotes of a string literal.
+	internal def annotationArgument(hit reflection.AttrHit, name string, position int) string {
+		let found = hit.attr.arguments.get(name)
+		found = hit.attr.arguments.get("#{position}") when found is none
+		return "" when found is none
+		let text = string(found).trim()
+		return text[1:text.len() - 1] when text.len() >= 2 && text.startsWith("\"") && text.endsWith("\"")
+		return text
+	}
 }

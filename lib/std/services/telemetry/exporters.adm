@@ -1,0 +1,391 @@
+partial module std.services.telemetry {
+	use (
+		std.services::(Application)
+		std.services.telemetry.otlp
+		std.data.encoding::(JSON)
+		std.data.compress.gzip
+		std.bytes::(Buffer)
+		std.net.grpc
+		std.net.http
+		std.net.tls
+		std.os
+		std.time
+	)
+
+	// How an OTLPExporter talks to its collector.
+	enum OTLPProtocol {
+		// Protocol Buffers over HTTP, to `/v1/metrics`, `/v1/logs` and `/v1/traces`.
+		HttpProtobuf,
+		// JSON over HTTP, to the same paths.
+		HttpJson,
+		// gRPC.
+		Grpc,
+	}
+
+	// Sends batches to an OpenTelemetry collector (OTLP 1.x).
+	//
+	// Metrics, log records and spans go as OTLP has them. Errors and usage events travel as
+	// log records: an error with the `exception.type`, `exception.message` and
+	// `exception.stacktrace` attributes, an event with its name as the record's event name.
+	//
+	// A batch is up to three requests, one per kind of record it holds. What the collector
+	// took is not sent again: after an answer that asks for another try (HTTP 429, 502, 503
+	// and 504, the gRPC codes OTLP names, a collector that cannot be reached) the records
+	// of that request and of the ones not made yet are kept, and a pause the collector
+	// asked for (`Retry-After`, gRPC `RetryInfo`) is kept to, up to an hour. Records it
+	// refuses for good (any other answer, and the count in a partial success) are dropped.
+	// Connecting needs the `adm.network.connect` permission for the endpoint.
+	//
+	// ```
+	// let collector = new OTLPExporter("https://telemetry.example.com:4318")
+	// collector.headers = {"Authorization": "Bearer {token}"}
+	// ```
+	type OTLPExporter {
+		// How the collector is spoken to.
+		protocol OTLPProtocol        = OTLPProtocol.HttpProtobuf
+		// Headers sent with every request, for the collector's authentication.
+		headers  map<string, string> = map<string, string>{}
+		// How long one request may take.
+		timeout  duration            = 10s
+		// Whether request bodies are gzip-compressed.
+		compress bool                = true
+		// TLS settings for an https endpoint: the roots that vouch for the collector, a
+		// client certificate it asks for. None trusts the system's roots. Read when the
+		// first batch is sent.
+		tls      ?tls.Config         = none
+
+		internal endpoint string
+		internal web      ?http.Client = none
+		internal rpc      ?grpc.Client = none
+
+		// endpoint is the collector's base URL: `https://host:4318` over HTTP,
+		// `https://host:4317` over gRPC.
+		def new(endpoint string) {
+			self.endpoint = endpoint.trimEnd("/")
+		}
+
+		// Name implements Exporter: `otlp` and the endpoint.
+		def name() string {
+			return "otlp {endpoint}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the collector did not take every record: it
+		// cannot be reached, does not answer in time, answers with anything but success,
+		// or reports that it left records out.
+		def export(batch TelemetryBatch) !none {
+			let binary = protocol != OTLPProtocol.HttpJson
+			let since = Application.startTime().unixNs()
+			let parts = [
+				Part{kind: "metrics", owner: "MetricsService", size: batch.metrics.len(), body: otlp.metricsRequest(batch, binary, since)},
+				Part{kind: "logs", owner: "LogsService", size: batch.logs.len() + batch.errors.len() + batch.events.len(), body: otlp.logsRequest(batch, binary)},
+				Part{kind: "traces", owner: "TraceService", size: batch.spans.len(), body: otlp.tracesRequest(batch, binary)},
+			]
+			let failure = ExportFailure{}
+			let rest = TelemetryBatch{resource: batch.resource}
+			let stopped = false
+			for let (_, part) in parts {
+				continue when part.size == 0
+				let delivery = Delivery{again: true}
+				delivery = deliver(part, binary) unless stopped
+				failure.rejected += delivery.rejected
+				if failure.message.isEmpty() && !delivery.message.isEmpty() {
+					failure.message = delivery.message
+					failure.cause = delivery.cause
+				}
+				continue unless delivery.again
+				// A collector that is away or busy is not asked for the other kinds.
+				stopped = true
+				failure.retryAfter = delivery.wait when delivery.wait > failure.retryAfter
+				switch part.kind {
+					case "metrics":
+						rest.metrics = batch.metrics
+					case "logs":
+						rest.logs = batch.logs
+						rest.errors = batch.errors
+						rest.events = batch.events
+					default:
+						rest.spans = batch.spans
+				}
+			}
+			return none when failure.message.isEmpty()
+			failure.rest = rest when stopped
+			fail failure
+		}
+
+		// Sends one request and reads how the collector took it.
+		internal def deliver(part Part, binary bool) Delivery {
+			let delivery = Delivery{}
+			if protocol == OTLPProtocol.Grpc {
+				// The trace service's package is `trace`, the others are named like their paths.
+				let family = part.kind == "traces" ?? ("trace", part.kind)
+				delivery = call("/opentelemetry.proto.collector.{family}.v1.{part.owner}/Export", part.body)
+			} else {
+				delivery = post("{endpoint}/v1/{part.kind}", part.body, binary)
+			}
+			// An answer that is neither success nor "try again" refuses every record.
+			delivery.rejected = part.size when !delivery.again && !delivery.accepted
+			delivery.rejected = part.size when delivery.rejected > part.size
+			return delivery
+		}
+
+		// One OTLP/HTTP request.
+		internal def post(target string, body byte[], binary bool) Delivery {
+			let response = send(target, body, binary) onerror (err error) {
+				return Delivery{again: true, message: "otlp: {target}: {err.message}", cause: err}
+			}
+			let said = response.bytes() onerror recover byte[]
+			return accepted(target, otlp.answerOf(said, binary)) when response.status >= 200 && response.status < 300
+			let delivery = Delivery{message: "otlp: {target} answered {response.status}: {otlp.refusalOf(said, binary)}"}
+			delivery.again = [429, 502, 503, 504].includes(response.status)
+			delivery.wait = pauseOf(response.headers.get("Retry-After")) when response.status := 429 || 503
+			return delivery
+		}
+
+		// Builds and sends the request of post. Fails when the body cannot be compressed,
+		// the target is not a URL, or no answer arrives in time.
+		internal def send(target string, body byte[], binary bool) !http.Response {
+			let payload = body
+			if compress {
+				let packed = new Buffer()
+				let packer = new gzip.Writer(packed)
+				try packer.write(body)
+				try packer.close()
+				payload = packed.bytes()
+			}
+			let request = try http.newRequest(http.Method.POST, target, payload)
+			request.headers.set("Content-Type", binary ?? ("application/x-protobuf", "application/json"))
+			request.headers.set("Content-Encoding", "gzip") when compress
+			for let (name, value) in headers {
+				request.headers.set(name, value)
+			}
+			return try client().do(request)
+		}
+
+		// One OTLP/gRPC call.
+		internal def call(method string, body byte[]) Delivery {
+			let options = grpc.CallOptions{timeout: timeout, compression: compress ?? (grpc.Compression.Gzip, grpc.Compression.Identity)}
+			if headers.len() > 0 {
+				let sent = new grpc.Metadata()
+				for let (name, value) in headers {
+					sent.set(name.lower(), value) onerror (err error) {
+						return Delivery{again: true, message: "otlp: header {name}: {err.message}", cause: err}
+					}
+				}
+				options.metadata = sent
+			}
+			let reply = new otlp.Reply()
+			channel().call(method, body, reply, options) onerror (err error) {
+				let delivery = Delivery{again: true, message: "otlp: {endpoint}{method}: {err.message}", cause: err}
+				if err is grpc.Status {
+					// The codes OTLP has a client try again after; ResourceExhausted only
+					// when the collector says how long to wait.
+					let pause = otlp.retryDelayOf(err.details)
+					delivery.again = [grpc.Code.Cancelled, grpc.Code.DeadlineExceeded, grpc.Code.Aborted, grpc.Code.OutOfRange, grpc.Code.Unavailable, grpc.Code.DataLoss].includes(err.kind) || (err.kind == grpc.Code.ResourceExhausted && !(pause is none))
+					delivery.wait = bounded(pause) unless pause is none
+					delivery.message = "otlp: {endpoint}{method}: {err.code}: {err.message}"
+				}
+				return delivery
+			}
+			return accepted("{endpoint}{method}", otlp.answerOf(reply.bytes, true))
+		}
+
+		// The delivery of a request the collector accepted, which may still have left
+		// records out.
+		internal def accepted(target string, answer otlp.Answer) Delivery {
+			let delivery = Delivery{accepted: true}
+			return delivery unless answer.rejected > 0
+			delivery.rejected = answer.rejected
+			delivery.message = "otlp: {target} left out {answer.rejected} records: {answer.message}"
+			return delivery
+		}
+
+		// The HTTP client, made on first use.
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+
+		// The gRPC connection, made on first use.
+		internal def channel() grpc.Client {
+			let held = rpc
+			return held unless held is none
+			let made = new grpc.Client(endpoint)
+			made.codec = new otlp.Passthrough()
+			made.tlsConfig = tls
+			rpc = made
+			return made
+		}
+
+		// Close implements Exporter. Fails when the gRPC connection does not close.
+		def close() !none {
+			let held = rpc
+			rpc = none
+			web = none
+			try held.close() unless held is none
+			return none
+		}
+	}
+
+	// One of the requests a batch becomes.
+	internal struct Part {
+		// `metrics`, `logs` or `traces`: the last part of the HTTP path.
+		kind  string
+		// The gRPC service that takes it.
+		owner string
+		// How many records it holds.
+		size  int
+		body  byte[]
+	}
+
+	// How the collector took one request.
+	internal struct Delivery {
+		// The collector answered with success.
+		accepted bool
+		// The records are to be sent again.
+		again    bool
+		// How long the collector asked to wait first.
+		wait     duration
+		// How many records it refused for good.
+		rejected int
+		// What went wrong, "" when every record was taken.
+		message  string
+		cause    ?error   = none
+	}
+
+	// The longest pause a collector is granted.
+	internal const longestPause = 1h
+
+	// A pause within what a collector is granted.
+	internal def bounded(pause duration) duration {
+		return 0s when pause < 0s
+		return pause > longestPause ?? (longestPause, pause)
+	}
+
+	// The pause a `Retry-After` header asks for: seconds, or a date to wait until. 0s when
+	// the header is absent or says neither.
+	internal def pauseOf(header string) duration {
+		let text = header.trim()
+		return 0s when text.isEmpty()
+		return bounded(duration(text.toInt<int>() * 1000000000)) when /^[0-9]{1,9}$/.test(text)
+		let until = time.parseHTTPDate(text) onerror (err error) {
+			return 0s
+		}
+		return bounded(until - time.now())
+	}
+
+	// Appends each batch to a file as one line of JSON: for keeping telemetry on the
+	// machine, and for reading what a program would send. The file is opened by the first
+	// batch and made when it does not exist. Writing needs the `adm.storage.write`
+	// permission for the path.
+	type FileExporter {
+		internal path string
+		internal file ?os.File = none
+
+		def new(path string) {
+			self.path = path
+		}
+
+		// Name implements Exporter: `file` and the path.
+		def name() string {
+			return "file {path}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails when the file cannot be opened or written.
+		def export(batch TelemetryBatch) !none {
+			let target = try opened()
+			let line = (new JSON()).encode(batch)
+			line.push(byte(10))
+			try target.write(line)
+			return none
+		}
+
+		// The file, opened on first use.
+		internal def opened() !os.File {
+			let held = file
+			return held unless held is none
+			let made = try os.open(path, "a")
+			file = made
+			return made
+		}
+
+		// Close implements Exporter. Fails when the file does not close.
+		def close() !none {
+			let target = file
+			return none when target is none
+			file = none
+			try target.close()
+			return none
+		}
+	}
+
+	// Prints each batch to standard error, one line per record, for the developer:
+	//
+	// ```
+	// telemetry metric http.requests counter 42 {"route":"/orders"}
+	// telemetry event export.finished {"format":"pdf"}
+	// telemetry error "card declined" billing.CardError {"order":7}
+	// telemetry span checkout 12.5ms
+	// telemetry log error "card declined" {"order":7}
+	// telemetry log - "an entry written without a level" {}
+	// ```
+	type ConsoleExporter {
+		// Name implements Exporter: `console`.
+		def name() string {
+			return "console"
+		}
+
+		// Export implements Exporter. Fails when standard error cannot be written.
+		def export(batch TelemetryBatch) !none {
+			let lines = consoleLines(batch)
+			return none when lines.len() == 0
+			try os.stderr.write((lines.join("\n") + "\n").bytes())
+			return none
+		}
+
+		// Close implements Exporter. Does not fail.
+		def close() !none {
+			return none
+		}
+	}
+
+	// What a ConsoleExporter prints for the batch, a line per record.
+	internal def consoleLines(batch TelemetryBatch) string[] {
+		let codec = new JSON()
+		let lines = string[]
+		for let (_, sample) in batch.metrics {
+			let labels = sample.labels.len() == 0 ?? ("", " " + string(codec.encode(sample.labels)))
+			let value = sample.kind == "counter" ?? ("{sample.count}", string(codec.encode(sample.value)))
+			lines.push("telemetry metric {sample.name} {sample.kind} {value}{labels}")
+		}
+		for let (_, entry) in batch.logs {
+			let level = entry.level
+			let shown = "-"
+			shown = level.name.lower() unless level is none
+			lines.push("telemetry log {shown} {string(codec.encode(entry.message))} {string(codec.encode(entry.fields))}")
+		}
+		for let (_, report) in batch.errors {
+			lines.push("telemetry error {string(codec.encode(report.message))} {report.kind} {string(codec.encode(report.fields))}")
+		}
+		for let (_, used) in batch.events {
+			lines.push("telemetry event {used.name} {string(codec.encode(used.properties))}")
+		}
+		for let (_, timed) in batch.spans {
+			let outcome = timed.failed ?? (" failed", "")
+			lines.push("telemetry span {timed.name} {string(codec.encode(float(timed.end - timed.start) / 1000000.0))}ms{outcome}")
+		}
+		return lines
+	}
+}
