@@ -1,0 +1,539 @@
+// A client's side of MCP over HTTP: the Streamable HTTP transport of
+// 2026-07-28, the one with sessions of 2025-03-26 to 2025-11-25, and the
+// HTTP+SSE transport of 2024-11-05.
+internal partial module std.proto.mcp.session {
+	use (
+		std.time
+		std.bytes
+		std.data.encoding::(JSON, Base64)
+		std.net.http
+		std.net.url
+		std.proto.jsonrpc
+		std.proto.mcp::(McpError, McpErrorKind)
+		std.proto.mcp.wire::*
+	)
+
+	// How a request ended: the response object, or why none came.
+	struct HttpOutcome {
+		response any
+		failure  ?error
+	}
+
+	// A request that waits for its response.
+	type HttpCall {
+		done     channel<HttpOutcome>
+		// The response while it is a stream being read; none for a body
+		// read in one go.
+		answer   ?http.Response
+		finished bool                 = false
+
+		def new() {
+			done = new channel<HttpOutcome>(1)
+		}
+
+		atomic def settle(outcome HttpOutcome) {
+			return when finished
+			finished = true
+			done <- outcome
+		}
+	}
+
+	type HttpCarrier {
+		// The MCP endpoint.
+		target     string
+		client     http.Client
+		// Sent with every request: authorization.
+		headers    map<string, string>
+		// The revision agreed, sent as `MCP-Protocol-Version` by the
+		// revisions that have sessions.
+		version    string              = ""
+		modern     bool                = true
+		session    string              = ""
+		// The 2024-11-05 transport: requests are posted to `postTarget`,
+		// everything of the server arrives on one stream.
+		old        bool                = false
+		postTarget string              = ""
+		open       bool                = true
+		ids        int                 = 0
+		calls      map<int, HttpCall>
+		streams    http.Response[]
+
+		told       def (string, any)
+		asked      def (string, any) !any
+		// The `Authorization` header of the next request, "" for none; and
+		// what to do with the status and challenges a request sent with it
+		// was answered with: true to send it again with new credentials.
+		credential ?def () string
+		answered   ?def (int, string[], string) !bool
+
+		def new(target string, told def (string, any), asked def (string, any) !any) {
+			self.target = target
+			self.told = told
+			self.asked = asked
+			client = new http.Client()
+		}
+
+		atomic def take() (int, HttpCall) {
+			ids++
+			let call = new HttpCall()
+			calls.set(ids, call)
+			return (ids, call)
+		}
+
+		// Keeps the session a server assigned.
+		atomic def adopt(given string) {
+			session = given when given != ""
+		}
+
+		atomic def callOf(handle int) ?HttpCall {
+			return calls.get(handle)
+		}
+
+		atomic def drop(handle int) {
+			calls.delete(handle) when calls.hasKey(handle)
+		}
+
+		// Implements Carrier.
+		def send(method string, params map<string, any>, mirrored map<string, string>) !int {
+			fail jsonrpc.RPCError{message: "mcp: the connection is closed", code: "Closed", kind: jsonrpc.ErrorCode.Closed} unless open
+			let (id, call) = take()
+			let body = map<string, any>{"jsonrpc": "2.0", "id": id, "method": method, "params": params}
+			if old {
+				let res = post(postTarget, body, method, params, mirrored) onerror (err error) {
+					drop(id)
+					fail err
+				}
+				res.close() onerror recover none
+				return id
+			}
+			let task = async perform(call, body, method, params, mirrored)
+			task.keepAlive()
+			return id
+		}
+
+		// Implements Carrier.
+		def receive(handle int, within duration) !any {
+			let call = callOf(handle)
+			fail jsonrpc.RPCError{message: "mcp: no request {handle} is waiting", code: "Protocol", kind: jsonrpc.ErrorCode.Protocol} when call is none
+			let outcome = HttpOutcome{}
+			if within > 0s {
+				let late = time.sleepChan(within)
+				select {
+					case call.done:
+						outcome = <-call.done
+					case late:
+						fail jsonrpc.RPCError{message: "mcp: no response within {within}", code: "Timeout", kind: jsonrpc.ErrorCode.Timeout}
+				}
+			} else {
+				outcome = <-call.done
+			}
+			drop(handle)
+			let failure = outcome.failure
+			fail failure unless failure is none
+			let response = outcome.response
+			if has(response, "error") {
+				let e = member(response, "error")
+				fail jsonrpc.errorOf(intOf(member(e, "code")), textOf(member(e, "message")), member(e, "data"))
+			}
+			return member(response, "result")
+		}
+
+		// Implements Carrier: closing the response stream is how revision
+		// 2026-07-28 cancels; the revisions before it are also told.
+		def cancel(handle int) {
+			let call = callOf(handle)
+			return when call is none
+			drop(handle)
+			if !modern {
+				notify("notifications/cancelled", map<string, any>{"requestId": handle}) onerror recover none
+			}
+			call.settle(HttpOutcome{failure: jsonrpc.RPCError{message: "mcp: the request was cancelled", code: "Closed", kind: jsonrpc.ErrorCode.Closed}})
+			let answer = call.answer
+			shut(answer)
+		}
+
+		// Implements Carrier.
+		def notify(method string, params map<string, any>) !none {
+			let body = map<string, any>{"jsonrpc": "2.0", "method": method, "params": params}
+			let res = try post(old ?? (postTarget, target), body, method, params, new map<string, string>())
+			let status = res.status
+			res.close() onerror recover none
+			fail jsonrpc.RPCError{message: "mcp: HTTP {status} for {method}", code: "Protocol", kind: jsonrpc.ErrorCode.Protocol} when status >= 400
+			return none
+		}
+
+		// Implements Carrier.
+		def alive() bool {
+			return open
+		}
+
+		// Implements Carrier.
+		def mirrors() bool {
+			return true
+		}
+
+		// Implements Carrier: once a revision with a handshake is agreed, the
+		// stream the server speaks on by itself is opened.
+		def agreed(revision string, modern bool) {
+			version = revision
+			self.modern = modern
+			return when modern || old
+			let task = async listen()
+			task.keepAlive()
+		}
+
+		// Implements Carrier: the 2024-11-05 transport, for a server that
+		// answers no POST at its URL. True when its stream opened.
+		def fallback() bool {
+			return false when old
+			let res = fetch(http.Method.GET, new map<string, string>()) onerror recover none
+			return false when res is none
+			if res.status != 200 || !res.headers.get("Content-Type").startsWith("text/event-stream") {
+				shut(res)
+				return false
+			}
+			let events = new http.EventReader(res.body)
+			let first = events.next() onerror recover none
+			let to = ""
+			to = resolved(first.data) when !(first is none) && first.name == "endpoint"
+			if to == "" {
+				shut(res)
+				return false
+			}
+			postTarget = to
+			old = true
+			modern = false
+			streams.push(res)
+			let task = async follow(events)
+			task.keepAlive()
+			return true
+		}
+
+		// A request without a body to the endpoint, with the carrier's
+		// headers and extra's.
+		def fetch(method http.Method, extra map<string, string>) !?http.Response {
+			let carrier = self
+			return try authorized(def () !http.Request {
+				let req = try http.newRequest(method, carrier.target)
+				req.headers.set("Accept", "text/event-stream")
+				for let (name, value) in carrier.headers {
+					req.headers.set(name, value)
+				}
+				for let (name, value) in extra {
+					req.headers.set(name, value)
+				}
+				return req
+			})
+		}
+
+		// Sends the request build makes, and again with new credentials
+		// while the server refuses the ones sent and the client's
+		// authorization finds others. Fails as the HTTP client does, or
+		// when the authorization fails.
+		def authorized(build def () !http.Request) !http.Response {
+			for {
+				let req = try build()
+				let giver = credential
+				let used = giver is none ?? ("", giver())
+				req.headers.set("Authorization", used) when used != ""
+				let res = try client.do(req)
+				let judge = answered
+				return res when judge is none
+				let again = try judge(res.status, res.headers.values("WWW-Authenticate"), used)
+				return res unless again
+				res.close() onerror recover none
+			}
+		}
+
+		// A reference of the server resolved against the endpoint; "" when
+		// either is no URL.
+		def resolved(reference string) string {
+			let out = resolve(reference) onerror recover ""
+			return out
+		}
+
+		def resolve(reference string) !string {
+			let base = try url.parse(target)
+			let to = try base.resolve(reference)
+			return to.str()
+		}
+
+		def shut(res ?http.Response) {
+			return when res is none
+			res.close() onerror recover none
+		}
+
+		// Implements Carrier: a session is ended with DELETE, every stream
+		// closed, and what still waits fails.
+		def close() {
+			return unless open
+			open = false
+			if session != "" {
+				let res = fetch(http.Method.DELETE, map<string, string>{"Mcp-Session-Id": session}) onerror recover none
+				shut(res)
+			}
+			for let (_, res) in streams {
+				res.close() onerror recover none
+			}
+			client.closeIdle()
+			let waiting = calls.values()
+			for let (_, call) in waiting {
+				call.settle(HttpOutcome{failure: jsonrpc.RPCError{message: "mcp: the connection is closed", code: "Closed", kind: jsonrpc.ErrorCode.Closed}})
+				let answer = call.answer
+				shut(answer)
+			}
+		}
+
+		// One POST with the headers its revision asks for.
+		def post(to string, body map<string, any>, method string, params map<string, any>, mirrored map<string, string>) !http.Response {
+			let carrier = self
+			let payload = new JSON().encode(body)
+			return try authorized(def () !http.Request {
+				let req = try http.newRequest(http.Method.POST, to, new bytes.Reader(payload))
+				req.headers.set("Content-Type", "application/json")
+				req.headers.set("Accept", "application/json, text/event-stream")
+				for let (name, value) in carrier.headers {
+					req.headers.set(name, value)
+				}
+				let stated = textOf(member(member(params, "_meta"), versionKey))
+				if stated != "" {
+					req.headers.set("MCP-Protocol-Version", stated)
+					req.headers.set("Mcp-Method", method)
+					if method := "tools/call" || "resources/read" || "prompts/get" || "tasks/get" || "tasks/update" || "tasks/cancel" {
+						req.headers.set("Mcp-Name", headerText(method == "resources/read" ?? (textOf(member(params, "uri")), textOf(member(params, method.startsWith("tasks/") ?? ("taskId", "name"))))))
+					}
+					for let (name, value) in mirrored {
+						req.headers.set("Mcp-Param-{name}", headerText(value))
+					}
+				} else {
+					req.headers.set("Mcp-Session-Id", carrier.session) when carrier.session != ""
+					req.headers.set("MCP-Protocol-Version", carrier.version) when carrier.version != "" && atLeast(carrier.version, "2025-06-18")
+				}
+				return req
+			})
+		}
+
+		// Sends a request and reads its answer: a JSON body, or an event
+		// stream that ends with the response.
+		def perform(call HttpCall, body map<string, any>, method string, params map<string, any>, mirrored map<string, string>) {
+			let failure ?error = none
+			let res = post(target, body, method, params, mirrored) onerror (err error) {
+				failure = err
+				recover new http.Response()
+			}
+			if !(failure is none) {
+				// A failed authorization says what is wrong; anything else is
+				// a connection that did not carry the request.
+				let reported = failure is McpError ?? (failure, jsonrpc.RPCError{message: "mcp: {failure.message}", code: "Closed", kind: jsonrpc.ErrorCode.Closed})
+				call.settle(HttpOutcome{failure: reported})
+				return
+			}
+			adopt(res.headers.get("Mcp-Session-Id")) when method == "initialize"
+			if call.finished {
+				// Cancelled while the request was on its way: nobody reads
+				// the answer, and closing it is how a stream is given up.
+				res.close() onerror recover none
+				return
+			}
+			if res.headers.get("Content-Type").startsWith("text/event-stream") {
+				// Only a stream is handed to `cancel`, which closes it under
+				// this read to end it. A body with a length is read here
+				// alone: closing drains it, and two readers of one body
+				// leave the connection with half a response in it.
+				call.answer = res
+				read(new http.EventReader(res.body), call)
+				call.settle(HttpOutcome{failure: jsonrpc.RPCError{message: "mcp: the stream ended before the response", code: "Closed", kind: jsonrpc.ErrorCode.Closed}})
+				res.close() onerror recover none
+				return
+			}
+			let status = res.status
+			let challenge = res.headers.get("WWW-Authenticate")
+			let data = res.bytes() onerror recover byte[]
+			res.close() onerror recover none
+			let doc = new JSON().parse(data) onerror recover none
+			if has(doc, "result") || has(doc, "error") {
+				call.settle(HttpOutcome{response: doc})
+				return
+			}
+			if status := 401 || 403 {
+				call.settle(HttpOutcome{failure: McpError{message: "mcp: HTTP {status}: the server refused the credentials", code: "Unauthorized", kind: McpErrorKind.Unauthorized, number: status, data: challenge}})
+				return
+			}
+			call.settle(HttpOutcome{failure: jsonrpc.RPCError{message: "mcp: HTTP {status} without a JSON-RPC response", code: "Protocol", kind: jsonrpc.ErrorCode.Protocol, number: status}})
+		}
+
+		// Reads events until the stream ends: notifications and requests of
+		// the server go to their handlers, a response to the call it
+		// answers. Returns once call has its response, when one is given.
+		def read(events http.EventReader, call ?HttpCall) {
+			for open {
+				let event = events.next() onerror recover none
+				return when event is none
+				let doc = new JSON().parse(event.data) onerror recover none
+				continue when doc is none
+				for let (_, message) in items(doc) {
+					take(message)
+				}
+				return when !(call is none) && call.finished
+			}
+		}
+
+		// The messages of an event's data: one, or a batch.
+		def items(doc any) any[] {
+			match doc {
+				case any[]:
+					return doc
+				default:
+					return [doc]
+			}
+		}
+
+		// Takes one message of the server.
+		def take(message any) {
+			let method = textOf(member(message, "method"))
+			if method == "" {
+				let call = callOf(intOf(member(message, "id")))
+				call.settle(HttpOutcome{response: message}) unless call is none
+				return
+			}
+			if !has(message, "id") {
+				told(method, member(message, "params"))
+				return
+			}
+			// A request of the server, answered with a POST of its own.
+			let answer = map<string, any>{"jsonrpc": "2.0", "id": member(message, "id")}
+			let failure ?error = none
+			let result = asked(method, member(message, "params")) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is none {
+				answer.set("result", result)
+			} else if failure is jsonrpc.RPCError {
+				answer.set("error", map<string, any>{"code": failure.number, "message": failure.message})
+			} else {
+				answer.set("error", map<string, any>{"code": -32603, "message": failure.message})
+			}
+			let res = post(old ?? (postTarget, target), answer, "", new map<string, any>(), new map<string, string>()) onerror (err error) {
+				recover new http.Response()
+			}
+			shut(res)
+		}
+
+		// The stream of the 2024-11-05 transport.
+		def follow(events http.EventReader) {
+			read(events, none)
+			close()
+		}
+
+		// The GET stream of a session, reopened where it broke off while the
+		// server keeps offering it.
+		def listen() {
+			let last = ""
+			for open {
+				let extra = new map<string, string>()
+				extra.set("Mcp-Session-Id", session) when session != ""
+				extra.set("MCP-Protocol-Version", version) when atLeast(version, "2025-06-18")
+				extra.set("Last-Event-ID", last) when last != ""
+				let res = fetch(http.Method.GET, extra) onerror recover none
+				return when res is none
+				if res.status != 200 {
+					// 405: the server offers no such stream.
+					res.close() onerror recover none
+					return
+				}
+				streams.push(res)
+				let events = new http.EventReader(res.body)
+				read(events, none)
+				last = events.lastId
+				res.close() onerror recover none
+				time.sleep(100ms) when open
+			}
+		}
+	}
+
+	// A value as a mirrored header carries it: as it is when it is plain
+	// ASCII without surrounding spaces, else as `=?base64?…?=`.
+	def headerText(value string) string {
+		let plain = value.len() > 0 && !value.startsWith(" ") && !value.endsWith(" ") && !(value.startsWith("=?base64?") && value.endsWith("?="))
+		for let (_, c) in value {
+			plain = false when c < ' ' || c > '~'
+		}
+		return value when plain
+		return "=?base64?" + new Base64().encode(value.bytes()) + "?="
+	}
+
+	// The `Mcp-Param-…` headers a tool call sends: the header name and the
+	// value of each argument whose schema carries `x-mcp-header`.
+	def mirroredHeaders(properties any, arguments any, out map<string, string>) {
+		for let (key, schema) in objectOf(properties) {
+			let value = member(arguments, key)
+			continue when value is none
+			let nested = member(schema, "properties")
+			mirroredHeaders(nested, value, out) unless nested is none
+			let header = textOf(member(schema, "x-mcp-header"))
+			continue when header == ""
+			match value {
+				case string:
+					out.set(header, value)
+				case bool:
+					out.set(header, value ?? ("true", "false"))
+				case int:
+					out.set(header, "{value}")
+				default:
+			}
+		}
+	}
+
+	// What is wrong with the `x-mcp-header` uses of a tool's input schema;
+	// "" when they are sound: a header name that is an HTTP token, used
+	// once, on a string, integer or boolean reached through `properties`
+	// only.
+	def mirrorProblem(schema any) string {
+		let seen string[] = []
+		let problem = checkMirrors(member(schema, "properties"), seen)
+		return problem when problem != ""
+		return strayMirror(schema, true) ?? ("x-mcp-header outside the properties of the arguments", "")
+	}
+
+	def checkMirrors(properties any, seen string[]) string {
+		for let (key, schema) in objectOf(properties) {
+			let nested = member(schema, "properties")
+			if !(nested is none) {
+				let inner = checkMirrors(nested, seen)
+				return inner when inner != ""
+			}
+			continue unless has(schema, "x-mcp-header")
+			let header = textOf(member(schema, "x-mcp-header"))
+			return "{key}: x-mcp-header is empty or not a header name" unless /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(header)
+			return "{key}: x-mcp-header {header} is used twice" when header.lower() in seen
+			seen.push(header.lower())
+			return "{key}: x-mcp-header needs a string, integer or boolean parameter" unless textOf(member(schema, "type")) := "string" || "integer" || "boolean"
+		}
+		return ""
+	}
+
+	// Whether `x-mcp-header` appears where a header cannot be read from:
+	// under anything but a chain of `properties`.
+	def strayMirror(schema any, reachable bool) bool {
+		for let (key, value) in objectOf(schema) {
+			return true when key == "x-mcp-header" && !reachable
+			if key == "properties" {
+				for let (_, property) in objectOf(value) {
+					return true when strayMirror(property, reachable)
+				}
+				continue
+			}
+			match value {
+				case map<string, any>:
+					return true when strayMirror(value, false)
+				case any[]:
+					for let (_, item) in value {
+						return true when strayMirror(item, false)
+					}
+				default:
+			}
+		}
+		return false
+	}
+}

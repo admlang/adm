@@ -1,0 +1,411 @@
+// Tasks: tool calls a server carries on after it answered. Revision
+// 2025-11-25 has them in its core (the client asks for one with `task`,
+// polls `tasks/get`, and fetches the result with `tasks/result`); revision
+// 2026-07-28 has the extension `io.modelcontextprotocol/tasks` (the server
+// decides, `tasks/get` carries the result, `tasks/update` the client's
+// answers). One record serves both.
+internal partial module std.proto.mcp.session {
+	use (
+		std.time
+		std.crypto::(rand)
+		std.proto.jsonrpc
+		std.proto.mcp::*
+		std.proto.mcp.wire::*
+	)
+
+	// A link for work nobody listens to: a task of revision 2026-07-28
+	// sends neither progress nor log messages, and outlives the response
+	// its request was answered on.
+	type SilentLink {
+		def new() {}
+
+		// Implements Link.
+		def notify(method string, params map<string, any>) !none {
+			return none
+		}
+
+		// Implements Link.
+		def call(method string, params any) !any {
+			fail jsonrpc.errorOf(-32603, "mcp: a task has no requests to the client")
+		}
+
+		// Implements Link.
+		def alive() bool {
+			return true
+		}
+
+		// Implements Link.
+		def beat() {}
+	}
+
+	// One task: its state as clients see it, the request it runs, what it
+	// ended with, and the questions it has for the client.
+	type TaskRecord {
+		info     Task
+		// Who may see it: the caller it was made for; "" for whoever holds
+		// its id.
+		owner    string            = ""
+		// Made under revision 2026-07-28.
+		modern   bool              = false
+		exchange Exchange
+		// The connection that is told of its changes (2025-11-25).
+		conn     ?Conn
+		// Tells whoever listens that the task changed.
+		told     ?def ()
+		result   ?map<string, any>
+		failure  ?map<string, any>
+		// The requests to the client that wait for an answer, and the
+		// answers that came, by key. A key is used once.
+		requests map<string, any>
+		answers  map<string, any>
+		keys     int               = 0
+		waiters  channel<bool>[]
+
+		def new(id string, exchange Exchange) {
+			self.exchange = exchange
+			let now = time.now()
+			info = Task{id: id, status: TaskStatus.Working, created: now, updated: now}
+		}
+
+		def wake() {
+			for let (_, waiter) in waiters {
+				waiter.offer(true)
+			}
+			waiters = []
+		}
+
+		atomic def terminal() bool {
+			return info.status := TaskStatus.Completed || TaskStatus.Failed || TaskStatus.Cancelled
+		}
+
+		// A channel that receives a value when the task next changes.
+		atomic def changed() channel<bool> {
+			let waiter = new channel<bool>(1)
+			waiters.push(waiter)
+			return waiter
+		}
+
+		// Moves a task that has not ended to another status. False when it
+		// had ended: an ended task stays as it is.
+		atomic def move(status TaskStatus, message string = "") bool {
+			return false when info.status := TaskStatus.Completed || TaskStatus.Failed || TaskStatus.Cancelled
+			info.status = status
+			info.message = message when message != ""
+			info.updated = time.now()
+			wake()
+			return true
+		}
+
+		// Ends the task with its result or its error.
+		atomic def conclude(status TaskStatus, result ?map<string, any>, failure ?map<string, any>, message string) bool {
+			return false when info.status := TaskStatus.Completed || TaskStatus.Failed || TaskStatus.Cancelled
+			info.status = status
+			info.message = message when message != ""
+			info.updated = time.now()
+			self.result = result
+			self.failure = failure
+			requests = new map<string, any>()
+			wake()
+			return true
+		}
+
+		atomic def note(message string) {
+			info.message = message
+			info.updated = time.now()
+		}
+
+		// Files a request to the client and returns its key.
+		atomic def want(method string, params any) string {
+			let key = "{method.replace("/", "-")}-{keys}"
+			keys++
+			let wanted = map<string, any>{"method": method}
+			wanted.set("params", params) unless params is none
+			requests.set(key, wanted)
+			info.status = TaskStatus.InputRequired
+			info.updated = time.now()
+			wake()
+			return key
+		}
+
+		// Takes the client's answers; one for a key that waits for none is
+		// dropped. False when none of them was waited for.
+		atomic def answer(responses map<string, any>) bool {
+			let taken = false
+			for let (key, response) in responses {
+				continue unless requests.hasKey(key)
+				requests.delete(key)
+				answers.set(key, response)
+				taken = true
+			}
+			return false unless taken
+			info.status = TaskStatus.Working when requests.len() == 0 && info.status == TaskStatus.InputRequired
+			info.updated = time.now()
+			wake()
+			return true
+		}
+
+		// The answer to a request, and whether it has come.
+		atomic def take(key string) (any, bool) {
+			return (none, false) unless answers.hasKey(key)
+			let response = answers[key]
+			answers.delete(key)
+			return (response, true)
+		}
+
+		atomic def outstanding() map<string, any> {
+			return requests.clone()
+		}
+
+		atomic def expired() bool {
+			let lifetime = info.lifetime
+			let created = info.created
+			return false when lifetime is none || created is none
+			return !time.now().before(created + lifetime)
+		}
+	}
+
+	def missingTasks(text string) jsonrpc.RPCError {
+		let needed = map<string, any>{"extensions": map<string, any>{tasksExtension: new map<string, any>()}}
+		return jsonrpc.errorOf(-32021, text, map<string, any>{"requiredCapabilities": needed})
+	}
+
+	// Who a request comes from, as far as tasks are kept apart: the subject
+	// and client of its access token; else its connection, where a
+	// connection outlives a request; else nobody, and the task's id is all
+	// that guards it.
+	def ownerOf(core Core, env Envelope, modern bool) string {
+		let admission = env.admission
+		if !(admission is none) {
+			let subject = admission.token.subject
+			let client = admission.token.clientId
+			return "token {subject is none ?? ("", subject)} {client is none ?? ("", client)}"
+		}
+		return modern ?? ("", core.tagOf(env.conn))
+	}
+
+	// Whether a `tools/call` is answered with a task. Fails when the tool
+	// and the client disagree on it.
+	def runsAsTask(core Core, req jsonrpc.Request, x Exchange) !bool {
+		let name = textOf(member(req.params, "name"))
+		let at = core.toolIndex(name)
+		return false when at < 0
+		let support = core.tools[at].info.taskSupport
+		if x.modern {
+			// The server decides, for a client that can follow a task.
+			let able = x.capabilities.extensions.hasKey(tasksExtension)
+			fail missingTasks("{name} runs as a task only") when support == TaskSupport.Required && !able
+			return able && support != TaskSupport.Forbidden
+		}
+		// The client asks; the revisions before 2025-11-25 have no tasks
+		// and are answered when the tool returns.
+		return false unless x.revision == "2025-11-25"
+		let asked = has(req.params, "task")
+		fail jsonrpc.errorOf(-32601, "{name} does not run as a task") when asked && support == TaskSupport.Forbidden
+		fail jsonrpc.errorOf(-32601, "{name} runs as a task only: send `task` with the call") when !asked && support == TaskSupport.Required
+		return asked
+	}
+
+	// Makes the task of a tool call, starts the tool beside the request,
+	// and returns what the request is answered with.
+	def startTask(core Core, req jsonrpc.Request, env Envelope, x Exchange) !map<string, any> {
+		let made = try rand(16)
+		let record = new TaskRecord(made.hex(), x)
+		record.owner = ownerOf(core, env, x.modern)
+		record.modern = x.modern
+		let lifetime = core.taskLifetime
+		let asked = optionalInt(member(member(req.params, "task"), "ttl"))
+		lifetime = 1ms * float(asked) when !(asked is none) && asked > 0 && 1ms * float(asked) < lifetime
+		record.info.lifetime = lifetime
+		record.info.pollInterval = core.taskPoll
+		record.told = def () {
+			announce(core, record)
+		}
+		x.task = record
+		if x.modern {
+			x.progressToken = none
+			x.logLevel = none
+			x.link = new SilentLink()
+		} else {
+			// What the task sends goes on the connection, not on the
+			// response of the request that made it.
+			record.conn = env.conn
+			x.link = env.conn.link
+		}
+		core.keepTask(record)
+		let work = async runTask(core, req, record)
+		work.keepAlive()
+		let out = taskJson(record.info, x.modern)
+		return map<string, any>{"task": out} unless x.modern
+		out.set("resultType", "task")
+		return out
+	}
+
+	def runTask(core Core, req jsonrpc.Request, record TaskRecord) {
+		let failure ?error = none
+		let out = core.run(req, record.exchange) onerror (err error) {
+			failure = err
+			recover new map<string, any>()
+		}
+		let ended = false
+		if failure is none {
+			// 2025-11-25 calls a tool that ran and failed a failed task; the
+			// extension keeps that word for protocol errors.
+			let failed = !record.modern && boolOf(member(out, "isError"))
+			let content = listOf(member(out, "content"))
+			let said = failed && content.len() > 0 ?? (textOf(member(content[0], "text")), "")
+			ended = record.conclude(failed ?? (TaskStatus.Failed, TaskStatus.Completed), out, none, said)
+		} else {
+			let report = map<string, any>{"code": failure is jsonrpc.RPCError ?? (failure.number, -32603), "message": failure.message}
+			let data = failure is jsonrpc.RPCError ?? (failure.data, none)
+			report.set("data", data) unless data is none
+			ended = record.conclude(TaskStatus.Failed, none, report, failure.message)
+		}
+		announce(core, record) when ended
+	}
+
+	// A task with what its status brings along: the result, the error, or
+	// the requests to the client (revision 2026-07-28).
+	def detailed(record TaskRecord) map<string, any> {
+		let out = taskJson(record.info, true)
+		match record.info.status {
+			case TaskStatus.Completed:
+				let result = record.result
+				out.set("result", result) unless result is none
+			case TaskStatus.Failed:
+				let failure = record.failure
+				out.set("error", failure) unless failure is none
+			case TaskStatus.InputRequired:
+				out.set("inputRequests", record.outstanding())
+			default:
+		}
+		return out
+	}
+
+	// Tells of a task's change: the connection it was made on (2025-11-25),
+	// the listen streams that named it (2026-07-28).
+	def announce(core Core, record TaskRecord) {
+		if !record.modern {
+			let conn = record.conn
+			return when conn is none
+			conn.link.notify("notifications/tasks/status", taskJson(record.info, false)) onerror recover none
+			return
+		}
+		for let (_, listener) in core.everyListener() {
+			continue unless record.info.id in listener.taskIds
+			listener.link.notify("notifications/tasks", tagged(listener.id, detailed(record))) onerror recover none
+		}
+	}
+
+	// A request of a task's handler to the client. Revision 2025-11-25
+	// sends it on the connection, tied to the task; revision 2026-07-28
+	// shows it in `tasks/get` and waits for `tasks/update`. Fails with the
+	// client's error, or when the task is cancelled meanwhile.
+	def awaitInput(record TaskRecord, x Exchange, method string, params any) !any {
+		let tell = record.told
+		if !record.modern {
+			record.move(TaskStatus.InputRequired)
+			tell() unless tell is none
+			let sent = objectOf(params).clone()
+			let carried = objectOf(member(sent, "_meta")).clone()
+			carried.set(relatedTaskKey, map<string, any>{"taskId": record.info.id})
+			sent.set("_meta", carried)
+			let failure ?error = none
+			let response = x.link.call(method, sent) onerror (err error) {
+				failure = err
+				recover none
+			}
+			record.move(TaskStatus.Working)
+			tell() unless tell is none
+			fail failure unless failure is none
+			return response
+		}
+		let key = record.want(method, params)
+		tell() unless tell is none
+		for {
+			let waiter = record.changed()
+			let (response, came) = record.take(key)
+			if came {
+				tell() unless tell is none
+				return response
+			}
+			fail jsonrpc.errorOf(-32603, "mcp: the task was cancelled") when x.stopped() || record.terminal()
+			select {
+				case waiter:
+				case x.wake:
+			}
+		}
+	}
+
+	// The task a request names, for the caller it was made for. Fails with
+	// -32602 for an id that is unknown, lapsed, or another caller's.
+	def taskNamed(core Core, env Envelope, modern bool, params any) !TaskRecord {
+		let record = core.findTask(textOf(member(params, "taskId")))
+		fail jsonrpc.errorOf(-32602, "Task not found") when record is none || record.owner != ownerOf(core, env, modern)
+		return record
+	}
+
+	def getTask(core Core, env Envelope, modern bool, params any) !map<string, any> {
+		let record = try taskNamed(core, env, modern, params)
+		return modern ?? (detailed(record), taskJson(record.info, false))
+	}
+
+	// `tasks/result` of 2025-11-25: waits until the task has ended, then
+	// answers as the call itself would have.
+	def taskResult(core Core, env Envelope, params any) !map<string, any> {
+		let record = try taskNamed(core, env, false, params)
+		for !record.terminal() {
+			let waiter = record.changed()
+			break when record.terminal()
+			let tick = time.sleepChan(listenCheck)
+			select {
+				case waiter:
+				case tick:
+					fail jsonrpc.NoReply{message: "mcp: the client left"} unless env.link.alive()
+			}
+		}
+		let failure = record.failure
+		fail jsonrpc.errorOf(intOf(member(failure, "code")), textOf(member(failure, "message")), member(failure, "data")) unless failure is none
+		let result = record.result
+		fail jsonrpc.errorOf(-32603, "mcp: the task was cancelled") when result is none
+		let out = result.clone()
+		let carried = objectOf(member(out, "_meta")).clone()
+		carried.set(relatedTaskKey, map<string, any>{"taskId": record.info.id})
+		out.set("_meta", carried)
+		return out
+	}
+
+	// `tasks/list` of 2025-11-25: the caller's tasks, oldest first.
+	def listTasks(core Core, env Envelope, params any) !map<string, any> {
+		let mine = core.tasksOf(ownerOf(core, env, false))
+		let (from, to, next) = try core.page(params, mine.len())
+		let items any[] = []
+		for let i = from; i < to; i++ {
+			items.push(taskJson(mine[i].info, false))
+		}
+		let out = map<string, any>{"tasks": items}
+		put(out, "nextCursor", next)
+		return out
+	}
+
+	// Cancels a task: its handler is told, and the task is cancelled from
+	// then on whatever the handler still returns. 2025-11-25 answers with
+	// the task and refuses one that has ended; the extension acknowledges.
+	def cancelTask(core Core, env Envelope, modern bool, params any) !map<string, any> {
+		let record = try taskNamed(core, env, modern, params)
+		record.exchange.stop()
+		let cancelled = record.conclude(TaskStatus.Cancelled, none, none, "The task was cancelled by request.")
+		announce(core, record) when cancelled
+		return new map<string, any>() when modern
+		fail jsonrpc.errorOf(-32602, "Cannot cancel task: already in terminal status '{record.info.status.value}'") unless cancelled
+		return taskJson(record.info, false)
+	}
+
+	// `tasks/update` of 2026-07-28: the client's answers to the task's
+	// requests.
+	def updateTask(core Core, env Envelope, params any) !map<string, any> {
+		let record = try taskNamed(core, env, true, params)
+		let taken = record.answer(objectOf(member(params, "inputResponses")))
+		announce(core, record) when taken
+		return new map<string, any>()
+	}
+}

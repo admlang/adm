@@ -1,0 +1,343 @@
+// A client's way into a server that asks for authorization: the protocol's
+// profile of OAuth 2.1 (protected resource metadata, authorization server
+// discovery, Client ID Metadata Documents or registration, the
+// authorization code flow with PKCE and resource indicators, refresh and
+// step-up).
+partial module std.proto.mcp {
+	use (
+		std.data.encoding::(JSON)
+		std.net.http
+		std.net.url
+		std.proto.auth.oauth2
+		std.proto.mcp.wire::*
+	)
+
+	// How often in a row a server may refuse the credentials an
+	// authorization just got before the request fails for good.
+	const authorizationRounds = 3
+
+	// CredentialStore keeps what an `Authorization` earned between runs of
+	// the program: tokens and dynamic registrations, as text under a key.
+	// The text holds secrets: keep it where the user's other secrets are.
+	interface CredentialStore {
+		// The text kept under key; none when there is none.
+		def load(key string) !?string
+		// Keeps text under key, replacing what was there.
+		def save(key string, value string) !none
+	}
+
+	// Authorization gets a client into an MCP server that asks for an
+	// access token. Give one to a `Client` before it opens; when the server
+	// answers 401, the client finds the server's authorization server, sends
+	// the user there through `browse`, and sends the request again with the
+	// token; it refreshes the token when it expires and asks for more
+	// scopes when the server answers 403 for lack of one.
+	//
+	// ```
+	// let access = new mcp.Authorization("http://127.0.0.1:7777/callback", def (page string) !string {
+	// 	// open page in the user's browser, wait for the request to
+	// 	// /callback on port 7777, and return its URL
+	// })
+	// access.documentUrl = "https://app.example.com/mcp-client.json"
+	// let client = try mcp.connect("https://tools.example.com/mcp", access)
+	// ```
+	//
+	// Who the client is to the authorization server, first match wins:
+	// `clientId` when set (registered by hand); `documentUrl` when the
+	// server takes Client ID Metadata Documents; a registration made on the
+	// spot under `name` when the server allows that (kept in `store`).
+	//
+	// One Authorization serves one MCP server; several clients of that
+	// server may share it.
+	type Authorization {
+		// Where the authorization server sends the browser back: a URL the
+		// program sees requests to, such as a loopback address it listens
+		// on. It must be one the client is registered with.
+		redirectUri string
+		// Takes the user through the authorization: given the page to open
+		// in a browser, returns the URL the browser was sent back to
+		// (redirectUri with its query). Fail to give up.
+		browse      def(string) !string
+		// The https URL of the client's Client ID Metadata Document, which
+		// `oauth2.ClientMetadata.document` renders; "" when it has none.
+		documentUrl string              = ""
+		// A client id registered by hand, its secret when it has one, and
+		// the issuer of the authorization server it is registered with; the
+		// authorization fails when the MCP server uses another one.
+		clientId    string              = ""
+		secret      ?Secret<string>
+		issuer      string              = ""
+		// The name a registration made on the spot shows to the user.
+		name        string              = "adm"
+		// The scopes to ask for when the server names none.
+		scopes      string[]
+		// Keeps tokens and registrations between runs; none keeps them
+		// while the program runs.
+		store       ?CredentialStore
+		// The client metadata, registration and tokens are fetched with; a
+		// default client when none.
+		httpClient  ?http.Client
+		// The token in use; none before the first authorization.
+		token       ?oauth2.Token
+
+		// The MCP endpoint, the resource identifier its metadata names, and
+		// the issuer of the authorization server the token came from.
+		internal target    string         = ""
+		internal resource  string         = ""
+		internal tokenFrom string         = ""
+		internal server    ?oauth2.Client
+		// Every scope asked for so far: a step-up asks for them again.
+		internal requested string[]
+		internal failures  int            = 0
+		internal restored  bool           = false
+		// Held by the one task that renews the credentials.
+		internal gate      channel<bool>
+
+		def new(redirectUri string, browse def(string) !string) {
+			self.redirectUri = redirectUri
+			self.browse = browse
+			gate = new channel<bool>(1)
+		}
+	}
+
+	internal def authorizationError(text string, cause ?error = none) McpError {
+		return McpError{message: "mcp: " + text, code: "Unauthorized", cause: cause, kind: McpErrorKind.Unauthorized}
+	}
+
+	// Ties an authorization to the endpoint a client opens; what it held
+	// for another endpoint is dropped, since a token goes only to the
+	// server it was issued for.
+	internal def bind(a Authorization, target string) {
+		return when a.target == target
+		if a.target != "" {
+			a.token = none
+			a.server = none
+			a.requested = []
+			a.tokenFrom = ""
+			a.resource = ""
+		}
+		a.target = target
+		a.restored = false
+		a.failures = 0
+	}
+
+	// The `Authorization` header of the next request; "" while there is no
+	// token. An expired token is refreshed first.
+	internal def credentialOf(a Authorization) string {
+		a.gate <- true
+		restore(a)
+		let held = a.token
+		if !(held is none) && held.expired() {
+			refresh(a) onerror recover false
+		}
+		let current = a.token
+		let _ = <-a.gate
+		return current is none ?? ("", "Bearer " + current.accessToken.reveal())
+	}
+
+	// What the server answered to a request sent with the credential used.
+	// True when it refused and there are new credentials to send the
+	// request again with. Fails with Unauthorized when the authorization
+	// was needed and did not succeed.
+	internal def answered(a Authorization, status int, challenges string[], used string) !bool {
+		if !(status := 401 || 403) {
+			a.failures = 0
+			return false
+		}
+		a.gate <- true
+		let failure ?error = none
+		let again = renew(a, status, challenges, used) onerror (err error) {
+			failure = err
+			recover false
+		}
+		let _ = <-a.gate
+		return again when failure is none
+		fail failure when failure is McpError
+		fail authorizationError(failure.message.trimPrefix("oauth2: "), failure)
+	}
+
+	internal def renew(a Authorization, status int, challenges string[], used string) !bool {
+		let current = a.token
+		// Another request renewed the credentials meanwhile.
+		return true when !(current is none) && "Bearer " + current.accessToken.reveal() != used
+		let asked = http.AuthChallenge{scheme: "bearer", params: map<string, string>{}}
+		for let challenge in http.parseChallenges(challenges) {
+			continue unless challenge.scheme == "bearer"
+			asked = challenge
+			break
+		}
+		let reason = asked.params.get("error")
+		// A 403 that is not about scopes is the server's last word.
+		return false when status == 403 && !(!(reason is none) && reason == "insufficient_scope")
+		a.failures++
+		return false when a.failures > authorizationRounds
+		// A token the server no longer takes: one refresh before the user
+		// is asked again.
+		if status == 401 && a.failures == 1 && !(current is none) {
+			let fresh = refresh(a) onerror recover false
+			return true when fresh
+		}
+		let described = try oauth2.discoverResource(a.target, a.httpClient, asked.params.get("resource_metadata"))
+		fail authorizationError("{a.target} names no authorization server in its metadata") when described.authorizationServers.len() == 0
+		let issuer = described.authorizationServers[0]
+		if a.clientId != "" && a.issuer != "" {
+			fail authorizationError("client {a.clientId} is registered with {a.issuer}, but {a.target} uses {described.authorizationServers.join(", ")}: register it there") unless a.issuer in described.authorizationServers
+			issuer = a.issuer
+		}
+		let client = try oauthClient(a, issuer)
+		// The scopes of the challenge are what this request needs; without
+		// them, what the resource says a client needs at least.
+		let wanted = a.scopes
+		wanted = described.scopesSupported when described.scopesSupported.len() > 0
+		let named = asked.params.get("scope")
+		wanted = named.split(" ").filter(s => s != "") unless named is none
+		for let scope in wanted {
+			a.requested.push(scope) unless scope in a.requested
+		}
+		let asking = a.requested.clone()
+		asking.push("offline_access") when "offline_access" in client.metadata.scopesSupported && !("offline_access" in asking)
+		let request = try client.authorize(a.redirectUri, asking, oauth2.AuthorizationOptions{resource: [described.resource]})
+		let visit = a.browse
+		let callback = try visit(request.url)
+		a.token = try client.exchange(request, callback)
+		a.resource = described.resource
+		a.tokenFrom = issuer
+		persist(a)
+		return true
+	}
+
+	// Redeems the refresh token. False when there is none to redeem; fails
+	// when the authorization server refuses it.
+	internal def refresh(a Authorization) !bool {
+		let held = a.token
+		return false when held is none || held.refreshToken is none || a.tokenFrom == ""
+		let client = try oauthClient(a, a.tokenFrom)
+		let failure ?error = none
+		let fresh = client.refresh(held, [], [a.resource]) onerror (err error) {
+			failure = err
+			recover held
+		}
+		if !(failure is none) {
+			// A refresh token is spent once tried; the user is asked again.
+			held.refreshToken = none
+			fail failure
+		}
+		a.token = fresh
+		persist(a)
+		return true
+	}
+
+	// The OAuth client of an authorization server: its metadata checked for
+	// what the protocol requires, and this client's identity there.
+	internal def oauthClient(a Authorization, issuer string) !oauth2.Client {
+		let existing = a.server
+		return existing when !(existing is none) && existing.metadata.issuer == issuer
+		let metadata = try oauth2.discover(issuer, a.httpClient)
+		fail authorizationError("authorization server {issuer} does not offer PKCE with S256, which MCP requires") unless "S256" in metadata.codeChallengeMethodsSupported
+		let (id, secret) = try identity(a, metadata)
+		let client = new oauth2.Client(id, metadata)
+		client.secret = secret
+		client.httpClient = a.httpClient
+		a.server = client
+		return client
+	}
+
+	// Who this client is to an authorization server: the id registered by
+	// hand, the client document's URL, a registration kept from before, or
+	// one made now.
+	internal def identity(a Authorization, metadata oauth2.ServerMetadata) !(string, ?Secret<string>) {
+		if a.clientId != "" {
+			fail authorizationError("client {a.clientId} is registered with {a.issuer}, not with {metadata.issuer}") unless a.issuer == "" || a.issuer == metadata.issuer
+			return (a.clientId, a.secret)
+		}
+		return (a.documentUrl, none) when a.documentUrl != "" && metadata.clientIdMetadataDocumentSupported
+		let key = "client " + metadata.issuer + " " + a.redirectUri
+		let kept = new JSON().parse(load(a, key)) onerror recover none
+		let known = textOf(member(kept, "client_id"))
+		if known != "" {
+			let password = textOf(member(kept, "client_secret"))
+			return (known, none) when password == ""
+			return (known, password)
+		}
+		fail authorizationError("authorization server {metadata.issuer} takes neither a client document nor a registration: register this client there and set Authorization.clientId") when metadata.registrationEndpoint is none
+		let described = new oauth2.ClientMetadata()
+		described.redirectUris = [a.redirectUri]
+		described.tokenEndpointAuthMethod = "none"
+		described.grantTypes = ["authorization_code", "refresh_token"]
+		described.responseTypes = ["code"]
+		described.clientName = a.name
+		// OpenID Connect servers take loopback redirect URIs from native
+		// applications only, and assume a web one unless told.
+		described.set("application_type", isLocal(a.redirectUri) ?? ("native", "web"))
+		let registrar = new oauth2.Client("", metadata)
+		registrar.httpClient = a.httpClient
+		let registration = try registrar.register(described)
+		let entry = map<string, any>{"client_id": registration.clientId}
+		let issued = registration.clientSecret
+		entry.set("client_secret", issued.reveal()) unless issued is none
+		save(a, key, string(new JSON().encode(entry)))
+		return (registration.clientId, issued)
+	}
+
+	// Whether a redirect URI stays on this machine: a loopback address, or
+	// a scheme of the application's own.
+	internal def isLocal(redirect string) bool {
+		let parsed = true
+		let u = url.parse(redirect) onerror (err error) {
+			parsed = false
+			recover new url.URL()
+		}
+		return false unless parsed
+		return true unless u.scheme := "http" || "https"
+		return u.hostname() := "localhost" || "127.0.0.1" || "[::1]" || "::1"
+	}
+
+	// Takes up the token kept for the endpoint by an earlier run.
+	internal def restore(a Authorization) {
+		return when a.restored
+		a.restored = true
+		return unless a.token is none
+		let kept = new JSON().parse(load(a, "token " + a.target)) onerror recover none
+		return unless has(kept, "token")
+		let readable = true
+		let token = oauth2.parseToken(string(new JSON().encode(member(kept, "token")))) onerror (err error) {
+			readable = false
+			recover new oauth2.Token("")
+		}
+		return unless readable
+		a.token = token
+		a.tokenFrom = textOf(member(kept, "issuer"))
+		a.resource = textOf(member(kept, "resource"))
+		for let scope in listOf(member(kept, "scopes")) {
+			a.requested.push(textOf(scope))
+		}
+	}
+
+	internal def persist(a Authorization) {
+		let token = a.token
+		return when token is none
+		let scopes any[] = []
+		for let scope in a.requested {
+			scopes.push(scope)
+		}
+		let members = new JSON().parse(token.json()) onerror recover none
+		let entry = map<string, any>{"issuer": a.tokenFrom, "resource": a.resource, "scopes": scopes, "token": members}
+		save(a, "token " + a.target, string(new JSON().encode(entry)))
+	}
+
+	// What the store keeps under key; "" without a store, without an entry,
+	// or when the store fails: the user is then asked again.
+	internal def load(a Authorization, key string) string {
+		let store = a.store
+		return "" when store is none
+		let text = store.load(key) onerror recover none
+		return text is none ?? ("", text)
+	}
+
+	// A store that fails loses nothing but the next run's shortcut.
+	internal def save(a Authorization, key string, value string) {
+		let store = a.store
+		return when store is none
+		store.save(key, value) onerror recover none
+	}
+}

@@ -1,0 +1,271 @@
+partial module std.proto.mcp {
+	use (
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.mcp.wire::*
+	)
+
+	// Stops at the first redirect, so its Location can be read.
+	internal type HeldRedirects {
+		def new() {}
+
+		def follow(next http.Request, via http.Request[]) !bool {
+			return false
+		}
+	}
+
+	// Credentials kept in memory, as a program's store would keep them.
+	internal type KeptCredentials {
+		entries map<string, string>
+
+		def new() {}
+
+		def load(key string) !?string {
+			return entries.get(key)
+		}
+
+		def save(key string, value string) !none {
+			entries.set(key, value)
+			return none
+		}
+	}
+
+	// An authorization server whose login page signs "alice" in and grants
+	// what was asked, and an MCP server it protects.
+	internal type ProtectedSite {
+		authority oauth2.AuthorizationServer
+		issuer    httptest.Server
+		server    Server
+		site      httptest.Server
+		target    string
+		// How often a user went through the login page.
+		logins    int                        = 0
+
+		def new(authority oauth2.AuthorizationServer, issuer httptest.Server, server Server, site httptest.Server) {
+			self.authority = authority
+			self.issuer = issuer
+			self.server = server
+			self.site = site
+			target = site.url + "/mcp"
+		}
+
+		// What a browser does with an authorization page: through the login
+		// to the redirect back, whose URL it returns.
+		def browse(page string) !string {
+			let browser = new http.Client()
+			browser.redirects = new HeldRedirects()
+			let first = try browser.get(page)
+			fail "the authorization page answered {first.status}: {try first.text()}" unless first.status == 303
+			let second = try browser.get(first.header("Location"))
+			fail "the login page answered {second.status}" unless second.status == 303
+			return second.header("Location")
+		}
+
+		// An authorization of a client of this site, with its own redirect URI.
+		def access() Authorization {
+			let made = self
+			return new Authorization("http://127.0.0.1:7777/callback", def (page string) !string {
+				return try made.browse(page)
+			})
+		}
+
+		def end() !none {
+			server.close()
+			try site.close()
+			return try issuer.close()
+		}
+	}
+
+	internal def protectedSite(lifetime duration = 1h) !ProtectedSite {
+		let signing = try jose.generateKey(jose.SignatureAlgorithm.ES256)
+		signing.kid = "as-1"
+		let authority = new oauth2.AuthorizationServer("http://placeholder", new jose.JwkSet([signing]))
+		authority.accessTokenFormat = oauth2.AccessTokenFormat.Jwt
+		authority.accessTokenLifetime = lifetime
+		authority.allowRegistration = true
+		let server = new Server("vault", "1.0.0")
+		let pages = new http.ServeMux()
+		try pages.handle("/", authority.handler())
+		let issuer = try httptest.Server.start(pages)
+		authority.issuer = issuer.url
+		authority.loginURL = issuer.url + "/login"
+		let mux = new http.ServeMux()
+		try mux.handle("/mcp", server.handler())
+		let made = new ProtectedSite(authority, issuer, server, try httptest.Server.start(mux))
+		try pages.handle("/login", def (ctx http.Context) !none {
+			made.logins++
+			return try authority.complete(ctx, ctx.query("request", ""), oauth2.Decision{subject: "alice"})
+		})
+		let guard = new oauth2.ResourceServer(authority.metadata(), made.target)
+		guard.resource = new oauth2.ResourceMetadata(made.target, [issuer.url])
+		let described = guard.resource
+		try mux.handle(described.metadataPath(), described.handler()) unless described is none
+		server.protect(guard, ["mcp"])
+		let plain = map<string, any>{"type": "object"}
+		server.tool(Tool{name: "whoami", inputSchema: plain}, def (request Request, _ map<string, any>) !ToolResult {
+			let token = request.token
+			fail "no token reached the handler" when token is none
+			let subject = token.subject
+			return ToolResult{content: [text(subject is none ?? ("", subject))]}
+		})
+		server.tool(Tool{name: "wipe", inputSchema: plain}, def (request Request, _ map<string, any>) !ToolResult {
+			try request.require("files:write", "mcp")
+			return ToolResult{content: [text("wiped")]}
+		})
+		return made
+	}
+
+	internal def heldToken(access Authorization) string {
+		let token = access.token
+		return token is none ?? ("", token.accessToken.reveal())
+	}
+
+	internal def firstText(result ToolResult) string {
+		return result.content.len() == 0 ?? ("", result.content[0].text)
+	}
+
+	check "MCP authorization" {
+		@test()
+		def TestEndpointAsksForAToken() !none {
+			let s = try protectedSite()
+			let body = "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":\{\"_meta\":\{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"\}\}\}"
+			let bare = try s.site.client().post(s.target, "application/json", body.bytes())
+			assert bare.status == 401
+			let asked = http.parseChallenges(bare.headers.values("WWW-Authenticate"))[0]
+			assert asked.scheme == "bearer" && asked.params["scope"] == "mcp"
+			assert asked.params["resource_metadata"] == s.site.url + "/.well-known/oauth-protected-resource/mcp"
+			// The metadata is public and names the authorization server.
+			let described = try oauth2.discoverResource(s.target, none, asked.params["resource_metadata"])
+			assert described.resource == s.target && described.authorizationServers[0] == s.issuer.url
+			// A token that is none of the server's is refused; so are GET and DELETE.
+			let req = try http.newRequest(http.Method.POST, s.target, body)
+			req.headers.set("Authorization", "Bearer made-up")
+			req.headers.set("Content-Type", "application/json")
+			assert (try s.site.client().do(req)).status == 401
+			assert (try s.site.client().get(s.target)).status == 401
+			// A client without an authorization fails with Unauthorized.
+			let kind = McpErrorKind.Remote
+			connect(s.target) onerror (err error) {
+				kind = err is McpError ?? (err.kind, McpErrorKind.Remote)
+				recover new Client()
+			}
+			assert kind == McpErrorKind.Unauthorized
+			try s.end()
+		}
+
+		@test()
+		def TestClientAuthorizesAndStepsUp() !none {
+			let s = try protectedSite()
+			let kept = new KeptCredentials()
+			let access = s.access()
+			access.store = kept
+			let client = try connect(s.target, access)
+			assert s.logins == 1 && client.revision == "2026-07-28"
+			assert firstText(try client.call("whoami")) == "alice"
+			let token = access.token
+			assert !(token is none) && token.scope.join(" ") == "mcp" && s.logins == 1
+			// The client registered itself, as a native application.
+			assert kept.entries.keys().filter(k => k.startsWith("client " + s.issuer.url)).len() == 1
+			// A tool that needs more is answered 403; the user is asked for the union.
+			assert firstText(try client.call("wipe")) == "wiped"
+			let wider = access.token
+			assert s.logins == 2 && !(wider is none) && "files:write" in wider.scope && "mcp" in wider.scope
+			assert firstText(try client.call("wipe")) == "wiped" && s.logins == 2
+			try client.close()
+			// Another run of the program finds the token and the registration.
+			let later = s.access()
+			later.store = kept
+			let again = try connect(s.target, later)
+			assert firstText(try again.call("whoami")) == "alice" && s.logins == 2
+			try again.close()
+			// The revisions with sessions go through the same door.
+			let old = new Client()
+			old.revisions = ["2025-06-18"]
+			old.authorization = s.access()
+			try old.open(s.target)
+			assert old.revision == "2025-06-18" && firstText(try old.call("whoami")) == "alice" && s.logins == 3
+			try old.close()
+			try s.end()
+		}
+
+		@test()
+		def TestExpiredTokensAreRefreshed() !none {
+			// A lifetime inside the client's leeway: every request finds the
+			// token expired and redeems the refresh token first.
+			let s = try protectedSite(20s)
+			let access = s.access()
+			let client = try connect(s.target, access)
+			let first = access.token
+			assert !(first is none) && !(first.refreshToken is none)
+			let before = heldToken(access)
+			assert firstText(try client.call("whoami")) == "alice"
+			assert before != "" && heldToken(access) != before && s.logins == 1
+			try client.close()
+			try s.end()
+		}
+
+		@test()
+		def TestClientIdentities() !none {
+			let s = try protectedSite()
+			// A client registered by hand with another authorization server says so.
+			let foreign = s.access()
+			foreign.clientId = "desk"
+			foreign.issuer = "https://login.example"
+			let reason = ""
+			connect(s.target, foreign) onerror (err error) {
+				reason = err is McpError && err.kind == McpErrorKind.Unauthorized ?? (err.message, "")
+				recover new Client()
+			}
+			assert reason.contains("https://login.example") && s.logins == 0
+			// Registered by hand with this one: no registration is made.
+			let described = new oauth2.ClientMetadata()
+			described.redirectUris = ["http://127.0.0.1:7777/callback"]
+			described.tokenEndpointAuthMethod = "none"
+			try s.authority.clients.save(new oauth2.RegisteredClient("desk", described))
+			let known = s.access()
+			known.clientId = "desk"
+			known.issuer = s.issuer.url
+			let kept = new KeptCredentials()
+			known.store = kept
+			let client = try connect(s.target, known)
+			assert firstText(try client.call("whoami")) == "alice"
+			assert kept.entries.keys().filter(k => k.startsWith("client ")).len() == 0
+			try client.close()
+			// A Client ID Metadata Document, where the server takes them.
+			let pages = new http.ServeMux()
+			let document = ""
+			try pages.handle("/client.json", def (ctx http.Context) !none {
+				return try ctx.blob(200, "application/json", document.bytes())
+			})
+			let host = new httptest.Server(pages)
+			try host.startTLS()
+			described.clientName = "Desk"
+			document = try described.document(host.url + "/client.json")
+			let documents = new oauth2.ClientDocuments()
+			documents.httpClient = host.client()
+			documents.allowPrivate = true
+			s.authority.clientDocuments = documents
+			s.authority.allowRegistration = false
+			let published = s.access()
+			published.documentUrl = host.url + "/client.json"
+			let third = try connect(s.target, published)
+			assert firstText(try third.call("whoami")) == "alice"
+			let server = published.server
+			assert !(server is none) && server.id == host.url + "/client.json"
+			try third.close()
+			// With neither, the failure names what to do.
+			s.authority.clientDocuments = none
+			let lost = s.access()
+			connect(s.target, lost) onerror (err error) {
+				reason = err.message
+				recover new Client()
+			}
+			assert reason.contains("Authorization.clientId")
+			try host.close()
+			try s.end()
+		}
+	}
+}

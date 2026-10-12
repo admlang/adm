@@ -1,0 +1,684 @@
+// MCP over HTTP: the Streamable HTTP transport of revision 2026-07-28 (one
+// POST per request, answered with JSON or an event stream), the one of
+// 2025-03-26 to 2025-11-25 (sessions, a GET stream for what the server sends
+// on its own), and the HTTP+SSE transport of 2024-11-05, on one endpoint.
+internal partial module std.proto.mcp.session {
+	use (
+		std.time
+		std.crypto::(rand)
+		std.data.encoding::(JSON, Base64)
+		std.net.http
+		std.proto.auth.oauth2
+		std.proto.jsonrpc
+		std.proto.mcp.wire::*
+	)
+
+	// How many events of a session's stream are kept for a client that
+	// reconnects with `Last-Event-ID`.
+	const replayDepth = 256
+
+	// One server-sent event stream over an HTTP response.
+	type EventStream {
+		ctx     http.Context
+		// The `event:` name of each message; "" for none.
+		name    string        = ""
+		started bool          = false
+		open    bool          = true
+		// Receives a value when the stream is closed.
+		ended   channel<bool>
+
+		def new(ctx http.Context, name string = "") {
+			self.ctx = ctx
+			self.name = name
+			ended = new channel<bool>(1)
+		}
+
+		// Sends one JSON message as an event. Fails when the client is gone.
+		atomic def emit(message any, id string = "") !none {
+			return try put(string(new JSON().encode(message)), name, id)
+		}
+
+		// Sends one event of any name.
+		atomic def write(data string, event string, id string) !none {
+			return try put(data, event, id)
+		}
+
+		internal def put(data string, event string, id string) !none {
+			fail "mcp: the event stream is closed" unless open
+			ctx.setHeader("X-Accel-Buffering", "no") unless started
+			started = true
+			let failure ?error = none
+			ctx.event(data, event, id) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return none when failure is none
+			open = false
+			fail failure
+		}
+
+		// Sends a comment, which keeps the connection from idling out and
+		// finds a client that left.
+		atomic def beat() {
+			return unless open && started
+			let failed = false
+			ctx.response.write(": keep-alive\n\n".bytes()) onerror (err error) {
+				failed = true
+				recover 0
+			}
+			ctx.flush() onerror (err error) {
+				failed = true
+				recover none
+			}
+			open = false when failed
+		}
+
+		def alive() bool {
+			return open && !ctx.cancelled()
+		}
+
+		atomic def close() {
+			open = false
+			ended.offer(true)
+		}
+	}
+
+	def notification(method string, params map<string, any>) map<string, any> {
+		return map<string, any>{"jsonrpc": "2.0", "method": method, "params": params}
+	}
+
+	// The response stream of one POST of revision 2026-07-28.
+	type PostLink {
+		stream EventStream
+
+		def new(stream EventStream) {
+			self.stream = stream
+		}
+
+		// Implements Link.
+		def notify(method string, params map<string, any>) !none {
+			return try stream.emit(notification(method, params))
+		}
+
+		// Implements Link: this revision has no requests to the client.
+		def call(method string, params any) !any {
+			fail jsonrpc.errorOf(-32603, "mcp: revision 2026-07-28 has no requests to the client")
+		}
+
+		// Implements Link.
+		def alive() bool {
+			return stream.alive()
+		}
+
+		// Implements Link.
+		def beat() {
+			stream.beat()
+		}
+	}
+
+	// A client of the revisions with sessions: its connection state, the
+	// stream the server speaks on by itself, and the requests it has made to
+	// the client.
+	type HttpSession {
+		id       string
+		conn     ?Conn
+		// The stream of a GET, or the one stream of the 2024-11-05 transport.
+		stream   ?EventStream
+		// The 2024-11-05 transport: every message of the server goes on the
+		// one stream, responses too.
+		old      bool                      = false
+		lastSeen time.Time
+		waiting  map<string, channel<any>>
+		calls    int                       = 0
+		events   int                       = 0
+		sentIds  int[]
+		sentData string[]
+		timeout  duration                  = 60s
+
+		def new(id string) {
+			self.id = id
+			lastSeen = time.now()
+		}
+
+		// Sends a message on the session's own stream and keeps it for a
+		// client that reconnects. Dropped when no stream is open: the client
+		// has not asked for the server's own messages.
+		atomic def push(message any) !none {
+			let data = string(new JSON().encode(message))
+			events++
+			sentIds.push(events)
+			sentData.push(data)
+			if sentIds.len() > replayDepth {
+				sentIds.remove(0)
+				sentData.remove(0)
+			}
+			let out = stream
+			return none when out is none || !out.alive()
+			return try out.write(data, out.name, old ?? ("", "{events}"))
+		}
+
+		// Sends again what a reconnecting client missed after event `last`.
+		atomic def replay(out EventStream, last int) {
+			for let (i, sent) in sentIds {
+				continue when sent <= last
+				out.write(sentData[i], out.name, "{sent}") onerror recover none
+			}
+		}
+
+		atomic def expect(key string) channel<any> {
+			let ch = new channel<any>(1)
+			waiting.set(key, ch)
+			return ch
+		}
+
+		atomic def forget(key string) {
+			waiting.delete(key) when waiting.hasKey(key)
+		}
+
+		// Hands the client's response to the call that waits for it.
+		atomic def deliver(key string, response any) {
+			let ch = waiting.get(key)
+			return when ch is none
+			waiting.delete(key)
+			ch <- response
+		}
+
+		atomic def nextCall() string {
+			calls++
+			return "server-{calls}"
+		}
+
+		// Calls a method of the client: the request goes on via when given,
+		// the stream of the POST being answered, else on the session's own
+		// stream; the response arrives in a later POST.
+		def call(via ?EventStream, method string, params any) !any {
+			let key = nextCall()
+			let ch = expect(key)
+			let request = map<string, any>{"jsonrpc": "2.0", "id": key, "method": method}
+			request.set("params", params) unless params is none
+			let failure ?error = none
+			if via is none || old {
+				push(request) onerror (err error) {
+					failure = err
+					recover none
+				}
+				let out = stream
+				failure = jsonrpc.errorOf(-32603, "mcp: the client has no stream open for requests") when out is none
+			} else {
+				via.emit(request) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				forget(key)
+				fail failure
+			}
+			let late = time.sleepChan(timeout)
+			select {
+				case ch:
+					let response = <-ch
+					if has(response, "error") {
+						let e = member(response, "error")
+						fail jsonrpc.errorOf(intOf(member(e, "code")), textOf(member(e, "message")), member(e, "data"))
+					}
+					return member(response, "result")
+				case late:
+					forget(key)
+					fail jsonrpc.RPCError{message: "mcp: the client did not answer {method}", code: "Timeout", kind: jsonrpc.ErrorCode.Timeout}
+			}
+		}
+	}
+
+	// The session's own side: list changes, resource updates.
+	type SessionLink {
+		session HttpSession
+
+		def new(session HttpSession) {
+			self.session = session
+		}
+
+		// Implements Link.
+		def notify(method string, params map<string, any>) !none {
+			return try session.push(notification(method, params))
+		}
+
+		// Implements Link.
+		def call(method string, params any) !any {
+			return try session.call(none, method, params)
+		}
+
+		// Implements Link.
+		def alive() bool {
+			return true
+		}
+
+		// Implements Link.
+		def beat() {}
+	}
+
+	// One POST of a session: what belongs to its requests goes on its own
+	// response stream.
+	type SessionPostLink {
+		session HttpSession
+		stream  EventStream
+
+		def new(session HttpSession, stream EventStream) {
+			self.session = session
+			self.stream = stream
+		}
+
+		// Implements Link.
+		def notify(method string, params map<string, any>) !none {
+			return try session.push(notification(method, params)) when session.old
+			return try stream.emit(notification(method, params))
+		}
+
+		// Implements Link.
+		def call(method string, params any) !any {
+			return try session.call(stream, method, params)
+		}
+
+		// Implements Link.
+		def alive() bool {
+			return session.old || stream.alive()
+		}
+
+		// Implements Link.
+		def beat() {
+			stream.beat()
+		}
+	}
+
+	// The MCP endpoint. It implements `http.Handler`.
+	type HttpEndpoint {
+		core     Core
+		sessions map<string, HttpSession>
+
+		def new(core Core) {
+			self.core = core
+			let endpoint = self
+			core.onClose(def () {
+				endpoint.closeAll()
+			})
+		}
+
+		// Ends every session: the server is closing.
+		def closeAll() {
+			for let (_, session) in everySession() {
+				close(session)
+			}
+		}
+
+		atomic def everySession() HttpSession[] {
+			return sessions.values()
+		}
+
+		// Serve implements std.net.http.Handler.
+		def serve(ctx http.Context) !none {
+			return try reject(ctx, 403, none, -32600, "Origin not allowed") unless originAllowed(ctx)
+			let admission ?Admission = none
+			let guard = core.guard
+			if !(guard is none) {
+				let failure ?error = none
+				let token = guard.authenticate(ctx, core.guardScopes) onerror (err error) {
+					failure = err
+					recover new oauth2.AccessToken()
+				}
+				return try guard.refuse(ctx, failure, core.guardScopes) unless failure is none
+				admission = new Admission(token)
+			}
+			match ctx.method() {
+				case http.Method.POST:
+					return try post(ctx, admission)
+				case http.Method.GET:
+					return try get(ctx)
+				case http.Method.DELETE:
+					return try delete(ctx)
+				default:
+			}
+			ctx.setHeader("Allow", legacyServed() ?? ("POST, GET, DELETE", "POST"))
+			return try ctx.error(405)
+		}
+
+		// Whether a revision with sessions is served.
+		def legacyServed() bool {
+			for let (_, r) in core.revisions {
+				return true unless atLeast(r, modernSince)
+			}
+			return false
+		}
+
+		// A browser page of another site must not reach a local server: an
+		// Origin is accepted when it is listed, or names the host the
+		// request was sent to.
+		def originAllowed(ctx http.Context) bool {
+			let origin = ctx.header("Origin")
+			return true when origin == ""
+			return true when origin in core.origins || "*" in core.origins
+			let at = origin.indexOf("://")
+			return false when at < 0
+			return origin[at + 3:].lower() == ctx.request.host.lower()
+		}
+
+		// Answers with a JSON-RPC error and an HTTP status.
+		def reject(ctx http.Context, status int, id any, number int, message string, data any = none) !none {
+			let e = map<string, any>{"code": number, "message": message}
+			e.set("data", data) unless data is none
+			let out = map<string, any>{"jsonrpc": "2.0", "error": e}
+			out.set("id", id) unless id is none
+			return try ctx.blob(status, "application/json", new JSON().encode(out))
+		}
+
+		// POST ---------------------------------------------------------------------
+
+		def post(ctx http.Context, admission ?Admission) !none {
+			let body = try ctx.bytes()
+			let failed = false
+			let doc = new JSON().parse(body) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return try reject(ctx, 400, none, -32700, "Parse error") when failed
+			let key = ctx.query("sessionId")
+			return try postOld(ctx, doc, key, admission) unless key is none
+			return try postModern(ctx, doc, admission) when has(member(member(doc, "params"), "_meta"), versionKey)
+			return try postSession(ctx, doc, admission)
+		}
+
+		// Whether a handler found the token short of scopes while nothing of
+		// the response is out: the request is then answered 403 with the
+		// scopes to ask for, in place of its JSON-RPC answer.
+		def lacksScope(admission ?Admission, stream EventStream) bool {
+			return !(admission is none) && admission.needed.len() > 0 && !stream.started
+		}
+
+		def refuseScope(ctx http.Context, admission ?Admission) !none {
+			let guard = core.guard
+			return try ctx.error(403) when guard is none || admission is none
+			let needed = core.guardScopes.clone()
+			for let scope in admission.needed {
+				needed.push(scope) unless scope in needed
+			}
+			let text = "scope {admission.needed.join(" ")} is required"
+			return try guard.refuse(ctx, oauth2.OAuthError{message: "oauth2: " + text, code: oauth2.OAuthErrorKind.InsufficientScope.value, kind: oauth2.OAuthErrorKind.InsufficientScope, description: text, status: 403}, needed)
+		}
+
+		// Revision 2026-07-28: one request, no session.
+		def postModern(ctx http.Context, doc any, admission ?Admission) !none {
+			let id = member(doc, "id")
+			let method = textOf(member(doc, "method"))
+			let params = member(doc, "params")
+			let version = textOf(member(member(params, "_meta"), versionKey))
+			let mismatch = headerMismatch(ctx, method, params, version)
+			return try reject(ctx, 400, id, -32020, "Header mismatch: {mismatch}") when mismatch != ""
+			let stream = new EventStream(ctx)
+			let link = new PostLink(stream)
+			let reply = core.dispatcher.answer(doc, Envelope{conn: new Conn(link), link: link, http: true, admission: admission})
+			return try refuseScope(ctx, admission) when lacksScope(admission, stream)
+			if reply is none {
+				// A notification, or a request whose client left.
+				return none when stream.started
+				return try ctx.noContent(202)
+			}
+			if stream.started {
+				stream.emit(reply) onerror recover none
+				return none
+			}
+			let status = 200
+			match intOf(member(member(reply, "error"), "code")) {
+				case - 32022, -32021, -32020:
+					status = 400
+				case - 32601:
+					status = 404
+			}
+			return try ctx.blob(status, "application/json", new JSON().encode(reply))
+		}
+
+		// What differs between the headers and the body they mirror; "" when
+		// they agree.
+		def headerMismatch(ctx http.Context, method string, params any, version string) string {
+			let sent = ctx.header("MCP-Protocol-Version")
+			return "the MCP-Protocol-Version header is missing" when sent == ""
+			return "MCP-Protocol-Version header value '{sent}' does not match body value '{version}'" when sent != version
+			let named = ctx.header("Mcp-Method")
+			return "the Mcp-Method header is missing" when named == ""
+			return "Mcp-Method header value '{named}' does not match body value '{method}'" when named != method
+			// A task's id routes the requests about it to the instance that
+			// holds it.
+			return "" unless method := "tools/call" || "resources/read" || "prompts/get" || "tasks/get" || "tasks/update" || "tasks/cancel"
+			let target = method == "resources/read" ?? (textOf(member(params, "uri")), textOf(member(params, method.startsWith("tasks/") ?? ("taskId", "name"))))
+			let raw = ctx.header("Mcp-Name")
+			return "the Mcp-Name header is missing" when raw == ""
+			let (name, valid) = headerValue(raw)
+			return "the Mcp-Name header is malformed" unless valid
+			return "Mcp-Name header value '{name}' does not match body value '{target}'" when name != target
+			return "" unless method == "tools/call"
+			let at = core.toolIndex(target)
+			return "" when at < 0
+			return mirroredMismatch(ctx, member(core.tools[at].info.inputSchema, "properties"), member(params, "arguments"))
+		}
+
+		// Checks the `Mcp-Param-…` headers of the tool parameters whose schema
+		// names one with `x-mcp-header`, through nested objects.
+		def mirroredMismatch(ctx http.Context, properties any, arguments any) string {
+			for let (key, schema) in objectOf(properties) {
+				let value = member(arguments, key)
+				let nested = member(schema, "properties")
+				if !(nested is none) {
+					let inner = mirroredMismatch(ctx, nested, value)
+					return inner when inner != ""
+				}
+				let header = textOf(member(schema, "x-mcp-header"))
+				continue when header == "" || value is none
+				let raw = ctx.header("Mcp-Param-{header}")
+				return "the Mcp-Param-{header} header is missing" when raw == ""
+				let (sent, valid) = headerValue(raw)
+				return "the Mcp-Param-{header} header is malformed" unless valid
+				let same = false
+				match value {
+					case string:
+						same = sent == value
+					case bool:
+						same = sent == (value ?? ("true", "false"))
+					case int:
+						same = sent.isNumeric() && parseFloat<float>(sent) == float(value)
+					case float:
+						same = sent.isNumeric() && parseFloat<float>(sent) == value
+					default:
+				}
+				return "Mcp-Param-{header} header value '{sent}' does not match the body" unless same
+			}
+			return ""
+		}
+
+		// The revisions with sessions, 2025-03-26 to 2025-11-25.
+		def postSession(ctx http.Context, doc any, admission ?Admission) !none {
+			return try ctx.error(405) unless legacyServed()
+			let items = listOf(doc)
+			let batch = items.len() > 0
+			items = [doc] unless batch
+			let opening = !batch && textOf(member(doc, "method")) == "initialize"
+			let found ?HttpSession = none
+			if opening {
+				found = try openSession(false)
+			} else {
+				let key = ctx.header("Mcp-Session-Id")
+				// Without a session only 2026-07-28 could be meant, and that
+				// needs its version in the body.
+				return try reject(ctx, 400, member(doc, "id"), -32600, "mcp: a request must carry {versionKey} in _meta, or an Mcp-Session-Id", map<string, any>{"supported": textsJson(core.revisions)}) when key == ""
+				found = find(key)
+				let sent = ctx.header("MCP-Protocol-Version")
+				return try ctx.error(400, "unsupported MCP-Protocol-Version") unless sent == "" || sent in core.revisions
+			}
+			let session = found
+			return try ctx.error(404, "unknown session") when session is none
+			let stream = new EventStream(ctx)
+			let conn = session.conn
+			return try ctx.error(500) when conn is none
+			let env = Envelope{conn: conn, link: new SessionPostLink(session, stream), admission: admission}
+			session.lastSeen = time.now()
+			let replies any[] = []
+			for let (_, item) in items {
+				if !has(item, "method") {
+					session.deliver(textOf(member(item, "id")), item)
+					continue
+				}
+				let reply = core.dispatcher.answer(item, env)
+				replies.push(reply) unless reply is none
+			}
+			return try refuseScope(ctx, admission) when lacksScope(admission, stream)
+			ctx.setHeader("Mcp-Session-Id", session.id) when opening
+			if replies.len() == 0 {
+				return none when stream.started
+				return try ctx.noContent(202)
+			}
+			let answer any = replies[0]
+			answer = replies when batch
+			if stream.started {
+				stream.emit(answer) onerror recover none
+				return none
+			}
+			return try ctx.blob(200, "application/json", new JSON().encode(answer))
+		}
+
+		// The 2024-11-05 transport: a message for the session a GET opened;
+		// its answer goes out on that stream.
+		def postOld(ctx http.Context, doc any, key string, admission ?Admission) !none {
+			let session = find(key)
+			return try ctx.error(404, "unknown session") when session is none
+			let conn = session.conn
+			let stream = session.stream
+			return try ctx.error(404, "the session's stream is closed") when conn is none || stream is none
+			session.lastSeen = time.now()
+			// The answer travels on the session's stream: this request ends
+			// here, and the work goes on beside it, so the connection is free
+			// for what the client sends meanwhile.
+			try ctx.noContent(202)
+			if !has(doc, "method") {
+				session.deliver(textOf(member(doc, "id")), doc)
+				return none
+			}
+			let task = async answerOld(session, conn, stream, doc, admission)
+			task.keepAlive()
+			return none
+		}
+
+		def answerOld(session HttpSession, conn Conn, stream EventStream, doc any, admission ?Admission) {
+			let reply = core.dispatcher.answer(doc, Envelope{conn: conn, link: new SessionPostLink(session, stream), admission: admission})
+			return when reply is none
+			session.push(reply) onerror recover none
+		}
+
+		// GET and DELETE ---------------------------------------------------------------
+
+		// The stream a server speaks on by itself: of a session when the
+		// request names one, else a new session of the 2024-11-05 transport,
+		// which starts by naming the URL to post to.
+		def get(ctx http.Context) !none {
+			return try ctx.error(405) unless legacyServed()
+			let key = ctx.header("Mcp-Session-Id")
+			if key != "" {
+				let session = find(key)
+				return try ctx.error(404, "unknown session") when session is none
+				let stream = new EventStream(ctx)
+				try stream.write("", "", "")
+				let last = ctx.header("Last-Event-ID")
+				session.replay(stream, last.toInt<int>()) when last.isNumeric()
+				session.stream = stream
+				hold(stream)
+				return none
+			}
+			let session = try openSession(true)
+			let stream = new EventStream(ctx, "message")
+			session.stream = stream
+			let target = ctx.path() + "?sessionId=" + session.id
+			try stream.write(target, "endpoint", "")
+			hold(stream)
+			close(session)
+			return none
+		}
+
+		// Keeps a stream open until its client leaves or the server closes.
+		def hold(stream EventStream) {
+			for stream.alive() && !core.closed {
+				let tick = time.sleepChan(listenCheck)
+				select {
+					case stream.ended:
+					case tick:
+						stream.beat()
+				}
+			}
+			stream.close()
+		}
+
+		def delete(ctx http.Context) !none {
+			return try ctx.error(405) unless legacyServed()
+			let session = find(ctx.header("Mcp-Session-Id"))
+			return try ctx.error(404, "unknown session") when session is none
+			close(session)
+			return try ctx.noContent()
+		}
+
+		// Sessions -------------------------------------------------------------------
+
+		atomic def find(key string) ?HttpSession {
+			return sessions.get(key)
+		}
+
+		def openSession(old bool) !HttpSession {
+			let made = try rand(16)
+			let session = new HttpSession(made.hex())
+			session.old = old
+			session.timeout = core.timeout
+			let conn = new Conn(new SessionLink(session))
+			session.conn = conn
+			core.attach(conn)
+			keep(session)
+			return session
+		}
+
+		// Adds a session and drops the ones idle past the server's limit.
+		atomic def keep(session HttpSession) {
+			let cutoff = time.now().unixNs() - int64(int(core.sessionIdle))
+			let stale string[] = []
+			for let (key, held) in sessions {
+				stale.push(key) when held.lastSeen.unixNs() < cutoff
+			}
+			for let (_, key) in stale {
+				let held = sessions.get(key)
+				continue when held is none
+				let conn = held.conn
+				core.detach(conn) unless conn is none
+				sessions.delete(key)
+			}
+			sessions.set(session.id, session)
+		}
+
+		atomic def close(session HttpSession) {
+			let conn = session.conn
+			if !(conn is none) {
+				conn.stopAll()
+				core.detach(conn)
+			}
+			let stream = session.stream
+			stream.close() unless stream is none
+			sessions.delete(session.id) when sessions.hasKey(session.id)
+		}
+	}
+
+	// The value of a mirrored header: as written, or the text inside
+	// `=?base64?…?=`. False when it is malformed.
+	def headerValue(raw string) (string, bool) {
+		for let (_, c) in raw {
+			return ("", false) when (c < ' ' && c != '\t') || c > '~'
+		}
+		return (raw, true) unless raw.startsWith("=?base64?") && raw.endsWith("?=") && raw.len() >= 11
+		let failed = false
+		let bytes = new Base64().decode(raw[9:raw.len() - 2]) onerror (err error) {
+			failed = true
+			recover byte[]
+		}
+		return (string(bytes), !failed)
+	}
+}

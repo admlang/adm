@@ -115,6 +115,10 @@ partial module std.proto.jsonrpc {
 		id           any
 		// Whether no response is expected.
 		notification bool
+		// What the transport attached to the message: `Peer.context`, or the
+		// context given to `Dispatcher.dispatch` or `answer`. None unless
+		// the program set one.
+		context      any
 
 		// Fills target's fields from named parameters (or a positional array
 		// into an array target) the way `JSON.decode` does. Fails with an
@@ -130,10 +134,21 @@ partial module std.proto.jsonrpc {
 	}
 
 	// Answers one request: the result to send, or a failure. Failing with an
-	// RPCError sends that error object; any other failure sends -32603
-	// (internal error) with the failure's message. For a notification the
-	// result is dropped.
+	// RPCError sends that error object, failing with a NoReply sends nothing;
+	// any other failure sends -32603 (internal error) with the failure's
+	// message. For a notification the result is dropped.
 	type Handler = def(Request) !any
+
+	// The failure of a handler that must not be answered: a request its
+	// caller cancelled.
+	//
+	//     fail jsonrpc.NoReply{message: "cancelled"}
+	struct NoReply {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
 
 	// One call of a batch.
 	struct Call {
@@ -179,8 +194,9 @@ partial module std.proto.jsonrpc {
 		// Answers one message (a request, a notification or a batch) and
 		// returns the response JSON, none when nothing is to be answered.
 		// Handlers run one after another; a malformed message gets the
-		// error response the specification asks for.
-		def dispatch(message byte[]) ?byte[] {
+		// error response the specification asks for. Each handler finds
+		// context in `Request.context`.
+		def dispatch(message byte[], context any = none) ?byte[] {
 			let doc = new JSON().parse(message) onerror (err error) {
 				recover ParseFailure{message: err.message}
 			}
@@ -191,16 +207,25 @@ partial module std.proto.jsonrpc {
 					return encodeError(none, -32600, "empty batch", none) when doc.len() == 0
 					let replies any[] = []
 					for let item in doc {
-						let reply = answer(self, item)
+						let reply = respond(self, item, context)
 						replies.push(reply) unless reply is none
 					}
 					return none when replies.len() == 0
 					return new JSON().encode(replies)
 				default:
-					let reply = answer(self, doc)
+					let reply = respond(self, doc, context)
 					return none when reply is none
 					return new JSON().encode(reply)
 			}
+		}
+
+		// Answers one parsed message, a request or a notification object as
+		// `JSON.parse` builds it, and returns the response object; none for
+		// a notification and for a request whose handler fails with NoReply.
+		// For a transport that frames and sends the messages itself. Each
+		// handler finds context in `Request.context`.
+		def answer(message any, context any = none) ?map<string, any> {
+			return respond(self, message, context)
 		}
 
 		// Serves a JSON-RPC POST. Fails when the response write does.
@@ -314,17 +339,21 @@ partial module std.proto.jsonrpc {
 		timeout        duration   = 0s
 		// The largest message read; a longer one ends the stream.
 		maxMessageSize int        = 64 << 20
+		// What every incoming request carries as `Request.context`.
+		context        any
 
-		internal reader  io.Reader
-		internal writer  io.Writer
-		internal buf     byte[]
-		internal at      int                         = 0
-		internal pending map<string, channel<Reply>>
-		internal next    int                         = 1
-		internal running bool
-		internal ended   bool
-		internal failure string                      = ""
-		internal done    channel<none>
+		internal reader    io.Reader
+		internal writer    io.Writer
+		internal buf       byte[]
+		internal at        int                         = 0
+		internal pending   map<string, channel<Reply>>
+		internal begun     map<string, channel<Reply>>
+		internal answering int                         = 0
+		internal next      int                         = 1
+		internal running   bool
+		internal ended     bool
+		internal failure   string                      = ""
+		internal done      channel<none>
 
 		def new(reader io.Reader, writer io.Writer, framing Framing = Framing.ContentLength) {
 			self.reader = reader
@@ -332,6 +361,7 @@ partial module std.proto.jsonrpc {
 			self.framing = framing
 			self.methods = new Dispatcher()
 			self.pending = {}
+			self.begun = {}
 			self.done = new channel<none>(1)
 		}
 
@@ -360,6 +390,24 @@ partial module std.proto.jsonrpc {
 			}
 		}
 
+		// Whether the stream is being read: start was called and the stream
+		// has not ended.
+		def isOpen() bool {
+			return running && !ended
+		}
+
+		// Waits until the requests being answered have their responses
+		// written, at most for within: after `wait`, when the stream ended
+		// while handlers still ran. True when none is left.
+		def drain(within duration = 5s) bool {
+			let until = time.now() + within
+			for answering > 0 {
+				return false when time.now().after(until)
+				time.sleep(1ms)
+			}
+			return true
+		}
+
 		// Why the stream ended; "" while it runs or when it ended cleanly.
 		def endReason() string {
 			return failure
@@ -376,7 +424,7 @@ partial module std.proto.jsonrpc {
 				forget(key)
 				fail err
 			}
-			let reply = try waitFor(key, ch)
+			let reply = try waitFor(key, ch, timeout)
 			fail reply.error unless reply.error is none
 			return reply.result
 		}
@@ -389,6 +437,49 @@ partial module std.proto.jsonrpc {
 			let json = new JSON()
 			try json.decode(json.encode(value), result)
 			return none
+		}
+
+		// Sends a request without waiting for its response and returns its
+		// id, which `response` waits on and `abandon` gives up: for a caller
+		// that must name the request meanwhile, to cancel it or to match
+		// notifications to it. Fails as call does when the request cannot be
+		// sent.
+		def request(method string, params any = none) !int {
+			let (id, ch) = try register()
+			let key = "n{id}"
+			hold(key, ch)
+			send(new JSON().encode(requestObject(id, method, params))) onerror (err error) {
+				forget(key)
+				drop(key)
+				fail err
+			}
+			return id
+		}
+
+		// Waits for the response of a request `request` sent and returns its
+		// result. within is how long to wait: 0s until the stream ends, less
+		// for the peer's `timeout`. Fails as call does, and with Protocol
+		// for an id that is not waiting.
+		def response(id int, within duration = -1s) !any {
+			let key = "n{id}"
+			let ch = held(key)
+			fail RPCError{message: "jsonrpc: no request {id} is waiting", code: "Protocol", kind: ErrorCode.Protocol} when ch is none
+			let failed ?error = none
+			let reply = waitFor(key, ch, within < 0s ?? (timeout, within)) onerror (err error) {
+				failed = err
+				recover Reply{}
+			}
+			drop(key)
+			fail failed unless failed is none
+			fail reply.error unless reply.error is none
+			return reply.result
+		}
+
+		// Gives up a request `request` sent: its response is dropped when it
+		// arrives.
+		def abandon(id int) {
+			forget("n{id}")
+			drop("n{id}")
 		}
 
 		// Sends a notification. Fails when the writer does or the peer has
@@ -427,7 +518,7 @@ partial module std.proto.jsonrpc {
 				if k == "" {
 					out.push(Reply{})
 				} else {
-					out.push(try waitFor(k, chans[i]))
+					out.push(try waitFor(k, chans[i], timeout))
 				}
 			}
 			return out
@@ -455,6 +546,20 @@ partial module std.proto.jsonrpc {
 			pending.delete(key) when pending.hasKey(key)
 		}
 
+		// The channels of the requests `request` sent and `response` has not
+		// collected.
+		internal atomic def hold(key string, ch channel<Reply>) {
+			begun.set(key, ch)
+		}
+
+		internal atomic def held(key string) ?channel<Reply> {
+			return begun.get(key)
+		}
+
+		internal atomic def drop(key string) {
+			begun.delete(key) when begun.hasKey(key)
+		}
+
 		// Hands a response to the call waiting for it; drops it when none is.
 		internal atomic def deliver(key string, reply Reply) {
 			return unless pending.hasKey(key)
@@ -466,7 +571,7 @@ partial module std.proto.jsonrpc {
 		// Waits for the reply of a pending call.
 		// Waits for the reply on the channel register handed out; deliver
 		// may already have put it there.
-		internal def waitFor(key string, ch channel<Reply>) !Reply {
+		internal def waitFor(key string, ch channel<Reply>, timeout duration) !Reply {
 			if timeout <= 0s {
 				select {
 					case ch:
@@ -624,6 +729,7 @@ partial module std.proto.jsonrpc {
 						}
 						return
 					}
+					enter()
 					let task = async answerBatch(doc)
 					task.keepAlive()
 				default:
@@ -637,26 +743,37 @@ partial module std.proto.jsonrpc {
 						return
 					}
 					if req.notification {
-						answer(methods, doc)
+						respond(methods, doc, context)
 						return
 					}
+					enter()
 					let task = async answerOne(doc)
 					task.keepAlive()
 			}
 		}
 
 		internal def answerOne(doc any) {
-			let out = answer(methods, doc)
+			let out = respond(methods, doc, context)
 			reply(new JSON().encode(out)) unless out is none
+			leave()
+		}
+
+		internal atomic def enter() {
+			answering++
+		}
+
+		internal atomic def leave() {
+			answering--
 		}
 
 		internal def answerBatch(items any[]) {
 			let replies any[] = []
 			for let item in items {
-				let out = answer(methods, item)
+				let out = respond(methods, item, context)
 				replies.push(out) unless out is none
 			}
 			reply(new JSON().encode(replies)) when replies.len() > 0
+			leave()
 		}
 
 		// Sends a response; a failed write ends the peer, since the stream
@@ -737,9 +854,10 @@ partial module std.proto.jsonrpc {
 
 	// The response object for one request value; none for a
 	// notification.
-	internal def answer(d Dispatcher, item any) ?map<string, any> {
+	internal def respond(d Dispatcher, item any, context any) ?map<string, any> {
 		let req = requestOf(item)
 		return errorObject(idOf(item), -32600, "invalid request", none) when req is none
+		req.context = context
 		let fn = d.handler(req.method)
 		if fn is none {
 			return none when req.notification
@@ -766,6 +884,7 @@ partial module std.proto.jsonrpc {
 			return out
 		}
 		return errorObject(req.id, err.number, err.message, err.data) when err is RPCError
+		return none when err is NoReply
 		return errorObject(req.id, -32603, err.message, none)
 	}
 

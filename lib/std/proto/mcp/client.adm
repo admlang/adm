@@ -1,0 +1,879 @@
+partial module std.proto.mcp {
+	use (
+		std.io
+		std.os
+		std.time
+		std.services.runtime::(Runtime)
+		std.proto.jsonrpc
+		std.proto.mcp.session::*
+		std.proto.mcp.wire::*
+	)
+
+	// What a completion is asked for.
+	enum Reference {
+		// An argument of a prompt, named by the prompt's name.
+		Prompt,
+		// A hole of a resource template, named by the URI template.
+		Resource
+	}
+
+	// What a server asks the user through the client.
+	struct ElicitationRequest {
+		message string
+		// The JSON Schema of the form's values; empty for a URL.
+		schema  map<string, any>
+		// The URL the user is asked to open; "" for a form.
+		url     string
+		// Names a URL elicitation: the server may report under it that what
+		// the URL led to is done (`Client.elicitationCompleted`). "" when
+		// the server gave none.
+		id      string
+	}
+
+	// Reports the progress of one call: how far, of how much (0 when not
+	// known), and what is happening.
+	type ProgressHandler = def(float, float, string)
+
+	// An MCP client: one connection to a server.
+	//
+	// ```
+	// let client = try mcp.connect(reader, writer)
+	// let tools = try client.tools()
+	// let result = try client.call("add", {"a": 2, "b": 3})
+	// let notes = try client.read("notes://7")
+	// try client.close()
+	// ```
+	//
+	// It speaks revision 2026-07-28 and the four before it, and finds out
+	// which the server speaks when it opens. What a server may ask of its
+	// client is answered by the handlers below; set them before opening,
+	// since a client announces only what it has a handler for.
+	type Client {
+		// Describes the client to servers.
+		info                 Implementation
+		// The revisions the client accepts, newest first.
+		revisions            string[]
+		// How long a request waits for its answer.
+		timeout              duration                               = 60s
+		// How long the opening probe waits before the server is taken for
+		// one that needs `initialize`.
+		probeTimeout         duration                               = 5s
+		// Writes a message with the client's model for the server.
+		sampling             ?def (SamplingRequest) !SamplingResult = none
+		// The sampling handler takes requests with tools.
+		samplingTools        bool                                   = false
+		// The folders and files the server may work in.
+		roots                ?def () !Root[]                        = none
+		// Shows a form to the user, or asks to open a URL.
+		elicitation          ?def (ElicitationRequest) !Elicitation = none
+		// The elicitation handler opens URLs.
+		elicitationUrls      bool                                   = false
+		// Called with the id of a URL elicitation when the server reports
+		// that what the URL led to is done (revision 2025-11-25).
+		elicitationCompleted ?def (string)                          = none
+		// Receives the server's log messages: level, data, logger name.
+		logged               ?def (LogLevel, any, string)           = none
+		// Called when a list changed: `tools`, `resources` or `prompts`.
+		changed              ?def (string)                          = none
+		// Called with the URI of a subscribed resource that changed.
+		updated              ?def (string)                          = none
+		// Called when the server tells of a task's change. It need not
+		// tell: `wait` and `task` are what a client can count on.
+		taskChanged          ?def (Task)                            = none
+		// Gets the access token of an HTTP server that asks for one, and
+		// renews it; none leaves a 401 to fail with Unauthorized.
+		authorization        ?Authorization                         = none
+
+		// The revision agreed with the server; "" before opening.
+		revision     string             = ""
+		// What the server says of itself.
+		server       Implementation
+		capabilities ServerCapabilities
+		// The server's guidance for the model; "" when it gives none.
+		instructions string             = ""
+
+		internal carrier   ?Carrier
+		internal modern    bool                         = false
+		internal level     ?LogLevel                    = none
+		internal progress  map<string, ProgressHandler>
+		internal tokens    int                          = 0
+		internal listening int                          = -1
+		internal watched   bool                         = false
+		internal uris      string[]
+		internal followed  string[]
+		// The server this client started, when it started one.
+		internal process   ?os.Process
+		internal ack       channel<bool>
+		internal known     map<string, Tool>
+
+		def new(name string = "adm", version string = "") {
+			info = Implementation{name: name, version: version}
+			revisions = allRevisions()
+			ack = new channel<bool>(4)
+		}
+
+		// Opens the connection over a stream, one JSON message per line:
+		// the two ends of a pipe or a socket. Fails when the server does not
+		// answer, or speaks none of `revisions`.
+		def open(reader io.Reader, writer io.Writer) !none {
+			let client = self
+			carrier = new StreamCarrier(reader, writer, def (method string, params any) {
+				client.told(method, params)
+			}, def (method string, params any) !any {
+				return try client.asked(method, params)
+			})
+			return try handshake()
+		}
+
+		// Starts a server as a program of its own and opens the connection
+		// over its standard input and output, as local MCP servers are run:
+		// `client.launch("adm", ["mcp"])`. program is a path or a name found
+		// in `PATH`, args follow it with no shell in between, env adds to
+		// this program's environment for it (credentials a local server
+		// reads), and dir is its working folder. What the server writes to
+		// standard error goes to this program's. `close` ends it. Needs the
+		// `spawn` permission of `Runtime`.
+		//
+		// Fails when the program cannot be started, or does not answer as an
+		// MCP server of one of `revisions`; it is stopped then.
+		def launch(program string, args string[] = [], env map<string, string> = {}, dir string = "") !none {
+			let child = try Runtime.start(program, args, env, dir)
+			process = child
+			let failure ?error = none
+			open(child.output, child.input) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return none when failure is none
+			close() onerror recover none
+			fail failure
+		}
+
+		// Opens the connection over HTTP to the MCP endpoint at target
+		// (`https://tools.example.com/mcp`). headers are sent with every
+		// request: an API key, or an `Authorization` when `authorization`
+		// is not set. Fails when the server does not answer, speaks none of
+		// `revisions`, or asks for an authorization that does not succeed
+		// (Unauthorized).
+		def open(target string, headers map<string, string> = {}) !none {
+			let client = self
+			let link = new HttpCarrier(target, def (method string, params any) {
+				client.told(method, params)
+			}, def (method string, params any) !any {
+				return try client.asked(method, params)
+			})
+			link.headers = headers
+			let access = authorization
+			if !(access is none) {
+				bind(access, target)
+				link.credential = def () string {
+					return credentialOf(access)
+				}
+				link.answered = def (status int, challenges string[], used string) !bool {
+					return try answered(access, status, challenges, used)
+				}
+			}
+			carrier = link
+			return try handshake()
+		}
+
+		// Every tool of the server, all pages. Over HTTP a tool whose schema
+		// misuses `x-mcp-header` is left out, as the protocol asks. Fails
+		// when the server does.
+		def tools() !Tool[] {
+			let out Tool[] = []
+			let cursor = ""
+			for {
+				let page = try request("tools/list", cursorParams(cursor))
+				for let (_, item) in listOf(member(page, "tools")) {
+					let tool = toolOf(item)
+					continue when mirroring() && mirrorProblem(tool.inputSchema) != ""
+					out.push(tool)
+					known.set(tool.name, tool)
+				}
+				cursor = textOf(member(page, "nextCursor"))
+				break when cursor == ""
+			}
+			return out
+		}
+
+		// Calls a tool with a JSON object of arguments. A tool that ran and
+		// failed returns a result with `isError` set; the call itself fails
+		// when there is no such tool, the server refuses, or no answer
+		// comes in time. progress receives what the server reports
+		// meanwhile.
+		//
+		// A server may run the tool as a task, work it carries on after it
+		// answered; the call then waits for the task as `wait` does, so it
+		// returns the tool's result either way and may take as long as the
+		// tool does.
+		def call(name string, arguments map<string, any> = {}, progress ?ProgressHandler = none) !ToolResult {
+			let run = try invoke(name, arguments, progress, false)
+			let task = run.task
+			return try wait(task.id) unless task is none
+			let result = run.result
+			return result is none ?? (ToolResult{}, result)
+		}
+
+		// Calls a tool without waiting for one that runs as a task: the
+		// result when the server answered at once, else the task, to hand
+		// to `wait`, `task` or `cancelTask`, now or after a restart (keep
+		// its id). A server of revision 2025-11-25 runs a tool as a task
+		// when the tool allows it; one of 2026-07-28 decides by itself.
+		// Fails as `call` does.
+		def start(name string, arguments map<string, any> = {}) !ToolRun {
+			return try invoke(name, arguments, none, true)
+		}
+
+		// Waits for a task and returns what its tool returned, looking at
+		// it as often as the server asks and answering what the task asks
+		// of the client (sampling, elicitation, roots) on the way. Fails
+		// with the error the call ended in, with Cancelled for a cancelled
+		// task, with Timeout when the task outlives the lifetime the server
+		// gave it, and when the server no longer knows the task.
+		def wait(taskId string) !ToolResult {
+			let params = map<string, any>{"taskId": taskId}
+			let answered string[] = []
+			for {
+				let seen = try request("tasks/get", params.clone())
+				let task = taskOf(seen)
+				if !modern {
+					// `tasks/result` answers once the task has ended, and is
+					// the stream the server asks its questions on meanwhile.
+					return toolResultOf(try exchange("tasks/result", params.clone(), 0s)) unless task.status == TaskStatus.Working
+				} else {
+					match task.status {
+						case TaskStatus.Completed:
+							return toolResultOf(member(seen, "result"))
+						case TaskStatus.Failed:
+							let e = member(seen, "error")
+							fail failureOf(jsonrpc.errorOf(intOf(member(e, "code")), textOf(member(e, "message")), member(e, "data")))
+						case TaskStatus.Cancelled:
+							fail McpError{message: "mcp: task {taskId} was cancelled", code: "Cancelled", kind: McpErrorKind.Cancelled}
+						case TaskStatus.InputRequired:
+							let answers = new map<string, any>()
+							for let (key, wanted) in objectOf(member(seen, "inputRequests")) {
+								continue when key in answered
+								answers.set(key, try asked(textOf(member(wanted, "method")), member(wanted, "params")))
+								answered.push(key)
+							}
+							if answers.len() > 0 {
+								try request("tasks/update", map<string, any>{"taskId": taskId, "inputResponses": answers})
+								continue
+							}
+						default:
+					}
+				}
+				fail McpError{message: "mcp: task {taskId} outlived its lifetime", code: "Timeout", kind: McpErrorKind.Timeout} when outlived(task)
+				let pause = task.pollInterval > 0s ?? (task.pollInterval, 1s)
+				pause = 10ms when pause < 10ms
+				pause = 30s when pause > 30s
+				time.sleep(pause)
+			}
+		}
+
+		// Where a task stands. Fails when the server no longer knows it.
+		def task(taskId string) !Task {
+			return taskOf(try request("tasks/get", map<string, any>{"taskId": taskId}))
+		}
+
+		// Asks the server to stop a task. The server may let it finish.
+		// Fails when the server does not know the task, and a server of
+		// revision 2025-11-25 also when the task has ended.
+		def cancelTask(taskId string) !none {
+			try request("tasks/cancel", map<string, any>{"taskId": taskId})
+			return none
+		}
+
+		// The tasks this client started that the server still keeps, all
+		// pages (revision 2025-11-25). Fails with NotFound on revision
+		// 2026-07-28, which has no such list: keep the ids.
+		def tasks() !Task[] {
+			fail McpError{message: "mcp: revision {revision} has no list of tasks", code: "NotFound", kind: McpErrorKind.NotFound} when modern
+			let out Task[] = []
+			let cursor = ""
+			for {
+				let page = try request("tasks/list", cursorParams(cursor))
+				for let (_, item) in listOf(member(page, "tasks")) {
+					out.push(taskOf(item))
+				}
+				cursor = textOf(member(page, "nextCursor"))
+				break when cursor == ""
+			}
+			return out
+		}
+
+		// Asks to be told of a task's changes through `taskChanged`
+		// (revision 2026-07-28; the earlier one tells without being asked).
+		// Fails when the stream of notifications cannot be opened.
+		def follow(taskId string) !none {
+			return none unless modern
+			followed.push(taskId) unless taskId in followed
+			return try relisten()
+		}
+
+		// Whether a task is past the lifetime its server gave it.
+		internal def outlived(task Task) bool {
+			let lifetime = task.lifetime
+			let created = task.created
+			return false when lifetime is none || created is none
+			return !time.now().before(created + lifetime)
+		}
+
+		// One `tools/call`, as a task when asked and the tool allows it.
+		internal def invoke(name string, arguments map<string, any>, progress ?ProgressHandler, asTask bool) !ToolRun {
+			let params = map<string, any>{"name": name, "arguments": arguments}
+			if !modern && revision == "2025-11-25" && capabilities.tasks {
+				// The client asks for a task there, and must for a tool that
+				// runs as one only.
+				try tools() unless known.hasKey(name)
+				let tool = known.get(name)
+				let support = tool is none ?? (TaskSupport.Forbidden, tool.taskSupport)
+				params.set("task", new map<string, any>()) when support == TaskSupport.Required || (asTask && support == TaskSupport.Optional)
+			}
+			let failure ?error = none
+			let result = request("tools/call", params, progress, mirrored(name, arguments)) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is McpError && failure.number == -32020 {
+				// The tool's schema changed: its headers are read again.
+				try tools()
+				failure = none
+				result = try request("tools/call", params, progress, mirrored(name, arguments))
+			}
+			fail failure unless failure is none
+			return ToolRun{task: taskOf(result)} when textOf(member(result, "resultType")) == "task"
+			return ToolRun{task: taskOf(member(result, "task"))} when !modern && has(result, "task")
+			return ToolRun{result: toolResultOf(result)}
+		}
+
+		// Every resource with a fixed URI, all pages. Fails when the server
+		// does or does not answer in time.
+		def resources() !Resource[] {
+			let out Resource[] = []
+			let cursor = ""
+			for {
+				let page = try request("resources/list", cursorParams(cursor))
+				for let (_, item) in listOf(member(page, "resources")) {
+					out.push(resourceOf(item))
+				}
+				cursor = textOf(member(page, "nextCursor"))
+				break when cursor == ""
+			}
+			return out
+		}
+
+		// Every resource template, all pages. Fails when the server does or
+		// does not answer in time.
+		def templates() !ResourceTemplate[] {
+			let out ResourceTemplate[] = []
+			let cursor = ""
+			for {
+				let page = try request("resources/templates/list", cursorParams(cursor))
+				for let (_, item) in listOf(member(page, "resourceTemplates")) {
+					out.push(templateOf(item))
+				}
+				cursor = textOf(member(page, "nextCursor"))
+				break when cursor == ""
+			}
+			return out
+		}
+
+		// The contents of a resource. Fails with NotFound when the server
+		// has none at that URI.
+		def read(uri string) !ResourceContents[] {
+			let failure ?error = none
+			let result = request("resources/read", map<string, any>{"uri": uri}) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				// -32602 since 2026-07-28, -32002 before.
+				fail McpError{...failure, code: "NotFound", kind: McpErrorKind.NotFound} when failure is McpError && (failure.number == -32002 || failure.number == -32602)
+				fail failure
+			}
+			let out ResourceContents[] = []
+			for let (_, item) in listOf(member(result, "contents")) {
+				out.push(contentsOf(item))
+			}
+			return out
+		}
+
+		// Asks to be told through `updated` when a resource changes. Fails
+		// when the server refuses or does not acknowledge in time.
+		def subscribe(uri string) !none {
+			if !modern {
+				try request("resources/subscribe", map<string, any>{"uri": uri})
+				return none
+			}
+			uris.push(uri) unless uri in uris
+			return try relisten()
+		}
+
+		// Ends a subscription. Fails when the server refuses or does not
+		// answer in time.
+		def unsubscribe(uri string) !none {
+			if !modern {
+				try request("resources/unsubscribe", map<string, any>{"uri": uri})
+				return none
+			}
+			let at = uris.indexOf(uri)
+			return none when at < 0
+			uris.remove(at)
+			return try relisten()
+		}
+
+		// Asks to be told through `changed` when the server's lists change.
+		// A server of the revisions before 2026-07-28 tells without being
+		// asked. Fails when the server does not acknowledge in time.
+		def watch() !none {
+			return none unless modern
+			watched = true
+			return try relisten()
+		}
+
+		// Every prompt, all pages. Fails when the server does or does not
+		// answer in time.
+		def prompts() !Prompt[] {
+			let out Prompt[] = []
+			let cursor = ""
+			for {
+				let page = try request("prompts/list", cursorParams(cursor))
+				for let (_, item) in listOf(member(page, "prompts")) {
+					out.push(promptOf(item))
+				}
+				cursor = textOf(member(page, "nextCursor"))
+				break when cursor == ""
+			}
+			return out
+		}
+
+		// A prompt filled in with its arguments. Fails when the server has
+		// no such prompt, a required argument is missing, or no answer comes
+		// in time.
+		def prompt(name string, arguments map<string, string> = {}) !PromptResult {
+			let given = new map<string, any>()
+			for let (key, value) in arguments {
+				given.set(key, value)
+			}
+			return promptResultOf(try request("prompts/get", map<string, any>{"name": name, "arguments": given}))
+		}
+
+		// Values the server offers for an argument of a prompt or a hole of
+		// a resource template, given the text typed so far and the
+		// arguments already filled in. Fails when the server does or does
+		// not answer in time.
+		def complete(reference string, argument string, typed string, given map<string, string> = {}, kind Reference = Reference.Prompt) !Completion {
+			let target = kind == Reference.Prompt ?? (map<string, any>{"type": "ref/prompt", "name": reference}, map<string, any>{"type": "ref/resource", "uri": reference})
+			let params = map<string, any>{"ref": target, "argument": map<string, any>{"name": argument, "value": typed}}
+			if given.len() > 0 {
+				let filled = new map<string, any>()
+				for let (key, value) in given {
+					filled.set(key, value)
+				}
+				params.set("context", map<string, any>{"arguments": filled})
+			}
+			return completionOf(try request("completion/complete", params))
+		}
+
+		// Asks for the server's log messages of this level and worse, which
+		// arrive through `logged`. Fails when the server refuses or does not
+		// answer in time.
+		def logs(least LogLevel) !none {
+			level = least
+			return none when modern
+			try request("logging/setLevel", map<string, any>{"level": levelText(least)})
+			return none
+		}
+
+		// Checks that the server answers. Revision 2026-07-28 has no ping;
+		// there a discovery is asked for instead. Fails when no answer comes
+		// in time.
+		def ping() !none {
+			try request(modern ?? ("server/discover", "ping"), new map<string, any>())
+			return none
+		}
+
+		// Ends the connection. Does not fail.
+		def close() !none {
+			let link = carrier
+			if link is none {
+				// A started server that never answered is still to be ended.
+				try stop()
+				return none
+			}
+			link.cancel(listening) when listening >= 0
+			listening = -1
+			link.close()
+			carrier = none
+			try stop()
+			return none
+		}
+
+		// Ends the server this client started: its input is closed by now,
+		// which a server takes as the end; one that stays is asked to stop,
+		// and one that still stays is killed.
+		internal def stop() !none {
+			let child = process
+			return none when child is none
+			process = none
+			let ended = try child.wait(2s)
+			return none unless ended is none
+			child.terminate() onerror recover none
+			ended = try child.wait(2s)
+			return none unless ended is none
+			try child.kill()
+			try child.wait()
+			return none
+		}
+
+		internal def mirroring() bool {
+			let link = carrier
+			return !(link is none) && link.mirrors()
+		}
+
+		// The headers that repeat a tool call's arguments over HTTP.
+		internal def mirrored(name string, arguments map<string, any>) map<string, string> {
+			let out = new map<string, string>()
+			return out unless mirroring()
+			if !known.hasKey(name) {
+				tools() onerror recover Tool[]
+			}
+			let tool = known.get(name)
+			return out when tool is none
+			mirroredHeaders(member(tool.inputSchema, "properties"), arguments, out)
+			return out
+		}
+
+		// Opening ---------------------------------------------------------------
+
+		// Finds out which era the server speaks and agrees on a revision.
+		internal def handshake() !none {
+			let newer string[] = []
+			let older string[] = []
+			for let (_, r) in revisions {
+				if atLeast(r, modernSince) {
+					newer.push(r)
+				} else {
+					older.push(r)
+				}
+			}
+			let wanted = newer.len() > 0 ?? (newer[0], "")
+			// A server may refuse the first version and name the ones it has.
+			for let attempt = 0; attempt < 2 && wanted != ""; attempt++ {
+				revision = wanted
+				modern = true
+				let failure ?error = none
+				let found = exchange("server/discover", stamped(new map<string, any>(), ""), probeTimeout) onerror (err error) {
+					failure = err
+					recover none
+				}
+				let offered string[] = []
+				if failure is none {
+					offered = textsOf(member(found, "supportedVersions"))
+				} else if failure is McpError && failure.kind == McpErrorKind.UnsupportedVersion {
+					offered = textsOf(member(failure.data, "supported"))
+				} else {
+					// Anything else is a server that wants `initialize`.
+					break
+				}
+				let chosen = ""
+				for let (_, r) in newer {
+					if r in offered {
+						chosen = r
+						break
+					}
+				}
+				if chosen == wanted && failure is none {
+					capabilities = serverCapabilitiesOf(member(found, "capabilities"))
+					instructions = textOf(member(found, "instructions"))
+					server = implementationOf(member(member(found, "_meta"), serverInfoKey))
+					let reached = carrier
+					reached.agreed(revision, true) unless reached is none
+					return none
+				}
+				if chosen == "" {
+					// A server of this era that shares only older revisions.
+					let shared = older.filter(r => r in offered)
+					fail McpError{message: "mcp: the server speaks {offered.join(", ")}, the client {revisions.join(", ")}", code: "UnsupportedVersion", kind: McpErrorKind.UnsupportedVersion} when shared.len() == 0
+					older = shared
+					break
+				}
+				wanted = chosen
+			}
+			modern = false
+			revision = ""
+			fail McpError{message: "mcp: the server does not speak {revisions.join(", ")}", code: "UnsupportedVersion", kind: McpErrorKind.UnsupportedVersion} when older.len() == 0
+			let params = map<string, any>{"protocolVersion": older[0], "capabilities": clientCapabilitiesJson(offers(), older[0]), "clientInfo": implementationJson(info, older[0])}
+			let refused ?error = none
+			let opened = exchange("initialize", params, timeout) onerror (err error) {
+				refused = err
+				recover none
+			}
+			if !(refused is none) {
+				// A server of the 2024-11-05 transport answers no POST here.
+				let reached = carrier
+				let transport = false
+				transport = refused.kind == McpErrorKind.Transport when refused is McpError
+				fail refused when reached is none || !transport
+				fail refused unless reached.fallback()
+				opened = try exchange("initialize", params, timeout)
+			}
+			let agreed = textOf(member(opened, "protocolVersion"))
+			fail McpError{message: "mcp: the server speaks {agreed}, the client {older.join(", ")}", code: "UnsupportedVersion", kind: McpErrorKind.UnsupportedVersion} unless agreed in older
+			revision = agreed
+			capabilities = serverCapabilitiesOf(member(opened, "capabilities"))
+			instructions = textOf(member(opened, "instructions"))
+			server = implementationOf(member(opened, "serverInfo"))
+			let link = carrier
+			return none when link is none
+			try link.notify("notifications/initialized", new map<string, any>())
+			link.agreed(revision, false)
+			return none
+		}
+
+		// What the client can do for the server: what it has handlers for.
+		internal def offers() ClientCapabilities {
+			return ClientCapabilities{
+				roots:          !(roots is none),
+				sampling:       !(sampling is none),
+				samplingTools:  !(sampling is none) && samplingTools,
+				elicitation:    !(elicitation is none),
+				elicitationUrl: !(elicitation is none) && elicitationUrls,
+				// A tool call may be answered with a task (2026-07-28).
+				extensions: map<string, any>{tasksExtension: new map<string, any>()},
+			}
+		}
+
+		// Requests ---------------------------------------------------------------
+
+		// The params of a list request at a cursor.
+		internal def cursorParams(cursor string) map<string, any> {
+			let params = new map<string, any>()
+			params.set("cursor", cursor) when cursor != ""
+			return params
+		}
+
+		// params with the `_meta` the revision asks for: in 2026-07-28 the
+		// version, the client and what it can do with every request.
+		internal def stamped(params map<string, any>, token string) map<string, any> {
+			let carried = new map<string, any>()
+			carried.set("progressToken", token) when token != ""
+			if modern {
+				carried.set(versionKey, revision)
+				carried.set(clientInfoKey, implementationJson(info, revision))
+				carried.set(capabilitiesKey, clientCapabilitiesJson(offers(), revision))
+				let wanted = level
+				carried.set(logLevelKey, levelText(wanted)) unless wanted is none
+			}
+			params.set("_meta", carried) when carried.len() > 0
+			return params
+		}
+
+		// Sends a request and returns its result, giving the server what it
+		// asks for on the way (revision 2026-07-28: an `input_required`
+		// result is answered and the request sent again).
+		internal def request(method string, params map<string, any>, reported ?ProgressHandler = none, headers map<string, string> = {}) !any {
+			fail McpError{message: "mcp: the client is not open", code: "Closed", kind: McpErrorKind.Closed} when carrier is none
+			let token = ""
+			if !(reported is none) {
+				tokens++
+				token = "p{tokens}"
+				progress.set(token, reported)
+			}
+			let failure ?error = none
+			let result = converse(method, params, token, headers) onerror (err error) {
+				failure = err
+				recover none
+			}
+			progress.delete(token) when token != ""
+			fail failure unless failure is none
+			return result
+		}
+
+		internal def converse(method string, params map<string, any>, token string, headers map<string, string>) !any {
+			let sent = stamped(params.clone(), token)
+			for let round = 0; round < 16; round++ {
+				let result = try exchange(method, sent, timeout, headers)
+				let kind = textOf(member(result, "resultType"))
+				// A server of an earlier revision sends no result type.
+				// A task is its request's answer; `wait` follows it.
+				return result when kind := "" || "complete" || "task"
+				fail McpError{message: "mcp: unknown result type {kind}", code: "Transport", kind: McpErrorKind.Transport} unless kind == "input_required"
+				let answers = new map<string, any>()
+				for let (key, wanted) in objectOf(member(result, "inputRequests")) {
+					answers.set(key, try asked(textOf(member(wanted, "method")), member(wanted, "params")))
+				}
+				sent = stamped(params.clone(), token)
+				sent.set("inputResponses", answers) when answers.len() > 0
+				sent.set("requestState", member(result, "requestState")) when has(result, "requestState")
+			}
+			fail McpError{message: "mcp: {method} kept asking for input", code: "Transport", kind: McpErrorKind.Transport}
+		}
+
+		// One request and its response.
+		internal def exchange(method string, params map<string, any>, within duration, headers map<string, string> = {}) !any {
+			let link = carrier
+			fail McpError{message: "mcp: the client is not open", code: "Closed", kind: McpErrorKind.Closed} when link is none
+			let handle = link.send(method, params, headers) onerror (err error) {
+				fail failureOf(err)
+			}
+			let failure ?error = none
+			let result = link.receive(handle, within) onerror (err error) {
+				failure = err
+				recover none
+			}
+			return result when failure is none
+			let failed = failureOf(failure)
+			link.cancel(handle) when failed.kind == McpErrorKind.Timeout
+			fail failed
+		}
+
+		// Opens the stream of change notifications for what `watch` and
+		// `subscribe` asked for, in place of the one before.
+		internal def relisten() !none {
+			let link = carrier
+			fail McpError{message: "mcp: the client is not open", code: "Closed", kind: McpErrorKind.Closed} when link is none
+			link.cancel(listening) when listening >= 0
+			listening = -1
+			return none unless watched || uris.len() > 0 || followed.len() > 0
+			let filter = new map<string, any>()
+			filter.set("taskIds", textsJson(followed)) when followed.len() > 0
+			if watched {
+				filter.set("toolsListChanged", true)
+				filter.set("promptsListChanged", true)
+				filter.set("resourcesListChanged", true)
+			}
+			filter.set("resourceSubscriptions", textsJson(uris)) when uris.len() > 0
+			for ack.len() > 0 {
+				<-ack
+			}
+			listening = link.send("subscriptions/listen", stamped(map<string, any>{"notifications": filter}, ""), new map<string, string>()) onerror (err error) {
+				fail failureOf(err)
+			}
+			let late = time.sleepChan(timeout)
+			select {
+				case ack:
+					return none
+				case late:
+					link.cancel(listening)
+					listening = -1
+					fail McpError{message: "mcp: the server did not acknowledge the subscription", code: "Timeout", kind: McpErrorKind.Timeout}
+			}
+		}
+
+		// What the server sends -------------------------------------------------------
+
+		// Takes one notification of the server.
+		internal def told(method string, params any) {
+			match method {
+				case "notifications/progress":
+					let reported = progress.get(textOf(member(params, "progressToken")))
+					return when reported is none
+					let done = optionalFloat(member(params, "progress"))
+					let total = optionalFloat(member(params, "total"))
+					reported(done is none ?? (0.0, done), total is none ?? (0.0, total), textOf(member(params, "message")))
+				case "notifications/message":
+					let handler = logged
+					let severity = levelOf(member(params, "level"))
+					return when handler is none || severity is none
+					handler(severity, member(params, "data"), textOf(member(params, "logger")))
+				case "notifications/tools/list_changed", "notifications/resources/list_changed", "notifications/prompts/list_changed":
+					let handler = changed
+					handler(method.split("/")[1]) unless handler is none
+				case "notifications/resources/updated":
+					let handler = updated
+					handler(textOf(member(params, "uri"))) unless handler is none
+				case "notifications/elicitation/complete":
+					let handler = elicitationCompleted
+					handler(textOf(member(params, "elicitationId"))) unless handler is none
+				case "notifications/tasks/status", "notifications/tasks":
+					let handler = taskChanged
+					handler(taskOf(params)) unless handler is none
+				case "notifications/subscriptions/acknowledged":
+					ack.offer(true)
+				case "notifications/cancelled":
+					// The server ended the stream of change notifications.
+					listening = -1 when idKey(member(params, "requestId")) == "n{listening}"
+			}
+		}
+
+		// Answers one request of the server. Fails with -32601 for what the
+		// client has no handler for.
+		internal def asked(method string, params any) !any {
+			match method {
+				case "ping":
+					return new map<string, any>()
+				case "sampling/createMessage":
+					let handler = sampling
+					fail jsonrpc.errorOf(-32601, "Sampling is not supported") when handler is none
+					return samplingResultJson(try handler(samplingRequestOf(params)), revision)
+				case "roots/list":
+					let handler = roots
+					fail jsonrpc.errorOf(-32601, "Roots are not supported") when handler is none
+					return rootsJson(try handler())
+				case "elicitation/create":
+					let handler = elicitation
+					fail jsonrpc.errorOf(-32601, "Elicitation is not supported") when handler is none
+					return elicitationJson(try handler(ElicitationRequest{message: textOf(member(params, "message")), schema: objectOf(member(params, "requestedSchema")), url: textOf(member(params, "url")), id: textOf(member(params, "elicitationId"))}))
+			}
+			fail jsonrpc.errorOf(-32601, "Method not found: {method}")
+		}
+
+		// A failure of the transport or the server as an McpError.
+		internal def failureOf(err error) McpError {
+			return err when err is McpError
+			if err is jsonrpc.RPCError {
+				let kind = McpErrorKind.Remote
+				match err.kind {
+					case jsonrpc.ErrorCode.Closed:
+						kind = McpErrorKind.Closed
+					case jsonrpc.ErrorCode.Timeout:
+						kind = McpErrorKind.Timeout
+					case jsonrpc.ErrorCode.Protocol:
+						kind = McpErrorKind.Transport
+					case jsonrpc.ErrorCode.MethodNotFound:
+						kind = McpErrorKind.NotFound
+					case jsonrpc.ErrorCode.InvalidParams:
+						kind = McpErrorKind.InvalidParams
+					default:
+				}
+				kind = McpErrorKind.UnsupportedVersion when err.number == -32022
+				kind = McpErrorKind.MissingCapability when err.number == -32021
+				return McpError{message: err.message, code: kind.name, kind: kind, number: err.number, data: err.data}
+			}
+			return McpError{message: err.message, code: "Transport", cause: err, kind: McpErrorKind.Transport}
+		}
+	}
+
+	// Opens a client over HTTP to the MCP endpoint at target, with
+	// authorization for a server that asks for an access token. Fails when
+	// the server does not answer, speaks none of the client's revisions, or
+	// the authorization does not succeed.
+	def connect(target string, authorization ?Authorization = none) !Client {
+		let client = new Client()
+		client.authorization = authorization
+		try client.open(target)
+		return client
+	}
+
+	// Starts a server as a program of its own (`mcp.launch("adm", ["mcp"])`)
+	// and opens a client over its standard input and output; closing the
+	// client ends the program. Fails when the program cannot be started or
+	// does not answer as an MCP server.
+	def launch(program string, args string[] = [], env map<string, string> = {}, dir string = "") !Client {
+		let client = new Client()
+		try client.launch(program, args, env, dir)
+		return client
+	}
+
+	// Opens a client over a stream, one JSON message per line: the two ends
+	// of a pipe or a socket. Fails when the server does not answer or
+	// speaks none of the client's revisions.
+	def connect(reader io.Reader, writer io.Writer) !Client {
+		let client = new Client()
+		try client.open(reader, writer)
+		return client
+	}
+}
