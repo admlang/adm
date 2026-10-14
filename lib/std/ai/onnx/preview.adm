@@ -1,0 +1,173 @@
+partial module std.ai.onnx {
+	use (
+		std.ai.tensor.gemm::*
+		std.math
+		std.simd
+		std.formats.ai.onnx::(ElementType)
+		std.ai.tensor::(Tensor, storageOf, Storage)
+	)
+
+	// Runs the operators of the ai.onnx.preview domain (FlexAttention);
+	// false for another operator.
+	// Fails when the operator fails on its inputs.
+	internal def applyPreview(c Call) !bool {
+		match c.step.op {
+			case "FlexAttention":
+				try flexAttention(c)
+			default:
+				return false
+		}
+		return true
+	}
+
+	// FlexAttention: softmax(score_mod(Q·Kᵀ · scale)) then prob_mod, times
+	// V, per batch and query head over [B, H, L, E] inputs (key/value
+	// heads shared by groups of query heads). Q and K are each scaled by
+	// √scale in their own type, the scores and the softmax are computed in
+	// `softmax_precision` (float32 for narrower inputs by default), and
+	// the result is stored in V's type.
+	// Fails unless Q, K and V are rank 4 with matching sizes, or when a
+	// modifier graph fails or does not keep the scores' shape.
+	internal def flexAttention(c Call) !none {
+		let q = try c.tensor(0)
+		let k = try c.tensor(1)
+		let v = try c.tensor(2)
+		fail c.about() + "takes rank-4 Q, K and V" unless q.rank() == 4 && k.rank() == 4 && v.rank() == 4
+		let (batch, heads, length, width) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3])
+		let (kvHeads, keys, vWidth) = (k.shape[1], k.shape[2], v.shape[3])
+		fail c.about() + "K and V differ in heads or length" unless v.shape[1] == kvHeads && v.shape[2] == keys
+		fail c.about() + "Q and K differ in head size" unless k.shape[3] == width
+		fail c.about() + "{heads} query heads do not share {kvHeads} key heads evenly" unless kvHeads > 0 && heads % kvHeads == 0
+		fail c.about() + "takes floating-point inputs" unless storageOf(q.element) != Storage.Ints && storageOf(q.element) != Storage.Strings
+		let scale = c.attribute("scale") is none ?? (1.0 / math.sqrt(float(width)), float(c.float("scale", float32(1))))
+		let precision = c.attribute("softmax_precision") is none ?? (narrow(q.element) ?? (ElementType.Float, q.element), ElementType(c.int("softmax_precision", 1)))
+		let group = heads / kvHeads
+		// Q and K times √scale, the root taken in float32 and rounded to
+		// their type.
+		let root = roundedIn(q.element, float(float32(math.sqrt(float(float32(scale))))))
+		let qs = scaledBy(q, root)
+		let ks = scaledBy(k, root)
+		let pairs = batch * heads
+		let scores = zerosLike(precision, int[batch, heads, length, keys])
+		let wide = precision == ElementType.Double
+		inBands(pairs, pairs * length * keys * width, def (lo int, hi int) {
+			for let p = lo; p < hi; p++ {
+				let (b, h) = (p / heads, p % heads)
+				let qo = p * length * width
+				let ko = (b * kvHeads + h / group) * keys * width
+				let so = p * length * keys
+				if wide {
+					attentionProduct(length, keys, width, qs.doubles, qo, width, ks.doubles, ko, width, true, scores.doubles, so, keys)
+				} else {
+					gemm(length, keys, width, float32(1), qs.floats, qo, width, false, ks.floats, ko, width, true, float32(0), scores.floats, so, keys)
+				}
+			}
+		})
+		// The product in the inputs' type, then in the precision.
+		if !wide {
+			roundTo(new Tensor(scores.shape, scores.floats, q.element))
+			roundTo(scores)
+		}
+		scores = try modified(c, "score_mod", scores, precision)
+		let rows = Axis3{outer: pairs * length, n: keys, inner: 1}
+		if wide {
+			softRows(scores.doubles, scores.doubles, rows, false)
+		} else {
+			softRows(scores.floats, scores.floats, rows, false)
+			roundTo(scores)
+		}
+		scores = try modified(c, "prob_mod", scores, precision)
+		// V in the precision, the product, then V's type.
+		let vp = try cast(v, precision, true, "up")
+		let product = zerosLike(precision, int[batch, heads, length, vWidth])
+		inBands(pairs, pairs * length * keys * vWidth, def (lo int, hi int) {
+			for let p = lo; p < hi; p++ {
+				let (b, h) = (p / heads, p % heads)
+				let vo = (b * kvHeads + h / group) * keys * vWidth
+				let so = p * length * keys
+				let oo = p * length * vWidth
+				if wide {
+					attentionProduct(length, vWidth, keys, scores.doubles, so, keys, vp.doubles, vo, vWidth, false, product.doubles, oo, vWidth)
+				} else {
+					gemm(length, vWidth, keys, float32(1), scores.floats, so, keys, false, vp.floats, vo, vWidth, false, float32(0), product.floats, oo, vWidth)
+				}
+			}
+		})
+		roundTo(product) unless wide
+		let out = product.element == v.element ?? (product, try cast(product, v.element, true, "up"))
+		c.out(0, out)
+		return none
+	}
+
+	// Whether `e` is narrower than float32.
+	internal def narrow(e ElementType) bool {
+		return e := ElementType.Float16 || ElementType.BFloat16
+	}
+
+	// `x` rounded to the floating-point type `e`.
+	internal def roundedIn(e ElementType, x float) float {
+		return x when e == ElementType.Double
+		let t = zerosLike(e, int[1])
+		t.floats[0] = float32(x)
+		roundTo(t)
+		return float(t.floats[0])
+	}
+
+	internal def valueAt(t Tensor, i int) float {
+		return storageOf(t.element) == Storage.Doubles ?? (t.doubles[i], float(t.floats[i]))
+	}
+
+	internal def setValue(t Tensor, i int, x float) {
+		if storageOf(t.element) == Storage.Doubles {
+			t.doubles[i] = x
+		} else {
+			t.floats[i] = float32(x)
+		}
+	}
+
+	// `t` times `factor`, rounded to its type.
+	internal def scaledBy(t Tensor, factor float) Tensor {
+		let out = zerosLike(t.element, t.shape.clone())
+		for let i = 0; i < t.count(); i++ {
+			setValue(out, i, valueAt(t, i) * factor)
+		}
+		roundTo(out)
+		return out
+	}
+
+	// `scores` through the graph attribute `name` when the node has one,
+	// its result in `precision`.
+	// Fails when the graph fails or gives another shape.
+	internal def modified(c Call, name string, scores Tensor, precision ElementType) !Tensor {
+		return scores unless c.step.graphs.get(name) is Plan
+		let outs = try runGraph(c, try graphOf(c, name), Held[Held{v: scores}])
+		fail c.about() + "{name} gives no output" unless outs.len() == 1
+		let got = outs[0].v
+		fail c.about() + "{name} must give a tensor" unless got is Tensor
+		fail c.about() + "{name} gives shape {got.shape}, not {scores.shape}" unless got.shape.equals(scores.shape)
+		return got when got.element == precision
+		return try cast(got, precision, true, "up")
+	}
+
+	// out = a · b (or a · bᵀ with `transB`) for float64 matrices: m × k
+	// `a` with rows lda apart, `b` k × n (n × k transposed), rows ldb apart.
+	internal def attentionProduct(m int, n int, k int, a float[], ao int, lda int, b float[], bo int, ldb int, transB bool, out float[], oo int, ldo int) {
+		let v vec4<float>
+		for let i = 0; i < m; i++ {
+			for let j = 0; j < n; j++ {
+				let acc = v.splat(0.0)
+				let p = 0
+				if transB {
+					for; p + 4 <= k; p += 4 {
+						acc = simd.fma(v.load(a, ao + i * lda + p), v.load(b, bo + j * ldb + p), acc)
+					}
+				}
+				let sum = simd.sum(acc)
+				for; p < k; p++ {
+					sum += a[ao + i * lda + p] * (transB ?? (b[bo + j * ldb + p], b[bo + p * ldb + j]))
+				}
+				out[oo + i * ldo + j] = sum
+			}
+		}
+	}
+}

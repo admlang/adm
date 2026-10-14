@@ -1,0 +1,1150 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.gpu
+		std.ai.tensor::(Weights, RopeStyle)
+		std.ai.tensor.gpu::*
+		std.ai.llm::*
+	)
+
+	// A LoRA pair's matrices on the GPU (as LoraPair holds them), and while
+	// it is tuned on the GPU its gradients and Adam's moments.
+	struct DevicePair {
+		a     gpu.DeviceBuffer<float32>
+		b     gpu.DeviceBuffer<float32>
+		gradA ?gpu.DeviceBuffer<float32>
+		gradB ?gpu.DeviceBuffer<float32>
+		meanA ?gpu.DeviceBuffer<float32>
+		meanB ?gpu.DeviceBuffer<float32>
+		varA  ?gpu.DeviceBuffer<float32>
+		varB  ?gpu.DeviceBuffer<float32>
+	}
+
+	// `pair` on the GPU, copied there on first use.
+	// Fails when the device memory runs out.
+	def devicePair(pair LoraPair) !DevicePair {
+		let held = pair.device
+		return held when held is DevicePair
+		let made = DevicePair{a: try gpu.upload(pair.a.data()), b: try gpu.upload(pair.b.data())}
+		pair.device = made
+		return made
+	}
+
+	// The widest rank of the adapters in `parts` (1 without any), for the
+	// room the device adapters' products take.
+	def widestRank(parts ModelParts) int {
+		let widest = 1
+		for let (_, layer) in parts.layers {
+			for let (_, list) in layer.adapters {
+				for let (_, adapted) in list {
+					widest = widest.max(adapted.pair.rank)
+				}
+			}
+			for let (_, lists) in layer.expertAdapters {
+				for let (_, list) in lists {
+					for let (_, adapted) in list {
+						widest = widest.max(adapted.pair.rank)
+					}
+				}
+			}
+		}
+		for let (_, adapted) in parts.outputAdapters {
+			widest = widest.max(adapted.pair.rank)
+		}
+		return widest
+	}
+
+	// out (n rows from oo, os apart, `rows` values each) += every adapter
+	// of `list` applied to the n rows of x (from xo, xs apart); `low`
+	// holds n times the widest rank of them.
+	// Fails when a launch fails.
+	def adaptDevice(list Adapted[], x gpu.DeviceBuffer<float32>, xo int, xs int, out gpu.DeviceBuffer<float32>, oo int, os int, n int, rows int, low gpu.DeviceBuffer<float32>) !none {
+		for let (_, adapted) in list {
+			let pair = adapted.pair
+			let d = try devicePair(pair)
+			let r = pair.rank
+			let cols = pair.a.cols
+			try lowRank(d.a, adapted.aFrom * cols, x, xo, xs, low, n, r, cols, n * r * 32)
+			try addLowRank(d.b, adapted.from * r, low, out, oo, os, n, rows, r, pair.scale, n * rows)
+		}
+		return none
+	}
+
+	// Back through `list` (see adaptDevice): given the multiply's input x
+	// and its output's gradient dy (n rows, `rows` values each), the
+	// gradient through every pair is added to dx, and a pair being tuned
+	// adds its A's and B's gradients to theirs. `low` and `dlow` hold n
+	// times the widest rank.
+	// Fails when a launch fails.
+	def adaptDeviceBack(list Adapted[], x gpu.DeviceBuffer<float32>, xo int, xs int, dy gpu.DeviceBuffer<float32>, yo int, ys int, dx gpu.DeviceBuffer<float32>, dxo int, dxs int, n int, rows int, low gpu.DeviceBuffer<float32>, dlow gpu.DeviceBuffer<float32>) !none {
+		for let (_, adapted) in list {
+			let pair = adapted.pair
+			let d = try devicePair(pair)
+			let r = pair.rank
+			let cols = pair.a.cols
+			let ao = adapted.aFrom * cols
+			let bo = adapted.from * r
+			try lowRankBack(d.b, bo, dy, yo, ys, dlow, n, rows, r, pair.scale, n * r * 32)
+			let (gradA, gradB) = (d.gradA, d.gradB)
+			if gradA is gpu.DeviceBuffer<float32> && gradB is gpu.DeviceBuffer<float32> {
+				try lowRank(d.a, ao, x, xo, xs, low, n, r, cols, n * r * 32)
+				try gradLowB(dy, yo, ys, low, gradB, bo, n, rows, r, pair.scale, rows * r)
+				try gradLowA(dlow, x, xo, xs, gradA, ao, n, r, cols, r * cols)
+			}
+			try addLowRankBack(d.a, ao, dlow, dx, dxo, dxs, n, r, cols, n * cols)
+		}
+		return none
+	}
+
+	// The Trainer's work on the GPU, for a model whose weights are there:
+	// the same passes on device buffers, with the kernels of
+	// std.ai.tensor.gpu. The buffers hold a sequence of up to `capacity`
+	// tokens and grow when a longer one comes.
+	type DeviceTrainer {
+		parts       ModelParts
+		model       DeviceModel
+		state       DeviceState
+		pairs       LoraPair[]
+		// Tokens the buffers hold room for, and in the sequence being run.
+		capacity    int
+		n           int
+		// The stream entering each layer and leaving the last, n · width
+		// values per layer one after another.
+		inputs      gpu.DeviceBuffer<float32>
+		// One layer's values, as the Trainer's fields of the same names.
+		normed      gpu.DeviceBuffer<float32>
+		both        gpu.DeviceBuffer<float32>
+		qPre        gpu.DeviceBuffer<float32>
+		q           gpu.DeviceBuffer<float32>
+		gates       gpu.DeviceBuffer<float32>
+		kPre        gpu.DeviceBuffer<float32>
+		k           gpu.DeviceBuffer<float32>
+		vPre        gpu.DeviceBuffer<float32>
+		v           gpu.DeviceBuffer<float32>
+		att         gpu.DeviceBuffer<float32>
+		gated       gpu.DeviceBuffer<float32>
+		proj        gpu.DeviceBuffer<float32>
+		mid         gpu.DeviceBuffer<float32>
+		normed2     gpu.DeviceBuffer<float32>
+		g           gpu.DeviceBuffer<float32>
+		u           gpu.DeviceBuffer<float32>
+		product     gpu.DeviceBuffer<float32>
+		down        gpu.DeviceBuffer<float32>
+		lse         gpu.DeviceBuffer<float32>
+		deltas      gpu.DeviceBuffer<float32>
+		// Gemma 4: per-layer inputs of the sequence, the stream before a
+		// layer's input, the gate's projection, the gated input and its
+		// projection back.
+		perLayer    gpu.DeviceBuffer<float32>
+		after       gpu.DeviceBuffer<float32>
+		inPre       gpu.DeviceBuffer<float32>
+		inAct       gpu.DeviceBuffer<float32>
+		inOut       gpu.DeviceBuffer<float32>
+		// Gradients.
+		dx          gpu.DeviceBuffer<float32>
+		dmid        gpu.DeviceBuffer<float32>
+		dn          gpu.DeviceBuffer<float32>
+		dq          gpu.DeviceBuffer<float32>
+		dqg         gpu.DeviceBuffer<float32>
+		dk          gpu.DeviceBuffer<float32>
+		dv          gpu.DeviceBuffer<float32>
+		datt        gpu.DeviceBuffer<float32>
+		dproj       gpu.DeviceBuffer<float32>
+		dg          gpu.DeviceBuffer<float32>
+		du          gpu.DeviceBuffer<float32>
+		dtmp        gpu.DeviceBuffer<float32>
+		// The keys and values of layers whose cache a later layer reads,
+		// and the gradients that layer sends back, by layer.
+		heldKeys    map<int, gpu.DeviceBuffer<float32>>
+		heldValues  map<int, gpu.DeviceBuffer<float32>>
+		heldDk      map<int, gpu.DeviceBuffer<float32>>
+		heldDv      map<int, gpu.DeviceBuffer<float32>>
+		// The adapters' products, the multiplies' column splits, and the
+		// output projection's rows of logits for `headRows` targets.
+		low         gpu.DeviceBuffer<float32>
+		dlow        gpu.DeviceBuffer<float32>
+		split       gpu.DeviceBuffer<float32>
+		hn          gpu.DeviceBuffer<float32>
+		hx          gpu.DeviceBuffer<float32>
+		dh          gpu.DeviceBuffer<float32>
+		dhx         gpu.DeviceBuffer<float32>
+		logits      gpu.DeviceBuffer<float32>
+		losses      gpu.DeviceBuffer<float32>
+		rows        gpu.DeviceBuffer<float32>
+		next        gpu.DeviceBuffer<float32>
+		host        float32[]
+		// The gradients' sums of squares by blocks (see update).
+		squaresRoom ?gpu.DeviceBuffer<float32>
+		// Mixture-of-experts layers.
+		mixer       DeviceMixer
+		// Gated DeltaNet layers (see Trainer's fields of the same names),
+		// the states at the start of each chunk of tokens and a chunk's
+		// states made again, and their gradients.
+		dMix        gpu.DeviceBuffer<float32>
+		pre         gpu.DeviceBuffer<float32>
+		ys          gpu.DeviceBuffer<float32>
+		yn          gpu.DeviceBuffer<float32>
+		zg          gpu.DeviceBuffer<float32>
+		alphaIn     gpu.DeviceBuffer<float32>
+		betaIn      gpu.DeviceBuffer<float32>
+		raw         gpu.DeviceBuffer<float32>
+		deltaOut    gpu.DeviceBuffer<float32>
+		checkpoints gpu.DeviceBuffer<float32>
+		states      gpu.DeviceBuffer<float32>
+		dOutD       gpu.DeviceBuffer<float32>
+		dRaw        gpu.DeviceBuffer<float32>
+		dzD         gpu.DeviceBuffer<float32>
+		dqh         gpu.DeviceBuffer<float32>
+		dkh         gpu.DeviceBuffer<float32>
+		dUnit       gpu.DeviceBuffer<float32>
+		dPre        gpu.DeviceBuffer<float32>
+		dMixed      gpu.DeviceBuffer<float32>
+		dDecay      gpu.DeviceBuffer<float32>
+		dBeta       gpu.DeviceBuffer<float32>
+
+		def new(parts ModelParts, model DeviceModel, state DeviceState, pairs LoraPair[]) {
+			self.parts = parts
+			self.model = model
+			self.state = state
+			self.pairs = pairs
+			mixer = new DeviceMixer(parts, model)
+			heldKeys = new map<int, gpu.DeviceBuffer<float32>>()
+			heldValues = new map<int, gpu.DeviceBuffer<float32>>()
+			heldDk = new map<int, gpu.DeviceBuffer<float32>>()
+			heldDv = new map<int, gpu.DeviceBuffer<float32>>()
+		}
+
+		// Device copies of the pairs being trained, with zero gradients and
+		// moments.
+		// Fails when the device memory runs out.
+		def prepare() !none {
+			for let (_, pair) in pairs {
+				let d = try devicePair(pair)
+				d.gradA = try zeros(pair.a.data().len())
+				d.gradB = try zeros(pair.b.data().len())
+				d.meanA = try zeros(pair.a.data().len())
+				d.meanB = try zeros(pair.b.data().len())
+				d.varA = try zeros(pair.a.data().len())
+				d.varB = try zeros(pair.b.data().len())
+			}
+			return none
+		}
+
+		// Allocates the buffers for `count` tokens.
+		// Fails when the device memory runs out.
+		internal def open(count int) !none {
+			try state.open() when state.capacity == 0
+			return none when count <= capacity
+			let c = count.max(capacity * 2)
+			let info = parts.info
+			let e = info.embedding
+			let hs = widestHead()
+			let qSize = info.heads * hs
+			let kvSize = info.kvHeads * hs
+			let ffn = widestFeedForward()
+			let w = parts.layerWidth.max(1)
+			let rank = widestRank(parts)
+			let vocab = parts.output.rows
+			inputs = try zeros((parts.layers.len() + 1) * c * e)
+			normed = try zeros(c * e)
+			both = try zeros(c * 2 * qSize)
+			qPre = try zeros(c * qSize)
+			q = try zeros(c * qSize)
+			gates = try zeros(c * qSize)
+			kPre = try zeros(c * kvSize)
+			k = try zeros(c * kvSize)
+			vPre = try zeros(c * kvSize)
+			v = try zeros(c * kvSize)
+			att = try zeros(c * qSize)
+			gated = try zeros(c * qSize)
+			proj = try zeros(c * e)
+			mid = try zeros(c * e)
+			normed2 = try zeros(c * e)
+			g = try zeros(c * ffn)
+			u = try zeros(c * ffn)
+			product = try zeros(c * ffn)
+			down = try zeros(c * e)
+			lse = try zeros(c * info.heads)
+			deltas = try zeros(c * info.heads)
+			perLayer = try zeros(c * parts.layers.len() * w)
+			after = try zeros(c * e)
+			inPre = try zeros(c * w)
+			inAct = try zeros(c * w)
+			inOut = try zeros(c * e)
+			dx = try zeros(c * e)
+			dmid = try zeros(c * e)
+			dn = try zeros(c * e)
+			dq = try zeros(c * qSize)
+			dqg = try zeros(c * 2 * qSize)
+			dk = try zeros(c * kvSize)
+			dv = try zeros(c * kvSize)
+			datt = try zeros(c * qSize)
+			dproj = try zeros(c * e)
+			dg = try zeros(c * ffn)
+			du = try zeros(c * ffn)
+			dtmp = try zeros(c * ffn.max(e))
+			low = try zeros(c * rank)
+			dlow = try zeros(c * rank)
+			split = try zeros(splitWork)
+			hn = try zeros(headRows * e)
+			hx = try zeros(headRows * e)
+			dh = try zeros(headRows * e)
+			dhx = try zeros(headRows * e)
+			logits = try zeros(headRows * vocab)
+			losses = try zeros(headRows)
+			rows = try zeros(headRows)
+			next = try zeros(headRows)
+			let (kH, vH, headSize) = (parts.deltaKeyHeads, parts.deltaValueHeads, parts.deltaHeadSize)
+			let channels = ((2 * kH + vH) * headSize).max(1)
+			let valueDim = (vH * headSize).max(1)
+			let chunks = (c + deltaChunk - 1) / deltaChunk
+			dMix = try zeros(c * channels)
+			pre = try zeros(c * channels)
+			ys = try zeros(c * channels)
+			yn = try zeros(c * channels)
+			zg = try zeros(c * valueDim)
+			alphaIn = try zeros((c * vH).max(1))
+			betaIn = try zeros((c * vH).max(1))
+			raw = try zeros(c * valueDim)
+			deltaOut = try zeros(c * valueDim)
+			checkpoints = try zeros((chunks * vH * headSize * headSize).max(1))
+			states = try zeros((vH * (deltaChunk + 1) * headSize * headSize).max(1))
+			dOutD = try zeros(c * valueDim)
+			dRaw = try zeros(c * valueDim)
+			dzD = try zeros(c * valueDim)
+			dqh = try zeros((vH * c * headSize).max(1))
+			dkh = try zeros((vH * c * headSize).max(1))
+			dUnit = try zeros(c * channels)
+			dPre = try zeros(c * channels)
+			dMixed = try zeros(c * channels)
+			dDecay = try zeros((c * vH).max(1))
+			dBeta = try zeros((c * vH).max(1))
+			heldKeys = new map<int, gpu.DeviceBuffer<float32>>()
+			heldValues = new map<int, gpu.DeviceBuffer<float32>>()
+			heldDk = new map<int, gpu.DeviceBuffer<float32>>()
+			heldDv = new map<int, gpu.DeviceBuffer<float32>>()
+			for let (_, layer) in parts.layers {
+				let s = layer.sharedCache
+				continue when s < 0 || !(heldKeys.get(s) is none)
+				let size = c * info.kvHeads * parts.layers[s].headSize
+				heldKeys.set(s, try zeros(size))
+				heldValues.set(s, try zeros(size))
+				heldDk.set(s, try zeros(size))
+				heldDv.set(s, try zeros(size))
+			}
+			capacity = c
+			return none
+		}
+
+		// The widest attention head of any layer.
+		internal def widestHead() int {
+			let widest = parts.headSize
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.headSize)
+			}
+			return widest
+		}
+
+		// The widest feed-forward of any layer or shared expert.
+		internal def widestFeedForward() int {
+			let widest = 1
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.gate.rows)
+				let shared = layer.sharedGate
+				widest = widest.max(shared.rows) when shared is Weights
+			}
+			return widest
+		}
+
+		// As Trainer.run, on the GPU: `x0` holds the tokens' embeddings
+		// (rows of the model's width), `perLayerInputs` Gemma 4's inputs
+		// for every layer (empty without).
+		// Fails when a launch or copy fails.
+		def run(x0 float32[], perLayerInputs float32[], turns float32[], count int, targets int[], nextTokens int[], grad float32) !float {
+			try open(count)
+			n = count
+			let e = parts.info.embedding
+			try inputs.write(x0, 0)
+			state.hasAxes = turns.len() > 0
+			if state.hasAxes {
+				if state.axes.len() < turns.len() {
+					state.axes.dispose()
+					state.axes = try zeros(turns.len())
+				}
+				try state.axes.write(turns, 0)
+			}
+			try perLayer.write(perLayerInputs, 0) when perLayerInputs.len() > 0
+			for let (index, layer) in parts.layers {
+				try layerForward(index, layer, index * n * e, (index + 1) * n * e)
+			}
+			let final = parts.layers.len() * n * e
+			try clearBuffer(dx, n * e)
+			let loss = try head(final, targets, nextTokens, grad)
+			return loss unless grad > float32(0)
+			for let (_, held) in heldDk {
+				try clearBuffer(held, held.len())
+			}
+			for let (_, held) in heldDv {
+				try clearBuffer(held, held.len())
+			}
+			for let index = parts.layers.len() - 1; index >= 0; index-- {
+				let layer = parts.layers[index]
+				try layerForward(index, layer, index * n * e, (index + 1) * n * e)
+				try layerBackward(index, layer, index * n * e)
+			}
+			return loss
+		}
+
+		// w times n rows of x into out (rows of the given widths).
+		internal def times(w DeviceWeights, x gpu.DeviceBuffer<float32>, xo int, xs int, out gpu.DeviceBuffer<float32>, oo int, os int) !none {
+			return w.multiplyTokens(x, xo, xs, out, oo, os, n, split)
+		}
+
+		// The adapters of `layer`'s `slot` on n rows of x added to out.
+		internal def adapt(layer Layer, slot int, x gpu.DeviceBuffer<float32>, xs int, out gpu.DeviceBuffer<float32>, os int, rows int) !none {
+			return none unless slot < layer.adapters.len()
+			return adaptDevice(layer.adapters[slot], x, 0, xs, out, 0, os, n, rows, low)
+		}
+
+		// Back through the adapters of `layer`'s `slot`.
+		internal def adaptBack(layer Layer, slot int, x gpu.DeviceBuffer<float32>, xs int, dy gpu.DeviceBuffer<float32>, ys int, dxb gpu.DeviceBuffer<float32>, dxs int, rows int) !none {
+			return none unless slot < layer.adapters.len()
+			return adaptDeviceBack(layer.adapters[slot], x, 0, xs, dy, 0, ys, dxb, 0, dxs, n, rows, low, dlow)
+		}
+
+		// v[at:] added to each of n rows of `width` values when at >= 0.
+		internal def bias(a gpu.DeviceBuffer<float32>, at int, width int) !none {
+			return none when at < 0
+			return addRows(a, 0, model.vectors, at, width, n * width)
+		}
+
+		// Layer `index` on the stream at inputs[xo:] into inputs[oo:],
+		// keeping its values for layerBackward.
+		// Fails when a launch fails.
+		internal def layerForward(index int, layer Layer, xo int, oo int) !none {
+			let info = parts.info
+			let e = info.embedding
+			let eps = parts.epsilon
+			let d = model.layers[index]
+			let vec = model.vectors
+			try rmsNorm(inputs, xo, normed, 0, e, vec, d.attentionNorm, float32(1), eps, n * 256)
+			let recurrent = d.recurrent
+			if recurrent is DeviceRecurrent {
+				try deltaForward(layer, d, recurrent)
+			} else {
+				try attentionForward(index, layer, d)
+			}
+			// mid = x + post(proj), and normed2 its norm.
+			try copyRows(inputs, xo, e, mid, 0, e, e, n * e)
+			try addNormed(mid, proj, e, vec, d.attentionPost, eps, float32(1), normed2, d.feedForwardNorm, n * 256)
+			let held = d.experts
+			if held is DeviceExperts {
+				try mixer.forward(layer, d, held, normed2, down, n)
+			} else {
+				try denseForward(layer, d)
+			}
+			try copyRows(mid, 0, e, inputs, oo, e, e, n * e)
+			let gate = d.inputGate
+			let projection = d.inputProjection
+			if gate is DeviceWeights && projection is DeviceWeights {
+				let w = parts.layerWidth
+				let L = parts.layers.len()
+				try addNormedAt(oo, d.feedForwardPost, float32(1))
+				try copyRows(inputs, oo, e, after, 0, e, e, n * e)
+				try times(gate, after, 0, e, inPre, 0, w)
+				try copyRows(inPre, 0, w, inAct, 0, w, w, n * w)
+				try activate(inAct, 0, w, perLayer, index * w, L * w, w, n * w, 1)
+				try times(projection, inAct, 0, w, inOut, 0, e)
+				return addNormedAt(oo, d.inputPost, layer.outputScale, inOut)
+			}
+			return addNormedAt(oo, d.feedForwardPost, layer.outputScale)
+		}
+
+		// inputs[oo:] rows = (rows + post(p)) · scale, p `down` unless given.
+		internal def addNormedAt(oo int, post int, scale float32, p ?gpu.DeviceBuffer<float32> = none) !none {
+			let e = parts.info.embedding
+			let source = p is gpu.DeviceBuffer<float32> ?? (p, down)
+			// addNormed works on whole buffers from 0: through `after`'s twin.
+			try copyRows(inputs, oo, e, dtmp, 0, e, e, n * e)
+			try addNormed(dtmp, source, e, model.vectors, post, parts.epsilon, scale, normed, -1, n * 256)
+			return copyRows(dtmp, 0, e, inputs, oo, e, e, n * e)
+		}
+
+		// A Gated DeltaNet layer on `normed` into `proj`, from an empty
+		// state, keeping its values.
+		internal def deltaForward(layer Layer, d DeviceLayer, r DeviceRecurrent) !none {
+			let (kH, vH, hs, width) = (parts.deltaKeyHeads, parts.deltaValueHeads, parts.deltaHeadSize, parts.convWidth)
+			let channels = (2 * kH + vH) * hs
+			let valueDim = vH * hs
+			let e = parts.info.embedding
+			let eps = parts.epsilon
+			let vec = model.vectors
+			try times(d.query, normed, 0, e, dMix, 0, channels)
+			try adapt(layer, slotQuery, normed, e, dMix, channels, channels)
+			try times(r.z, normed, 0, e, zg, 0, valueDim)
+			try adapt(layer, slotOutputGate, normed, e, zg, valueDim, valueDim)
+			try times(r.alpha, normed, 0, e, alphaIn, 0, vH)
+			try times(r.beta, normed, 0, e, betaIn, 0, vH)
+			try deltaConvKeep(dMix, vec, r.conv, pre, ys, channels, width, n)
+			try copyRows(ys, 0, channels, yn, 0, channels, channels, n * channels)
+			try deltaNorms(yn, channels, kH, hs, n, eps, n * 2 * kH * 32)
+			try deltaRecurKeep(yn, channels, kH, vH, hs, alphaIn, betaIn, vec, r.dtBias, r.decay, checkpoints, deltaChunk, raw, n, valueDim * 32)
+			try copyRows(raw, 0, valueDim, deltaOut, 0, valueDim, valueDim, n * valueDim)
+			try deltaGate(deltaOut, zg, vec, r.norm, vH, hs, n, eps, n * vH * 32)
+			try times(d.output, deltaOut, 0, valueDim, proj, 0, e)
+			return adapt(layer, slotOutput, deltaOut, valueDim, proj, e, e)
+		}
+
+		// Back through a Gated DeltaNet layer: dproj holds its output's
+		// gradient, which goes into dn.
+		internal def deltaBack(layer Layer, d DeviceLayer, r DeviceRecurrent) !none {
+			let (kH, vH, hs, width) = (parts.deltaKeyHeads, parts.deltaValueHeads, parts.deltaHeadSize, parts.convWidth)
+			let channels = (2 * kH + vH) * hs
+			let keyDim = kH * hs
+			let valueDim = vH * hs
+			let e = parts.info.embedding
+			let eps = parts.epsilon
+			let vec = model.vectors
+			try clearBuffer(dOutD, n * valueDim)
+			try d.output.multiplyBack(dproj, 0, e, dOutD, 0, valueDim, n, split)
+			try adaptBack(layer, slotOutput, deltaOut, valueDim, dproj, e, dOutD, valueDim, e)
+			try deltaGateBack(raw, zg, vec, r.norm, dOutD, dRaw, dzD, vH, hs, n, eps, n * vH * 32)
+			try clearBuffer(dUnit, n * channels)
+			try deltaRecurBack(yn, channels, kH, vH, hs, alphaIn, betaIn, vec, r.dtBias, r.decay, checkpoints, deltaChunk, states, dRaw, dqh, dkh, dUnit, dDecay, dBeta, n, vH * 1024)
+			try deltaHeadsSum(dqh, dkh, dUnit, channels, kH, vH, hs, n, n * 2 * keyDim)
+			try clearBuffer(dPre, n * channels)
+			try l2BackRows(ys, 0, channels, 2 * kH, dUnit, 0, channels, dPre, 0, channels, hs, n * 2 * kH, eps, n * 2 * kH * 32)
+			try copyRows(dUnit, 2 * keyDim, channels, dPre, 2 * keyDim, channels, valueDim, n * valueDim)
+			try siluBack(pre, dPre, n * channels)
+			try deltaConvBack(dPre, vec, r.conv, dMixed, channels, width, n, n * channels)
+			try deltaGatesBack(alphaIn, betaIn, vec, r.dtBias, r.decay, dDecay, dBeta, vH, n * vH)
+			try d.query.multiplyBack(dMixed, 0, channels, dn, 0, e, n, split)
+			try r.z.multiplyBack(dzD, 0, valueDim, dn, 0, e, n, split)
+			try r.alpha.multiplyBack(dDecay, 0, vH, dn, 0, e, n, split)
+			try r.beta.multiplyBack(dBeta, 0, vH, dn, 0, e, n, split)
+			try adaptBack(layer, slotQuery, normed, e, dMixed, channels, dn, e, channels)
+			return adaptBack(layer, slotOutputGate, normed, e, dzD, valueDim, dn, e, valueDim)
+		}
+
+		// Layer `index`'s attention on `normed` into `proj`.
+		internal def attentionForward(index int, layer Layer, d DeviceLayer) !none {
+			let info = parts.info
+			let e = info.embedding
+			let eps = parts.epsilon
+			let hs = layer.headSize
+			let heads = info.heads
+			let kvHeads = info.kvHeads
+			let qSize = heads * hs
+			let kvSize = kvHeads * hs
+			let vec = model.vectors
+			let halves = parts.pairing == RopeStyle.Halves ?? (1, 0)
+			let dims = parts.rotated > 0 ?? (parts.rotated, hs)
+			let turnAt = state.turnAt[index]
+			let axesAt = state.hasAxes ?? (0, -1)
+			if layer.gatedQuery {
+				try times(d.query, normed, 0, e, both, 0, 2 * qSize)
+				try adapt(layer, slotQuery, normed, e, both, 2 * qSize, 2 * qSize)
+				try splitGated(both, qPre, gates, hs, n * qSize)
+			} else {
+				try times(d.query, normed, 0, e, qPre, 0, qSize)
+				try adapt(layer, slotQuery, normed, e, qPre, qSize, qSize)
+			}
+			try bias(qPre, d.queryBias, qSize)
+			try copyRows(qPre, 0, qSize, q, 0, qSize, qSize, n * qSize)
+			try prepareHeads(q, 0, hs, heads, d.queryNorm >= 0 ?? (1, 0), vec, d.queryNorm, eps, 1, 0, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * heads * 256)
+			let (key, value) = (d.key, d.value)
+			let own = layer.sharedCache < 0
+			if own && key is DeviceWeights && value is DeviceWeights {
+				try times(key, normed, 0, e, kPre, 0, kvSize)
+				try times(value, normed, 0, e, vPre, 0, kvSize)
+				try adapt(layer, slotKey, normed, e, kPre, kvSize, kvSize)
+				try adapt(layer, slotValue, normed, e, vPre, kvSize, kvSize)
+				try bias(kPre, d.keyBias, kvSize)
+				try bias(vPre, d.valueBias, kvSize)
+				try copyRows(kPre, 0, kvSize, k, 0, kvSize, kvSize, n * kvSize)
+				try copyRows(vPre, 0, kvSize, v, 0, kvSize, kvSize, n * kvSize)
+				try prepareHeads(k, 0, hs, kvHeads, d.keyNorm >= 0 ?? (1, 0), vec, d.keyNorm, eps, 1, 0, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * kvHeads * 256)
+				try prepareHeads(v, 0, hs, kvHeads, 1, vec, d.valueNorm, eps, 0, 0, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * kvHeads * 256) when d.valueNorm >= 0
+				let hk = heldKeys.get(index)
+				let hv = heldValues.get(index)
+				if hk is gpu.DeviceBuffer<float32> && hv is gpu.DeviceBuffer<float32> {
+					try copyRows(k, 0, kvSize, hk, 0, kvSize, kvSize, n * kvSize)
+					try copyRows(v, 0, kvSize, hv, 0, kvSize, kvSize, n * kvSize)
+				}
+			}
+			let keys = own ?? (k, heldOf(heldKeys, layer.sharedCache, k))
+			let values = own ?? (v, heldOf(heldValues, layer.sharedCache, v))
+			try attendTiles(q, keys, values, att, lse, heads, kvHeads, hs, n, layer.window, parts.attentionScale, parts.attentionCap, vec, d.sinks, (n + 63) / 64 * heads * 256)
+			try copyRows(att, 0, qSize, gated, 0, qSize, qSize, n * qSize)
+			try gateValues(gated, gates, n * qSize) when layer.gatedQuery
+			try times(d.output, gated, 0, qSize, proj, 0, e)
+			try adapt(layer, slotOutput, gated, qSize, proj, e, e)
+			return bias(proj, d.outputBias, e)
+		}
+
+		// A dense feed-forward on `normed2` into `down`.
+		internal def denseForward(layer Layer, d DeviceLayer) !none {
+			let e = parts.info.embedding
+			let width = layer.gate.rows
+			try times(d.gate, normed2, 0, e, g, 0, width)
+			try times(d.up, normed2, 0, e, u, 0, width)
+			try adapt(layer, slotGate, normed2, e, g, width, width)
+			try adapt(layer, slotUp, normed2, e, u, width, width)
+			try copyRows(g, 0, width, product, 0, width, width, n * width)
+			try activate(product, 0, width, u, 0, width, width, n * width, parts.gelu ?? (1, 0))
+			try times(d.down, product, 0, width, down, 0, e)
+			return adapt(layer, slotDown, product, width, down, e, e)
+		}
+
+		// Back through layer `index`: `dx` holds the gradient of its output
+		// and leaves with that of its input (inputs[xo:]).
+		// Fails when a launch fails.
+		internal def layerBackward(index int, layer Layer, xo int) !none {
+			let info = parts.info
+			let e = info.embedding
+			let eps = parts.epsilon
+			let d = model.layers[index]
+			let vec = model.vectors
+			try accumulate(dx, 0, dx, 0, n * e, float32(0), layer.outputScale) unless layer.outputScale == float32(1)
+			let gate = d.inputGate
+			let projection = d.inputProjection
+			if gate is DeviceWeights && projection is DeviceWeights {
+				let w = parts.layerWidth
+				let L = parts.layers.len()
+				try clearBuffer(dproj, n * e)
+				try rmsBackRows(inOut, 0, e, 1, vec, d.inputPost, dx, 0, e, dproj, 0, e, e, eps, n * 256)
+				try clearBuffer(dg, n * w)
+				try projection.multiplyBack(dproj, 0, e, dg, 0, w, n, split)
+				try gatedBack(inPre, 0, w, perLayer, index * w, L * w, dg, 0, w, du, 0, w, w, n * w, 1)
+				try gate.multiplyBack(dg, 0, w, dx, 0, e, n, split)
+			}
+			try copyRows(dx, 0, e, dmid, 0, e, e, n * e)
+			if d.feedForwardPost >= 0 {
+				try clearBuffer(dproj, n * e)
+				try rmsBackRows(down, 0, e, 1, vec, d.feedForwardPost, dx, 0, e, dproj, 0, e, e, eps, n * 256)
+			} else {
+				try copyRows(dx, 0, e, dproj, 0, e, e, n * e)
+			}
+			try clearBuffer(dn, n * e)
+			let held = d.experts
+			if held is DeviceExperts {
+				try mixer.back(layer, d, held, normed2, dproj, dn, n)
+			} else {
+				try denseBack(layer, d)
+			}
+			try rmsBackRows(mid, 0, e, 1, vec, d.feedForwardNorm, dn, 0, e, dmid, 0, e, e, eps, n * 256)
+			try copyRows(dmid, 0, e, dx, 0, e, e, n * e)
+			if d.attentionPost >= 0 {
+				try clearBuffer(dproj, n * e)
+				try rmsBackRows(proj, 0, e, 1, vec, d.attentionPost, dmid, 0, e, dproj, 0, e, e, eps, n * 256)
+			} else {
+				try copyRows(dmid, 0, e, dproj, 0, e, e, n * e)
+			}
+			try clearBuffer(dn, n * e)
+			let recurrent = d.recurrent
+			if recurrent is DeviceRecurrent {
+				try deltaBack(layer, d, recurrent)
+			} else {
+				try attentionBack(index, layer, d)
+			}
+			return rmsBackRows(inputs, xo, e, 1, vec, d.attentionNorm, dn, 0, e, dx, 0, e, e, eps, n * 256)
+		}
+
+		// Back through a dense feed-forward: dproj holds its output's
+		// gradient, which goes into dn.
+		internal def denseBack(layer Layer, d DeviceLayer) !none {
+			let e = parts.info.embedding
+			let width = layer.gate.rows
+			try clearBuffer(dg, n * width)
+			try d.down.multiplyBack(dproj, 0, e, dg, 0, width, n, split)
+			try adaptBack(layer, slotDown, product, width, dproj, e, dg, width, e)
+			try gatedBack(g, 0, width, u, 0, width, dg, 0, width, du, 0, width, width, n * width, parts.gelu ?? (1, 0))
+			try d.gate.multiplyBack(dg, 0, width, dn, 0, e, n, split)
+			try d.up.multiplyBack(du, 0, width, dn, 0, e, n, split)
+			try adaptBack(layer, slotGate, normed2, e, dg, width, dn, e, width)
+			return adaptBack(layer, slotUp, normed2, e, du, width, dn, e, width)
+		}
+
+		// Back through layer `index`'s attention: dproj holds its output's
+		// gradient, which goes into dn.
+		internal def attentionBack(index int, layer Layer, d DeviceLayer) !none {
+			let info = parts.info
+			let e = info.embedding
+			let eps = parts.epsilon
+			let hs = layer.headSize
+			let heads = info.heads
+			let kvHeads = info.kvHeads
+			let qSize = heads * hs
+			let kvSize = kvHeads * hs
+			let vec = model.vectors
+			let halves = parts.pairing == RopeStyle.Halves ?? (1, 0)
+			let dims = parts.rotated > 0 ?? (parts.rotated, hs)
+			let turnAt = state.turnAt[index]
+			let axesAt = state.hasAxes ?? (0, -1)
+			try clearBuffer(datt, n * qSize)
+			try d.output.multiplyBack(dproj, 0, e, datt, 0, qSize, n, split)
+			try adaptBack(layer, slotOutput, gated, qSize, dproj, e, datt, qSize, e)
+			// The gates now hold their own gradient.
+			try gateValuesBack(datt, att, gates, n * qSize) when layer.gatedQuery
+			let own = layer.sharedCache < 0
+			let keys = own ?? (k, heldOf(heldKeys, layer.sharedCache, k))
+			let values = own ?? (v, heldOf(heldValues, layer.sharedCache, v))
+			let gk = own ?? (dk, heldOf(heldDk, layer.sharedCache, dk))
+			let gv = own ?? (dv, heldOf(heldDv, layer.sharedCache, dv))
+			if own {
+				let hk = heldDk.get(index)
+				let hv = heldDv.get(index)
+				if hk is gpu.DeviceBuffer<float32> && hv is gpu.DeviceBuffer<float32> {
+					try copyRows(hk, 0, kvSize, dk, 0, kvSize, kvSize, n * kvSize)
+					try copyRows(hv, 0, kvSize, dv, 0, kvSize, kvSize, n * kvSize)
+				} else {
+					try clearBuffer(dk, n * kvSize)
+					try clearBuffer(dv, n * kvSize)
+				}
+			}
+			try attentionDeltas(att, datt, deltas, n * heads, hs, n * heads * 32)
+			try attendBackQueries(q, keys, values, datt, lse, deltas, dq, heads, kvHeads, hs, n, layer.window, parts.attentionScale, parts.attentionCap, (n + 63) / 64 * heads * 256)
+			try attendBackKeys(q, keys, values, datt, lse, deltas, gk, gv, heads, kvHeads, hs, n, layer.window, parts.attentionScale, parts.attentionCap, (n + 31) / 32 * kvHeads * 256)
+			try prepareHeadsBack(dq, qPre, dq, hs, heads, d.queryNorm >= 0 ?? (1, 0), vec, d.queryNorm, eps, 1, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * heads * 256)
+			if layer.gatedQuery {
+				try joinGated(dq, gates, dqg, hs, n * qSize)
+				try d.query.multiplyBack(dqg, 0, 2 * qSize, dn, 0, e, n, split)
+				try adaptBack(layer, slotQuery, normed, e, dqg, 2 * qSize, dn, e, 2 * qSize)
+			} else {
+				try d.query.multiplyBack(dq, 0, qSize, dn, 0, e, n, split)
+				try adaptBack(layer, slotQuery, normed, e, dq, qSize, dn, e, qSize)
+			}
+			let (key, value) = (d.key, d.value)
+			if own && key is DeviceWeights && value is DeviceWeights {
+				try prepareHeadsBack(dk, kPre, dk, hs, kvHeads, d.keyNorm >= 0 ?? (1, 0), vec, d.keyNorm, eps, 1, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * kvHeads * 256)
+				try prepareHeadsBack(dv, vPre, dv, hs, kvHeads, 1, vec, d.valueNorm, eps, 0, state.axes, axesAt, parts.ropeSections, state.turns, turnAt, dims, halves, layer.ropeMagnitude, n * kvHeads * 256) when d.valueNorm >= 0
+				try key.multiplyBack(dk, 0, kvSize, dn, 0, e, n, split)
+				try value.multiplyBack(dv, 0, kvSize, dn, 0, e, n, split)
+				try adaptBack(layer, slotKey, normed, e, dk, kvSize, dn, e, kvSize)
+				try adaptBack(layer, slotValue, normed, e, dv, kvSize, dn, e, kvSize)
+			}
+			return none
+		}
+
+		// The summed loss of the next tokens after the positions `targets`
+		// of the final stream (inputs[final:]); with grad > 0, grad times
+		// its gradient goes into dx's rows.
+		internal def head(final int, targets int[], nextTokens int[], grad float32) !float {
+			let e = parts.info.embedding
+			let vocab = parts.output.rows
+			let total = 0.0
+			let picked float32[]
+			let wanted float32[]
+			let lost float32[]
+			for let from = 0; from < targets.len(); from += headRows {
+				let count = headRows.min(targets.len() - from)
+				picked.len(0)
+				wanted.len(0)
+				for let r = 0; r < count; r++ {
+					picked.push(float32(targets[from + r]))
+					wanted.push(float32(nextTokens[from + r]))
+				}
+				try rows.write(picked, 0)
+				try next.write(wanted, 0)
+				try gatherAt(final, count)
+				try rmsNorm(hx, 0, hn, 0, e, model.vectors, model.outputNorm, float32(1), parts.epsilon, count * 256)
+				try model.output.multiplyTokens(hn, 0, e, logits, 0, vocab, count, split)
+				try adaptDevice(parts.outputAdapters, hn, 0, e, logits, 0, vocab, count, vocab, low)
+				try softmaxLoss(logits, vocab, next, losses, grad, parts.softCap, count * 256)
+				// A download takes the whole buffer; the first `count` are this pass's.
+				lost.len(losses.len())
+				try losses.download(lost)
+				for let r = 0; r < count; r++ {
+					total += float(lost[r])
+				}
+				continue unless grad > float32(0)
+				try clearBuffer(dh, count * e)
+				try model.output.multiplyBack(logits, 0, vocab, dh, 0, e, count, split)
+				try adaptDeviceBack(parts.outputAdapters, hn, 0, e, logits, 0, vocab, dh, 0, e, count, vocab, low, dlow)
+				try clearBuffer(dhx, count * e)
+				try rmsBackRows(hx, 0, e, 1, model.vectors, model.outputNorm, dh, 0, e, dhx, 0, e, e, parts.epsilon, count * 256)
+				try scatterRows(dhx, rows, 0, rows, -1, dx, e, count)
+			}
+			return total
+		}
+
+		// Rows `rows` of the stream at inputs[final:] into hx.
+		internal def gatherAt(final int, count int) !none {
+			let e = parts.info.embedding
+			try copyRows(inputs, final, e, dtmp, 0, e, e, n * e)
+			return gatherRows(dtmp, rows, 0, rows, -1, hx, e, count * e)
+		}
+
+		def clearGradients() !none {
+			for let (_, pair) in pairs {
+				let d = try devicePair(pair)
+				let (ga, gb) = (d.gradA, d.gradB)
+				try clearBuffer(ga, ga.len()) when ga is gpu.DeviceBuffer<float32>
+				try clearBuffer(gb, gb.len()) when gb is gpu.DeviceBuffer<float32>
+			}
+			return none
+		}
+
+		// As Trainer.update, on the device copies; the host copies are
+		// stale until `download`.
+		// Fails when a launch or copy fails.
+		def update(step int, rate float, decay float, clip float) !none {
+			// Every gradient's sums of squares by blocks into one buffer,
+			// read back once and added in order.
+			let blocks = 0
+			for let (_, pair) in pairs {
+				blocks += (pair.a.data().len() + 16383) / 16384 + (pair.b.data().len() + 16383) / 16384
+			}
+			let held = squaresRoom
+			if !(held is gpu.DeviceBuffer<float32> && held.len() == blocks) {
+				held.dispose() when held is gpu.DeviceBuffer<float32>
+				squaresRoom = try zeros(blocks)
+			}
+			let room = squaresRoom
+			fail "llm: no room for the gradients' norm" when room is none
+			let at = 0
+			for let (_, pair) in pairs {
+				let d = try devicePair(pair)
+				for let (_, grads) in [d.gradA, d.gradB] {
+					continue unless grads is gpu.DeviceBuffer<float32>
+					let count = (grads.len() + 16383) / 16384
+					try blockSquares(grads, grads.len(), room, at, count * 256)
+					at += count
+				}
+			}
+			let sums float32[]
+			sums.len(blocks)
+			try room.download(sums)
+			let squares = 0.0
+			for let (_, p) in sums {
+				squares += float(p)
+			}
+			let norm = squares ** 0.5
+			let scale = clip > 0.0 && norm > clip ?? (clip / norm, 1.0)
+			let fix1 = 1.0 - 0.9 ** float(step)
+			let fix2 = 1.0 - 0.999 ** float(step)
+			for let (_, pair) in pairs {
+				let d = try devicePair(pair)
+				let (ga, gb, ma, mb, va, vb) = (d.gradA, d.gradB, d.meanA, d.meanB, d.varA, d.varB)
+				if ga is gpu.DeviceBuffer<float32> && ma is gpu.DeviceBuffer<float32> && va is gpu.DeviceBuffer<float32> {
+					try adamWValues(d.a, ga, ma, va, d.a.len(), float32(scale), float32(rate), float32(decay), float32(fix1), float32(fix2))
+				}
+				if gb is gpu.DeviceBuffer<float32> && mb is gpu.DeviceBuffer<float32> && vb is gpu.DeviceBuffer<float32> {
+					try adamWValues(d.b, gb, mb, vb, d.b.len(), float32(scale), float32(rate), float32(decay), float32(fix1), float32(fix2))
+				}
+				pair.stale = true
+			}
+			return none
+		}
+
+		// The pairs' values copied back to their host matrices.
+		// Fails when a copy fails.
+		def download() !none {
+			for let (_, pair) in pairs {
+				continue unless pair.stale
+				let d = try devicePair(pair)
+				try d.a.download(pair.a.data())
+				try d.b.download(pair.b.data())
+				pair.stale = false
+			}
+			return none
+		}
+
+		// Frees the gradients and moments; the pairs stay on the device.
+		def freeze() {
+			for let (_, pair) in pairs {
+				let held = pair.device
+				continue unless held is DevicePair
+				for let (_, buffer) in [held.gradA, held.gradB, held.meanA, held.meanB, held.varA, held.varB] {
+					buffer.dispose() when buffer is gpu.DeviceBuffer<float32>
+				}
+				held.gradA = none
+				held.gradB = none
+				held.meanA = none
+				held.meanB = none
+				held.varA = none
+				held.varB = none
+			}
+		}
+	}
+
+	// The buffer `held` holds for `key`, or `otherwise` when it holds none.
+	def heldOf(held map<int, gpu.DeviceBuffer<float32>>, key int, otherwise gpu.DeviceBuffer<float32>) gpu.DeviceBuffer<float32> {
+		let b = held.get(key)
+		return b is gpu.DeviceBuffer<float32> ?? (b, otherwise)
+	}
+
+	// The first n values of `b` set to 0.
+	// Fails when the launch fails.
+	def clearBuffer(b gpu.DeviceBuffer<float32>, n int) !none {
+		return accumulate(b, 0, b, 0, n, float32(0), float32(0))
+	}
+
+	// A mixture-of-experts layer on the GPU with its picks made on the
+	// host (as the Trainer makes them): every expert runs once over the
+	// rows of the tokens that picked it, gathered into one block per
+	// expert, through the expert stacks (experts the device does not hold
+	// are brought into slots a batch at a time). It keeps what `back`
+	// reads. The tuning runs layers this way, and so does generation on
+	// a layer whose experts have adapters.
+	type DeviceMixer {
+		parts     ModelParts
+		model     DeviceModel
+		// Tokens and picks (tokens · used) the buffers hold room for.
+		capacity  int
+		routed    gpu.DeviceBuffer<float32>
+		dz        gpu.DeviceBuffer<float32>
+		rows      gpu.DeviceBuffer<float32>
+		scales    gpu.DeviceBuffer<float32>
+		dw        gpu.DeviceBuffer<float32>
+		xs        gpu.DeviceBuffer<float32>
+		gs        gpu.DeviceBuffer<float32>
+		us        gpu.DeviceBuffer<float32>
+		acts      gpu.DeviceBuffer<float32>
+		ys        gpu.DeviceBuffer<float32>
+		dys       gpu.DeviceBuffer<float32>
+		dxs       gpu.DeviceBuffer<float32>
+		dgs       gpu.DeviceBuffer<float32>
+		dus       gpu.DeviceBuffer<float32>
+		sg        gpu.DeviceBuffer<float32>
+		su        gpu.DeviceBuffer<float32>
+		sact      gpu.DeviceBuffer<float32>
+		sharedOut gpu.DeviceBuffer<float32>
+		dyShared  gpu.DeviceBuffer<float32>
+		split     gpu.DeviceBuffer<float32>
+		low       gpu.DeviceBuffer<float32>
+		dlow      gpu.DeviceBuffer<float32>
+		// The last forward's picks: per token its experts and weights from
+		// t · used, the logits' softmax and picked sums (see routeToken);
+		// the picks by expert (each one's first pick and count in `rows`
+		// order), and per pick where `rows` holds it.
+		picked    int[]
+		weights   float32[]
+		totals    float32[]
+		probs     float32[]
+		firsts    int[]
+		counts    int[]
+		entryOf   int[]
+		host      float32[]
+
+		def new(parts ModelParts, model DeviceModel) {
+			self.parts = parts
+			self.model = model
+		}
+
+		// Room for `n` tokens.
+		// Fails when the device memory runs out.
+		internal def open(n int) !none {
+			return none when n <= capacity
+			let c = n.max(capacity * 2)
+			let e = parts.info.embedding
+			let used = parts.expertsUsed.max(1)
+			let picks = c * used
+			let (experts, widest, shared) = (1, 1, 1)
+			for let (_, layer) in parts.layers {
+				experts = experts.max(layer.expertGate.len())
+				for let (_, w) in layer.expertGate {
+					widest = widest.max(w.rows)
+				}
+				let sharedGate = layer.sharedGate
+				shared = shared.max(sharedGate.rows) when sharedGate is Weights
+			}
+			let rank = widestRank(parts)
+			routed = try zeros(c * experts)
+			dz = try zeros(c * experts)
+			rows = try zeros(picks)
+			scales = try zeros(picks)
+			dw = try zeros(picks)
+			xs = try zeros(picks * e)
+			gs = try zeros(picks * widest)
+			us = try zeros(picks * widest)
+			acts = try zeros(picks * widest)
+			ys = try zeros(picks * e)
+			dys = try zeros(picks * e)
+			dxs = try zeros(picks * e)
+			dgs = try zeros(picks * widest)
+			dus = try zeros(picks * widest)
+			sg = try zeros(c * shared)
+			su = try zeros(c * shared)
+			sact = try zeros(c * shared)
+			sharedOut = try zeros(c * e)
+			dyShared = try zeros(c * e)
+			split = try zeros(splitWork)
+			low = try zeros(picks * rank)
+			dlow = try zeros(picks * rank)
+			capacity = c
+			return none
+		}
+
+		// Layer `layer` (`d` on the device, experts `held`) on the n rows
+		// of `normed` into `out`.
+		// Fails when a launch or copy fails.
+		def forward(layer Layer, d DeviceLayer, held DeviceExperts, normed gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, n int) !none {
+			try open(n)
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let count = layer.expertGate.len()
+			let router = d.router
+			fail "llm: an experts layer has no router on the device" when router is none
+			try router.multiplyTokens(normed, 0, e, routed, 0, count, n, split)
+			try addRows(routed, 0, model.vectors, d.routerBias, count, n * count) when d.routerBias >= 0
+			host.len(routed.len())
+			try routed.download(host)
+			picked.len(n * used)
+			weights.len(n * used)
+			totals.len(n)
+			probs.len(n * count)
+			for let i = 0; i < n; i++ {
+				routeToken(host[i * count:(i + 1) * count], probs[i * count:(i + 1) * count], i, used, parts.pickThenSoftmax, picked, weights, totals)
+			}
+			// The picks by expert, tokens in order.
+			let order float32[]
+			let scale float32[]
+			firsts.len(0)
+			counts.len(0)
+			entryOf.len(n * used)
+			for let ex = 0; ex < count; ex++ {
+				firsts.push(order.len())
+				for let i = 0; i < n; i++ {
+					for let k = 0; k < used; k++ {
+						continue unless picked[i * used + k] == ex
+						entryOf[i * used + k] = order.len()
+						order.push(float32(i))
+						scale.push(weights[i * used + k] * parts.expertScale)
+					}
+				}
+				counts.push(order.len() - firsts[ex])
+			}
+			try rows.write(order, 0)
+			try scales.write(scale, 0)
+			let entries = order.len()
+			try gatherRows(normed, rows, 0, scales, -1, xs, e, entries * e)
+			try eachHeld(held, def (ex int, slot int) !none {
+				return expertForward(layer, d, held, ex, slot)
+			})
+			try clearBuffer(out, n * e)
+			try scatterRows(ys, rows, 0, scales, 0, out, e, entries)
+			let (gate, up, down) = (d.sharedGate, d.sharedUp, d.sharedDown)
+			if gate is DeviceWeights && up is DeviceWeights && down is DeviceWeights {
+				let w = gate.rows
+				try gate.multiplyTokens(normed, 0, e, sg, 0, w, n, split)
+				try up.multiplyTokens(normed, 0, e, su, 0, w, n, split)
+				try adaptDevice(slotAdapted(layer, slotSharedGate), normed, 0, e, sg, 0, w, n, w, low)
+				try adaptDevice(slotAdapted(layer, slotSharedUp), normed, 0, e, su, 0, w, n, w, low)
+				try gatedValues(sg, 0, w, su, 0, w, sact, 0, w, w, n * w, 0)
+				try down.multiplyTokens(sact, 0, w, sharedOut, 0, e, n, split)
+				try adaptDevice(slotAdapted(layer, slotSharedDown), sact, 0, w, sharedOut, 0, e, n, e, low)
+				try addShared(out, sharedOut, normed, model.vectors, d.sharedRouter, e, n * 256)
+			}
+			return none
+		}
+
+		// Calls `work(expert, slot)` for every expert some token picked,
+		// bringing them into the device's slots a batch at a time when it
+		// does not hold them all.
+		internal def eachHeld(held DeviceExperts, work def(int, int) !none) !none {
+			let wanted int[]
+			for let (ex, c) in counts {
+				wanted.push(ex) when c > 0
+			}
+			let batch = held.whole() ?? (wanted.len().max(1), held.slots())
+			for let from = 0; from < wanted.len(); from += batch {
+				let part = wanted[from:(from + batch).min(wanted.len())].clone()
+				try held.hold(part, false) unless held.whole()
+				let slots = held.slotsOf(part)
+				for let (k, ex) in part {
+					try work(ex, slots[k])
+				}
+			}
+			return none
+		}
+
+		// Expert `ex` (in slot `slot`) over the rows that picked it.
+		internal def expertForward(layer Layer, d DeviceLayer, held DeviceExperts, ex int, slot int) !none {
+			let e = parts.info.embedding
+			let (at, m) = (firsts[ex], counts[ex])
+			let r = layer.expertGate[ex].rows
+			try held.gate.multiplyTokens(xs, at * e, e, gs, at * r, r, m, split, first = slot * r, count = r)
+			try held.up.multiplyTokens(xs, at * e, e, us, at * r, r, m, split, first = slot * r, count = r)
+			try adaptDevice(expertAdapted(layer, 0, ex), xs, at * e, e, gs, at * r, r, m, r, low)
+			try adaptDevice(expertAdapted(layer, 1, ex), xs, at * e, e, us, at * r, r, m, r, low)
+			if d.expertGateBias >= 0 {
+				try addRows(gs, at * r, model.vectors, d.expertGateBias + ex * r, r, m * r)
+				try addRows(us, at * r, model.vectors, d.expertUpBias + ex * r, r, m * r)
+			}
+			try gatedValues(gs, at * r, r, us, at * r, r, acts, at * r, r, r, m * r, parts.clampedSwiglu ?? (2, 0))
+			try held.down.multiplyTokens(acts, at * r, r, ys, at * e, e, m, split, first = slot * e, count = e)
+			try adaptDevice(expertAdapted(layer, 2, ex), acts, at * r, r, ys, at * e, e, m, e, low)
+			try addRows(ys, at * e, model.vectors, d.expertDownBias + ex * e, e, m * e) when d.expertDownBias >= 0
+			return none
+		}
+
+		// Back through the last forward: `dout` holds the gradient of its
+		// output, which is added to `dn` (and the pairs').
+		// Fails when a launch or copy fails.
+		def back(layer Layer, d DeviceLayer, held DeviceExperts, normed gpu.DeviceBuffer<float32>, dout gpu.DeviceBuffer<float32>, dn gpu.DeviceBuffer<float32>, n int) !none {
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let count = layer.expertGate.len()
+			let entries = n * used
+			try pickGradients(dout, ys, rows, dw, e, entries, parts.expertScale, entries * 32)
+			host.len(dw.len())
+			try dw.download(host)
+			let byPick float32[]
+			byPick.len(entries)
+			for let p = 0; p < entries; p++ {
+				byPick[p] = host[entryOf[p]]
+			}
+			let gradient float32[]
+			gradient.len(n * count)
+			for let i = 0; i < n; i++ {
+				routeBack(i, used, parts.pickThenSoftmax, picked, weights, byPick, probs[i * count:(i + 1) * count], totals[i], gradient[i * count:(i + 1) * count])
+			}
+			try dz.write(gradient, 0)
+			let router = d.router
+			if router is DeviceWeights {
+				try router.multiplyBack(dz, 0, count, dn, 0, e, n, split)
+			}
+			try gatherRows(dout, rows, 0, scales, 0, dys, e, entries * e)
+			try clearBuffer(dxs, entries * e)
+			try eachHeld(held, def (ex int, slot int) !none {
+				return expertBack(layer, held, ex, slot)
+			})
+			try scatterRows(dxs, rows, 0, scales, -1, dn, e, entries)
+			let (gate, up, down) = (d.sharedGate, d.sharedUp, d.sharedDown)
+			if gate is DeviceWeights && up is DeviceWeights && down is DeviceWeights {
+				let w = gate.rows
+				try sharedGateBack(dout, sharedOut, normed, model.vectors, d.sharedRouter, e, dn, dyShared, n * 256)
+				try clearBuffer(dgs, n * w)
+				try down.multiplyBack(dyShared, 0, e, dgs, 0, w, n, split)
+				try adaptDeviceBack(slotAdapted(layer, slotSharedDown), sact, 0, w, dyShared, 0, e, dgs, 0, w, n, e, low, dlow)
+				try gatedBack(sg, 0, w, su, 0, w, dgs, 0, w, dus, 0, w, w, n * w, 0)
+				try gate.multiplyBack(dgs, 0, w, dn, 0, e, n, split)
+				try up.multiplyBack(dus, 0, w, dn, 0, e, n, split)
+				try adaptDeviceBack(slotAdapted(layer, slotSharedGate), normed, 0, e, dgs, 0, w, dn, 0, e, n, w, low, dlow)
+				try adaptDeviceBack(slotAdapted(layer, slotSharedUp), normed, 0, e, dus, 0, w, dn, 0, e, n, w, low, dlow)
+			}
+			return none
+		}
+
+		// Back through expert `ex` (in slot `slot`).
+		internal def expertBack(layer Layer, held DeviceExperts, ex int, slot int) !none {
+			let e = parts.info.embedding
+			let (at, m) = (firsts[ex], counts[ex])
+			let r = layer.expertGate[ex].rows
+			try clearBuffer2(dgs, at * r, m * r)
+			try held.down.multiplyBack(dys, at * e, e, dgs, at * r, r, m, split, first = slot * e, count = e)
+			try adaptDeviceBack(expertAdapted(layer, 2, ex), acts, at * r, r, dys, at * e, e, dgs, at * r, r, m, e, low, dlow)
+			try gatedBack(gs, at * r, r, us, at * r, r, dgs, at * r, r, dus, at * r, r, r, m * r, parts.clampedSwiglu ?? (2, 0))
+			try held.gate.multiplyBack(dgs, at * r, r, dxs, at * e, e, m, split, first = slot * r, count = r)
+			try held.up.multiplyBack(dus, at * r, r, dxs, at * e, e, m, split, first = slot * r, count = r)
+			try adaptDeviceBack(expertAdapted(layer, 0, ex), xs, at * e, e, dgs, at * r, r, dxs, at * e, e, m, r, low, dlow)
+			return adaptDeviceBack(expertAdapted(layer, 1, ex), xs, at * e, e, dus, at * r, r, dxs, at * e, e, m, r, low, dlow)
+		}
+	}
+
+	// b[from:from + n] set to 0.
+	// Fails when the launch fails.
+	def clearBuffer2(b gpu.DeviceBuffer<float32>, from int, n int) !none {
+		return accumulate(b, from, b, from, n, float32(0), float32(0))
+	}
+}

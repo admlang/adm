@@ -1,0 +1,625 @@
+internal std partial module std.text.regex {
+	use std.sync::(ReadWriteLock)
+
+	// The instructions of a program. Every one has the operands `a`, `b`
+	// and `c`:
+	//   opByte    a byte between a and b, then on to c
+	//   opSwitch  a byte in one of the b (first, last, target) triples of
+	//             the table from index a, then on to that target
+	//   opSplit   on to a, and with lower priority to b
+	//   opJump    on to a
+	//   opSave    the position into capture slot a, then on to c
+	//   opAssert  on to c when zero-width assertion a holds
+	//   opMatch   a match
+	const (
+		opByte   = 0
+		opSwitch = 1
+		opSplit  = 2
+		opJump   = 3
+		opSave   = 4
+		opAssert = 5
+		opMatch  = 6
+	)
+
+	// The most instructions a program may have, about 32 MB of them (RE2
+	// refuses patterns past its memory budget the same way). \pL{1000} fits.
+	const programLimit = 1 << 20
+
+	// A target to be patched to the end of the code being emitted.
+	const exitTarget = -2
+
+	// A compiled RE2 pattern: a Thompson automaton over UTF-8 bytes.
+	type Program {
+		// The instructions, one entry per instruction in each array.
+		op    int[]
+		a     int[]
+		b     int[]
+		c     int[]
+		// The (first byte, last byte, target) triples of the switches.
+		table int[]
+		// Group names by number, "" for an unnamed group; names[0] stands
+		// for the whole match.
+		names string[]
+		// Whether this is the reverse program: the pattern backwards, with
+		// no captures, which finds where a match starts from where it ends.
+		reversed bool
+		// The byte classes: bytes no instruction or assertion tells apart
+		// share a class (and a DFA transition).
+		classOf int[]
+		classes int
+		// The look-behind flags the program's assertions read.
+		lookMask int
+		// The first byte every match starts with, -1 when there is none.
+		firstByte int
+		// Whether every match starts at the start of the text.
+		anchored bool
+		// Why the pattern did not compile, "" when it did: such a program
+		// matches nothing (`failedProgram`).
+		fault    string
+		// The pattern backwards, the DFAs over both, and the lock their
+		// caches share.
+		backward ?Program
+		forward  ?Dfa
+		whole    ?Dfa
+		reverse  ?Dfa
+
+		// The number of parenthesised capture groups.
+		def groups() int {
+			return names.len() - 1
+		}
+
+		// A matcher for searches with this program.
+		def matcher() Matcher {
+			return new Matcher(self)
+		}
+
+		// Whether `text` holds a match.
+		def test(text string) bool {
+			return matcher().search(text.bytes(), 0)
+		}
+
+		// Whether the whole of `text` matches.
+		def fullMatch(text string) bool {
+			return matcher().search(text.bytes(), 0, Anchor.Both)
+		}
+
+		// The leftmost match in `raw` at or after byte `from` as byte
+		// offsets (see `Matcher.search`) for the match and every group;
+		// empty when there is none.
+		def find(raw byte[], from int = 0) int[] {
+			let slots int[]
+			slots.len(2 * names.len())
+			return matcher().search(raw, from, Anchor.Unanchored, slots) ?? (slots, [])
+		}
+
+		// Sets the byte classes from the byte ranges the instructions take
+		// and the bytes the assertions tell apart.
+		def classify() {
+			let starts bool[]
+			starts.len(257)
+			starts[0] = true
+			for let pc = 0; pc < op.len(); pc++ {
+				if op[pc] == opByte {
+					(starts[a[pc]], starts[b[pc] + 1]) = (true, true)
+				} else if op[pc] == opSwitch {
+					for let t = a[pc]; t < a[pc] + 3 * b[pc]; t += 3 {
+						(starts[table[t]], starts[table[t + 1] + 1]) = (true, true)
+					}
+				} else if op[pc] == opAssert {
+					for let (_, edge) in [10, 11, 48, 58, 65, 91, 95, 96, 97, 123] {
+						starts[edge] = true
+					}
+				}
+			}
+			classOf.len(256)
+			classes = 0
+			for let v = 0; v < 256; v++ {
+				classes++ when starts[v] && v > 0
+				classOf[v] = classes
+			}
+			classes++
+		}
+
+		// The look-behind flags the assertions of the program read.
+		def lookFlags() int {
+			let mask = 0
+			for let pc = 0; pc < op.len(); pc++ {
+				continue unless op[pc] == opAssert
+				let k = a[pc]
+				if k == beginText {
+					mask = mask | atTextStart
+				} else if k == beginLine {
+					mask = mask | atTextStart | afterNewline
+				} else if k == wordBoundary || k == notWordBoundary {
+					mask = mask | afterWord
+				}
+			}
+			return mask
+		}
+
+		// Whether a match ends at the end of `raw` (one starting anywhere):
+		// the reverse DFA run back from the end.
+		def matchesAtEnd(raw byte[]) bool {
+			let reverse = self.reverse
+			return reverse is Dfa && reverse.matchStart(raw, raw.len(), 0) >= 0
+		}
+
+		// The number of an instruction appended with the given operands.
+		def add(op int, a int, b int, c int) int {
+			self.op.push(op)
+			self.a.push(a)
+			self.b.push(b)
+			self.c.push(c)
+			return self.op.len() - 1
+		}
+
+		// Appends the instructions of `node`; each one that falls through
+		// goes on to the instruction after it.
+		// Fails when the program grows past `programLimit`.
+		def emit(node Node) !none {
+			fail "pattern too large: compile failed" when op.len() > programLimit
+			if node.first >= 0 {
+				relocate(node.first, node.last)
+				return none
+			}
+			let first = op.len()
+			try emitNode(node)
+			(node.first, node.last) = (first, op.len())
+			return none
+		}
+
+		// Appends a copy of the instructions from `first` up to `last`,
+		// whose targets all lie in that span or at its end, moved to the
+		// end of the program: a repeated node is compiled once.
+		def relocate(first int, last int) {
+			let delta = op.len() - first
+			for let pc = first; pc < last; pc++ {
+				let o = op[pc]
+				if o == opSwitch {
+					let base = table.len()
+					for let t = a[pc]; t < a[pc] + 3 * b[pc]; t += 3 {
+						table.push(table[t], table[t + 1], table[t + 2] + delta)
+					}
+					add(o, base, b[pc], 0)
+				} else if o == opSplit {
+					add(o, a[pc] + delta, b[pc] + delta, 0)
+				} else if o == opJump {
+					add(o, a[pc] + delta, 0, 0)
+				} else {
+					add(o, a[pc], b[pc], c[pc] + delta)
+				}
+			}
+		}
+
+		// Appends the instructions of `node` (see `emit`).
+		def emitNode(node Node) !none {
+			match node.kind {
+				case NodeKind.Empty:
+					return none
+				case NodeKind.Literal:
+					if node.caseless {
+						let orbit = orbitOf(node.ch)
+						if orbit.len() > 1 {
+							let r int[]
+							for let (_, o) in orbit {
+								r.push(o, o)
+							}
+							emitRanges(normalize(r))
+							return none
+						}
+					}
+					let bytes int[]
+					encodeUtf8(node.ch, bytes)
+					bytes.reverse() when reversed
+					for let (_, v) in bytes {
+						add(opByte, v, v, op.len() + 1)
+					}
+				case NodeKind.Class:
+					let k = node.set
+					emitRanges(k.resolve()) when k is CharClass
+				case NodeKind.AnyChar:
+					emitRanges(node.dotAll ?? ([0, maxRune], [0, 9, 11, maxRune]))
+				case NodeKind.AnyByte:
+					add(opByte, 0, 255, op.len() + 1)
+				case NodeKind.Assert:
+					add(opAssert, reversed ?? (mirrored(node.zeroWidth), node.zeroWidth), 0, op.len() + 1)
+				case NodeKind.Capture:
+					if reversed {
+						try emit(node.subs[0])
+						return none
+					}
+					add(opSave, 2 * node.index, 0, op.len() + 1)
+					try emit(node.subs[0])
+					add(opSave, 2 * node.index + 1, 0, op.len() + 1)
+				case NodeKind.Concat:
+					for let i = 0; i < node.subs.len(); i++ {
+						try emit(node.subs[reversed ?? (node.subs.len() - 1 - i, i)])
+					}
+				case NodeKind.Alternate:
+					let jumps int[]
+					for let i = 0; i + 1 < node.subs.len(); i++ {
+						let split = add(opSplit, op.len() + 1, 0, 0)
+						try emit(node.subs[i])
+						jumps.push(add(opJump, 0, 0, 0))
+						b[split] = op.len()
+					}
+					try emit(node.subs[node.subs.len() - 1])
+					for let (_, j) in jumps {
+						a[j] = op.len()
+					}
+				default:
+					try emitRepeat(node)
+			}
+			return none
+		}
+
+		// Appends a repeat: `min` copies of the body, then the optional
+		// ones nested (x{2,4} is xx(x(x)?)?) or a loop.
+		def emitRepeat(node Node) !none {
+			let sub = node.subs[0]
+			if node.max < 0 {
+				if node.min > 0 {
+					// The last copy loops back.
+					for let i = 1; i < node.min; i++ {
+						try emit(sub)
+					}
+					let last = op.len()
+					try emit(sub)
+					splitTo(last, node.greedy)
+					return none
+				}
+				if sub.nullable() {
+					// x* as (x+)?, as RE2 compiles it: a loop of an empty body
+					// still records the empty iteration's groups.
+					let outer = add(opSplit, 0, 0, 0)
+					let body = op.len()
+					try emit(sub)
+					splitTo(body, node.greedy)
+					setSplit(outer, outer + 1, op.len(), node.greedy)
+					return none
+				}
+				let top = add(opSplit, 0, 0, 0)
+				try emit(sub)
+				add(opJump, top, 0, 0)
+				setSplit(top, top + 1, op.len(), node.greedy)
+				return none
+			}
+			for let i = 0; i < node.min; i++ {
+				try emit(sub)
+			}
+			let splits int[]
+			for let i = node.min; i < node.max; i++ {
+				splits.push(add(opSplit, 0, 0, 0))
+				try emit(sub)
+			}
+			for let (_, s) in splits {
+				setSplit(s, s + 1, op.len(), node.greedy)
+			}
+			return none
+		}
+
+		// Appends a split that goes back to `loop` or on to the instruction
+		// after it, preferring the loop when greedy.
+		def splitTo(loop int, greedy bool) {
+			let s = add(opSplit, 0, 0, 0)
+			setSplit(s, loop, s + 1, greedy)
+		}
+
+		// Points split `s` at `more` (another round) and `done`, the first
+		// preferred when greedy.
+		def setSplit(s int, more int, done int, greedy bool) {
+			(a[s], b[s]) = greedy ?? ((more, done), (done, more))
+		}
+
+		// Appends the instructions that take one code point in the sorted,
+		// disjoint ranges `r`, as a trie of UTF-8 byte ranges: sequences
+		// that share a first byte share its instruction, so one thread
+		// follows a class of any size.
+		// The reverse program takes each sequence backwards; their leading
+		// byte ranges may then overlap, and its trie splits them.
+		def emitRanges(r int[]) {
+			let seqs int[]
+			for let i = 0; i + 1 < r.len(); i += 2 {
+				utf8Sequences(r[i], r[i + 1], seqs)
+			}
+			let trie = new ByteTrie()
+			let at = 0
+			for at < seqs.len() {
+				let n = seqs[at]
+				if reversed {
+					for let k = 0; k < n / 2; k++ {
+						let (x, y) = (at + 1 + 2 * k, at + 1 + 2 * (n - 1 - k))
+						(seqs[x], seqs[x + 1], seqs[y], seqs[y + 1]) = (seqs[y], seqs[y + 1], seqs[x], seqs[x + 1])
+					}
+				}
+				if reversed {
+					trie.insertSplitting(0, seqs, at + 1, n, 0)
+				} else {
+					trie.insert(seqs, at + 1, n)
+				}
+				at += 1 + 2 * n
+			}
+			let start = op.len()
+			emitTrieNode(trie, 0)
+			let end = op.len()
+			for let pc = start; pc < end; pc++ {
+				let o = self.op[pc]
+				if o == opByte {
+					c[pc] = end when c[pc] == exitTarget
+				} else if o == opSwitch {
+					for let t = a[pc]; t < a[pc] + 3 * b[pc]; t += 3 {
+						table[t + 2] = end when table[t + 2] == exitTarget
+					}
+				}
+			}
+		}
+
+		// Appends the instructions of trie node `n` and of the nodes under
+		// it, `n`'s first (the code before falls through into it); returns
+		// its instruction. Equal subtrees (the same edges to equal subtrees)
+		// are emitted once.
+		def emitTrieNode(trie ByteTrie, n int) int {
+			let shapes = new map<string, int>()
+			let ids int[]
+			ids.len(trie.edges.len())
+			for let i = 0; i < ids.len(); i++ {
+				ids[i] = -1
+			}
+			trie.shapeId(n, ids, shapes)
+			let pcs int[]
+			pcs.len(shapes.len())
+			for let i = 0; i < pcs.len(); i++ {
+				pcs[i] = -1
+			}
+			return emitShape(trie, n, ids, pcs)
+		}
+
+		// Emits node `n` unless a node of its shape was; returns the
+		// instruction of its shape.
+		def emitShape(trie ByteTrie, n int, ids int[], pcs int[]) int {
+			let id = ids[n]
+			return pcs[id] when pcs[id] >= 0
+			let edges = trie.edges[n]
+			let count = edges.len() / 3
+			let pc = 0
+			if count == 1 {
+				pc = add(opByte, edges[0], edges[1], exitTarget)
+			} else {
+				// A switch (an empty one for a class that matches nothing).
+				pc = add(opSwitch, table.len(), count, 0)
+				for let i = 0; i < count; i++ {
+					table.push(edges[3 * i], edges[3 * i + 1], exitTarget)
+				}
+			}
+			pcs[id] = pc
+			for let i = 0; i < count; i++ {
+				let child = edges[3 * i + 2]
+				continue when child < 0
+				let target = emitShape(trie, child, ids, pcs)
+				if count == 1 {
+					c[pc] = target
+				} else {
+					table[a[pc] + 3 * i + 2] = target
+				}
+			}
+			return pc
+		}
+	}
+
+	// A trie of byte-range sequences: per node, its edges as (first byte,
+	// last byte, child node) triples, child -1 where a sequence ends.
+	// Sequences that come from disjoint, ascending code point ranges have
+	// leading byte ranges that are either equal or disjoint, so an equal
+	// range is always the node's last edge (`insert`); taken backwards they
+	// overlap (`insertSplitting`).
+	type ByteTrie {
+		edges int[][]
+		// How many edges refer to each node.
+		refs  int[]
+
+		def new() {
+			edges.push([])
+			refs.push(1)
+		}
+
+		// The shape number of node `n` in `ids`: nodes with the same edges
+		// to subtrees of the same shapes share one, numbered in `shapes`.
+		def shapeId(n int, ids int[], shapes map<string, int>) int {
+			return ids[n] when ids[n] >= 0
+			let e = edges[n]
+			let key = ""
+			for let j = 0; j < e.len(); j += 3 {
+				let child = e[j + 2]
+				key += "{e[j]},{e[j + 1]},{child >= 0 ?? (shapeId(child, ids, shapes), -1)};"
+			}
+			let found = shapes.get(key)
+			let id = found is int ?? (found, shapes.len())
+			shapes.set(key, id) unless found is int
+			ids[n] = id
+			return id
+		}
+
+		// Adds the `n` (first, last) byte pairs of `seqs` from `at`.
+		def insert(seqs int[], at int, n int) {
+			let node = 0
+			for let k = 0; k < n; k++ {
+				let (lo, hi) = (seqs[at + 2 * k], seqs[at + 2 * k + 1])
+				let e = edges[node]
+				let last = e.len() - 3
+				if k + 1 < n && last >= 0 && e[last] == lo && e[last + 1] == hi && e[last + 2] >= 0 {
+					node = e[last + 2]
+					continue
+				}
+				if k + 1 == n {
+					e.push(lo, hi, -1)
+				} else {
+					edges.push([])
+					refs.push(1)
+					e.push(lo, hi, edges.len() - 1)
+					node = edges.len() - 1
+				}
+			}
+		}
+
+		// Adds byte pairs `k` to `n` - 1 of the sequence at `at` under
+		// `node`, for sequences whose ranges overlap (UTF-8 taken
+		// backwards): an edge the new range overlaps is split where they
+		// part, the parts outside keeping copies of its subtree, so the
+		// trie stays deterministic. A sequence never ends where another goes
+		// on (lead and continuation bytes do not overlap).
+		def insertSplitting(node int, seqs int[], at int, n int, k int) {
+			let (lo, hi) = (seqs[at + 2 * k], seqs[at + 2 * k + 1])
+			let old = edges[node]
+			let out int[]
+			let cur = lo
+			for let j = 0; j < old.len(); j += 3 {
+				let (elo, ehi, child) = (old[j], old[j + 1], old[j + 2])
+				if ehi < cur || elo > hi {
+					if elo > hi && cur <= hi {
+						out.push(cur, hi, chain(seqs, at, n, k + 1))
+						cur = hi + 1
+					}
+					out.push(elo, ehi, child)
+					continue
+				}
+				out.push(elo, cur - 1, share(child)) when elo < cur
+				if cur < elo {
+					out.push(cur, elo - 1, chain(seqs, at, n, k + 1))
+					cur = elo
+				}
+				let top = ehi < hi ?? (ehi, hi)
+				out.push(hi + 1, ehi, share(child)) when ehi > hi
+				let mine = child
+				if child >= 0 && k + 1 < n {
+					if refs[child] > 1 {
+						refs[child]--
+						mine = shallow(child)
+					}
+					insertSplitting(mine, seqs, at, n, k + 1)
+				}
+				out.push(cur, top, mine)
+				cur = top + 1
+			}
+			out.push(cur, hi, chain(seqs, at, n, k + 1)) when cur <= hi
+			// Keep the edges in byte order.
+			let order int[]
+			for let j = 0; j < out.len(); j += 3 {
+				order.push(j)
+			}
+			order.sort((x, y int) => out[x] < out[y])
+			let sorted int[]
+			for let (_, j) in order {
+				sorted.push(out[j], out[j + 1], out[j + 2])
+			}
+			edges[node] = sorted
+		}
+
+		// A new path for byte pairs `k` on of the sequence at `at`: its
+		// first node, -1 when the sequence ends before `k`.
+		def chain(seqs int[], at int, n int, k int) int {
+			return -1 when k >= n
+			let rest = chain(seqs, at, n, k + 1)
+			edges.push([seqs[at + 2 * k], seqs[at + 2 * k + 1], rest])
+			refs.push(1)
+			return edges.len() - 1
+		}
+
+		// `node` referred to once more (subtrees are shared until one of
+		// their referrers changes them).
+		def share(node int) int {
+			refs[node]++ when node >= 0
+			return node
+		}
+
+		// A node with the edges of `node`, sharing its children, for a
+		// referrer about to change it.
+		def shallow(node int) int {
+			let src = edges[node].clone()
+			for let j = 2; j < src.len(); j += 3 {
+				share(src[j])
+			}
+			edges.push(src)
+			refs.push(1)
+			return edges.len() - 1
+		}
+	}
+
+	// Compiles an RE2 pattern with the flags in `flags`: i (caseless), m
+	// (^ and $ at line breaks), s (. matches \n), U (lazy and greedy
+	// swapped), as `(?imsU)` at its start would.
+	// Fails when the pattern is not RE2 syntax or uses what RE2 does not
+	// support (backreferences, lookaround), when a flag is not one of
+	// those, or when the program would be too large.
+	def compile(pattern string, flags string = "") !Program {
+		let parser = new Parser(pattern)
+		for let (_, f) in flags {
+			match f {
+				case 'i':
+					parser.caseless = true
+				case 'm':
+					parser.multiLine = true
+				case 's':
+					parser.dotAll = true
+				case 'U':
+					parser.ungreedy = true
+				default:
+					fail "unknown flag {f}"
+			}
+		}
+		let tree = try parser.alternation()
+		fail "unexpected ): `{pattern}`" when parser.pos < parser.src.len()
+		fail "invalid repeat count: `{pattern}`" when tree.repeatProduct() > repeatLimit
+		return try build(tree, parser.names)
+	}
+
+	// A program that matches nothing, for a pattern that did not compile:
+	// `fault` says why.
+	def failedProgram(fault string) Program {
+		let never = new Node(NodeKind.Class)
+		never.set = new CharClass()
+		let program = build(never, [""]) onerror recover new Program()
+		program.fault = fault
+		return program
+	}
+
+	// The program of a parsed pattern with group names `names`, its reverse
+	// program and DFAs.
+	// Fails when the program would be too large.
+	def build(tree Node, names string[]) !Program {
+		let program = new Program()
+		program.names = names
+		program.add(opSave, 0, 0, 1)
+		try program.emit(tree)
+		program.add(opSave, 1, 0, program.op.len() + 1)
+		program.add(opMatch, 0, 0, 0)
+		tree.forget()
+		let back = new Program()
+		back.names = names
+		back.reversed = true
+		try back.emit(tree)
+		back.add(opMatch, 0, 0, 0)
+		program.classify()
+		(back.classOf, back.classes) = (program.classOf, program.classes)
+		program.lookMask = program.lookFlags()
+		back.lookMask = back.lookFlags()
+		let first int[]
+		tree.literalPrefix(first)
+		program.firstByte = first.len() > 0 ?? (first[0], -1)
+		program.anchored = tree.startsAtText()
+		let lock = new ReadWriteLock()
+		program.backward = back
+		program.forward = new Dfa(program, false, lock)
+		program.whole = new Dfa(program, true, lock)
+		program.reverse = new Dfa(back, true, lock)
+		return program
+	}
+
+	// The assertion that stands for `a` in the reverse program.
+	def mirrored(a int) int {
+		return endText when a == beginText
+		return beginText when a == endText
+		return endLine when a == beginLine
+		return beginLine when a == endLine
+		return a
+	}
+}

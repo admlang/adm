@@ -1,0 +1,672 @@
+partial module std.ai.onnx {
+	use (
+		std.simd
+		std.formats.ai.onnx::(ElementType, isFloat, elementBits)
+		std.ai.tensor::(Tensor, storageOf, Storage, halfBits, bfloatBits, miniCode)
+		std.formats.ai.onnx::(halfValue, minifloat)
+	)
+
+	// The binary operations of the elementwise operators.
+	internal enum Binary {
+		Add,
+		Sub,
+		Mul,
+		Div,
+		Pow,
+		Max,
+		Min,
+		// Mod with fmod = 0 (the divisor's sign) and 1 (the dividend's).
+		Mod,
+		Fmod,
+		PRelu,
+		ShiftLeft,
+		ShiftRight,
+		BitAnd,
+		BitOr,
+		BitXor,
+		And,
+		Or,
+		Xor,
+		Equal,
+		Less,
+		LessOrEqual,
+		Greater,
+		GreaterOrEqual,
+	}
+
+	// Whether `op` gives Bool values whatever its inputs.
+	internal def comparison(op Binary) bool {
+		return op := Binary.Equal || Binary.Less || Binary.LessOrEqual || Binary.Greater || Binary.GreaterOrEqual || Binary.And || Binary.Or || Binary.Xor
+	}
+
+	// How two shapes broadcast, as numpy does: the output `shape`, its
+	// values in `outer` blocks of `inner` values, and per block where it
+	// starts in each input; within a block an input's values are
+	// contiguous (`aStep` 1) or one value (`aStep` 0).
+	internal struct Broadcast {
+		shape    int[]
+		inner    int
+		outer    int
+		aStep    int
+		bStep    int
+		aOffsets int[]
+		bOffsets int[]
+	}
+
+	// The broadcast of shapes `a` and `b`.
+	// Fails when a dimension differs and neither is 1.
+	internal def broadcast(a int[], b int[]) !Broadcast {
+		let rank = a.len().max(b.len())
+		let pa int[]
+		let pb int[]
+		for let d = 0; d < rank; d++ {
+			pa.push(d < rank - a.len() ?? (1, a[d - (rank - a.len())]))
+			pb.push(d < rank - b.len() ?? (1, b[d - (rank - b.len())]))
+		}
+		let shape int[]
+		for let d = 0; d < rank; d++ {
+			fail "onnx: shapes {a} and {b} do not broadcast" unless pa[d] == pb[d] || pa[d] == 1 || pb[d] == 1
+			shape.push(pa[d] == 1 ?? (pb[d], pa[d]))
+		}
+		// The trailing dimensions both inputs read the same way make the
+		// block: both contiguous, or one contiguous and the other one value.
+		let (aStep, bStep) = (-1, -1)
+		let inner = 1
+		let k = rank - 1
+		for; k >= 0; k-- {
+			continue when shape[k] == 1
+			let aFull = pa[k] == shape[k]
+			let bFull = pb[k] == shape[k]
+			let sa = aFull ?? (1, 0)
+			let sb = bFull ?? (1, 0)
+			if aStep < 0 {
+				break when !aFull && !bFull
+				(aStep, bStep) = (sa, sb)
+			} else if sa != aStep || sb != bStep {
+				break
+			}
+			inner *= shape[k]
+		}
+		(aStep, bStep) = (aStep < 0 ?? (1, aStep), bStep < 0 ?? (1, bStep))
+		let outer = 1
+		for let d = 0; d <= k; d++ {
+			outer *= shape[d]
+		}
+		// Strides of each input over the outer dimensions (0 where it
+		// broadcasts), in elements of that input.
+		let strideA int[]
+		let strideB int[]
+		strideA.len(rank)
+		strideB.len(rank)
+		let (ra, rb) = (1, 1)
+		for let d = rank - 1; d >= 0; d-- {
+			strideA[d] = pa[d] == 1 ?? (0, ra)
+			strideB[d] = pb[d] == 1 ?? (0, rb)
+			ra *= pa[d]
+			rb *= pb[d]
+		}
+		let plan = Broadcast{shape: shape, inner: inner, outer: outer, aStep: aStep, bStep: bStep}
+		plan.aOffsets.len(outer)
+		plan.bOffsets.len(outer)
+		let index int[]
+		index.len(k + 1)
+		for let o = 0; o < outer; o++ {
+			let (oa, ob) = (0, 0)
+			for let d = 0; d <= k; d++ {
+				oa += index[d] * strideA[d]
+				ob += index[d] * strideB[d]
+			}
+			plan.aOffsets[o] = oa
+			plan.bOffsets[o] = ob
+			for let d = k; d >= 0; d-- {
+				index[d]++
+				break when index[d] < shape[d]
+				index[d] = 0
+			}
+		}
+		return plan
+	}
+
+	// Values per task from which elementwise work is split across tasks.
+	const parallelFrom = 1 << 14
+
+	// `op` of `a` and `b` with broadcasting: the same element type as
+	// theirs, Bool for comparisons and the logical operators. With
+	// `reuse` (a is dead after the call and its arrays are its own, see
+	// Call.consumes) a result of a's shape and type is written into a.
+	// Fails when the shapes do not broadcast or the element types differ.
+	// Outputs come from `pool` when given.
+	internal def binary(a Tensor, b Tensor, op Binary, reuse bool = false, pool ?Pool = none) !Tensor {
+		fail "onnx: {op.name} of {a.element.name} and {b.element.name}" unless a.element == b.element || (op := Binary.ShiftLeft || Binary.ShiftRight)
+		let plan = try broadcast(a.shape, b.shape)
+		let element = comparison(op) ?? (ElementType.Bool, a.element)
+		let inPlace = reuse && element == a.element && a.shape.equals(plan.shape) && storageOf(element) != Storage.Strings
+		let out = inPlace ?? (a, pool is Pool ?? (pool.tensor(element, plan.shape), zerosLike(element, plan.shape)))
+		match storageOf(a.element) {
+			case Storage.Floats:
+				if comparison(op) {
+					runBlocks(plan, def (o int, from int, n int) {
+						compareFloats(op, a.floats, plan.aOffsets[o] + from * plan.aStep, plan.aStep, b.floats, plan.bOffsets[o] + from * plan.bStep, plan.bStep, out.ints, o * plan.inner + from, n)
+					})
+				} else {
+					runBlocks(plan, def (o int, from int, n int) {
+						floatBlock(op, a.floats, plan.aOffsets[o] + from * plan.aStep, plan.aStep, b.floats, plan.bOffsets[o] + from * plan.bStep, plan.bStep, out.floats, o * plan.inner + from, n)
+					})
+					roundTo(out)
+				}
+			case Storage.Doubles:
+				for let o = 0; o < plan.outer; o++ {
+					for let i = 0; i < plan.inner; i++ {
+						let x = a.doubles[plan.aOffsets[o] + i * plan.aStep]
+						let y = b.doubles[plan.bOffsets[o] + i * plan.bStep]
+						if comparison(op) {
+							out.ints[o * plan.inner + i] = compare(op, x < y, x == y, x > y) ?? (1, 0)
+						} else {
+							out.doubles[o * plan.inner + i] = doubleOp(op, x, y)
+						}
+					}
+				}
+			case Storage.Ints:
+				let signed = a.element := ElementType.Int8 || ElementType.Int16 || ElementType.Int32 || ElementType.Int64 || ElementType.Int4 || ElementType.Int2
+				let bits = elementBits(a.element)
+				runBlocks(plan, def (o int, from int, n int) {
+					intBlock(op, a.ints, plan.aOffsets[o] + from * plan.aStep, plan.aStep, b.ints, plan.bOffsets[o] + from * plan.bStep, plan.bStep, out.ints, o * plan.inner + from, n, signed, bits)
+				})
+			default:
+				fail "onnx: {op.name} of strings" unless op == Binary.Equal
+				for let o = 0; o < plan.outer; o++ {
+					for let i = 0; i < plan.inner; i++ {
+						out.ints[o * plan.inner + i] = a.strings[plan.aOffsets[o] + i * plan.aStep] == b.strings[plan.bOffsets[o] + i * plan.bStep] ?? (1, 0)
+					}
+				}
+		}
+		return out
+	}
+
+	// Runs `block(o, from, n)` over every block of `plan` (`n` values of
+	// block `o` from value `from`), on several tasks for large outputs.
+	internal def runBlocks(plan Broadcast, block def(int, int, int)) {
+		let total = plan.outer * plan.inner
+		let tasks = (total / parallelFrom).clamp(1, 32)
+		if tasks == 1 {
+			for let o = 0; o < plan.outer; o++ {
+				block(o, 0, plan.inner)
+			}
+			return
+		}
+		if plan.outer >= tasks {
+			forall let t in 0..tasks {
+				for let o = plan.outer * t / tasks; o < plan.outer * (t + 1) / tasks; o++ {
+					block(o, 0, plan.inner)
+				}
+			}
+			return
+		}
+		// Few long blocks: split each.
+		for let o = 0; o < plan.outer; o++ {
+			let parts = (plan.inner / parallelFrom).clamp(1, 32)
+			forall let t in 0..parts {
+				let from = plan.inner * t / parts
+				block(o, from, plan.inner * (t + 1) / parts - from)
+			}
+		}
+	}
+
+	// out[oo + i] = a[ao + i · aStride] op b[bo + i · bStride] for i < n
+	// (a stride is 1 or 0). The vector loops are chosen once per block:
+	// one per operator and per operand that repeats.
+	internal def floatBlock(op Binary, a float32[], ao int, aStride int, b float32[], bo int, bStride int, out float32[], oo int, n int) {
+		return when n == 0
+		let i = 0
+		let xs = simd.splat8<float32>(a[ao])
+		let ys = simd.splat8<float32>(b[bo])
+		if aStride == 1 && bStride == 1 {
+			match op {
+				case Binary.Add:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x + y)
+					}
+				case Binary.Sub:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x - y)
+					}
+				case Binary.Mul:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x * y)
+					}
+				case Binary.Div:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x / y)
+					}
+				case Binary.Max:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, simd.max(x, y))
+					}
+				case Binary.Min:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, simd.min(x, y))
+					}
+				default:
+			}
+		} else if aStride == 1 {
+			match op {
+				case Binary.Add:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, x + y)
+					}
+				case Binary.Sub:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, x - y)
+					}
+				case Binary.Mul:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, x * y)
+					}
+				case Binary.Div:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, x / y)
+					}
+				case Binary.Max:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, simd.max(x, y))
+					}
+				case Binary.Min:
+					for; i + 8 <= n; i += 8 {
+						let x = simd.load8<float32>(a, ao + i)
+						let y = ys
+						simd.store8<float32>(out, oo + i, simd.min(x, y))
+					}
+				default:
+			}
+		} else if bStride == 1 {
+			match op {
+				case Binary.Add:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x + y)
+					}
+				case Binary.Sub:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x - y)
+					}
+				case Binary.Mul:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x * y)
+					}
+				case Binary.Div:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, x / y)
+					}
+				case Binary.Max:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, simd.max(x, y))
+					}
+				case Binary.Min:
+					for; i + 8 <= n; i += 8 {
+						let x = xs
+						let y = simd.load8<float32>(b, bo + i)
+						simd.store8<float32>(out, oo + i, simd.min(x, y))
+					}
+				default:
+			}
+		}
+		for; i < n; i++ {
+			out[oo + i] = floatOp(op, a[ao + i * aStride], b[bo + i * bStride])
+		}
+	}
+
+	// One value of `op` on floats.
+	internal def floatOp(op Binary, x float32, y float32) float32 {
+		match op {
+			case Binary.Add:
+				return x + y
+			case Binary.Sub:
+				return x - y
+			case Binary.Mul:
+				return x * y
+			case Binary.Div:
+				return x / y
+			case Binary.Pow:
+				return float32(power(float(x), float(y)))
+			case Binary.Max:
+				return x != x || y != y ?? (x + y, x.max(y))
+			case Binary.Min:
+				return x != x || y != y ?? (x + y, x.min(y))
+			case Binary.Fmod:
+				return float32(fmod(float(x), float(y)))
+			case Binary.Mod:
+				return float32(floorMod(float(x), float(y)))
+			case Binary.PRelu:
+				return x < float32(0) ?? (x * y, x)
+			default:
+				return float32(0)
+		}
+	}
+
+	// One value of `op` on doubles.
+	internal def doubleOp(op Binary, x float, y float) float {
+		match op {
+			case Binary.Add:
+				return x + y
+			case Binary.Sub:
+				return x - y
+			case Binary.Mul:
+				return x * y
+			case Binary.Div:
+				return x / y
+			case Binary.Pow:
+				return power(x, y)
+			case Binary.Max:
+				return x != x || y != y ?? (x + y, x.max(y))
+			case Binary.Min:
+				return x != x || y != y ?? (x + y, x.min(y))
+			case Binary.Fmod:
+				return fmod(x, y)
+			case Binary.Mod:
+				return floorMod(x, y)
+			case Binary.PRelu:
+				return x < 0.0 ?? (x * y, x)
+			default:
+				return 0.0
+		}
+	}
+
+	// numpy's mod: C's fmod moved to the divisor's sign, a zero result
+	// taking the divisor's sign.
+	internal def floorMod(x float, y float) float {
+		let m = fmod(x, y)
+		return m when y == 0.0 || m != m
+		if m == 0.0 {
+			return y < 0.0 ?? (-0.0, 0.0)
+		}
+		return (y < 0.0) != (m < 0.0) ?? (m + y, m)
+	}
+
+	// x raised to y, as C's pow: NaN for a negative x and a fractional y,
+	// 1 for y of 0.
+	internal def power(x float, y float) float {
+		return 1.0 when y == 0.0
+		if x < 0.0 {
+			let whole = y.floor() == y
+			return 0.0 / 0.0 unless whole
+			let magnitude = (-x) ** y
+			return (y / 2.0).floor() * 2.0 == y ?? (magnitude, -magnitude)
+		}
+		return x ** y
+	}
+
+	// C's fmod, exactly: x − y · trunc(x / y), the sign of x. The
+	// remainder takes away the largest power-of-two multiple of |y| that
+	// fits, again and again; each subtraction is exact (Sterbenz).
+	internal def fmod(x float, y float) float {
+		return 0.0 / 0.0 when y == 0.0 || x != x || y != y || x.abs() == 1.0 / 0.0
+		return x when y.abs() == 1.0 / 0.0
+		let r = x.abs()
+		let b = y.abs()
+		for r >= b {
+			let t = b
+			for t * 2.0 <= r {
+				t *= 2.0
+			}
+			r -= t
+		}
+		return x < 0.0 || (x == 0.0 && 1.0 / x < 0.0) ?? (-r, r)
+	}
+
+	// Comparison or logical `op` of two floats into Bool values.
+	internal def compareFloats(op Binary, a float32[], ao int, aStride int, b float32[], bo int, bStride int, out int[], oo int, n int) {
+		for let i = 0; i < n; i++ {
+			let x = a[ao + i * aStride]
+			let y = b[bo + i * bStride]
+			out[oo + i] = compare(op, x < y, x == y, x > y) ?? (1, 0)
+		}
+	}
+
+	// The comparison `op` given whether x < y, x == y and x > y (all
+	// false when either is NaN, which every comparison then fails).
+	internal def compare(op Binary, less bool, equal bool, greater bool) bool {
+		match op {
+			case Binary.Equal:
+				return equal
+			case Binary.Less:
+				return less
+			case Binary.LessOrEqual:
+				return less || equal
+			case Binary.Greater:
+				return greater
+			default:
+				return greater || equal
+		}
+	}
+
+	// `op` on integers (Bool included) of `bits` width, results wrapped to
+	// it as the type does.
+	internal def intBlock(op Binary, a int[], ao int, aStride int, b int[], bo int, bStride int, out int[], oo int, n int, signed bool, bits int) {
+		for let i = 0; i < n; i++ {
+			let x = a[ao + i * aStride]
+			let y = b[bo + i * bStride]
+			let r = 0
+			match op {
+				case Binary.Add:
+					r = x + y
+				case Binary.Sub:
+					r = x - y
+				case Binary.Mul:
+					r = x * y
+				case Binary.Div:
+					r = y == 0 ?? (0, signed ?? (x / y, int(uint(x) / uint(y))))
+				case Binary.Pow:
+					r = intPower(x, y)
+				case Binary.Max:
+					r = signed ?? (x.max(y), uint(x) > uint(y) ?? (x, y))
+				case Binary.Min:
+					r = signed ?? (x.min(y), uint(x) < uint(y) ?? (x, y))
+				case Binary.Mod:
+					// The divisor's sign, as Python's %.
+					r = y == 0 ?? (0, x - y * floorDiv(x, y))
+				case Binary.Fmod:
+					r = y == 0 ?? (0, x % y)
+				case Binary.ShiftLeft:
+					// A shift by the width or more (or a negative one) leaves 0,
+					// as numpy saturates.
+					r = y < 0 || y >= bits ?? (0, x << y)
+				case Binary.ShiftRight:
+					// Signed values shift in their sign; a shift past the width
+					// leaves 0, or -1 for a negative value.
+					if y < 0 || y >= bits {
+						r = signed && x < 0 ?? (-1, 0)
+					} else {
+						r = signed ?? (x >> y, int(uint(x) >> uint(y)))
+					}
+				case Binary.BitAnd:
+					r = x & y
+				case Binary.BitOr:
+					r = x | y
+				case Binary.BitXor:
+					r = x ^ y
+				case Binary.PRelu:
+					r = x < 0 ?? (x * y, x)
+				case Binary.And:
+					r = x != 0 && y != 0 ?? (1, 0)
+				case Binary.Or:
+					r = x != 0 || y != 0 ?? (1, 0)
+				case Binary.Xor:
+					r = (x != 0) != (y != 0) ?? (1, 0)
+				case Binary.Equal:
+					r = x == y ?? (1, 0)
+				case Binary.Less:
+					r = (signed ?? (x < y, uint(x) < uint(y))) ?? (1, 0)
+				case Binary.LessOrEqual:
+					r = (signed ?? (x <= y, uint(x) <= uint(y))) ?? (1, 0)
+				case Binary.Greater:
+					r = (signed ?? (x > y, uint(x) > uint(y))) ?? (1, 0)
+				default:
+					r = (signed ?? (x >= y, uint(x) >= uint(y))) ?? (1, 0)
+			}
+			out[oo + i] = comparison(op) ?? (r, wrap(r, bits, signed))
+		}
+	}
+
+	// Floor division of integers (toward minus infinity).
+	internal def floorDiv(x int, y int) int {
+		let q = x / y
+		return (x % y != 0 && (x < 0) != (y < 0)) ?? (q - 1, q)
+	}
+
+	// x to the integer power y (0 for a negative y unless x is ±1).
+	internal def intPower(x int, y int) int {
+		if y < 0 {
+			return x == 1 ?? (1, x == -1 ?? ((y % 2 == 0) ?? (1, -1), 0))
+		}
+		let r = 1
+		let base = x
+		let e = y
+		for e > 0 {
+			r *= e & 1 == 1 ?? (base, 1)
+			base *= base
+			e >>= 1
+		}
+		return r
+	}
+
+	// `v` wrapped to a `bits`-wide integer, signed or not.
+	internal def wrap(v int, bits int, signed bool) int {
+		return v when bits >= 64
+		let mask = (1 << bits) - 1
+		let low = v & mask
+		return signed && low >= 1 << (bits - 1) ?? (low - (1 << bits), low)
+	}
+
+	// Rounds the values of a tensor of a floating-point type narrower than
+	// Float to that type, as an operator computing it in float32 would
+	// store its result.
+	internal def roundTo(t Tensor) {
+		match t.element {
+			case ElementType.Float, ElementType.Complex64:
+				return
+			case ElementType.Float16:
+				for let i = 0; i < t.floats.len(); i++ {
+					t.floats[i] = halfValue(halfBits(t.floats[i]))
+				}
+			case ElementType.BFloat16:
+				for let i = 0; i < t.floats.len(); i++ {
+					t.floats[i] = __bitcast_f32_from_u32(uint32(bfloatBits(t.floats[i]) << 16))
+				}
+			default:
+				if isFloat(t.element) && storageOf(t.element) == Storage.Floats {
+					for let i = 0; i < t.floats.len(); i++ {
+						t.floats[i] = minifloat(t.element, miniCode(t.element, t.floats[i]))
+					}
+				}
+		}
+	}
+
+	// The variadic Sum, Mean, Max and Min: the inputs broadcast together,
+	// combined in order.
+	internal def variadic(c Call, op Binary, mean bool) !none {
+		let acc = try c.tensor(0)
+		for let i = 1; i < c.inputs.len(); i++ {
+			acc = try binary(acc, try c.tensor(i), op)
+		}
+		if mean && c.inputs.len() > 1 {
+			let n = c.inputs.len()
+			match storageOf(acc.element) {
+				case Storage.Floats:
+					let scaled = acc == (try c.tensor(0)) ?? (cloneTensor(acc), acc)
+					for let i = 0; i < scaled.floats.len(); i++ {
+						scaled.floats[i] /= float32(n)
+					}
+					roundTo(scaled)
+					acc = scaled
+				case Storage.Doubles:
+					let scaled = cloneTensor(acc)
+					for let i = 0; i < scaled.doubles.len(); i++ {
+						scaled.doubles[i] /= float(n)
+					}
+					acc = scaled
+				default:
+					fail c.about() + "Mean of {acc.element.name}"
+			}
+		}
+		c.out(0, acc)
+		return none
+	}
+
+	// A copy of `t` that shares nothing with it.
+	internal def cloneTensor(t Tensor) Tensor {
+		let c = zerosLike(t.element, t.shape)
+		c.floats = t.floats.clone()
+		c.doubles = t.doubles.clone()
+		c.ints = t.ints.clone()
+		c.strings = t.strings.clone()
+		return c
+	}
+
+	// Where(condition, x, y): x where the condition holds, y elsewhere,
+	// the three broadcast together.
+	internal def choose(c Call) !none {
+		let condition = try c.tensor(0)
+		let x = try c.tensor(1)
+		let y = try c.tensor(2)
+		fail c.about() + "x is {x.element.name}, y {y.element.name}" unless x.element == y.element
+		let first = try broadcast(condition.shape, x.shape)
+		let shape = (try broadcast(first.shape, y.shape)).shape
+		let out = zerosLike(x.element, shape)
+		let pc = try broadcast(shape, condition.shape)
+		let px = try broadcast(shape, x.shape)
+		let py = try broadcast(shape, y.shape)
+		for let o = 0; o < pc.outer; o++ {
+			for let i = 0; i < pc.inner; i++ {
+				let at = o * pc.inner + i
+				let cond = condition.ints[pc.bOffsets[o] + i * pc.bStep] != 0
+				let ox = outerIndex(px, at)
+				let oy = outerIndex(py, at)
+				if cond {
+					copyValue(x, ox, out, at)
+				} else {
+					copyValue(y, oy, out, at)
+				}
+			}
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// The place in input b of `plan` (the broadcast of an output shape
+	// with b's) of output value `at`.
+	internal def outerIndex(plan Broadcast, at int) int {
+		let o = at / plan.inner
+		return plan.bOffsets[o] + (at % plan.inner) * plan.bStep
+	}
+}

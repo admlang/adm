@@ -6,6 +6,7 @@ partial module std.ai.tensor {
 		std.formats.ai
 		std.formats.ai::(TensorType)
 		std.ai.tensor.gpu::*
+		std.ai.tensor.gemm::*
 	)
 
 	check "Tensor kernels on the GPU" {
@@ -35,8 +36,13 @@ partial module std.ai.tensor {
 			let size = ai.blockBytes(kind)
 			let count = rows * cols / ai.blockSize(kind)
 			let data = noise(count * size, seed)
-			let at = kind == TensorType.Q6_K ?? (int[208], kind == TensorType.Q4_K ?? (int[0, 2], int[0]))
+			let at = kind == TensorType.Q6_K ?? (int[208], (kind := TensorType.Q4_K || TensorType.Q5_K) ?? (int[0, 2], int[0]))
 			for let b = 0; b < count; b++ {
+				if kind == TensorType.MXFP4 {
+					// An E8M0 scale of 2^(e − 127), e in 117..124.
+					data[b * size] = byte(117 + int(data[b * size]) % 8)
+					continue
+				}
 				for let (_, o) in at {
 					// 0x1C00..0x1CFF: about 0.004
 					data[b * size + o + 1] = byte(0x1C)
@@ -95,7 +101,7 @@ partial module std.ai.tensor {
 			let cols = 512
 			let x = values(cols + 4, 3)
 			let dx = try gpu.upload(x)
-			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.F32, TensorType.F16, TensorType.BF16] {
+			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q5_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.Q4_0, TensorType.MXFP4, TensorType.F32, TensorType.F16, TensorType.BF16] {
 				let data = (kind := TensorType.F32 || TensorType.F16 || TensorType.BF16) ?? (plain(kind, rows * cols), blocks(kind, rows, cols))
 				let w = new Weights(kind, rows, cols, data)
 				let want = zeros(rows)
@@ -116,7 +122,7 @@ partial module std.ai.tensor {
 			let cols = 768
 			let x = values(cols, 41)
 			let dx = try gpu.upload(x)
-			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q6_K, TensorType.Q8_0] {
+			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q5_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.Q4_0, TensorType.MXFP4] {
 				let gate = new Weights(kind, rows, cols, blocks(kind, rows, cols))
 				let up = new Weights(kind, rows, cols, blocks(kind, rows, cols, 99))
 				let want = zeros(rows)
@@ -131,7 +137,10 @@ partial module std.ai.tensor {
 				try (try upload(gate)).multiplyGated(try upload(up), dx, out, true)
 				let got = zeros(rows)
 				try out.download(got)
-				assert close(want, got, float32(0.0001))
+				// Q5_K's larger weights: a gate of 0.1 is what is left of sums of
+				// ±70, times an up of 70, so float32 summation order shows at 1e-4.
+				let tolerance = kind == TensorType.Q5_K ?? (float32(0.0005), float32(0.0001))
+				assert close(want, got, tolerance) onerror fail "{kind.name}"
 			}
 		}
 
@@ -183,6 +192,25 @@ partial module std.ai.tensor {
 			assert close(want, got, float32(0.0001))
 			try normed.download(got)
 			assert close(normedWant, got, float32(0.0001))
+			// The plain add of a width read four values at a time.
+			let wide = 1024
+			let stream = values(wide, 54)
+			let added = values(wide, 55)
+			let scales = values(2 * wide, 56)
+			let sum = zeros(wide)
+			for let i = 0; i < wide; i++ {
+				sum[i] = stream[i] + added[i]
+			}
+			let sumNormed = sum.clone()
+			rmsNorm(sumNormed, scales[wide:], float32(0.00001))
+			let dStream = try gpu.upload(stream)
+			let dNormed = try gpu.upload(zeros(wide))
+			try addNormed(dStream, try gpu.upload(added), wide, try gpu.upload(scales), -1, float32(0.00001), float32(1), dNormed, wide, 256)
+			let wideGot = zeros(wide)
+			try dStream.download(wideGot)
+			assert close(sum, wideGot, float32(0.0001))
+			try dNormed.download(wideGot)
+			assert close(sumNormed, wideGot, float32(0.0001))
 		}
 
 		@test()
@@ -201,7 +229,7 @@ partial module std.ai.tensor {
 			let dx = try gpu.upload(x)
 			let dw = try gpu.upload(weight)
 			let table = try gpu.upload(ropeTable(48, float32(10000), float32(0.5), factors))
-			try prepareHeads(dx, 0, hs, heads, 1, dw, 0, float32(0.000001), 1, 17, table, 0, 48, 1, float32(1.5), heads * 256)
+			try prepareHeads(dx, 0, hs, heads, 1, dw, 0, float32(0.000001), 1, 17, dw, -1, 0, table, 0, 48, 1, float32(1.5), heads * 256)
 			let got = zeros(x.len())
 			try dx.download(got)
 			assert close(want, got, float32(0.0001))
@@ -220,30 +248,41 @@ partial module std.ai.tensor {
 			let vals = values(positions * kvSize, 23)
 			let first = 2
 			let count = positions - first
-			let want = zeros(heads * hs)
-			for let h = 0; h < heads; h++ {
-				let kv = (h / (heads / kvHeads)) * hs
-				let scores = zeros(count)
-				for let t = 0; t < count; t++ {
-					let s = float32(0)
-					for let i = 0; i < hs; i++ {
-						s += q[h * hs + i] * keys[(first + t) * kvSize + kv + i]
+			// Sink logits of gpt-oss, one per head, at vectors[1:]; the
+			// last head's is above every score.
+			let sinks = float32[0, 1.5, -2, 0.5, 40]
+			let dSinks = try gpu.upload(sinks)
+			for let (_, sunk) in bool[false, true] {
+				let want = zeros(heads * hs)
+				for let h = 0; h < heads; h++ {
+					let kv = (h / (heads / kvHeads)) * hs
+					let scores = zeros(count + 1)
+					for let t = 0; t < count; t++ {
+						let s = float32(0)
+						for let i = 0; i < hs; i++ {
+							s += q[h * hs + i] * keys[(first + t) * kvSize + kv + i]
+						}
+						scores[t] = s * float32(0.25)
 					}
-					scores[t] = s * float32(0.25)
-				}
-				softmax(scores)
-				for let t = 0; t < count; t++ {
-					for let i = 0; i < hs; i++ {
-						want[h * hs + i] += scores[t] * vals[(first + t) * kvSize + kv + i]
+					if sunk {
+						scores[count] = sinks[1 + h]
+						softmax(scores)
+					} else {
+						softmax(scores[:count])
+					}
+					for let t = 0; t < count; t++ {
+						for let i = 0; i < hs; i++ {
+							want[h * hs + i] += scores[t] * vals[(first + t) * kvSize + kv + i]
+						}
 					}
 				}
+				let out = try gpu.upload(zeros(heads * hs))
+				let work = try gpu.upload(zeros(partsSize(heads, hs, count)))
+				try attention(try gpu.upload(q), try gpu.upload(keys), try gpu.upload(vals), out, work, heads, kvHeads, hs, first, count, float32(0.25), float32(0), dSinks, sunk ?? (1, -1))
+				let got = zeros(heads * hs)
+				try out.download(got)
+				assert close(want, got, float32(0.0001)) onerror fail "sinks {sunk}"
 			}
-			let out = try gpu.upload(zeros(heads * hs))
-			let work = try gpu.upload(zeros(partsSize(heads, hs, count)))
-			try attention(try gpu.upload(q), try gpu.upload(keys), try gpu.upload(vals), out, work, heads, kvHeads, hs, first, count, float32(0.25), float32(0))
-			let got = zeros(heads * hs)
-			try out.download(got)
-			assert close(want, got, float32(0.0001))
 		}
 
 		@test()
@@ -257,7 +296,7 @@ partial module std.ai.tensor {
 			let x = values(4 + n * xs, 71)
 			let dx = try gpu.upload(x)
 			let work = try gpu.upload(zeros(splitWork))
-			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.F32, TensorType.F16, TensorType.BF16] {
+			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q5_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.Q4_0, TensorType.MXFP4, TensorType.F32, TensorType.F16, TensorType.BF16] {
 				let data = (kind := TensorType.F32 || TensorType.F16 || TensorType.BF16) ?? (plain(kind, rows * cols), blocks(kind, rows, cols))
 				let w = new Weights(kind, rows, cols, data)
 				let out = try gpu.upload(zeros(2 + n * os))
@@ -275,51 +314,102 @@ partial module std.ai.tensor {
 		}
 
 		@test()
+		def TestGpuRoundedMultiply() !none {
+			return none unless gpu.available()
+			let rows = 70
+			let cols = 512
+			let n = 67
+			// Whole numbers up to ±127 with a 127 in every block of 32 are
+			// their own rounding, so the products equal the exact ones.
+			let x float32[]
+			let bytes = noise(n * cols, 31)
+			for let i = 0; i < n * cols; i++ {
+				x.push(i % 32 == 0 ?? (float32(127), float32(int(bytes[i]) % 100 - 50)))
+			}
+			let dx = try gpu.upload(x)
+			let held byte[]
+			held.len(n * cols)
+			let q = try gpu.upload(held)
+			let scales = try gpu.upload(zeros(n * cols / 16))
+			try roundRows(dx, 0, cols, q, scales, cols, n, n * cols)
+			let work = try gpu.upload(zeros(splitWork))
+			let got = zeros(n * rows)
+			let row = zeros(rows)
+			for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q5_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.Q4_0, TensorType.MXFP4] {
+				let w = new Weights(kind, rows, cols, blocks(kind, rows, cols, 9))
+				let d = try upload(w)
+				assert d.rounds()
+				let out = try gpu.upload(zeros(n * rows))
+				try d.multiplyRounded(q, scales, out, 0, rows, n, work)
+				try out.download(got)
+				for let t = 0; t < n; t++ {
+					w.multiply(x[t * cols:(t + 1) * cols], row)
+					assert close(row, got[t * rows:(t + 1) * rows], float32(0.02)) onerror fail "{kind.name} token {t}"
+				}
+			}
+			return none
+		}
+
+		@test()
 		def TestGpuAttendTokens() !none {
 			return none unless gpu.available()
 			let heads = 4
 			let kvHeads = 2
-			let hs = 320
-			let start = 62
 			let n = 5
-			let kvSize = kvHeads * hs
-			let q = values(n * heads * hs, 81)
-			let keys = values((start + n) * kvSize, 82)
-			let vals = values((start + n) * kvSize, 83)
-			let dq = try gpu.upload(q)
-			let dk = try gpu.upload(keys)
-			let dv = try gpu.upload(vals)
-			for let (_, window) in int[0, 40] {
-				let want = zeros(n * heads * hs)
-				for let t = 0; t < n; t++ {
-					let pos = start + t
-					let first = window > 0 ?? ((pos - window + 1).max(0), 0)
-					let count = pos + 1 - first
-					for let h = 0; h < heads; h++ {
-						let kv = (h / (heads / kvHeads)) * hs
-						let qo = (t * heads + h) * hs
-						let scores = zeros(count)
-						for let p = 0; p < count; p++ {
-							let s = float32(0)
-							for let i = 0; i < hs; i++ {
-								s += q[qo + i] * keys[(first + p) * kvSize + kv + i]
+			// A head whose values are summed one at a time within one chunk
+			// of positions, then one summed four at a time over two chunks.
+			for let (_, hs) in int[320, 128] {
+				let start = hs == 320 ?? (62, 300)
+				let kvSize = kvHeads * hs
+				let q = values(n * heads * hs, 81)
+				let keys = values((start + n) * kvSize, 82)
+				let vals = values((start + n) * kvSize, 83)
+				let dq = try gpu.upload(q)
+				let dk = try gpu.upload(keys)
+				let dv = try gpu.upload(vals)
+				let sinks = float32[0, 1.5, -2, 0.5, 40]
+				let dSinks = try gpu.upload(sinks)
+				// Window 0 and 40 without sinks, then 40 with them.
+				for let (_, window) in int[0, 40, -40] {
+					let sunk = window < 0
+					window = window.abs()
+					let want = zeros(n * heads * hs)
+					for let t = 0; t < n; t++ {
+						let pos = start + t
+						let first = window > 0 ?? ((pos - window + 1).max(0), 0)
+						let count = pos + 1 - first
+						for let h = 0; h < heads; h++ {
+							let kv = (h / (heads / kvHeads)) * hs
+							let qo = (t * heads + h) * hs
+							let scores = zeros(count)
+							for let p = 0; p < count; p++ {
+								let s = float32(0)
+								for let i = 0; i < hs; i++ {
+									s += q[qo + i] * keys[(first + p) * kvSize + kv + i]
+								}
+								scores[p] = float32(30) * float32(math.tanh(float(s * float32(0.05) / float32(30))))
 							}
-							scores[p] = float32(30) * float32(math.tanh(float(s * float32(0.05) / float32(30))))
-						}
-						softmax(scores)
-						for let p = 0; p < count; p++ {
-							for let i = 0; i < hs; i++ {
-								want[qo + i] += scores[p] * vals[(first + p) * kvSize + kv + i]
+							if sunk {
+								scores.push(sinks[1 + h])
+								softmax(scores)
+							} else {
+								softmax(scores)
+							}
+							for let p = 0; p < count; p++ {
+								for let i = 0; i < hs; i++ {
+									want[qo + i] += scores[p] * vals[(first + p) * kvSize + kv + i]
+								}
 							}
 						}
 					}
+					let out = try gpu.upload(zeros(n * heads * hs))
+					try attendTokens(dq, dk, dv, out, heads, kvHeads, hs, start, window, float32(0.05), float32(30), dSinks, sunk ?? (1, -1), 1, dSinks, -1, n * heads * 256)
+					let got = zeros(n * heads * hs)
+					try out.download(got)
+					assert close(want, got, float32(0.0001)) onerror fail "head size {hs}, window {window}, sinks {sunk}"
 				}
-				let out = try gpu.upload(zeros(n * heads * hs))
-				try attendTokens(dq, dk, dv, out, heads, kvHeads, hs, start, window, float32(0.05), float32(30), n * heads * 256)
-				let got = zeros(n * heads * hs)
-				try out.download(got)
-				assert close(want, got, float32(0.0001))
 			}
+			return none
 		}
 
 		@test()
@@ -344,6 +434,648 @@ partial module std.ai.tensor {
 				try da.download(got)
 				assert close(want, got, float32(0.0001))
 			}
+		}
+
+		// The expert kernels against `Weights.multiply` per pick, with the
+		// experts' gate, up and down stored as `gateKind`, `upKind`, `downKind`.
+		internal def checkExperts(gateKind TensorType, upKind TensorType, downKind TensorType) !none {
+			return none unless gpu.available()
+			let experts = 6
+			let used = 3
+			// More tokens than a tile's 64, so an expert's picks span two.
+			let n = 150
+			let e = 512
+			let ff = 256
+			let gateData = blocks(gateKind, experts * ff, e)
+			let upData = blocks(upKind, experts * ff, e, 99)
+			let downData = blocks(downKind, experts * e, ff, 5)
+			let gateSize = gateData.len() / experts
+			let upSize = upData.len() / experts
+			let downSize = downData.len() / experts
+			// Small inputs keep the halves near 1, so the weighted sums do
+			// not cancel large terms.
+			let x = values(n * e, 3)
+			for let i = 0; i < x.len(); i++ {
+				x[i] = x[i] / float32(128)
+			}
+			let scores = values(n * experts, 23)
+			// Equal best scores: the earlier expert is picked first.
+			scores[1] = float32(2.5)
+			scores[4] = float32(2.5)
+			let bias = values(experts * (2 * ff + e), 77)
+			let gateBias = 0
+			let upBias = experts * ff
+			let downBias = 2 * experts * ff
+			let scale = float32(1.5)
+			let dGate = try uploadStack(new Weights(gateKind, ff, e, gateData[0:gateSize]), experts, gateData)
+			let dUp = try uploadStack(new Weights(upKind, ff, e, upData[0:upSize]), experts, upData)
+			let dDown = try uploadStack(new Weights(downKind, e, ff, downData[0:downSize]), experts, downData)
+			assert dGate.rows == experts * ff && dDown.rows == experts * e
+			let dx = try gpu.upload(x)
+			let dBias = try gpu.upload(bias)
+			let slots = zeros(experts)
+			for let i = 0; i < experts; i++ {
+				slots[i] = float32(i)
+			}
+			let dSlots = try gpu.upload(slots)
+			let gates Weights[]
+			let ups Weights[]
+			let downs Weights[]
+			for let i = 0; i < experts; i++ {
+				gates.push(new Weights(gateKind, ff, e, gateData[i * gateSize:(i + 1) * gateSize]))
+				ups.push(new Weights(upKind, ff, e, upData[i * upSize:(i + 1) * upSize]))
+				downs.push(new Weights(downKind, e, ff, downData[i * downSize:(i + 1) * downSize]))
+			}
+			for let (_, pickFirst) in bool[false, true] {
+				for let (_, mode) in int[0, 2] {
+					let wantPicks = zeros(n * 2 * used)
+					let want = zeros(n * e)
+					let g = zeros(ff)
+					let u = zeros(ff)
+					let part = zeros(e)
+					for let t = 0; t < n; t++ {
+						let s = scores[t * experts:(t + 1) * experts].clone()
+						let ids int[]
+						ids.len(used)
+						for let i = 0; i < experts; i++ {
+							let rank = 0
+							for let j = 0; j < experts; j++ {
+								rank++ when s[j] > s[i] || (s[j] == s[i] && j < i)
+							}
+							ids[rank] = i when rank < used
+						}
+						let weights float32[]
+						if pickFirst {
+							for let (_, id) in ids {
+								weights.push(s[id])
+							}
+							softmax(weights)
+						} else {
+							softmax(s)
+							let total = float32(0)
+							for let (_, id) in ids {
+								total += s[id]
+							}
+							for let (_, id) in ids {
+								weights.push(s[id] / total)
+							}
+						}
+						for let (j, id) in ids {
+							wantPicks[t * 2 * used + j] = float32(id)
+							wantPicks[t * 2 * used + used + j] = weights[j] * scale
+							new Weights(gateKind, ff, e, gateData[id * gateSize:(id + 1) * gateSize]).multiply(x[t * e:(t + 1) * e], g)
+							new Weights(upKind, ff, e, upData[id * upSize:(id + 1) * upSize]).multiply(x[t * e:(t + 1) * e], u)
+							for let r = 0; r < ff; r++ {
+								let a = g[r] + bias[gateBias + id * ff + r]
+								let b = u[r] + bias[upBias + id * ff + r]
+								if mode == 2 {
+									a = a.min(float32(7))
+									b = b.max(float32(-7)).min(float32(7))
+									g[r] = a / float32(1.0 + math.E ** (-1.702 * float(a))) * (b + float32(1))
+								} else {
+									g[r] = a / float32(1.0 + math.E ** (-float(a))) * b
+								}
+							}
+							new Weights(downKind, e, ff, downData[id * downSize:(id + 1) * downSize]).multiply(g, part)
+							for let r = 0; r < e; r++ {
+								want[t * e + r] += weights[j] * scale * (part[r] + bias[downBias + id * e + r])
+							}
+						}
+					}
+					let dScores = try gpu.upload(scores)
+					let dPicks = try gpu.upload(zeros(n * 2 * used))
+					let dHalves = try gpu.upload(zeros(n * used * ff))
+					let dOut = try gpu.upload(zeros(n * e))
+					try pickExperts(dScores, 0, experts, used, pickFirst ?? (1, 0), scale, dPicks, 0, n * 256)
+					try multiplyExperts(dGate, dUp, dSlots, dx, 0, e, dPicks, 0, used, dBias, gateBias, upBias, dHalves, 0, ff, n, n, mode)
+					try sumExperts(dDown, dSlots, dHalves, 0, dPicks, 0, used, dBias, downBias, dOut, 0, e, e, n, n)
+					let gotPicks = zeros(n * 2 * used)
+					try dPicks.download(gotPicks)
+					for let t = 0; t < n; t++ {
+						for let j = 0; j < used; j++ {
+							assert gotPicks[t * 2 * used + j] == wantPicks[t * 2 * used + j]
+						}
+					}
+					assert gotPicks[0] == float32(1) && gotPicks[1] == float32(4)
+					assert close(wantPicks, gotPicks, float32(0.0001))
+					let got = zeros(n * e)
+					try dOut.download(got)
+					assert close(want, got, float32(0.0005))
+					let wholeTokens = got.clone()
+					// The same through the tiles of each expert's tokens.
+					let dTiled = try gpu.upload(zeros(n * e))
+					try mixExpertTiles(dGate, dUp, dDown, dSlots, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, try gpu.upload(zeros(n * used * ff)), try gpu.upload(zeros(n * used * ff)), try gpu.upload(zeros(n * used * e)), try gpu.upload(zeros(groupsSize(n, experts))), dTiled, e, n, mode)
+					try dTiled.download(got)
+					assert close(want, got, float32(0.0005))
+					let wholeTiled = got.clone()
+					// And on activations rounded to 8 bits: the same up to
+					// the rounding, measured against the outputs' size.
+					let room byte[]
+					room.len(n * used * ff)
+					let dRounded = try gpu.upload(zeros(n * e))
+					try mixExpertTilesRounded(dGate, dUp, dDown, dSlots, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, try gpu.upload(zeros(n * used * ff)), try gpu.upload(zeros(n * used * ff)), try gpu.upload(zeros(n * used * e)), try gpu.upload(zeros(groupsSize(n, experts))), try gpu.upload(room), try gpu.upload(zeros(n * used * ff / 16 + 2)), dRounded, e, n, mode)
+					try dRounded.download(got)
+					let squares = float32(0)
+					let worst = float32(0)
+					for let i = 0; i < want.len(); i++ {
+						squares += want[i] * want[i]
+						worst = worst.max((want[i] - got[i]).abs())
+					}
+					// About 5% of the outputs' size here.
+					assert float(worst) < 0.1 * (float(squares) / float(want.len())) ** 0.5
+					let wholeRounded = got.clone()
+					// Half the experts on the GPU at a time gives the
+					// values of all of them there, to the bit: token by
+					// token, each with its picks in the slots, ...
+					// The experts outside the slots come from the model's bytes
+					// until the page-locked cache is made: on the first pass
+					// halfway through, after experts changed places, on the
+					// second before the first token. On the third the cache
+					// has one entry for the three experts outside the slots,
+					// which the one asked for latest takes; the tiles and
+					// arenas below run on that cache.
+					let held = try uploadExperts(gates, ups, downs, gateData, upData, downData, 1, used, false)
+					let dPart = try gpu.upload(zeros(n * e))
+					for let pass = 0; pass < 3; pass++ {
+						if pass >= 1 {
+							held.dispose()
+							held = try uploadExperts(gates, ups, downs, gateData, upData, downData, 1, used, entries = pass == 2 ?? (1, -1))
+							assert held.awaitsCache()
+							try held.awaitCache()
+							try dPart.write(zeros(n * e))
+						}
+						assert held.count() == experts && held.slots() == used && !held.whole()
+						assert held.holds(used - 1) && !held.holds(used)
+						let copied = 0
+						// The tokens again in reverse ask at once for experts
+						// that left their slots a moment ago.
+						for let visit = 0; visit < 2 * n; visit++ {
+							if pass == 0 && visit == n {
+								assert !held.awaitsCache()
+								held.startCache()
+								try held.awaitCache()
+							}
+							let t = visit < n ?? (visit, 2 * n - 1 - visit)
+							let ids int[]
+							for let j = 0; j < used; j++ {
+								ids.push(int(gotPicks[t * 2 * used + j]))
+								copied++ unless held.holds(ids[j])
+							}
+							try held.hold(ids, false)
+							for let (_, id) in ids {
+								assert held.holds(id)
+							}
+							try multiplyExperts(held.gate, held.up, held.table, dx, t * e, e, dPicks, t * 2 * used, used, dBias, gateBias, upBias, dHalves, t * used * ff, ff, 1, n, mode)
+							try sumExperts(held.down, held.table, dHalves, t * used * ff, dPicks, t * 2 * used, used, dBias, downBias, dPart, t * e, e, e, 1, n)
+						}
+						assert copied > 0 && !held.awaitsCache()
+						try dPart.download(got)
+						assert close(wholeTokens, got, float32(0))
+					}
+					// ... and through the tiles, the experts in two turns.
+					let dHalf = try gpu.upload(zeros(n * used * ff))
+					let dUps = try gpu.upload(zeros(n * used * ff))
+					let dParts = try gpu.upload(zeros(n * used * e))
+					let dGroups = try gpu.upload(zeros(groupsSize(n, experts)))
+					let turns = int[][int[4, 1, 5], int[0, 3, 2]]
+					for let (_, turn) in turns {
+						try held.hold(turn, true)
+						try mixExpertTiles(held.gate, held.up, held.down, held.table, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, dHalf, dUps, dParts, dGroups, dPart, e, n, mode)
+					}
+					try dPart.download(got)
+					assert close(wholeTiled, got, float32(0))
+					let dBytes = try gpu.upload(room)
+					let dScales = try gpu.upload(zeros(n * used * ff / 16 + 2))
+					for let (_, turn) in turns {
+						try held.hold(turn, true)
+						try mixExpertTilesRounded(held.gate, held.up, held.down, held.table, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, dHalf, dUps, dParts, dGroups, dBytes, dScales, dPart, e, n, mode)
+					}
+					try dPart.download(got)
+					assert close(wholeRounded, got, float32(0))
+					// The experts outside the slots lent to an arena, two
+					// at a time: the tiles of those in slots, then of those
+					// in the arena, with the slots left as they are; again
+					// after experts changed places.
+					let arena = try expertArena(gateSize, upSize, downSize, 2, experts)
+					let lent = held.lent(arena)
+					assert held.fits(arena) && held.outside() == experts - used
+					for let (_, turn) in turns {
+						try held.hold(turn, false)
+						try mixExpertTiles(held.gate, held.up, held.down, held.table, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, dHalf, dUps, dParts, dGroups, dPart, e, n, mode)
+						let outside int[]
+						for let id = 0; id < experts; id++ {
+							outside.push(id) unless held.holds(id)
+						}
+						for let first = 0; first < outside.len(); first += arena.places {
+							try held.lend(arena, outside[first:(first + arena.places).min(outside.len())])
+							try arena.join()
+							try mixExpertTiles(lent[0], lent[1], lent[2], arena.window.table, experts, dx, e, dPicks, used, dBias, gateBias, upBias, downBias, dHalf, dUps, dParts, dGroups, dPart, e, n, mode)
+						}
+						for let (_, id) in turn {
+							assert held.holds(id)
+						}
+						try dPart.download(got)
+						assert close(wholeTiled, got, float32(0))
+					}
+					arena.dispose()
+					held.dispose()
+				}
+			}
+		}
+
+		@test()
+		def TestGpuExperts() !none {
+			try checkExperts(TensorType.Q4_K, TensorType.Q6_K, TensorType.Q8_0)
+			// gpt-oss stores its experts as MXFP4.
+			return checkExperts(TensorType.MXFP4, TensorType.MXFP4, TensorType.MXFP4)
+		}
+
+		// multiplyBack adds dY · W, as the CPU's multiplyTransposed does, for
+		// every form; 3 tokens give splits of the rows, 80 tokens one span.
+		@test()
+		def TestGpuMultiplyBack() !none {
+			return none unless gpu.available()
+			let rows = 96
+			let cols = 512
+			let work = try gpu.upload(zeros(splitWork))
+			for let (_, n) in int[3, 80] {
+				let ys = rows + 5
+				let xs = cols + 3
+				let dy = values(2 + n * ys, 31)
+				let ddy = try gpu.upload(dy)
+				for let (_, kind) in TensorType[TensorType.Q4_K, TensorType.Q5_K, TensorType.Q6_K, TensorType.Q8_0, TensorType.Q4_0, TensorType.MXFP4, TensorType.F32, TensorType.F16, TensorType.BF16] {
+					let data = (kind := TensorType.F32 || TensorType.F16 || TensorType.BF16) ?? (plain(kind, rows * cols), blocks(kind, rows, cols))
+					let w = new Weights(kind, rows, cols, data)
+					let start = values(1 + n * xs, 5)
+					let dx = try gpu.upload(start)
+					try (try upload(w)).multiplyBack(ddy, 2, ys, dx, 1, xs, n, work)
+					let got = zeros(1 + n * xs)
+					try dx.download(got)
+					let y = matrix<float32>[].size(n, rows)
+					let want = matrix<float32>[].size(n, cols)
+					for let t = 0; t < n; t++ {
+						dy[2 + t * ys:2 + t * ys + rows].copy(y.row(t))
+						start[1 + t * xs:1 + t * xs + cols].copy(want.row(t))
+					}
+					multiplyTransposed(w, y, want)
+					for let t = 0; t < n; t++ {
+						fail "multiplyBack {kind.name} at token {t} of {n}" unless close(want.row(t), got[1 + t * xs:1 + t * xs + cols], float32(0.0005))
+					}
+				}
+			}
+		}
+
+		// The LoRA kernels against loops: low = X·Aᵀ, out += s·B·low, and the
+		// gradients of low, B, A and X.
+		@test()
+		def TestGpuLowRank() !none {
+			return none unless gpu.available()
+			let (n, rank, cols, rows) = (5, 3, 70, 41)
+			let scale = float32(0.75)
+			let (xs, ys) = (cols + 2, rows + 1)
+			let a = values(4 + rank * cols, 1)
+			let b = values(2 + rows * rank, 2)
+			let x = values(n * xs, 3)
+			let dy = values(n * ys, 4)
+			let (da, db, dx, ddy) = (try gpu.upload(a), try gpu.upload(b), try gpu.upload(x), try gpu.upload(dy))
+			let low = try gpu.upload(zeros(n * rank))
+			try lowRank(da, 4, dx, 0, xs, low, n, rank, cols, n * rank * 32)
+			let lowGot = zeros(n * rank)
+			try low.download(lowGot)
+			let lowWant = zeros(n * rank)
+			for let t = 0; t < n; t++ {
+				for let k = 0; k < rank; k++ {
+					let sum = 0.0
+					for let c = 0; c < cols; c++ {
+						sum += float(a[4 + k * cols + c]) * float(x[t * xs + c])
+					}
+					lowWant[t * rank + k] = float32(sum)
+				}
+			}
+			assert close(lowWant, lowGot, float32(0.0001))
+			let out = values(n * ys, 9)
+			let dout = try gpu.upload(out)
+			try addLowRank(db, 2, low, dout, 0, ys, n, rows, rank, scale, n * rows)
+			let outGot = zeros(n * ys)
+			try dout.download(outGot)
+			for let t = 0; t < n; t++ {
+				for let o = 0; o < rows; o++ {
+					let sum = float32(0)
+					for let k = 0; k < rank; k++ {
+						sum += b[2 + o * rank + k] * lowWant[t * rank + k]
+					}
+					out[t * ys + o] += scale * sum
+				}
+			}
+			assert close(out, outGot, float32(0.0001))
+			let dlow = try gpu.upload(zeros(n * rank))
+			try lowRankBack(db, 2, ddy, 0, ys, dlow, n, rows, rank, scale, n * rank * 32)
+			let dlowGot = zeros(n * rank)
+			try dlow.download(dlowGot)
+			let dlowWant = zeros(n * rank)
+			for let t = 0; t < n; t++ {
+				for let k = 0; k < rank; k++ {
+					let sum = float32(0)
+					for let o = 0; o < rows; o++ {
+						sum += dy[t * ys + o] * b[2 + o * rank + k]
+					}
+					dlowWant[t * rank + k] = scale * sum
+				}
+			}
+			assert close(dlowWant, dlowGot, float32(0.0001))
+			let gradB = try gpu.upload(zeros(2 + rows * rank))
+			try gradLowB(ddy, 0, ys, low, gradB, 2, n, rows, rank, scale, rows * rank)
+			let gbGot = zeros(2 + rows * rank)
+			try gradB.download(gbGot)
+			for let o = 0; o < rows; o++ {
+				for let k = 0; k < rank; k++ {
+					let sum = float32(0)
+					for let t = 0; t < n; t++ {
+						sum += dy[t * ys + o] * lowWant[t * rank + k]
+					}
+					fail "gradLowB at {o}, {k}" unless close(float32[scale * sum], float32[gbGot[2 + o * rank + k]], float32(0.0001))
+				}
+			}
+			let gradA = try gpu.upload(zeros(4 + rank * cols))
+			try gradLowA(dlow, dx, 0, xs, gradA, 4, n, rank, cols, rank * cols)
+			let gaGot = zeros(4 + rank * cols)
+			try gradA.download(gaGot)
+			for let k = 0; k < rank; k++ {
+				for let c = 0; c < cols; c++ {
+					let sum = float32(0)
+					for let t = 0; t < n; t++ {
+						sum += dlowWant[t * rank + k] * x[t * xs + c]
+					}
+					fail "gradLowA at {k}, {c}" unless close(float32[sum], float32[gaGot[4 + k * cols + c]], float32(0.0001))
+				}
+			}
+			let back = try gpu.upload(zeros(n * xs))
+			try addLowRankBack(da, 4, dlow, back, 0, xs, n, rank, cols, n * cols)
+			let backGot = zeros(n * xs)
+			try back.download(backGot)
+			for let t = 0; t < n; t++ {
+				for let c = 0; c < cols; c++ {
+					let sum = float32(0)
+					for let k = 0; k < rank; k++ {
+						sum += dlowWant[t * rank + k] * a[4 + k * cols + c]
+					}
+					fail "addLowRankBack at {t}, {c}" unless close(float32[sum], float32[backGot[t * xs + c]], float32(0.0001))
+				}
+			}
+		}
+
+		// rmsBackRows and l2BackRows against the slope of the forward norm
+		// along each value (central differences in float64).
+		@test()
+		def TestGpuNormBack() !none {
+			return none unless gpu.available()
+			let (tokens, per, cols) = (3, 2, 40)
+			let xs = per * cols + 3
+			let x = values(tokens * xs, 12)
+			let dy = values(tokens * xs, 13)
+			let w = values(cols, 14)
+			let eps = float32(0.000001)
+			let (dxv, dyv, dw) = (try gpu.upload(x), try gpu.upload(dy), try gpu.upload(w))
+			for let (_, l2) in bool[false, true] {
+				let into = try gpu.upload(zeros(tokens * xs))
+				if l2 {
+					try l2BackRows(dxv, 0, xs, per, dyv, 0, xs, into, 0, xs, cols, tokens * per, eps, tokens * per * 32)
+				} else {
+					try rmsBackRows(dxv, 0, xs, per, dw, 0, dyv, 0, xs, into, 0, xs, cols, eps, tokens * per * 256)
+				}
+				let got = zeros(tokens * xs)
+				try into.download(got)
+				for let r = 0; r < tokens * per; r++ {
+					let at = (r / per) * xs + (r % per) * cols
+					for let i = 0; i < cols; i++ {
+						// d/dx_i of Σ_j dy_j · y_j(x).
+						let f = def (d float) float {
+							let sq = 0.0
+							for let j = 0; j < cols; j++ {
+								let v = float(x[at + j]) + (j == i ?? (d, 0.0))
+								sq += v * v
+							}
+							let s = l2 ?? (1.0 / (sq + float(eps)) ** 0.5, 1.0 / (sq / float(cols) + float(eps)) ** 0.5)
+							let sum = 0.0
+							for let j = 0; j < cols; j++ {
+								let v = float(x[at + j]) + (j == i ?? (d, 0.0))
+								sum += float(dy[at + j]) * v * s * (l2 ?? (1.0, float(w[j])))
+							}
+							return sum
+						}
+						let slope = (f(0.0001) - f(-0.0001)) / 0.0002
+						fail "{l2 ?? ("l2", "rms")} back at row {r}, {i}: {got[at + i]} vs {slope}" unless (float(got[at + i]) - slope).abs() < 0.001 * slope.abs().max(1.0)
+					}
+				}
+			}
+		}
+
+		// gatedBack's gradients against the slopes of its products, in
+		// every mode, around the clamp's edges too.
+		@test()
+		def TestGpuGatedBack() !none {
+			return none unless gpu.available()
+			let width = 9
+			let n = 3 * width
+			let g float32[]
+			let u float32[]
+			for let i = 0; i < n; i++ {
+				g.push(float32(i % 9) * float32(1.9) - float32(8))
+				u.push(float32((i * 5) % 9) * float32(2.1) - float32(8.5))
+			}
+			let d = values(n, 21)
+			for let mode = 0; mode < 3; mode++ {
+				let (dg, du, dd, ddu) = (try gpu.upload(g), try gpu.upload(u), try gpu.upload(d), try gpu.upload(zeros(n)))
+				try gatedBack(dg, 0, width, du, 0, width, dd, 0, width, ddu, 0, width, width, n, mode)
+				let gotG = zeros(n)
+				let gotU = zeros(n)
+				try dd.download(gotG)
+				try ddu.download(gotU)
+				for let i = 0; i < n; i++ {
+					let p = def (gv float, uv float) float {
+						if mode == 2 {
+							let limited = gv.min(7.0)
+							return limited / (1.0 + math.E ** (-1.702 * limited)) * (uv.clamp(-7.0, 7.0) + 1.0)
+						}
+						if mode == 1 {
+							return 0.5 * gv * (1.0 + math.tanh(0.7978845608028654 * (gv + 0.044715 * gv * gv * gv))) * uv
+						}
+						return gv / (1.0 + math.E ** (-gv)) * uv
+					}
+					let (gv, uv) = (float(g[i]), float(u[i]))
+					let sg = (p(gv + 0.0001, uv) - p(gv - 0.0001, uv)) / 0.0002 * float(d[i])
+					let su = (p(gv, uv + 0.0001) - p(gv, uv - 0.0001)) / 0.0002 * float(d[i])
+					fail "gatedBack mode {mode} gate at {i}: {gotG[i]} vs {sg}" unless (float(gotG[i]) - sg).abs() < 0.002 * sg.abs().max(1.0)
+					fail "gatedBack mode {mode} up at {i}: {gotU[i]} vs {su}" unless (float(gotU[i]) - su).abs() < 0.002 * su.abs().max(1.0)
+				}
+			}
+		}
+
+		// softmaxLoss's losses and gradients against float64 sums, capped
+		// and not.
+		@test()
+		def TestGpuSoftmaxLoss() !none {
+			return none unless gpu.available()
+			let (rows, vocab) = (3, 1000)
+			let logits = values(rows * vocab, 41)
+			let targets = float32[7, 999, 0]
+			for let (_, cap) in float32[float32(0), float32(1.5)] {
+				let dl = try gpu.upload(logits)
+				let losses = try gpu.upload(zeros(rows))
+				try softmaxLoss(dl, vocab, try gpu.upload(targets), losses, float32(0.5), cap, rows * 256)
+				let lossGot = zeros(rows)
+				try losses.download(lossGot)
+				let gradGot = zeros(rows * vocab)
+				try dl.download(gradGot)
+				for let r = 0; r < rows; r++ {
+					let capped float[]
+					for let i = 0; i < vocab; i++ {
+						let v = float(logits[r * vocab + i])
+						capped.push(cap > float32(0) ?? (float(cap) * math.tanh(v / float(cap)), v))
+					}
+					let sum = 0.0
+					for let (_, v) in capped {
+						sum += math.E ** v
+					}
+					let lse = math.ln(sum)
+					let target = int(targets[r])
+					fail "softmaxLoss loss of row {r}" unless (float(lossGot[r]) - (lse - capped[target])).abs() < 0.0001
+					for let i = 0; i < vocab; i++ {
+						let p = math.E ** (capped[i] - lse) - (i == target ?? (1.0, 0.0))
+						let slope = cap > float32(0) ?? (1.0 - (capped[i] / float(cap)) ** 2.0, 1.0)
+						fail "softmaxLoss gradient at {r}, {i}" unless (float(gradGot[r * vocab + i]) - 0.5 * p * slope).abs() < 0.00001
+					}
+				}
+			}
+		}
+
+		// adamW against the update written out in float64.
+		@test()
+		def TestGpuAdamW() !none {
+			return none unless gpu.available()
+			let n = 300
+			let w = values(n, 51)
+			let gr = values(n, 52)
+			let m = values(n, 53)
+			let v float32[]
+			for let i = 0; i < n; i++ {
+				v.push(float32(i % 5) * float32(0.01))
+			}
+			let (dw, dg, dm, dv) = (try gpu.upload(w), try gpu.upload(gr), try gpu.upload(m), try gpu.upload(v))
+			try adamWValues(dw, dg, dm, dv, n, float32(0.5), float32(0.01), float32(0.1), float32(0.19), float32(0.002))
+			let got = zeros(n)
+			try dw.download(got)
+			for let i = 0; i < n; i++ {
+				let g = float(gr[i]) * 0.5
+				let mean = 0.9 * float(m[i]) + 0.1 * g
+				let variance = 0.999 * float(v[i]) + 0.001 * g * g
+				let want = float(w[i]) - 0.01 * ((mean / 0.19) / ((variance / 0.002) ** 0.5 + 1e-8) + 0.1 * float(w[i]))
+				fail "adamW at {i}: {got[i]} vs {want}" unless (float(got[i]) - want).abs() < 0.00001 * want.abs().max(1.0)
+			}
+		}
+
+		// Σ dO · o of causal attention over n tokens computed in float64:
+		// queries q (n · heads · hs), keys and values (n · kvHeads · hs), a
+		// sink logit per head when sunk, scores capped by tanh at cap.
+		internal def attentionLoss(q float32[], k float32[], v float32[], dO float32[], n int, heads int, kvHeads int, hs int, window int, scale float, cap float, sinks float32[]) float {
+			let group = heads / kvHeads
+			let total = 0.0
+			for let t = 0; t < n; t++ {
+				for let h = 0; h < heads; h++ {
+					let first = window > 0 ?? ((t - window + 1).max(0), 0)
+					let scores float[]
+					for let j = first; j <= t; j++ {
+						let dot = 0.0
+						for let c = 0; c < hs; c++ {
+							dot += float(q[(t * heads + h) * hs + c]) * float(k[(j * kvHeads + h / group) * hs + c])
+						}
+						let sc = dot * scale
+						scores.push(cap > 0.0 ?? (cap * math.tanh(sc / cap), sc))
+					}
+					let top = sinks.len() > 0 ?? (float(sinks[h]), -1e300)
+					for let (_, x) in scores {
+						top = top.max(x)
+					}
+					let sum = sinks.len() > 0 ?? (math.E ** (float(sinks[h]) - top), 0.0)
+					for let (_, x) in scores {
+						sum += math.E ** (x - top)
+					}
+					for let (i, x) in scores {
+						let p = math.E ** (x - top) / sum
+						for let c = 0; c < hs; c++ {
+							total += p * float(v[((first + i) * kvHeads + h / group) * hs + c]) * float(dO[(t * heads + h) * hs + c])
+						}
+					}
+				}
+			}
+			return total
+		}
+
+		@test()
+		def TestGpuAttentionBack() !none {
+			return none unless gpu.available()
+			try attentionBackAgrees(7, 8, 0.4)
+			// Heads wider than 128 values: the forward pass takes two passes.
+			try attentionBackAgrees(9, 200, 0.1)
+			// Several tiles, heads that are not whole chunks of 64 values.
+			return attentionBackAgrees(100, 72, 0.1)
+		}
+
+		internal def attentionBackAgrees(n int, hs int, scale float) !none {
+			let (heads, kvHeads) = (4, 2)
+			let q = values(n * heads * hs, 61)
+			let k = values(n * kvHeads * hs, 62)
+			let v = values(n * kvHeads * hs, 63)
+			let dO = values(n * heads * hs, 64)
+			for let (_, shape) in int[0, 1, 2] {
+				let window = shape == 1 ?? (n > 50 ?? (70, 3), 0)
+				let cap = shape == 2 ?? (2.0, 0.0)
+				let sinks = shape == 1 ?? (float32[0.5, -1, 2, 0], float32[])
+				let (dq, dk, dv, ddO) = (try gpu.upload(q), try gpu.upload(k), try gpu.upload(v), try gpu.upload(dO))
+				let dSinks = try gpu.upload(sinks.len() > 0 ?? (sinks, float32[0]))
+				let att = try gpu.upload(zeros(n * heads * hs))
+				let lse = try gpu.upload(zeros(n * heads))
+				try attendTokens(dq, dk, dv, att, heads, kvHeads, hs, 0, window, float32(scale), float32(cap), dSinks, sinks.len() > 0 ?? (0, -1), 1, lse, 0, n * heads * 256)
+				// The tiled forward pass gives the same outputs and log sums.
+				let tiled = try gpu.upload(zeros(n * heads * hs))
+				let tiledLse = try gpu.upload(zeros(n * heads))
+				try attendTiles(dq, dk, dv, tiled, tiledLse, heads, kvHeads, hs, n, window, float32(scale), float32(cap), dSinks, sinks.len() > 0 ?? (0, -1), (n + 63) / 64 * heads * 256)
+				let (o1, o2, l1, l2) = (zeros(n * heads * hs), zeros(n * heads * hs), zeros(n * heads), zeros(n * heads))
+				try att.download(o1)
+				try tiled.download(o2)
+				try lse.download(l1)
+				try tiledLse.download(l2)
+				fail "attendTiles outputs, shape {shape}" unless close(o1, o2, float32(0.00001))
+				fail "attendTiles log sums, shape {shape}" unless close(l1, l2, float32(0.00001))
+				let deltas = try gpu.upload(zeros(n * heads))
+				let gq = try gpu.upload(zeros(n * heads * hs))
+				let gk = try gpu.upload(zeros(n * kvHeads * hs))
+				let gv = try gpu.upload(zeros(n * kvHeads * hs))
+				try attentionDeltas(att, ddO, deltas, n * heads, hs, n * heads * 32)
+				try attendBackQueries(dq, dk, dv, ddO, lse, deltas, gq, heads, kvHeads, hs, n, window, float32(scale), float32(cap), (n + 63) / 64 * heads * 256)
+				try attendBackKeys(dq, dk, dv, ddO, lse, deltas, gk, gv, heads, kvHeads, hs, n, window, float32(scale), float32(cap), (n + 31) / 32 * kvHeads * 256)
+				let got = zeros(n * heads * hs)
+				let gotK = zeros(n * kvHeads * hs)
+				let gotV = zeros(n * kvHeads * hs)
+				try gq.download(got)
+				try gk.download(gotK)
+				try gv.download(gotV)
+				for let (which, values) in [q, k, v] {
+					let grads = which == 0 ?? (got, which == 1 ?? (gotK, gotV))
+					// About a dozen values of each, spread over the tokens.
+					for let i = 0; i < values.len(); i += (values.len() / 12).max(1) {
+						let kept = values[i]
+						values[i] = kept + float32(0.001)
+						let up = attentionLoss(q, k, v, dO, n, heads, kvHeads, hs, window, scale, cap, sinks)
+						values[i] = kept - float32(0.001)
+						let down = attentionLoss(q, k, v, dO, n, heads, kvHeads, hs, window, scale, cap, sinks)
+						values[i] = kept
+						let slope = (up - down) / (float(kept + float32(0.001)) - float(kept - float32(0.001)))
+						fail "attention back, shape {shape}, {which == 0 ?? ("q", which == 1 ?? ("k", "v"))}[{i}]: {grads[i]} vs {slope}" unless (float(grads[i]) - slope).abs() < 0.002 * slope.abs().max(1.0)
+					}
+				}
+			}
+			return none
 		}
 	}
 }

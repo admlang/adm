@@ -1,0 +1,456 @@
+internal std partial module std.text.regex {
+	use (
+		std.simd
+		std.sync::(ReadWriteLock)
+	)
+
+	// The look-behind a state carries: what the byte before its position
+	// was, as far as the program's assertions ask.
+	const (
+		atTextStart  = 1
+		afterNewline = 2
+		afterWord    = 4
+	)
+
+	// The attributes of a state, read on every byte.
+	const (
+		// The position before the byte that led here ends a match.
+		matchBefore = 1
+		// No thread is left (nothing can match from here).
+		deadState   = 2
+		// The start state of an unanchored search, where the text can be
+		// skipped up to the pattern's first byte.
+		startState  = 4
+	)
+
+	// The entry of a state standing for the unanchored search loop: a new
+	// thread starts at every position, below all others in priority.
+	const loopEntry = -1
+
+	// How many ints of transitions and entries a cache may hold (16 MB)
+	// before it starts over.
+	const cacheBudget = 1 << 21
+
+	// A lazily built DFA over a program, its states made on first use. A
+	// state is the program's threads at a position in priority order (the
+	// consuming instructions, matches, and the assertions that wait for the
+	// next byte), with the look-behind flags; its transitions, one per byte
+	// class and one for the end of the text, are filled in as searches take
+	// them. Leftmost-first matching cuts the threads below a match as the
+	// Pike VM does, so a search ends where the VM's would; `longest` keeps
+	// them (whole-text matches and the reverse program, which look for any
+	// match).
+	//
+	// Searches share the cache: they hold `lock` for reading, and one that
+	// needs a new state takes it for writing.
+	type Dfa {
+		program  Program
+		longest  bool
+		lock     ReadWriteLock
+		stride   int
+		// stride transitions per state, -1 until taken: the next state as
+		// its row offset in `trans` shifted left 3, with its attributes in
+		// the low bits, so a search reads one array per byte.
+		trans    int[]
+		attrs    int[]
+		flags    int[]
+		// Each state's entries are `entries[entryStart[s]:entryStart[s] + entryCount[s]]`.
+		entryStart int[]
+		entryCount int[]
+		entries  int[]
+		index    map<string, int>
+		// Start states by look-behind flags (0-7) and whether they loop
+		// (8 more), -1 until made.
+		starts   int[]
+		// How many ints of transitions and entries the cache may hold.
+		budget   int
+		// Bumped whenever the cache starts over; a state number is only
+		// good within its epoch.
+		epoch    int
+		// Scratch for making states, used under the write lock.
+		marks    int[]
+		markGen  int
+		closed   int[]
+		closedGen int
+		stack    int[]
+		built    int[]
+
+		def new(program Program, longest bool, lock ReadWriteLock) {
+			self.program = program
+			self.longest = longest
+			self.lock = lock
+			stride = program.classes + 1
+			budget = cacheBudget
+			index = new map<string, int>()
+			marks.len(program.op.len())
+			closed.len(program.op.len())
+			reset()
+		}
+
+		// Empties the cache, keeping the two dead states (0 without and 1
+		// with a match before them).
+		def reset() {
+			trans.len(0)
+			attrs.len(0)
+			flags.len(0)
+			entryStart.len(0)
+			entryCount.len(0)
+			entries.len(0)
+			index = new map<string, int>()
+			starts.len(0)
+			starts.len(16)
+			for let i = 0; i < 16; i++ {
+				starts[i] = -1
+			}
+			epoch++
+			let noEntries int[] = []
+			intern(0, 0, noEntries)
+			intern(0, matchBefore, noEntries)
+		}
+
+		// The state with look-behind `f`, match flag `m` and entries `e`,
+		// made when new. Called under the write lock.
+		def intern(f int, m int, e int[]) int {
+			let key = "{f}/{m}/{e.join(",")}"
+			let found = index.get(key)
+			return found when found is int
+			let s = attrs.len()
+			let a = m
+			a = a | deadState when e.len() == 0
+			attrs.push(a)
+			flags.push(f)
+			entryStart.push(entries.len())
+			entryCount.push(e.len())
+			entries.push(...e)
+			let base = trans.len()
+			trans.len(base + stride)
+			for let i = base; i < base + stride; i++ {
+				trans[i] = -1
+			}
+			index.set(key, s)
+			return s
+		}
+
+		// Whether the cache has outgrown its budget.
+		def full() bool {
+			return trans.len() + entries.len() > budget
+		}
+
+		// The start state for look-behind `f`, with the search loop or not.
+		// Called under the write lock.
+		def makeStart(f int, loop bool) int {
+			built.len(0)
+			built.push(0)
+			built.push(loopEntry) when loop
+			let s = intern(f, 0, built)
+			attrs[s] = attrs[s] | startState when loop
+			starts[f + (loop ?? (8, 0))] = s
+			return s
+		}
+
+		// The state state `s` goes to over byte `b` (-1 for the end of the
+		// text, which leads to a dead state that says whether the end
+		// matches). A state holds the roots of its threads: where the
+		// threads of the previous position went, then the new start thread.
+		// Now that the byte after the position is known, the roots are
+		// followed in priority order exactly as the Pike VM follows them,
+		// and the threads they reach are stepped over `b`. Called under the
+		// write lock.
+		def step(s int, b int) int {
+			let p = program
+			let f = flags[s]
+			let next = b < 0 ?? (0, lookBehind(b))
+			// The roots are read from a copy: making states appends to
+			// `entries`.
+			let roots = entries.slice(entryStart[s], entryCount[s]).clone()
+			built.len(0)
+			closedGen++
+			markGen++
+			let matched = 0
+			let cut = false
+			for let (_, e) in roots {
+				break when cut
+				if e == loopEntry {
+					if b >= 0 {
+						addRoot(0)
+						built.push(loopEntry)
+					}
+					continue
+				}
+				stack.len(0)
+				stack.push(e)
+				for stack.len() > 0 && !cut {
+					let pc = stack.pop()
+					continue when marks[pc] == markGen
+					marks[pc] = markGen
+					let o = p.op[pc]
+					if o == opJump {
+						stack.push(p.a[pc])
+					} else if o == opSplit {
+						stack.push(p.b[pc], p.a[pc])
+					} else if o == opSave {
+						stack.push(p.c[pc])
+					} else if o == opAssert {
+						stack.push(p.c[pc]) when assertionHolds(p.a[pc], f, b)
+					} else if o == opMatch {
+						matched = matchBefore
+						cut = !longest
+					} else if b >= 0 {
+						let target = o == opByte ?? ((b >= p.a[pc] && b <= p.b[pc]) ?? (p.c[pc], -1), switchTarget(p.table, p.a[pc], p.b[pc], b))
+						addRoot(target) when target >= 0
+					}
+				}
+			}
+			return intern(next, matched, built)
+		}
+
+		// Adds root `pc` to the state being made, unless it is there.
+		def addRoot(pc int) {
+			if closed[pc] != closedGen {
+				closed[pc] = closedGen
+				built.push(pc)
+			}
+		}
+
+		// The start state for look-behind `f`, with the search loop or not,
+		// made when missing. Called under the read lock.
+		def start(f int, loop bool) int {
+			let at = f + (loop ?? (8, 0))
+			for {
+				let s = starts[at]
+				return s when s >= 0
+				lock.unlockRead()
+				lock.lock()
+				reset() when full()
+				makeStart(f, loop) when starts[at] < 0
+				lock.unlock()
+				lock.lockRead()
+			}
+		}
+
+		// The state `s` goes to over byte `b` of class `cls` (-1 and the
+		// last class for the end of the text), made when missing. Called
+		// under the read lock, which it gives up while it makes the state;
+		// `s` may then be gone from a cache that started over, so its key
+		// is kept to find or make it again.
+		def transition(s int, cls int, b int) int {
+			let v = trans[s * stride + cls]
+			return (v >> 3) / stride when v >= 0
+			let (f, m, wasStart) = (flags[s], attrs[s] & matchBefore, attrs[s] & startState)
+			let key = entries.slice(entryStart[s], entryCount[s]).clone()
+			let seen = epoch
+			for {
+				lock.unlockRead()
+				lock.lock()
+				let src = s
+				if epoch != seen || full() {
+					reset() when full()
+					src = intern(f, m, key)
+					attrs[src] = attrs[src] | wasStart
+				}
+				let held = trans[src * stride + cls]
+				let next = held >= 0 ?? ((held >> 3) / stride, -1)
+				if next < 0 {
+					next = step(src, b)
+					trans[src * stride + cls] = code(next)
+				}
+				let made = epoch
+				lock.unlock()
+				lock.lockRead()
+				return next when epoch == made
+				seen = -1
+			}
+		}
+
+		// What `trans` holds for a move to state `t`.
+		def code(t int) int {
+			return (t * stride) << 3 | attrs[t]
+		}
+
+		// Where the leftmost-first match at or after byte `from` of `raw`
+		// ends, -1 without one: the end the Pike VM would find. `loop`
+		// searches every starting position (else only `from`); `earliest`
+		// stops at the first match end seen, for a yes or no. In the start
+		// state the search skips ahead to the pattern's first byte.
+		def matchEnd(raw byte[], from int, loop bool, earliest bool) int {
+			let n = raw.len()
+			let first = program.firstByte
+			let classOf = program.classOf
+			let last = -1
+			lock.lockRead()
+			let s = start(lookAt(raw, from), loop)
+			// The current state's row in the cache's transitions, which are
+			// read again after a miss (that may grow them).
+			let off = s * stride
+			let trans = self.trans
+			let a = self.attrs[s]
+			let pos = from
+			for {
+				if first >= 0 && a & startState != 0 {
+					let q = indexByte(raw, first, pos)
+					if q < 0 {
+						// Every match starts with that byte, so none is left
+						// (nor an empty one at the end).
+						lock.unlockRead()
+						return last
+					}
+					if q != pos {
+						pos = q
+						off = start(lookAt(raw, q), loop) * stride
+						trans = self.trans
+					}
+				}
+				break when pos >= n
+				let b = int(raw[pos])
+				let cls = classOf[b]
+				let v = trans[off + cls]
+				if v < 0 {
+					v = code(transition(off / stride, cls, b))
+					trans = self.trans
+				}
+				pos++
+				off = v >> 3
+				a = v & 7
+				if a & (matchBefore | deadState) != 0 {
+					if a & matchBefore != 0 {
+						last = pos - 1
+						if earliest {
+							lock.unlockRead()
+							return last
+						}
+					}
+					if a & deadState != 0 {
+						lock.unlockRead()
+						return last
+					}
+				}
+			}
+			s = off / stride
+			let t = transition(s, stride - 1, -1)
+			last = n when attrs[t] & matchBefore != 0
+			lock.unlockRead()
+			return last
+		}
+
+		// Whether `raw` from byte `from` to its end matches as a whole. The
+		// DFA is a `longest` one: no thread is cut.
+		def matchesWhole(raw byte[], from int) bool {
+			let n = raw.len()
+			let classOf = program.classOf
+			lock.lockRead()
+			let off = start(lookAt(raw, from), false) * stride
+			let trans = self.trans
+			for let pos = from; pos < n; pos++ {
+				let b = int(raw[pos])
+				let cls = classOf[b]
+				let v = trans[off + cls]
+				if v < 0 {
+					v = code(transition(off / stride, cls, b))
+					trans = self.trans
+				}
+				off = v >> 3
+				if v & deadState != 0 {
+					lock.unlockRead()
+					return false
+				}
+			}
+			let t = transition(off / stride, stride - 1, -1)
+			let matched = attrs[t] & matchBefore != 0
+			lock.unlockRead()
+			return matched
+		}
+
+		// Where the leftmost match ending at byte `end` starts, no earlier
+		// than `from`; -1 when none does. Runs the reverse program backwards
+		// from `end` (a `longest` DFA) and keeps the earliest start seen;
+		// its look-behind is the text after the position, and the bytes
+		// beyond `end` and before `from` still count for assertions.
+		def matchStart(raw byte[], end int, from int) int {
+			let n = raw.len()
+			let classOf = program.classOf
+			let best = -1
+			lock.lockRead()
+			let f = end == n ?? (atTextStart & program.lookMask, lookBehind(int(raw[end])))
+			let off = start(f, false) * stride
+			let trans = self.trans
+			let pos = end
+			let dead = false
+			for pos > from {
+				let b = int(raw[pos - 1])
+				let cls = classOf[b]
+				let v = trans[off + cls]
+				if v < 0 {
+					v = code(transition(off / stride, cls, b))
+					trans = self.trans
+				}
+				best = pos when v & matchBefore != 0
+				pos--
+				off = v >> 3
+				if v & deadState != 0 {
+					dead = true
+					break
+				}
+			}
+			let s = off / stride
+			if !dead {
+				// Whether `from` itself starts the match: decided by the byte
+				// before it (or the start of the text).
+				let b = from > 0 ?? (int(raw[from - 1]), -1)
+				let t = transition(s, b < 0 ?? (stride - 1, classOf[b]), b)
+				best = from when attrs[t] & matchBefore != 0
+			}
+			lock.unlockRead()
+			return best
+		}
+
+		// The look-behind flags after byte `b`, as far as the program's
+		// assertions ask.
+		def lookBehind(b int) int {
+			let f = 0
+			f = afterNewline when b == 10
+			f = afterWord when isWordChar(b)
+			return f & program.lookMask
+		}
+
+		// The look-behind flags at byte `pos` of `raw`.
+		def lookAt(raw byte[], pos int) int {
+			return atTextStart & program.lookMask when pos == 0
+			return lookBehind(int(raw[pos - 1]))
+		}
+	}
+
+	// Whether assertion `a` holds between a position with look-behind
+	// `f` and the byte `b` after it (-1 at the end of the text).
+	def assertionHolds(a int, f int, b int) bool {
+		let start = f & atTextStart != 0
+		if a == beginText {
+			return start
+		} else if a == endText {
+			return b < 0
+		} else if a == beginLine {
+			return start || f & afterNewline != 0
+		} else if a == endLine {
+			return b < 0 || b == 10
+		}
+		let boundary = (f & afterWord != 0) != isWordChar(b)
+		return a == wordBoundary ?? (boundary, !boundary)
+	}
+
+	// The index of the first byte `b` in `raw` at or after `from`, -1 when
+	// there is none; 32 bytes a step.
+	def indexByte(raw byte[], b int, from int) int {
+		let n = raw.len()
+		let i = from
+		let needle = simd.splat32(byte(b))
+		for i + 32 <= n {
+			let hits = simd.eq(simd.loadBytes32(raw, i), needle).bits()
+			return i + hits.trailingZeros() when hits != 0
+			i += 32
+		}
+		for i < n {
+			return i when int(raw[i]) == b
+			i++
+		}
+		return -1
+	}
+}

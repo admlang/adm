@@ -1,0 +1,302 @@
+partial module std.ai.embeddings {
+	use (
+		std.testing
+		std.math
+		std.math::(Random)
+		std.formats.ai::(TensorType)
+		std.ai.tensor::(Weights)
+		std.services.runtime::(Runtime)
+	)
+
+	check "Embeddings" {
+		const width = 16
+		const heads = 2
+		const wide = 24
+		const vocab = 20
+
+		// The values of a tiny encoder's tensors by GGUF name, and its
+		// Encoder built from them.
+		internal struct Tiny {
+			values  map<string, float32[]>
+			encoder Encoder
+		}
+
+		internal def randomValues(random Random, n int, scale float) float32[] {
+			let out float32[]
+			for let i = 0; i < n; i++ {
+				out.push(float32(random.range(-scale, scale)))
+			}
+			return out
+		}
+
+		internal def weightsOf(values float32[], rows int, cols int) Weights {
+			let data byte[]
+			for let (_, v) in values {
+				data.push(...v.bytes())
+			}
+			return new Weights(TensorType.F32, rows, cols, data)
+		}
+
+		// Two layers of BERT (separate projections with biases, learned
+		// positions, GELU) or Nomic BERT (fused projections, rotary
+		// positions, SwiGLU), random values.
+		internal def tiny(nomic bool) Tiny {
+			let random = new Random(nomic ?? (2, 1))
+			let v = new map<string, float32[]>()
+			v.set("tok", randomValues(random, vocab * width, 1.0))
+			v.set("pos", randomValues(random, 12 * width, 0.5))
+			v.set("type", randomValues(random, width, 0.5))
+			v.set("embNorm", randomValues(random, width, 1.0))
+			v.set("embBias", randomValues(random, width, 0.2))
+			let encoder = new Encoder(weightsOf(get(v, "tok"), vocab, width), get(v, "type"), get(v, "embNorm"), get(v, "embBias"))
+			encoder.width = width
+			encoder.heads = heads
+			encoder.context = 12
+			encoder.epsilon = float32(1e-12)
+			encoder.rotary = nomic
+			encoder.ropeBase = float32(1000)
+			encoder.poolingKind = Pooling.Mean
+			encoder.positions = weightsOf(get(v, "pos"), 12, width) unless nomic
+			for let l = 0; l < 2; l++ {
+				let p = "{l}."
+				for let (_, name) in string["q", "k", "v", "o"] {
+					v.set(p + name, randomValues(random, width * width, 0.4))
+					v.set(p + name + "b", randomValues(random, width, 0.1))
+				}
+				v.set(p + "up", randomValues(random, wide * width, 0.4))
+				v.set(p + "upb", randomValues(random, wide, 0.1))
+				v.set(p + "gate", randomValues(random, wide * width, 0.4))
+				v.set(p + "down", randomValues(random, width * wide, 0.4))
+				v.set(p + "downb", randomValues(random, width, 0.1))
+				for let (_, name) in string["an", "ab", "ln", "lb"] {
+					v.set(p + name, randomValues(random, width, name.endsWith("n") ?? (1.0, 0.2)))
+				}
+				let layer = new EncoderLayer(weightsOf(get(v, p + "o"), width, width), weightsOf(get(v, p + "up"), wide, width), weightsOf(get(v, p + "down"), width, wide), get(v, p + "an"), get(v, p + "ab"), get(v, p + "ln"), get(v, p + "lb"))
+				if nomic {
+					layer.fused = weightsOf(get(v, p + "q") + get(v, p + "k") + get(v, p + "v"), 3 * width, width)
+					layer.gate = weightsOf(get(v, p + "gate"), wide, width)
+				} else {
+					layer.query = weightsOf(get(v, p + "q"), width, width)
+					layer.key = weightsOf(get(v, p + "k"), width, width)
+					layer.value = weightsOf(get(v, p + "v"), width, width)
+					layer.queryBias = get(v, p + "qb")
+					layer.keyBias = get(v, p + "kb")
+					layer.valueBias = get(v, p + "vb")
+					layer.outputBias = get(v, p + "ob")
+					layer.upBias = get(v, p + "upb")
+					layer.downBias = get(v, p + "downb")
+				}
+				encoder.layers.push(layer)
+			}
+			return Tiny{values: v, encoder: encoder}
+		}
+
+		internal def get(v map<string, float32[]>, name string) float32[] {
+			let found = v.get(name)
+			return found is float32[] ?? (found, float32[])
+		}
+
+		// W · x for a row-major W of `rows` rows.
+		internal def times(w float32[], x float[], rows int) float[] {
+			let cols = x.len()
+			let out float[]
+			for let r = 0; r < rows; r++ {
+				let sum = 0.0
+				for let c = 0; c < cols; c++ {
+					sum += float(w[r * cols + c]) * x[c]
+				}
+				out.push(sum)
+			}
+			return out
+		}
+
+		internal def plus(a float[], b float32[]) float[] {
+			let out float[]
+			for let i = 0; i < a.len(); i++ {
+				out.push(a[i] + (b.len() > 0 ?? (float(b[i]), 0.0)))
+			}
+			return out
+		}
+
+		internal def normed(x float[], w float32[], b float32[]) float[] {
+			let mean = 0.0
+			for let (_, v) in x {
+				mean += v
+			}
+			mean /= float(x.len())
+			let variance = 0.0
+			for let (_, v) in x {
+				variance += (v - mean) * (v - mean)
+			}
+			variance /= float(x.len())
+			let out float[]
+			for let (i, v) in x {
+				out.push((v - mean) / math.sqrt(variance + 1e-12) * float(w[i]) + float(b[i]))
+			}
+			return out
+		}
+
+		// Rotates pairs i and i + half of each head by position · base^(−2i/hd).
+		internal def rotated(x float[], position int) float[] {
+			let hd = width / heads
+			let out = x.clone()
+			for let h = 0; h < heads; h++ {
+				for let i = 0; i < hd / 2; i++ {
+					let angle = float(position) * 1000.0 ** (-2.0 * float(i) / float(hd))
+					let (a, b) = (x[h * hd + i], x[h * hd + i + hd / 2])
+					out[h * hd + i] = a * math.cos(angle) - b * math.sin(angle)
+					out[h * hd + i + hd / 2] = b * math.cos(angle) + a * math.sin(angle)
+				}
+			}
+			return out
+		}
+
+		// The encoder written out plainly, in float64, one token at a time.
+		internal def reference(t Tiny, ids int[], nomic bool) float[] {
+			return referenceLayers(t, ids, nomic, 2)
+		}
+
+		internal def referenceLayers(t Tiny, ids int[], nomic bool, layers int) float[] {
+			let v = t.values
+			let n = ids.len()
+			let hd = width / heads
+			let x float[][]
+			for let (pos, id) in ids {
+				let e float[]
+				for let c = 0; c < width; c++ {
+					let sum = float(get(v, "tok")[id * width + c]) + float(get(v, "type")[c])
+					sum += float(get(v, "pos")[pos * width + c]) unless nomic
+					e.push(sum)
+				}
+				x.push(normed(e, get(v, "embNorm"), get(v, "embBias")))
+			}
+			for let l = 0; l < layers; l++ {
+				let p = "{l}."
+				let bias = def (name string) float32[] {
+					return nomic ?? (float32[], get(v, p + name))
+				}
+				let qs float[][]
+				let ks float[][]
+				let vs float[][]
+				for let (pos, row) in x {
+					let q = plus(times(get(v, p + "q"), row, width), bias("qb"))
+					let k = plus(times(get(v, p + "k"), row, width), bias("kb"))
+					qs.push(nomic ?? (rotated(q, pos), q))
+					ks.push(nomic ?? (rotated(k, pos), k))
+					vs.push(plus(times(get(v, p + "v"), row, width), bias("vb")))
+				}
+				let next float[][]
+				for let i = 0; i < n; i++ {
+					let attended float[]
+					attended.len(width)
+					for let h = 0; h < heads; h++ {
+						let scores float[]
+						let top = -1e300
+						for let j = 0; j < n; j++ {
+							let s = 0.0
+							for let e = 0; e < hd; e++ {
+								s += qs[i][h * hd + e] * ks[j][h * hd + e]
+							}
+							s /= math.sqrt(float(hd))
+							scores.push(s)
+							top = s.max(top)
+						}
+						let total = 0.0
+						for let j = 0; j < n; j++ {
+							scores[j] = math.E ** (scores[j] - top)
+							total += scores[j]
+						}
+						for let j = 0; j < n; j++ {
+							for let e = 0; e < hd; e++ {
+								attended[h * hd + e] += scores[j] / total * vs[j][h * hd + e]
+							}
+						}
+					}
+					let o = plus(times(get(v, p + "o"), attended, width), bias("ob"))
+					let a float[]
+					for let c = 0; c < width; c++ {
+						a.push(x[i][c] + o[c])
+					}
+					a = normed(a, get(v, p + "an"), get(v, p + "ab"))
+					let up = plus(times(get(v, p + "up"), a, wide), bias("upb"))
+					if nomic {
+						let gate = times(get(v, p + "gate"), a, wide)
+						for let j = 0; j < wide; j++ {
+							up[j] *= gate[j] / (1.0 + math.E ** (-gate[j]))
+						}
+					} else {
+						for let j = 0; j < wide; j++ {
+							up[j] = 0.5 * up[j] * (1.0 + math.erf(up[j] / math.Sqrt2))
+						}
+					}
+					let down = plus(times(get(v, p + "down"), up, width), bias("downb"))
+					let f float[]
+					for let c = 0; c < width; c++ {
+						f.push(a[c] + down[c])
+					}
+					next.push(normed(f, get(v, p + "ln"), get(v, p + "lb")))
+				}
+				x = next
+			}
+			let mean float[]
+			mean.len(width)
+			for let (_, row) in x {
+				for let c = 0; c < width; c++ {
+					mean[c] += row[c] / float(n)
+				}
+			}
+			return mean
+		}
+
+		@test()
+		def encoders_equal_the_plain_reference() !none {
+			let ids = int[3, 17, 5, 5, 9, 0, 12]
+			for let (_, nomic) in bool[false, true] {
+				let t = tiny(nomic)
+				let got = t.encoder.pool(t.encoder.forward(ids), Pooling.Mean)
+				let want = reference(t, ids, nomic)
+				for let c = 0; c < width; c++ {
+					fail "nomic={nomic} value {c}: {got[c]} want {want[c]}" unless (float(got[c]) - want[c]).abs() < 1e-4
+				}
+			}
+			return none
+		}
+
+		@test()
+		def similarity_and_nearest() {
+			let a = float32[1, 0, 0]
+			let b = float32[0.5, 0.5, 0]
+			let c = float32[-1, 0, 0]
+			assert math.approx(similarity(a, a), 1.0, 1e-9)
+			assert math.approx(similarity(a, c), -1.0, 1e-9)
+			assert math.approx(similarity(a, float32[0, 1, 0]), 0.0, 1e-9)
+			assert similarity(a, float32[0, 0, 0]) == 0.0
+			assert nearest(a, [c, b, a], 2).equals(int[2, 1])
+			assert nearest(a, [c, b, a], 10).equals(int[2, 1, 0])
+			assert nearest(a, float32[][], 3).len() == 0
+		}
+
+		// Real models when their paths are given: the first values of a
+		// sentence's vector equal sentence-transformers' through onnxruntime
+		// (all-MiniLM-L6-v2) and Ollama's (nomic-embed-text v1.5).
+		@test()
+		def real_models() !none {
+			let text = "The quick brown fox jumps over the lazy dog."
+			let cases = map<string, float32[]>{
+				"ADM_TEST_EMBEDDINGS_MINILM_GGUF": float32[0.043934, 0.058934, 0.048178, 0.077548],
+				"ADM_TEST_EMBEDDINGS_MINILM_ONNX": float32[0.043934, 0.058934, 0.048178, 0.077548],
+				"ADM_TEST_EMBEDDINGS_NOMIC_GGUF":  float32[-0.013922, 0.025799, -0.145473, -0.008123],
+			}
+			for let (key, want) in cases {
+				let path = Runtime.getEnv(key)
+				continue when path is none || path.len() == 0
+				let model = try load(path)
+				let v = try model.embed(text)
+				for let (i, w) in want {
+					fail "{key} value {i}: {v[i]} want {w}" unless (v[i] - w).abs() < float32(2e-4)
+				}
+			}
+			return none
+		}
+	}
+}

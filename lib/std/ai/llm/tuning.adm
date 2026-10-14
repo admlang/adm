@@ -1,0 +1,1957 @@
+// Fine-tuning a language model with LoRA: low-rank pairs added to the
+// layers' weight matrices are trained on examples while the model's own
+// weights stay as they are, quantized or not, and saved as a GGUF adapter
+// llama.cpp and `llm.load(path, adapters = ...)` read.
+//
+// ```
+// let model = try llm.load("qwen3-0.6b.gguf")
+// let tuning = try model.tune(rank = 16)
+// for let epoch = 0; epoch < 3; epoch++ {
+// 	for let (_, example) in examples {
+// 		let loss = try tuning.learn(example)
+// 	}
+// }
+// try tuning.save("mine.gguf")
+// ```
+partial module std.ai.llm {
+	use (
+		std.math
+		std.math::(Random)
+		std.ai.tensor::(Weights)
+		std.ai.llm.model::*
+	)
+
+	// A LoRA adapter being trained on a model (`LanguageModel.tune`). Each
+	// `learn` is one AdamW step over its examples; the model's sessions use
+	// the adapter as trained so far.
+	type Tuning {
+		// AdamW's step size; change it between steps for a schedule.
+		learningRate float = 0.0001
+		// AdamW's decoupled weight decay: each step takes this times the
+		// step size off every adapter value.
+		weightDecay  float = 0.0
+		// A step whose gradient has a larger overall norm is scaled down to
+		// it; 0 leaves gradients as they are.
+		clip         float = 1.0
+		// Steps taken so far.
+		steps        int
+
+		internal model   LanguageModel
+		internal session Session
+		internal trainer Trainer
+		internal alpha   float
+		internal context int
+
+		// A tuning of `model` training `trainer`'s pairs; use `LanguageModel.tune`.
+		def new(model LanguageModel, session Session, trainer Trainer, alpha float, context int) {
+			self.model = model
+			self.session = session
+			self.trainer = trainer
+			self.alpha = alpha
+			self.context = context
+		}
+
+		// One step on `text`: every token after the first is learnt from
+		// the ones before it. Returns the mean loss (cross-entropy in nats)
+		// of the learnt tokens before the step.
+		// Fails when the text has fewer than two tokens or more than the
+		// tuning's context.
+		def learn(text string) !float {
+			return learn(string[text])
+		}
+
+		// One step over `texts` together: the gradient is the mean over
+		// every learnt token of all of them.
+		// Fails when a text has fewer than two tokens or more than the
+		// tuning's context.
+		def learn(texts string[]) !float {
+			return step(try encodeTexts(texts), true)
+		}
+
+		// One step on a conversation rendered by the model's chat format:
+		// the assistant messages' tokens (their thinking, text, calls and
+		// end of turn) are learnt from everything before them, the other
+		// messages are only read.
+		// Fails when the conversation has no assistant message, its
+		// pictures or sounds cannot be read by the model, it is longer than
+		// the tuning's context, or the chat template renders an earlier
+		// part of it differently once later messages follow.
+		def learn(conversation Message[]) !float {
+			return learn(Message[][conversation])
+		}
+
+		// One step over several conversations together.
+		// Fails as `learn(conversation)` does for any of them.
+		def learn(conversations Message[][]) !float {
+			return step(try encodeConversations(conversations), true)
+		}
+
+		// The mean loss of `text`'s tokens without learning from it.
+		// Fails as `learn(text)` does.
+		def loss(text string) !float {
+			return step(try encodeTexts(string[text]), false)
+		}
+
+		// The mean loss of a conversation's assistant messages without
+		// learning from it.
+		// Fails as `learn(conversation)` does.
+		def loss(conversation Message[]) !float {
+			return step(try encodeConversations(Message[][conversation]), false)
+		}
+
+		// Writes the adapter as trained so far to a GGUF file.
+		// Fails when the file cannot be written.
+		def save(path string) !none {
+			try trainer.download()
+			return saveAdapter(path, model.info.architecture, alpha, trainer.pairs)
+		}
+
+		// Ends the tuning: the adapter stays in the model as trained, and
+		// what training kept beside it (gradients, AdamW's moments) is freed.
+		def dispose() {
+			trainer.freeze()
+		}
+
+		// Runs `examples` through the model, their losses summed and, when
+		// `learning`, their gradients, and takes one AdamW step.
+		internal def step(examples Example[], learning bool) !float {
+			let total = 0
+			for let (_, e) in examples {
+				total += e.targets.len()
+			}
+			fail "llm: the examples have no token to learn" when total == 0
+			let scale = float32(1) / float32(total)
+			try trainer.clearGradients() when learning
+			let sum = 0.0
+			for let (_, e) in examples {
+				sum += try trainer.run(e.tokens, e.targets, learning ?? (scale, float32(0)))
+			}
+			if learning {
+				steps++
+				try trainer.update(steps, learningRate, weightDecay, clip)
+			}
+			return sum / float(total)
+		}
+
+		// Each text as tokens, every position after the first learnt.
+		internal def encodeTexts(texts string[]) !Example[] {
+			let out Example[]
+			for let (_, text) in texts {
+				let tokens = model.tokenizer.encode(text, true)
+				fail "llm: a text to learn needs at least two tokens" when tokens.len() < 2
+				fail "llm: a text of {tokens.len()} tokens is longer than the tuning's context of {context}" when tokens.len() > context
+				let targets int[]
+				for let i = 0; i + 1 < tokens.len(); i++ {
+					targets.push(i)
+				}
+				out.push(Example{tokens: tokens, targets: targets})
+			}
+			return out
+		}
+
+		// Each conversation as tokens, the assistant messages learnt.
+		internal def encodeConversations(conversations Message[][]) !Example[] {
+			let out Example[]
+			for let (_, conversation) in conversations {
+				out.push(try encodeConversation(conversation))
+			}
+			return out
+		}
+
+		// A conversation rendered whole, and the positions whose next token
+		// is in an assistant message: from where the rendering of the
+		// messages before it with the reply opened ends, to the end of its
+		// turn.
+		internal def encodeConversation(conversation Message[]) !Example {
+			let s = session
+			s.reset()
+			s.system = ""
+			let thinks = false
+			for let (k, m) in conversation {
+				try encodeMedia(s, m, k)
+				thinks = thinks || m.thinking.len() > 0
+			}
+			s.conversation = conversation.clone()
+			let tokens = try promptTokens(s, conversation, open = false, think = thinks, withTools = false)
+			fail "llm: a conversation of {tokens.len()} tokens is longer than the tuning's context of {context}" when tokens.len() > context
+			let learnt bool[]
+			learnt.len(tokens.len())
+			let tokenizer = model.tokenizer
+			for let (k, m) in conversation {
+				continue unless m.role == Role.Assistant
+				s.conversation = conversation[:k].clone()
+				let before = try promptTokens(s, conversation[:k], open = true, think = m.thinking.len() > 0, withTools = false)
+				fail "llm: the chat template renders the messages before message {k} differently once later ones follow" unless before.len() <= tokens.len() && tokens[:before.len()].equals(before)
+				let at = before.len()
+				for at < tokens.len() {
+					learnt[at] = true
+					let t = tokens[at]
+					at++
+					break when t >= 0 && tokenizer.isEnd(t)
+				}
+			}
+			s.conversation = conversation.clone()
+			let targets int[]
+			for let i = 0; i + 1 < tokens.len(); i++ {
+				targets.push(i) when learnt[i + 1] && tokens[i + 1] >= 0
+			}
+			fail "llm: the conversation has no assistant message to learn" when targets.len() == 0
+			return Example{tokens: tokens, targets: targets}
+		}
+	}
+}
+
+internal partial module std.ai.llm.model {
+	use (
+		std.math
+		std.math::(Random)
+		std.simd
+		std.ai.tensor::(Weights, rmsNorm, silu, gelu, softmax)
+		std.ai.tensor.gemm::*
+		std.ai.llm::*
+	)
+
+	// A sequence to run while tuning: its tokens (negative ids for encoder
+	// rows) and the positions whose next token is learnt.
+	struct Example {
+		tokens  int[]
+		targets int[]
+	}
+
+	// Tokens between the Gated DeltaNet states a tuning keeps: the rest
+	// are made again on the way back.
+	const deltaChunk = 32
+
+	// Rows from which a tuning's multiplies go through float tiles and
+	// gemm instead of the quantized kernels, which read the weights once
+	// per row.
+	const tiledRows = 16
+
+	// Rows of logits one pass of the output projection makes while
+	// tuning: bounds the memory a large vocabulary takes.
+	const headRows = 128
+
+	// What a tuning can train on, or why not.
+	def tuningGap(parts ModelParts) ?string {
+		return none
+	}
+
+	// New LoRA pairs of `rank` on the matrices `targets` name in every
+	// layer, added to the layers' slots: A uniform in ±1/√cols (as PEFT
+	// starts it), B zero, so the model starts unchanged. Matrices sharing
+	// one GGUF tensor (Phi-3's attn_qkv) share one pair; an expert stack
+	// gets a pair per expert, held in one LoraPair.
+	def newPairs(parts ModelParts, rank int, alpha float, targets Target[], seed int) LoraPair[] {
+		let random = new Random(seed)
+		let pairs LoraPair[]
+		let scale = float32(alpha / float(rank))
+		for let (_, layer) in parts.layers {
+			let made = new map<string, LoraPair>()
+			let added = new map<string, bool>()
+			for let (_, target) in targets {
+				for let (_, slot) in targetSlots(layer, target) {
+					continue unless slot < layer.sources.len()
+					let name = layer.sources[slot]
+					continue when name.len() == 0 || !(added.get("{slot} {name}") is none)
+					added.set("{slot} {name}", true)
+					let held = made.get(name)
+					let pair = held is none ?? (newPair(layer, name, rank, scale, random), held)
+					if held is none {
+						made.set(name, pair)
+						pairs.push(pair)
+					}
+					addAdapted(layer, slot, Adapted{pair: pair, from: layer.sourceRows[slot]})
+				}
+				let stack = target == Target.Gate ?? (0, target == Target.Up ?? (1, target == Target.Down ?? (2, -1)))
+				if stack >= 0 && stack < layer.expertSources.len() && made.get(layer.expertSources[stack]) is none {
+					let name = layer.expertSources[stack]
+					let experts = expertWeights(layer, stack)
+					let w = experts[0]
+					let count = experts.len()
+					let pair = newMatrices(name, w.rows * count, w.cols, rank, count, scale, random)
+					made.set(name, pair)
+					pairs.push(pair)
+					for let e = 0; e < count; e++ {
+						addExpertAdapted(layer, stack, e, Adapted{pair: pair, from: e * w.rows, aFrom: e * rank})
+					}
+				}
+			}
+		}
+		return pairs
+	}
+
+	// The slots `target` adapts in `layer`: a Gated DeltaNet layer's query,
+	// key and value are its mixed projection, its output comes with the
+	// output gate; a feed-forward target takes the shared expert's matrix
+	// beside the layer's.
+	def targetSlots(layer Layer, target Target) int[] {
+		let recurrent = !(layer.recurrent is none)
+		return recurrent ?? (int[slotQuery], int[target.ordinal]) when target == Target.Query || target == Target.Key || target == Target.Value
+		return recurrent ?? (int[slotOutput, slotOutputGate], int[slotOutput]) when target == Target.Output
+		return int[slotGate, slotSharedGate] when target == Target.Gate
+		return int[slotUp, slotSharedUp] when target == Target.Up
+		return int[slotDown, slotSharedDown]
+	}
+
+	// A pair on the matrix `name` of `layer`: as wide as the slot matrices
+	// reading it, and as tall as all of them together.
+	def newPair(layer Layer, name string, rank int, scale float32, random Random) LoraPair {
+		let cols = 0
+		let rows = 0
+		for let (slot, source) in layer.sources {
+			continue unless source == name
+			let w = slotWeights(layer, slot)
+			cols = w.cols
+			rows = rows.max(layer.sourceRows[slot] + w.rows)
+		}
+		return newMatrices(name, rows, cols, rank, 1, scale, random)
+	}
+
+	// `experts` pairs of `rank` for matrices of rows / experts × cols, one
+	// after another, with their training state.
+	def newMatrices(name string, rows int, cols int, rank int, experts int, scale float32, random Random) LoraPair {
+		let a = matrix<float32>[].size(rank * experts, cols)
+		let bound = 1.0 / (float(cols)) ** 0.5
+		let values = a.data()
+		for let i = 0; i < values.len(); i++ {
+			values[i] = float32(random.range<float>(-bound, bound))
+		}
+		let pair = new LoraPair(name, a, matrix<float32>[].size(rows, rank), scale, rank, experts)
+		pair.gradA.len(values.len())
+		pair.gradB.len(rows * rank)
+		pair.meanA.len(values.len())
+		pair.meanB.len(rows * rank)
+		pair.varA.len(values.len())
+		pair.varB.len(rows * rank)
+		return pair
+	}
+
+	// Runs examples forward and back for a tuning: the residual stream
+	// entering each layer is kept, and each layer runs again on it on the
+	// way back, keeping what its gradient needs (one layer's values at a
+	// time).
+	type Trainer {
+		parts ModelParts
+		state ForwardState
+		pairs LoraPair[]
+		// Tokens of the sequence being run.
+		n     int
+
+		// The stream entering each layer, and leaving the last.
+		internal inputs      matrix<float32>[]
+		// One layer's values from `layerForward`: the normed input, the
+		// queries before their norm and after their turn, the gates of
+		// gated queries, keys and values before their norms and as
+		// attended, the attention output before and after its gate, the
+		// output projection, the stream after attention, its norm, the
+		// feed-forward's gate and up halves and their product, and the
+		// feed-forward's output.
+		internal normed      matrix<float32>
+		internal both        matrix<float32>
+		internal qPre        matrix<float32>
+		internal q           matrix<float32>
+		internal gates       matrix<float32>
+		internal kPre        matrix<float32>
+		internal k           matrix<float32>
+		internal vPre        matrix<float32>
+		internal v           matrix<float32>
+		internal att         matrix<float32>
+		internal gated       matrix<float32>
+		internal proj        matrix<float32>
+		internal mid         matrix<float32>
+		internal normed2     matrix<float32>
+		internal g           matrix<float32>
+		internal u           matrix<float32>
+		internal product     matrix<float32>
+		internal down        matrix<float32>
+		// Per token and query head: the log of the softmax's sum (its
+		// largest score included), and Σ p·(dO·v) on the way back.
+		internal lse         matrix<float32>
+		internal deltas      matrix<float32>
+		// The keys and values of layers whose cache a later layer reads, by
+		// layer, and the gradients that later layer sends back to them.
+		internal heldKeys    map<int, matrix<float32>>
+		internal heldValues  map<int, matrix<float32>>
+		internal heldDk      map<int, matrix<float32>>
+		internal heldDv      map<int, matrix<float32>>
+		// A mixture of experts: the router's logits and their softmax, each
+		// token's picks, their weights and (renormalised picks) the sum of
+		// the picked probabilities, the tokens each expert ran, and where a
+		// pick's output is (group · n · used + its row in the group); the
+		// shared expert's output and share.
+		internal routed      matrix<float32>
+		internal probs       matrix<float32>
+		internal picked      int[]
+		internal weights     float32[]
+		internal totals      float32[]
+		internal groups      ExpertGroup[]
+		internal at          int[]
+		internal sharedOut   matrix<float32>
+		internal shares      float32[]
+		// Gemma 4: each token's inputs for every layer, and one layer's
+		// stream before its input, the gate's projection, the gated input
+		// and its projection back.
+		internal perLayer    matrix<float32>
+		internal after       matrix<float32>
+		internal inPre       matrix<float32>
+		internal inAct       matrix<float32>
+		internal inOut       matrix<float32>
+		// A Gated DeltaNet layer: the mixed projection, its convolution
+		// before and after SiLU, those with queries and keys normed, the
+		// output gate, the decay and beta inputs, each token's decay and
+		// beta per value head, the recurrence's outputs before their norm
+		// and the gated outputs; the state of every value head at the start
+		// of every `deltaChunk` tokens, head-major.
+		internal mixed       matrix<float32>
+		internal convPre     matrix<float32>
+		internal ys          matrix<float32>
+		internal yn          matrix<float32>
+		internal zg          matrix<float32>
+		internal alphaIn     matrix<float32>
+		internal betaIn      matrix<float32>
+		internal decays      matrix<float32>
+		internal betas       matrix<float32>
+		internal raw         matrix<float32>
+		internal deltaOut    matrix<float32>
+		internal checkpoints float32[][]
+		// The passes on the GPU for a model there; `none` on the CPU.
+		internal device      ?DeviceTrainer
+		// Gradients on the way back.
+		internal dx          matrix<float32>
+		internal dmid        matrix<float32>
+		internal dn          matrix<float32>
+		internal dq          matrix<float32>
+		internal dqg         matrix<float32>
+		internal dk          matrix<float32>
+		internal dv          matrix<float32>
+		internal datt        matrix<float32>
+		internal dproj       matrix<float32>
+		internal dg          matrix<float32>
+		internal du          matrix<float32>
+
+		def new(parts ModelParts, state ForwardState, pairs LoraPair[]) {
+			self.parts = parts
+			self.state = state
+			self.pairs = pairs
+			heldKeys = new map<int, matrix<float32>>()
+			heldValues = new map<int, matrix<float32>>()
+			heldDk = new map<int, matrix<float32>>()
+			heldDv = new map<int, matrix<float32>>()
+		}
+
+		// For a model on the GPU: the device trainer, with the pairs there.
+		// Fails when the device memory runs out.
+		def prepareDevice() !none {
+			let (model, deviceState) = (parts.device, state.device)
+			return none unless model is DeviceModel && deviceState is DeviceState
+			let made = new DeviceTrainer(parts, model, deviceState, pairs)
+			try made.prepare()
+			device = made
+			return none
+		}
+
+		// The pairs' values tuned on the GPU copied back to the host.
+		// Fails when a copy fails.
+		def download() !none {
+			let d = device
+			return none unless d is DeviceTrainer
+			return d.download()
+		}
+
+		// Frees the pairs' training state: they stay in the layers' slots
+		// as adapters no tuning trains.
+		def freeze() {
+			let d = device
+			d.freeze() when d is DeviceTrainer
+			for let (_, pair) in pairs {
+				pair.gradA = float32[]
+				pair.gradB = float32[]
+				pair.meanA = float32[]
+				pair.meanB = float32[]
+				pair.varA = float32[]
+				pair.varB = float32[]
+			}
+		}
+
+		// Fails when a launch fails.
+		def clearGradients() !none {
+			let d = device
+			return d.clearGradients() when d is DeviceTrainer
+			for let (_, pair) in pairs {
+				clearRange(pair.gradA, 0, pair.gradA.len())
+				clearRange(pair.gradB, 0, pair.gradB.len())
+			}
+			return none
+		}
+
+		// Runs `tokens` forward; returns the summed loss of predicting the
+		// token after each of `targets`, and with `grad` > 0 adds the
+		// gradient of grad times that sum to the pairs'.
+		// Fails when an encoder row the tokens name is missing.
+		def run(tokens int[], targets int[], grad float32) !float {
+			let info = parts.info
+			let e = info.embedding
+			let count = tokens.len()
+			let embedded = matrix<float32>[].size(count, e)
+			let rows = state.rows
+			for let (i, t) in tokens {
+				let row = embedded.row(i)
+				if t < 0 {
+					let held = rows.get(t)
+					fail "llm: the encoder row {t} is missing" when held is none
+					copyInto(held, row)
+					continue
+				}
+				parts.embedding.row(t, row)
+				embed(parts.embeddingAdapters, t, row)
+				scaleBy(row, parts.embeddingScale) unless parts.embeddingScale == float32(1)
+			}
+			state.placeTokens(tokens, 0) unless parts.ropeSections == 0
+			let layerInputs = float32[]
+			if parts.layerWidth > 0 {
+				state.shape(count)
+				for let i = 0; i < count; i++ {
+					copyInto(embedded.row(i), state.bx.row(i))
+				}
+				state.layerInputs(tokens)
+				layerInputs = state.bpl.data()
+			}
+			let next int[]
+			for let (_, t) in targets {
+				next.push(tokens[t + 1])
+			}
+			let d = device
+			if d is DeviceTrainer {
+				let turns = parts.ropeSections == 0 ?? (float32[], state.axes[:3 * count])
+				return d.run(embedded.data(), layerInputs, turns, count, targets, next, grad)
+			}
+			shape(count)
+			let x = inputs[0]
+			embedded.data().copy(x.data())
+			perLayer = state.bpl when parts.layerWidth > 0
+			for let (index, layer) in parts.layers {
+				layerForward(index, layer, inputs[index], inputs[index + 1])
+			}
+			let final = inputs[parts.layers.len()]
+			clear(dx)
+			let loss = head(final, targets, next, grad, dx)
+			return loss unless grad > float32(0)
+			for let (_, held) in heldDk {
+				clear(held)
+			}
+			for let (_, held) in heldDv {
+				clear(held)
+			}
+			for let index = parts.layers.len() - 1; index >= 0; index-- {
+				let layer = parts.layers[index]
+				layerForward(index, layer, inputs[index], inputs[index + 1])
+				layerBackward(index, layer, inputs[index])
+			}
+			return loss
+		}
+
+		// Sizes every matrix for `count` tokens.
+		internal def shape(count int) {
+			return when n == count && inputs.len() == parts.layers.len() + 1
+			n = count
+			let info = parts.info
+			let e = info.embedding
+			let heads = info.heads
+			let qSize = heads * widestHead()
+			let kvSize = info.kvHeads * widestHead()
+			let ffn = state.widestFeedForward()
+			inputs.len(0)
+			for let l = 0; l <= parts.layers.len(); l++ {
+				inputs.push(matrix<float32>[].size(count, e))
+			}
+			normed = matrix<float32>[].size(count, e)
+			both = matrix<float32>[].size(count, 2 * qSize)
+			qPre = matrix<float32>[].size(count, qSize)
+			q = matrix<float32>[].size(count, qSize)
+			gates = matrix<float32>[].size(count, qSize)
+			kPre = matrix<float32>[].size(count, kvSize)
+			k = matrix<float32>[].size(count, kvSize)
+			vPre = matrix<float32>[].size(count, kvSize)
+			v = matrix<float32>[].size(count, kvSize)
+			att = matrix<float32>[].size(count, qSize)
+			gated = matrix<float32>[].size(count, qSize)
+			proj = matrix<float32>[].size(count, e)
+			mid = matrix<float32>[].size(count, e)
+			normed2 = matrix<float32>[].size(count, e)
+			g = matrix<float32>[].size(count, ffn)
+			u = matrix<float32>[].size(count, ffn)
+			product = matrix<float32>[].size(count, ffn)
+			down = matrix<float32>[].size(count, e)
+			sharedOut = matrix<float32>[].size(count, e)
+			after = matrix<float32>[].size(count, e)
+			inPre = matrix<float32>[].size(count, parts.layerWidth.max(1))
+			inAct = matrix<float32>[].size(count, parts.layerWidth.max(1))
+			inOut = matrix<float32>[].size(count, e)
+			lse = matrix<float32>[].size(count, heads)
+			deltas = matrix<float32>[].size(count, heads)
+			dx = matrix<float32>[].size(count, e)
+			dmid = matrix<float32>[].size(count, e)
+			dn = matrix<float32>[].size(count, e)
+			dq = matrix<float32>[].size(count, qSize)
+			dqg = matrix<float32>[].size(count, 2 * qSize)
+			dk = matrix<float32>[].size(count, kvSize)
+			dv = matrix<float32>[].size(count, kvSize)
+			datt = matrix<float32>[].size(count, qSize)
+			dproj = matrix<float32>[].size(count, e)
+			dg = matrix<float32>[].size(count, ffn)
+			du = matrix<float32>[].size(count, ffn)
+			heldKeys = new map<int, matrix<float32>>()
+			heldValues = new map<int, matrix<float32>>()
+			heldDk = new map<int, matrix<float32>>()
+			heldDv = new map<int, matrix<float32>>()
+			for let (_, layer) in parts.layers {
+				let s = layer.sharedCache
+				continue when s < 0 || !(heldKeys.get(s) is none)
+				let size = info.kvHeads * parts.layers[s].headSize
+				heldKeys.set(s, matrix<float32>[].size(count, size))
+				heldValues.set(s, matrix<float32>[].size(count, size))
+				heldDk.set(s, matrix<float32>[].size(count, size))
+				heldDv.set(s, matrix<float32>[].size(count, size))
+			}
+		}
+
+		// The widest attention head of any layer.
+		internal def widestHead() int {
+			let widest = parts.headSize
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.headSize)
+			}
+			return widest
+		}
+
+		// Layer `index` on the stream `x` into `out`, keeping its values
+		// (see the fields) for `layerBackward`.
+		internal def layerForward(index int, layer Layer, x matrix<float32>, out matrix<float32>) {
+			let info = parts.info
+			let eps = parts.epsilon
+			for let i = 0; i < n; i++ {
+				copyInto(x.row(i), normed.row(i))
+				rmsNorm(normed.row(i), layer.attentionNorm, eps)
+			}
+			let recurrent = layer.recurrent
+			if recurrent is Recurrent {
+				deltaForward(layer, recurrent)
+			} else {
+				attentionForward(index, layer)
+			}
+			for let i = 0; i < n; i++ {
+				let p = proj.row(i)
+				addInto(p, layer.outputBias)
+				let m = mid.row(i)
+				copyInto(p, m)
+				rmsNorm(m, layer.attentionPost, eps) when layer.attentionPost.len() > 0
+				addInto(m, x.row(i))
+				copyInto(m, normed2.row(i))
+				rmsNorm(normed2.row(i), layer.feedForwardNorm, eps)
+			}
+			let router = layer.router
+			if router is Weights {
+				expertsForward(layer, router)
+			} else {
+				denseForward(layer)
+			}
+			let gate = layer.inputGate
+			let projection = layer.inputProjection
+			let w = parts.layerWidth
+			for let i = 0; i < n; i++ {
+				let o = out.row(i)
+				copyInto(down.row(i), o)
+				rmsNorm(o, layer.feedForwardPost, eps) when layer.feedForwardPost.len() > 0
+				addInto(o, mid.row(i))
+			}
+			if gate is Weights && projection is Weights {
+				// Gemma 4: the layer's own input, gated by the stream.
+				for let i = 0; i < n; i++ {
+					copyInto(out.row(i), after.row(i))
+				}
+				times(gate, after, inPre)
+				for let i = 0; i < n; i++ {
+					let a = inAct.row(i)
+					copyInto(inPre.row(i), a)
+					gelu(a)
+					multiplyInto(a, perLayer.row(i)[index * w:(index + 1) * w])
+				}
+				times(projection, inAct, inOut)
+				for let i = 0; i < n; i++ {
+					let projected = inOut.row(i).clone()
+					rmsNorm(projected, layer.inputPost, eps)
+					addInto(out.row(i), projected)
+				}
+			}
+			for let i = 0; i < n; i++ {
+				scaleBy(out.row(i), layer.outputScale) unless layer.outputScale == float32(1)
+			}
+		}
+
+		// A dense feed-forward on `normed2` into `down`.
+		internal def denseForward(layer Layer) {
+			let width = layer.gate.rows
+			times(layer.gate, normed2, g)
+			times(layer.up, normed2, u)
+			adapt(layer, slotGate, normed2, g, n, width)
+			adapt(layer, slotUp, normed2, u, n, layer.up.rows)
+			for let i = 0; i < n; i++ {
+				let a = product.row(i)[:width]
+				copyInto(g.row(i)[:width], a)
+				if parts.gelu {
+					gelu(a)
+				} else {
+					silu(a)
+				}
+				multiplyInto(a, u.row(i)[:width])
+			}
+			times(layer.down, product, down)
+			adapt(layer, slotDown, product, down, n, layer.down.rows)
+		}
+
+		// A mixture of experts on `normed2` into `down`: each token's picked
+		// experts (as `ForwardState.mixExperts` picks and weighs them), run
+		// for all the tokens that picked an expert at once, summed in the
+		// order they were picked; then the shared expert.
+		internal def expertsForward(layer Layer, router Weights) {
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let count = layer.expertGate.len()
+			routed = sized(routed, n, count)
+			probs = sized(probs, n, count)
+			times(router, normed2, routed)
+			picked.len(n * used)
+			weights.len(n * used)
+			totals.len(n)
+			for let i = 0; i < n; i++ {
+				let logits = routed.row(i)
+				addInto(logits, layer.routerBias)
+				routeToken(logits, probs.row(i), i, used, parts.pickThenSoftmax, picked, weights, totals)
+			}
+			groups = ExpertGroup[]
+			at.len(n * used)
+			for let ex = 0; ex < count; ex++ {
+				let group = ExpertGroup{expert: ex}
+				for let i = 0; i < n; i++ {
+					for let pick = 0; pick < used; pick++ {
+						if picked[i * used + pick] == ex {
+							at[i * used + pick] = groups.len() * (n * used) + group.tokens.len()
+							group.tokens.push(i)
+						}
+					}
+				}
+				continue when group.tokens.len() == 0
+				let m = group.tokens.len()
+				let wg = layer.expertGate[ex]
+				let rows = wg.rows
+				group.x = matrix<float32>[].size(m, e)
+				for let (r, i) in group.tokens {
+					copyInto(normed2.row(i), group.x.row(r))
+				}
+				group.g = matrix<float32>[].size(m, rows)
+				group.u = matrix<float32>[].size(m, rows)
+				group.act = matrix<float32>[].size(m, rows)
+				group.y = matrix<float32>[].size(m, e)
+				times(wg, group.x, group.g)
+				times(layer.expertUp[ex], group.x, group.u)
+				adaptList(expertAdapted(layer, 0, ex), group.x, group.g, m, rows)
+				adaptList(expertAdapted(layer, 1, ex), group.x, group.u, m, rows)
+				for let r = 0; r < m; r++ {
+					if layer.expertGateBias.len() > 0 {
+						addInto(group.g.row(r), layer.expertGateBias[ex])
+						addInto(group.u.row(r), layer.expertUpBias[ex])
+					}
+					let a = group.act.row(r)
+					let gr = group.g.row(r)
+					let ur = group.u.row(r)
+					for let j = 0; j < rows; j++ {
+						let (value, _, _) = gated(gr[j], ur[j], parts.clampedSwiglu ?? (Gating.Clamped, Gating.Silu))
+						a[j] = value
+					}
+				}
+				times(layer.expertDown[ex], group.act, group.y)
+				adaptList(expertAdapted(layer, 2, ex), group.act, group.y, m, e)
+				if layer.expertDownBias.len() > 0 {
+					for let r = 0; r < m; r++ {
+						addInto(group.y.row(r), layer.expertDownBias[ex])
+					}
+				}
+				groups.push(group)
+			}
+			for let i = 0; i < n; i++ {
+				let o = down.row(i)
+				clearRange(o, 0, e)
+				for let pick = 0; pick < used; pick++ {
+					let place = at[i * used + pick]
+					let group = groups[place / (n * used)]
+					addScaled(o, 0, group.y.row(place % (n * used)), 0, weights[i * used + pick] * parts.expertScale, e)
+				}
+			}
+			let (sharedGate, sharedUp, sharedDown) = (layer.sharedGate, layer.sharedUp, layer.sharedDown)
+			if sharedGate is Weights && sharedUp is Weights && sharedDown is Weights {
+				let width = sharedGate.rows
+				times(sharedGate, normed2, g)
+				times(sharedUp, normed2, u)
+				adaptList(slotAdapted(layer, slotSharedGate), normed2, g, n, width)
+				adaptList(slotAdapted(layer, slotSharedUp), normed2, u, n, width)
+				for let i = 0; i < n; i++ {
+					let a = product.row(i)[:width]
+					copyInto(g.row(i)[:width], a)
+					silu(a)
+					multiplyInto(a, u.row(i)[:width])
+				}
+				clear(sharedOut)
+				times(sharedDown, product, sharedOut)
+				adaptList(slotAdapted(layer, slotSharedDown), product, sharedOut, n, e)
+				shares.len(n)
+				for let i = 0; i < n; i++ {
+					let share = float32(1.0 / (1.0 + math.E ** (-float(dot(normed2.row(i), 0, layer.sharedRouter, 0, e)))))
+					shares[i] = share
+					addScaled(down.row(i), 0, sharedOut.row(i), 0, share, e)
+				}
+			}
+		}
+
+		// A Gated DeltaNet layer on `normed` into `proj`, as
+		// `ForwardState.deltaStep` runs it from an empty state, keeping its
+		// values.
+		internal def deltaForward(layer Layer, r Recurrent) {
+			let kHeads = parts.deltaKeyHeads
+			let vHeads = parts.deltaValueHeads
+			let hs = parts.deltaHeadSize
+			let width = parts.convWidth
+			let channels = (2 * kHeads + vHeads) * hs
+			let keyDim = kHeads * hs
+			let valueDim = vHeads * hs
+			let e = parts.info.embedding
+			let eps = parts.epsilon
+			mixed = sized(mixed, n, channels)
+			zg = sized(zg, n, valueDim)
+			alphaIn = sized(alphaIn, n, vHeads)
+			betaIn = sized(betaIn, n, vHeads)
+			times(r.mixed, normed, mixed)
+			times(r.z, normed, zg)
+			adapt(layer, slotQuery, normed, mixed, n, channels)
+			adapt(layer, slotOutputGate, normed, zg, n, valueDim)
+			times(r.alpha, normed, alphaIn)
+			times(r.beta, normed, betaIn)
+			convPre = sized(convPre, n, channels)
+			ys = sized(ys, n, channels)
+			yn = sized(yn, n, channels)
+			decays = sized(decays, n, vHeads)
+			betas = sized(betas, n, vHeads)
+			raw = sized(raw, n, valueDim)
+			deltaOut = sized(deltaOut, n, valueDim)
+			forall let t in 0..n {
+				let y = convPre.row(t)
+				let x = mixed.row(t)
+				for let c = 0; c < channels; c++ {
+					let sum = r.conv[c * width + width - 1] * x[c]
+					for let tap = 0; tap < width - 1; tap++ {
+						let source = t - (width - 1) + tap
+						sum += source >= 0 ?? (r.conv[c * width + tap] * mixed.row(source)[c], float32(0))
+					}
+					y[c] = sum
+				}
+				let active = ys.row(t)
+				copyInto(y, active)
+				silu(active)
+				let unit = yn.row(t)
+				copyInto(active, unit)
+				for let h = 0; h < kHeads; h++ {
+					l2Norm(unit[h * hs:(h + 1) * hs], eps)
+					l2Norm(unit[keyDim + h * hs:keyDim + (h + 1) * hs], eps)
+				}
+				for let h = 0; h < vHeads; h++ {
+					decays.row(t)[h] = float32(math.E ** (softplus(float(alphaIn.row(t)[h] + r.dtBias[h])) * float(r.decay[h])))
+					betas.row(t)[h] = float32(1.0 / (1.0 + math.E ** (-float(betaIn.row(t)[h]))))
+				}
+			}
+			let chunks = (n + deltaChunk - 1) / deltaChunk
+			checkpoints.len(vHeads * chunks)
+			let scale = float32(1.0 / (float(hs)) ** 0.5)
+			forall let h in 0..vHeads {
+				let running float32[]
+				running.len(hs * hs)
+				for let t = 0; t < n; t++ {
+					checkpoints[h * chunks + t / deltaChunk] = running.clone() when t % deltaChunk == 0
+					deltaToken(h, t, running, scale)
+				}
+			}
+			for let t = 0; t < n; t++ {
+				let out = deltaOut.row(t)
+				copyInto(raw.row(t)[:valueDim], out[:valueDim])
+				let z = zg.row(t)
+				for let h = 0; h < vHeads; h++ {
+					let head = out[h * hs:(h + 1) * hs]
+					rmsNorm(head, r.norm, eps)
+					for let j = 0; j < hs; j++ {
+						let gateValue = float(z[h * hs + j])
+						head[j] = head[j] * float32(gateValue / (1.0 + math.E ** (-gateValue)))
+					}
+				}
+			}
+			times(r.output, deltaOut, proj)
+			adapt(layer, slotOutput, deltaOut, proj, n, e)
+		}
+
+		// Token `t` of value head `h` on its `state`: decay, the delta
+		// rule's update and the output into `raw`, as deltaStep runs them.
+		internal def deltaToken(h int, t int, state float32[], scale float32) {
+			let hs = parts.deltaHeadSize
+			let kHeads = parts.deltaKeyHeads
+			let keyDim = kHeads * hs
+			let y = yn.row(t)
+			let queryAt = (h % kHeads) * hs
+			let keyAt = keyDim + (h % kHeads) * hs
+			let decay = decays.row(t)[h]
+			let b = betas.row(t)[h]
+			let out = raw.row(t)
+			for let j = 0; j < hs; j++ {
+				let row = j * hs
+				scaleRange(state, row, hs, decay)
+				let delta = (y[2 * keyDim + h * hs + j] - dot(state, row, y, keyAt, hs)) * b
+				addScaled(state, row, y, keyAt, delta, hs)
+				out[h * hs + j] = dot(state, row, y, queryAt, hs) * scale
+			}
+		}
+
+		// Back through a Gated DeltaNet layer: `dproj` holds the gradient of
+		// its output, which goes into `dn` (and the pairs'). Each value
+		// head runs back through its tokens a chunk at a time, the chunk's
+		// states made again from its checkpoint.
+		internal def deltaBack(layer Layer, r Recurrent) {
+			let kHeads = parts.deltaKeyHeads
+			let vHeads = parts.deltaValueHeads
+			let hs = parts.deltaHeadSize
+			let width = parts.convWidth
+			let channels = (2 * kHeads + vHeads) * hs
+			let keyDim = kHeads * hs
+			let valueDim = vHeads * hs
+			let e = parts.info.embedding
+			let eps = parts.epsilon
+			let dOut = matrix<float32>[].size(n, valueDim)
+			multiplyTransposed(r.output, dproj, dOut)
+			adaptBack(layer, slotOutput, deltaOut, dproj, dOut, n, e)
+			// The gate and the heads' norm.
+			let dz = matrix<float32>[].size(n, valueDim)
+			let dRaw = matrix<float32>[].size(n, valueDim)
+			for let t = 0; t < n; t++ {
+				let z = zg.row(t)
+				let d = dOut.row(t)
+				for let h = 0; h < vHeads; h++ {
+					let normedHead = raw.row(t)[h * hs:(h + 1) * hs].clone()
+					rmsNorm(normedHead, r.norm, eps)
+					let dh float32[]
+					dh.len(hs)
+					for let j = 0; j < hs; j++ {
+						let gateValue = float(z[h * hs + j])
+						let s = 1.0 / (1.0 + math.E ** (-gateValue))
+						dh[j] = d[h * hs + j] * float32(gateValue * s)
+						dz.row(t)[h * hs + j] = d[h * hs + j] * normedHead[j] * float32(s * (1.0 + gateValue * (1.0 - s)))
+					}
+					rmsBack(raw.row(t)[h * hs:(h + 1) * hs], r.norm, eps, dh, dRaw.row(t)[h * hs:(h + 1) * hs])
+				}
+			}
+			// The recurrence, per value head: queries' and keys' gradients by
+			// value head (several share a key head), values', decays' and betas'.
+			let dqHeads = matrix<float32>[].size(vHeads, n * hs)
+			let dkHeads = matrix<float32>[].size(vHeads, n * hs)
+			let dUnit = matrix<float32>[].size(n, channels)
+			let dDecay = matrix<float32>[].size(n, vHeads)
+			let dBeta = matrix<float32>[].size(n, vHeads)
+			let chunks = (n + deltaChunk - 1) / deltaChunk
+			let scale = float32(1.0 / (float(hs)) ** 0.5)
+			forall let h in 0..vHeads {
+				deltaHeadBack(h, chunks, scale, dRaw, dqHeads.row(h), dkHeads.row(h), dUnit, dDecay, dBeta)
+			}
+			for let t = 0; t < n; t++ {
+				let unitRow = dUnit.row(t)
+				for let h = 0; h < vHeads; h++ {
+					let kh = h % kHeads
+					addScaled(unitRow, kh * hs, dqHeads.row(h), t * hs, float32(1), hs)
+					addScaled(unitRow, keyDim + kh * hs, dkHeads.row(h), t * hs, float32(1), hs)
+				}
+			}
+			// The norms of queries and keys, SiLU, then the convolution.
+			let dPre = matrix<float32>[].size(n, channels)
+			for let t = 0; t < n; t++ {
+				let active = ys.row(t)
+				let unitRow = dUnit.row(t)
+				let dy = dPre.row(t)
+				copyInto(unitRow, dy)
+				for let h = 0; h < kHeads; h++ {
+					for let (_, from) in int[h * hs, keyDim + h * hs] {
+						clearRange(dy, from, hs)
+						l2Back(active, from, hs, eps, unitRow, dy)
+					}
+				}
+				let pre = convPre.row(t)
+				for let c = 0; c < channels; c++ {
+					let (_, slope) = activation(pre[c], false)
+					dy[c] = dy[c] * slope
+				}
+			}
+			let dMixed = matrix<float32>[].size(n, channels)
+			forall let t in 0..n {
+				let mixedRow = dMixed.row(t)
+				for let c = 0; c < channels; c++ {
+					let sum = float32(0)
+					for let tap = 0; tap < width; tap++ {
+						let source = t + (width - 1) - tap
+						sum += source < n ?? (r.conv[c * width + tap] * dPre.row(source)[c], float32(0))
+					}
+					mixedRow[c] = sum
+				}
+			}
+			// The decay's input through exp(softplus(a + dt) · A), and beta's
+			// through its sigmoid.
+			for let t = 0; t < n; t++ {
+				for let h = 0; h < vHeads; h++ {
+					let a = float(alphaIn.row(t)[h] + r.dtBias[h])
+					let sig = 1.0 / (1.0 + math.E ** (-a))
+					let slope = a > 20.0 ?? (1.0, sig)
+					dDecay.row(t)[h] = float32(float(dDecay.row(t)[h]) * float(decays.row(t)[h]) * float(r.decay[h]) * slope)
+					let b = float(betas.row(t)[h])
+					dBeta.row(t)[h] = float32(float(dBeta.row(t)[h]) * b * (1.0 - b))
+				}
+			}
+			multiplyTransposed(r.mixed, dMixed, dn)
+			multiplyTransposed(r.z, dz, dn)
+			multiplyTransposed(r.alpha, dDecay, dn)
+			multiplyTransposed(r.beta, dBeta, dn)
+			adaptBack(layer, slotQuery, normed, dMixed, dn, n, channels)
+			adaptBack(layer, slotOutputGate, normed, dz, dn, n, valueDim)
+		}
+
+		// Value head `h` back through its tokens, last first: given the
+		// gradients of its outputs (`dRaw`), the gradients of its queries
+		// and keys go to dq and dk (token t at t · hs), of its values to
+		// `dUnit`, of its decays and betas to dDecay and dBeta.
+		internal def deltaHeadBack(h int, chunks int, scale float32, dRaw matrix<float32>, dq float32[], dk float32[], dUnit matrix<float32>, dDecay matrix<float32>, dBeta matrix<float32>) {
+			let hs = parts.deltaHeadSize
+			let kHeads = parts.deltaKeyHeads
+			let keyDim = kHeads * hs
+			let size = hs * hs
+			// Each token's state before it, for one chunk, and the gradient
+			// of the state after the token being undone.
+			let before float32[]
+			before.len((deltaChunk + 1) * size)
+			let dS float32[]
+			dS.len(size)
+			let decayed float32[]
+			decayed.len(size)
+			let update float32[]
+			update.len(hs)
+			let e float32[]
+			e.len(hs)
+			let dUpdate float32[]
+			dUpdate.len(hs)
+			for let c = chunks - 1; c >= 0; c-- {
+				let first = c * deltaChunk
+				let last = (first + deltaChunk).min(n)
+				let running = checkpoints[h * chunks + c].clone()
+				for let t = first; t < last; t++ {
+					running.copy(before[(t - first) * size:(t - first + 1) * size])
+					deltaToken(h, t, running, scale)
+				}
+				running.copy(before[(last - first) * size:(last - first + 1) * size])
+				for let t = last - 1; t >= first; t-- {
+					let y = yn.row(t)
+					let queryAt = (h % kHeads) * hs
+					let keyAt = keyDim + (h % kHeads) * hs
+					let d = decays.row(t)[h]
+					let b = betas.row(t)[h]
+					let prev = before[(t - first) * size:(t - first + 1) * size]
+					let later = before[(t - first + 1) * size:(t - first + 2) * size]
+					let dout = dRaw.row(t)
+					for let i = 0; i < size; i++ {
+						decayed[i] = prev[i] * d
+					}
+					// o = scale · S q: the state's and the query's gradients.
+					for let j = 0; j < hs; j++ {
+						let weight = dout[h * hs + j] * scale
+						addScaled(dS, j * hs, y, queryAt, weight, hs)
+						addScaled(dq, t * hs, later, j * hs, weight, hs)
+					}
+					// S = P + u kᵀ, u = b (v − P k), P the decayed state.
+					let dbeta = float32(0)
+					for let j = 0; j < hs; j++ {
+						e[j] = y[2 * keyDim + h * hs + j] - dot(decayed, j * hs, y, keyAt, hs)
+						update[j] = b * e[j]
+						dUpdate[j] = dot(dS, j * hs, y, keyAt, hs)
+						dbeta += dUpdate[j] * e[j]
+					}
+					for let j = 0; j < hs; j++ {
+						// dk += dSᵀ u − Pᵀ (b du); dv = b du; dP = dS − (b du) kᵀ.
+						let de = b * dUpdate[j]
+						addScaled(dk, t * hs, dS, j * hs, update[j], hs)
+						addScaled(dk, t * hs, decayed, j * hs, -de, hs)
+						dUnit.row(t)[2 * keyDim + h * hs + j] = de
+						addScaled(dS, j * hs, y, keyAt, -de, hs)
+					}
+					// P = d · S_prev.
+					let along = 0.0
+					for let i = 0; i < size; i++ {
+						along += float(dS[i]) * float(prev[i])
+					}
+					dDecay.row(t)[h] = float32(along)
+					dBeta.row(t)[h] = dbeta
+					scaleRange(dS, 0, size, d)
+				}
+			}
+		}
+
+		// Layer `index`'s attention on `normed` into `proj`, keeping its
+		// values.
+		internal def attentionForward(index int, layer Layer) {
+			let info = parts.info
+			let eps = parts.epsilon
+			let hs = layer.headSize
+			let heads = info.heads
+			let kvHeads = info.kvHeads
+			let qSize = heads * hs
+			let kvSize = kvHeads * hs
+			let turns = layer.ropeFactors.len() > 0 ?? (layer.ropeFactors, state.factors)
+			if layer.gatedQuery {
+				times(layer.query, normed, both)
+				adapt(layer, slotQuery, normed, both, n, layer.query.rows)
+				for let i = 0; i < n; i++ {
+					let row = both.row(i)
+					for let h = 0; h < heads; h++ {
+						row[h * 2 * hs:h * 2 * hs + hs].copy(qPre.row(i)[h * hs:(h + 1) * hs])
+						row[h * 2 * hs + hs:(h + 1) * 2 * hs].copy(gates.row(i)[h * hs:(h + 1) * hs])
+					}
+				}
+			} else {
+				times(layer.query, normed, qPre)
+				adapt(layer, slotQuery, normed, qPre, n, layer.query.rows)
+			}
+			let own = layer.sharedCache < 0
+			if own {
+				times(layer.key, normed, kPre)
+				times(layer.value, normed, vPre)
+				adapt(layer, slotKey, normed, kPre, n, layer.key.rows)
+				adapt(layer, slotValue, normed, vPre, n, layer.value.rows)
+			}
+			forall let i in 0..n {
+				let pre = qPre.row(i)[:qSize]
+				addInto(pre, layer.queryBias)
+				let query = q.row(i)[:qSize]
+				copyInto(pre, query)
+				if layer.queryNorm.len() > 0 {
+					for let h = 0; h < heads; h++ {
+						rmsNorm(query[h * hs:(h + 1) * hs], layer.queryNorm, eps)
+					}
+				}
+				state.turn(query, heads, hs, layer, turns, i)
+				if own {
+					let kp = kPre.row(i)[:kvSize]
+					let vp = vPre.row(i)[:kvSize]
+					addInto(kp, layer.keyBias)
+					addInto(vp, layer.valueBias)
+					let key = k.row(i)[:kvSize]
+					let value = v.row(i)[:kvSize]
+					copyInto(kp, key)
+					copyInto(vp, value)
+					if layer.valueNorm.len() > 0 {
+						for let h = 0; h < kvHeads; h++ {
+							rmsNorm(value[h * hs:(h + 1) * hs], layer.valueNorm, eps)
+						}
+					}
+					if layer.keyNorm.len() > 0 {
+						for let h = 0; h < kvHeads; h++ {
+							rmsNorm(key[h * hs:(h + 1) * hs], layer.keyNorm, eps)
+						}
+					}
+					state.turn(key, kvHeads, hs, layer, turns, i)
+				}
+			}
+			let keys = own ?? (k, heldBy(heldKeys, layer.sharedCache))
+			let values = own ?? (v, heldBy(heldValues, layer.sharedCache))
+			if own && !(heldKeys.get(index) is none) {
+				let hk = heldBy(heldKeys, index)
+				let hv = heldBy(heldValues, index)
+				for let i = 0; i < n; i++ {
+					copyInto(k.row(i)[:kvSize], hk.row(i))
+					copyInto(v.row(i)[:kvSize], hv.row(i))
+				}
+			}
+			forall let i in 0..n {
+				attendRow(layer, i, keys, values)
+			}
+			for let i = 0; i < n; i++ {
+				copyInto(att.row(i)[:qSize], gated.row(i)[:qSize])
+				multiplySigmoid(gated.row(i)[:qSize], gates.row(i)[:qSize]) when layer.gatedQuery
+			}
+			times(layer.output, gated, proj)
+			adapt(layer, slotOutput, gated, proj, n, layer.output.rows)
+		}
+
+		// Back through layer `index`'s attention: `dproj` holds the
+		// gradient of its output, which goes into `dn` (and the pairs').
+		internal def attentionBack(index int, layer Layer) {
+			let info = parts.info
+			let eps = parts.epsilon
+			let hs = layer.headSize
+			let heads = info.heads
+			let kvHeads = info.kvHeads
+			let qSize = heads * hs
+			let kvSize = kvHeads * hs
+			let turns = layer.ropeFactors.len() > 0 ?? (layer.ropeFactors, state.factors)
+			clear(datt)
+			multiplyTransposed(layer.output, dproj, datt)
+			adaptBack(layer, slotOutput, gated, dproj, datt, n, layer.output.rows)
+			if layer.gatedQuery {
+				for let i = 0; i < n; i++ {
+					let da = datt.row(i)
+					let ar = att.row(i)
+					let gr = gates.row(i)
+					let dgr = dq.row(i)
+					for let j = 0; j < qSize; j++ {
+						let s = float32(1) / (float32(1) + float32(math.E) ** (-gr[j]))
+						dgr[j] = da[j] * ar[j] * s * (float32(1) - s)
+						da[j] = da[j] * s
+					}
+					// The gates are not read again: their row now holds their gradient.
+					copyInto(dgr[:qSize], gates.row(i)[:qSize])
+				}
+			}
+			let own = layer.sharedCache < 0
+			let keys = own ?? (k, heldBy(heldKeys, layer.sharedCache))
+			let values = own ?? (v, heldBy(heldValues, layer.sharedCache))
+			let gk = own ?? (dk, heldBy(heldDk, layer.sharedCache))
+			let gv = own ?? (dv, heldBy(heldDv, layer.sharedCache))
+			if own {
+				// What later layers reading this one's cache sent back starts
+				// its key and value gradients.
+				let shared = !(heldDk.get(index) is none)
+				let held = heldBy(heldDk, index)
+				let heldV = heldBy(heldDv, index)
+				for let i = 0; i < n; i++ {
+					if shared {
+						copyInto(held.row(i)[:kvSize], dk.row(i)[:kvSize])
+						copyInto(heldV.row(i)[:kvSize], dv.row(i)[:kvSize])
+					} else {
+						clearRange(dk.row(i), 0, kvSize)
+						clearRange(dv.row(i), 0, kvSize)
+					}
+				}
+			}
+			forall let i in 0..n {
+				attendBackQuery(layer, i, keys, values)
+			}
+			forall let j in 0..n {
+				attendBackKey(layer, j, keys, values, gk, gv)
+			}
+			// The queries' turn and norm, the gates beside them.
+			forall let i in 0..n {
+				let dqr = dq.row(i)[:qSize]
+				state.turn(dqr, heads, hs, layer, turns, i, true)
+				if layer.queryNorm.len() > 0 {
+					let pre = qPre.row(i)
+					let back float32[]
+					back.len(hs)
+					for let h = 0; h < heads; h++ {
+						clearRange(back, 0, hs)
+						rmsBack(pre[h * hs:(h + 1) * hs], layer.queryNorm, eps, dqr[h * hs:(h + 1) * hs], back)
+						copyInto(back, dqr[h * hs:(h + 1) * hs])
+					}
+				}
+				if layer.gatedQuery {
+					let row = dqg.row(i)
+					let gr = gates.row(i)
+					for let h = 0; h < heads; h++ {
+						dqr[h * hs:(h + 1) * hs].copy(row[h * 2 * hs:h * 2 * hs + hs])
+						gr[h * hs:(h + 1) * hs].copy(row[h * 2 * hs + hs:(h + 1) * 2 * hs])
+					}
+				}
+			}
+			if layer.gatedQuery {
+				multiplyTransposed(layer.query, dqg, dn)
+				adaptBack(layer, slotQuery, normed, dqg, dn, n, layer.query.rows)
+			} else {
+				multiplyTransposed(layer.query, dq, dn)
+				adaptBack(layer, slotQuery, normed, dq, dn, n, layer.query.rows)
+			}
+			if own {
+				forall let i in 0..n {
+					let dkr = dk.row(i)[:kvSize]
+					state.turn(dkr, kvHeads, hs, layer, turns, i, true)
+					let back float32[]
+					back.len(hs)
+					if layer.keyNorm.len() > 0 {
+						let pre = kPre.row(i)
+						for let h = 0; h < kvHeads; h++ {
+							clearRange(back, 0, hs)
+							rmsBack(pre[h * hs:(h + 1) * hs], layer.keyNorm, eps, dkr[h * hs:(h + 1) * hs], back)
+							copyInto(back, dkr[h * hs:(h + 1) * hs])
+						}
+					}
+					if layer.valueNorm.len() > 0 {
+						let pre = vPre.row(i)
+						let dvr = dv.row(i)
+						for let h = 0; h < kvHeads; h++ {
+							clearRange(back, 0, hs)
+							rmsBack(pre[h * hs:(h + 1) * hs], layer.valueNorm, eps, dvr[h * hs:(h + 1) * hs], back)
+							copyInto(back, dvr[h * hs:(h + 1) * hs])
+						}
+					}
+				}
+				multiplyTransposed(layer.key, dk, dn)
+				multiplyTransposed(layer.value, dv, dn)
+				adaptBack(layer, slotKey, normed, dk, dn, n, layer.key.rows)
+				adaptBack(layer, slotValue, normed, dv, dn, n, layer.value.rows)
+			}
+		}
+
+		// Attention of token `i` over keys and values 0..i of the sequence
+		// (or the layer's window of them), into `att`, and each head's log
+		// sum into `lse`.
+		internal def attendRow(layer Layer, i int, keys matrix<float32>, values matrix<float32>) {
+			let info = parts.info
+			let hs = layer.headSize
+			let group = info.heads / info.kvHeads
+			let first = layer.window > 0 ?? ((i - layer.window + 1).max(0), 0)
+			let count = i + 1 - first
+			let query = q.row(i)
+			let out = att.row(i)
+			let scores float32[]
+			scores.len(count)
+			let cap = parts.attentionCap
+			// Keys and values as flat arrays: a row view per score would cost
+			// more than the score.
+			let kd = keys.data()
+			let vd = values.data()
+			let stride = keys.cols
+			for let h = 0; h < info.heads; h++ {
+				let kv = (h / group) * hs
+				let top = layer.sinks.len() > 0 ?? (layer.sinks[h], float32(-3.4e38))
+				for let t = 0; t < count; t++ {
+					let s = dot(query, h * hs, kd, (first + t) * stride + kv, hs) * parts.attentionScale
+					s = cap * float32(math.tanh(float(s / cap))) when cap > float32(0)
+					scores[t] = s
+					top = top.max(s)
+				}
+				let sum = 0.0
+				for let t = 0; t < count; t++ {
+					sum += float(float32(math.E) ** (scores[t] - top))
+				}
+				sum += float(float32(math.E) ** (layer.sinks[h] - top)) when layer.sinks.len() > 0
+				let log = float(top) + math.ln(sum)
+				lse.row(i)[h] = float32(log)
+				clearRange(out, h * hs, hs)
+				for let t = 0; t < count; t++ {
+					let p = float32(math.E ** (float(scores[t]) - log))
+					addScaled(out, h * hs, vd, (first + t) * stride + kv, p, hs)
+				}
+			}
+		}
+
+		// Back through layer `index`, whose values `layerForward` just
+		// kept: `dx` holds the gradient of its output and leaves with that
+		// of its input `x`; the pairs' gradients grow.
+		internal def layerBackward(index int, layer Layer, x matrix<float32>) {
+			let info = parts.info
+			let eps = parts.epsilon
+			let e = info.embedding
+			// The output scale and Gemma 4's per-layer input, then the
+			// feed-forward's residual: dmid is the gradient of the stream
+			// after attention.
+			for let i = 0; i < n; i++ {
+				scaleBy(dx.row(i), layer.outputScale) unless layer.outputScale == float32(1)
+			}
+			let gate = layer.inputGate
+			let projection = layer.inputProjection
+			if gate is Weights && projection is Weights {
+				let w = parts.layerWidth
+				let dpp = matrix<float32>[].size(n, e)
+				for let i = 0; i < n; i++ {
+					rmsBack(inOut.row(i), layer.inputPost, eps, dx.row(i), dpp.row(i))
+				}
+				let dact = matrix<float32>[].size(n, w)
+				multiplyTransposed(projection, dpp, dact)
+				for let i = 0; i < n; i++ {
+					let da = dact.row(i)
+					let pre = inPre.row(i)
+					let own = perLayer.row(i)
+					for let j = 0; j < w; j++ {
+						let (_, slope) = activation(pre[j], true)
+						da[j] = da[j] * own[index * w + j] * slope
+					}
+				}
+				multiplyTransposed(gate, dact, dx)
+			}
+			for let i = 0; i < n; i++ {
+				copyInto(dx.row(i), dmid.row(i))
+				let dd = dproj.row(i)
+				if layer.feedForwardPost.len() > 0 {
+					clearRange(dd, 0, e)
+					rmsBack(down.row(i), layer.feedForwardPost, eps, dx.row(i), dd)
+				} else {
+					copyInto(dx.row(i), dd)
+				}
+			}
+			clear(dn)
+			let router = layer.router
+			if router is Weights {
+				expertsBack(layer, router)
+			} else {
+				denseBack(layer)
+			}
+			for let i = 0; i < n; i++ {
+				rmsBack(mid.row(i), layer.feedForwardNorm, eps, dn.row(i), dmid.row(i))
+			}
+			// Attention's residual: dx starts as the stream's gradient.
+			for let i = 0; i < n; i++ {
+				copyInto(dmid.row(i), dx.row(i))
+				let dp = dproj.row(i)
+				if layer.attentionPost.len() > 0 {
+					clearRange(dp, 0, e)
+					rmsBack(proj.row(i), layer.attentionPost, eps, dmid.row(i), dp)
+				} else {
+					copyInto(dmid.row(i), dp)
+				}
+			}
+			clear(dn)
+			let recurrent = layer.recurrent
+			if recurrent is Recurrent {
+				deltaBack(layer, recurrent)
+			} else {
+				attentionBack(index, layer)
+			}
+			for let i = 0; i < n; i++ {
+				rmsBack(x.row(i), layer.attentionNorm, eps, dn.row(i), dx.row(i))
+			}
+		}
+
+		// Back through a dense feed-forward: `dproj` holds the gradient of
+		// its output, which goes into `dn` (and the pairs').
+		internal def denseBack(layer Layer) {
+			let width = layer.gate.rows
+			clear(dg)
+			multiplyTransposed(layer.down, dproj, dg)
+			adaptBack(layer, slotDown, product, dproj, dg, n, layer.down.rows)
+			activationBack(g, u, dg, du, width, parts.gelu ?? (Gating.Gelu, Gating.Silu))
+			multiplyTransposed(layer.gate, dg, dn)
+			multiplyTransposed(layer.up, du, dn)
+			adaptBack(layer, slotGate, normed2, dg, dn, n, width)
+			adaptBack(layer, slotUp, normed2, du, dn, n, layer.up.rows)
+		}
+
+		// Back through the experts and their router, and the shared expert:
+		// `dproj` holds the gradient of the sum, which goes into `dn`.
+		internal def expertsBack(layer Layer, router Weights) {
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let count = layer.expertGate.len()
+			let scale = parts.expertScale
+			// Each pick's weight gradient: the sum's gradient · its expert's
+			// output, times the scale.
+			let dw float32[]
+			dw.len(n * used)
+			for let i = 0; i < n; i++ {
+				for let pick = 0; pick < used; pick++ {
+					let place = at[i * used + pick]
+					let group = groups[place / (n * used)]
+					dw[i * used + pick] = scale * dot(dproj.row(i), 0, group.y.row(place % (n * used)), 0, e)
+				}
+			}
+			for let (gi, group) in groups {
+				let ex = group.expert
+				let m = group.tokens.len()
+				let rows = layer.expertGate[ex].rows
+				let dy = matrix<float32>[].size(m, e)
+				for let (r, i) in group.tokens {
+					for let pick = 0; pick < used; pick++ {
+						continue unless at[i * used + pick] == gi * (n * used) + r
+						addScaled(dy.row(r), 0, dproj.row(i), 0, weights[i * used + pick] * scale, e)
+					}
+				}
+				let dg2 = matrix<float32>[].size(m, rows)
+				let du2 = matrix<float32>[].size(m, rows)
+				multiplyTransposed(layer.expertDown[ex], dy, dg2)
+				adaptListBack(expertAdapted(layer, 2, ex), group.act, dy, dg2, m, e)
+				activationBack(group.g, group.u, dg2, du2, rows, parts.clampedSwiglu ?? (Gating.Clamped, Gating.Silu))
+				let dxg = matrix<float32>[].size(m, e)
+				multiplyTransposed(layer.expertGate[ex], dg2, dxg)
+				multiplyTransposed(layer.expertUp[ex], du2, dxg)
+				adaptListBack(expertAdapted(layer, 0, ex), group.x, dg2, dxg, m, rows)
+				adaptListBack(expertAdapted(layer, 1, ex), group.x, du2, dxg, m, rows)
+				for let (r, i) in group.tokens {
+					addInto(dn.row(i), dxg.row(r))
+				}
+			}
+			// The router: the picked weights' gradients through their softmax.
+			let dz = matrix<float32>[].size(n, count)
+			for let i = 0; i < n; i++ {
+				routeBack(i, used, parts.pickThenSoftmax, picked, weights, dw, probs.row(i), totals[i], dz.row(i))
+			}
+			multiplyTransposed(router, dz, dn)
+			let (sharedGate, sharedUp, sharedDown) = (layer.sharedGate, layer.sharedUp, layer.sharedDown)
+			if sharedGate is Weights && sharedUp is Weights && sharedDown is Weights {
+				let width = sharedGate.rows
+				let dy = matrix<float32>[].size(n, e)
+				for let i = 0; i < n; i++ {
+					addScaled(dy.row(i), 0, dproj.row(i), 0, shares[i], e)
+					let ds = dot(dproj.row(i), 0, sharedOut.row(i), 0, e) * shares[i] * (float32(1) - shares[i])
+					addScaled(dn.row(i), 0, layer.sharedRouter, 0, ds, e)
+				}
+				clear(dg)
+				multiplyTransposed(sharedDown, dy, dg)
+				adaptBack(layer, slotSharedDown, product, dy, dg, n, e)
+				activationBack(g, u, dg, du, width, Gating.Silu)
+				multiplyTransposed(sharedGate, dg, dn)
+				multiplyTransposed(sharedUp, du, dn)
+				adaptBack(layer, slotSharedGate, normed2, dg, dn, n, width)
+				adaptBack(layer, slotSharedUp, normed2, du, dn, n, width)
+			}
+		}
+
+		// Token `i`'s query gradient from the attention output's (`datt`):
+		// each score's gradient p·(dO·v − D) through the cap, times the
+		// scale, weighs its key. Keeps D = Σ p·(dO·v) in `deltas`.
+		internal def attendBackQuery(layer Layer, i int, keys matrix<float32>, values matrix<float32>) {
+			let info = parts.info
+			let hs = layer.headSize
+			let group = info.heads / info.kvHeads
+			let first = layer.window > 0 ?? ((i - layer.window + 1).max(0), 0)
+			let count = i + 1 - first
+			let query = q.row(i)
+			let dO = datt.row(i)
+			let out = dq.row(i)
+			let kd = keys.data()
+			let vd = values.data()
+			let stride = keys.cols
+			let cap = parts.attentionCap
+			let ps float32[]
+			let dps float32[]
+			ps.len(count)
+			dps.len(count)
+			for let h = 0; h < info.heads; h++ {
+				let kv = (h / group) * hs
+				let log = lse.row(i)[h]
+				let d = float32(0)
+				for let t = 0; t < count; t++ {
+					let s = dot(query, h * hs, kd, (first + t) * stride + kv, hs) * parts.attentionScale
+					s = cap * float32(math.tanh(float(s / cap))) when cap > float32(0)
+					let p = float32(math.E ** (float(s) - float(log)))
+					let dp = dot(dO, h * hs, vd, (first + t) * stride + kv, hs)
+					d += p * dp
+					dps[t] = dp
+					// p times the cap's slope at the score.
+					let c = cap > float32(0) ?? (s / cap, float32(0))
+					ps[t] = p * (float32(1) - c * c)
+				}
+				deltas.row(i)[h] = d
+				clearRange(out, h * hs, hs)
+				for let t = 0; t < count; t++ {
+					addScaled(out, h * hs, kd, (first + t) * stride + kv, ps[t] * (dps[t] - d) * parts.attentionScale, hs)
+				}
+			}
+		}
+
+		// Key position `j`'s key and value gradients, added to `gk` and
+		// `gv`: over every query that attends to it.
+		internal def attendBackKey(layer Layer, j int, keys matrix<float32>, values matrix<float32>, gk matrix<float32>, gv matrix<float32>) {
+			let info = parts.info
+			let hs = layer.headSize
+			let group = info.heads / info.kvHeads
+			let last = layer.window > 0 ?? ((j + layer.window - 1).min(n - 1), n - 1)
+			let cap = parts.attentionCap
+			let key = keys.row(j)
+			let value = values.row(j)
+			let dkr = gk.row(j)
+			let dvr = gv.row(j)
+			let qd = q.data()
+			let qs = q.cols
+			let od = datt.data()
+			let os = datt.cols
+			let ld = lse.data()
+			let ls = lse.cols
+			let dd = deltas.data()
+			for let h = 0; h < info.heads; h++ {
+				let kv = (h / group) * hs
+				for let i = j; i <= last; i++ {
+					let s = dot(qd, i * qs + h * hs, key, kv, hs) * parts.attentionScale
+					s = cap * float32(math.tanh(float(s / cap))) when cap > float32(0)
+					let p = float32(math.E ** (float(s) - float(ld[i * ls + h])))
+					addScaled(dvr, kv, od, i * os + h * hs, p, hs)
+					let dp = dot(od, i * os + h * hs, value, kv, hs)
+					let ds = p * (dp - dd[i * ls + h])
+					if cap > float32(0) {
+						let c = s / cap
+						ds = ds * (float32(1) - c * c)
+					}
+					addScaled(dkr, kv, qd, i * qs + h * hs, ds * parts.attentionScale, hs)
+				}
+			}
+		}
+
+		// The summed loss of the next tokens `next` after the positions
+		// `targets` of the final stream; with `grad` > 0, grad times its
+		// gradient is added to `into`'s rows.
+		internal def head(final matrix<float32>, targets int[], next int[], grad float32, into matrix<float32>) float {
+			let e = parts.info.embedding
+			let vocab = parts.output.rows
+			let total = 0.0
+			let cap = parts.softCap
+			for let from = 0; from < targets.len(); from += headRows {
+				let count = headRows.min(targets.len() - from)
+				let hn = matrix<float32>[].size(count, e)
+				for let r = 0; r < count; r++ {
+					copyInto(final.row(targets[from + r]), hn.row(r))
+					rmsNorm(hn.row(r), parts.outputNorm, parts.epsilon)
+				}
+				let logits = matrix<float32>[].size(count, vocab)
+				times(parts.output, hn, logits)
+				adaptList(parts.outputAdapters, hn, logits, count, vocab)
+				let losses float[]
+				losses.len(count)
+				forall let r in 0..count {
+					let row = logits.row(r)
+					softCap(row, cap) when cap > float32(0)
+					let log = logSumExp(row)
+					let target = next[from + r]
+					losses[r] = log - float(row[target])
+					if grad > float32(0) {
+						// The softmax less the target's one-hot, times grad,
+						// through the cap's slope.
+						let capped = row.clone()
+						expShift(row, float32(log))
+						row[target] -= float32(1)
+						scaleBy(row, grad)
+						if cap > float32(0) {
+							for let c = 0; c < vocab; c++ {
+								let t = capped[c] / cap
+								row[c] = row[c] * (float32(1) - t * t)
+							}
+						}
+					}
+				}
+				for let r = 0; r < count; r++ {
+					total += losses[r]
+				}
+				continue unless grad > float32(0)
+				let dh = matrix<float32>[].size(count, e)
+				multiplyTransposed(parts.output, logits, dh)
+				adaptListBack(parts.outputAdapters, hn, logits, dh, count, vocab)
+				for let r = 0; r < count; r++ {
+					let t = targets[from + r]
+					rmsBack(final.row(t), parts.outputNorm, parts.epsilon, dh.row(r), into.row(t))
+				}
+			}
+			return total
+		}
+
+		// One AdamW step of every pair (β 0.9 and 0.999, ε 1e-8) on its
+		// gradients, after scaling them to a norm of at most `clip`.
+		// Fails when a launch fails.
+		def update(step int, rate float, decay float, clip float) !none {
+			let d = device
+			return d.update(step, rate, decay, clip) when d is DeviceTrainer
+			let squares = 0.0
+			for let (_, pair) in pairs {
+				squares += sumSquares(pair.gradA) + sumSquares(pair.gradB)
+			}
+			let norm = math.sqrt(squares)
+			let scale = clip > 0.0 && norm > clip ?? (clip / norm, 1.0)
+			let fix1 = 1.0 - 0.9 ** float(step)
+			let fix2 = 1.0 - 0.999 ** float(step)
+			for let (_, pair) in pairs {
+				adamW(pair.a.data(), pair.gradA, pair.meanA, pair.varA, scale, rate, decay, fix1, fix2)
+				adamW(pair.b.data(), pair.gradB, pair.meanB, pair.varB, scale, rate, decay, fix1, fix2)
+			}
+			return none
+		}
+	}
+
+	// The tokens a mixture-of-experts layer sent to one expert while
+	// tuning, and that expert's values for them: its inputs, gate and up
+	// halves, their gated product and its output.
+	struct ExpertGroup {
+		expert int
+		tokens int[]
+		x      matrix<float32>
+		g      matrix<float32>
+		u      matrix<float32>
+		act    matrix<float32>
+		y      matrix<float32>
+	}
+
+	// How a feed-forward combines its gate and up halves: act(gate) · up
+	// with SiLU or GELU, or gpt-oss's clamped SwiGLU.
+	enum Gating {
+		Silu,
+		Gelu,
+		Clamped,
+	}
+
+	// (value, ∂value/∂gate, ∂value/∂up) of one gated pair.
+	def gated(g float32, u float32, gating Gating) (float32, float32, float32) {
+		if gating == Gating.Clamped {
+			// min(g, 7) · sigmoid(1.702 · min(g, 7)) · (clamp(u, ±7) + 1)
+			let limited = float(g.min(float32(7)))
+			let s = 1.0 / (1.0 + math.E ** (-1.702 * limited))
+			let up = float(u.clamp(float32(-7), float32(7))) + 1.0
+			let a = limited * s
+			let dg = g < float32(7) ?? ((s + 1.702 * limited * s * (1.0 - s)) * up, 0.0)
+			let du = u > float32(-7) && u < float32(7) ?? (a, 0.0)
+			return (float32(a * up), float32(dg), float32(du))
+		}
+		let (a, slope) = activation(g, gating == Gating.Gelu)
+		return (a * u, slope * u, a)
+	}
+
+	// Back through gated products: dg holds the gradient of the products
+	// (first `width` columns of each row of g) and leaves with the gate
+	// halves'; du gets the up halves'.
+	def activationBack(g matrix<float32>, u matrix<float32>, dg matrix<float32>, du matrix<float32>, width int, gating Gating) {
+		for let i = 0; i < g.rows; i++ {
+			let gr = g.row(i)
+			let ur = u.row(i)
+			let dgr = dg.row(i)
+			let dur = du.row(i)
+			for let j = 0; j < width; j++ {
+				let (_, sg, su) = gated(gr[j], ur[j], gating)
+				dur[j] = dgr[j] * su
+				dgr[j] = dgr[j] * sg
+			}
+		}
+	}
+
+	// `m` when it has `rows` × `cols` cells, else a new matrix of that shape.
+	def sized(m matrix<float32>, rows int, cols int) matrix<float32> {
+		return m.rows == rows && m.cols == cols ?? (m, matrix<float32>[].size(rows, cols))
+	}
+
+	// w times each row of `from` into `to`, through float tiles (see
+	// multiplyTiled) from `tiledRows` rows on.
+	def times(w Weights, from matrix<float32>, to matrix<float32>) {
+		if from.rows >= tiledRows {
+			multiplyTiled(w, from, to)
+		} else {
+			w.multiply(from, to)
+		}
+	}
+
+	// Every cell of `m` set to 0.
+	def clear(m matrix<float32>) {
+		let data = m.data()
+		clearRange(data, 0, data.len())
+	}
+
+	// The matrix `held` holds for `key`; an empty one when it holds none.
+	def heldBy(held map<int, matrix<float32>>, key int) matrix<float32> {
+		let m = held.get(key)
+		return m is none ?? (matrix<float32>[], m)
+	}
+
+	// ln Σ exp(x).
+	def logSumExp(x float32[]) float {
+		let n = x.len()
+		let top = x[0]
+		for let i = 1; i < n; i++ {
+			top = top.max(x[i])
+		}
+		let vt = simd.splat8<float32>(top)
+		let acc = simd.splat8<float32>(float32(0))
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			acc = acc + simd.exp(simd.load8<float32>(x, i) - vt)
+		}
+		let total = float(simd.sum(acc))
+		for; i < n; i++ {
+			total += float(float32(math.E) ** (x[i] - top))
+		}
+		return float(top) + math.ln(total)
+	}
+
+	// x = exp(x − shift) in place.
+	def expShift(x float32[], shift float32) {
+		let n = x.len()
+		let vs = simd.splat8<float32>(shift)
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(x, i, simd.exp(simd.load8<float32>(x, i) - vs))
+		}
+		for; i < n; i++ {
+			x[i] = float32(math.E) ** (x[i] - shift)
+		}
+	}
+
+	// Token i's picks from its router logits (the router bias added), as
+	// ForwardState.mixExperts makes them, into picked and weights from
+	// i · used on: with `pickFirst` the best logits, weighted by their
+	// softmax; else the best of the logits' softmax (into `probs`; the
+	// logits themselves otherwise), weighted by their share of the picked
+	// ones' sum, which totals[i] keeps (clamped as mixExperts clamps it).
+	def routeToken(logits float32[], probs float32[], i int, used int, pickFirst bool, picked int[], weights float32[], totals float32[]) {
+		copyInto(logits, probs)
+		if pickFirst {
+			let best = topCandidates(logits, used)
+			let ws float32[]
+			for let (_, ex) in best {
+				ws.push(logits[ex])
+			}
+			softmax(ws)
+			for let k = 0; k < used; k++ {
+				picked[i * used + k] = best[k]
+				weights[i * used + k] = ws[k]
+			}
+			return
+		}
+		softmax(probs)
+		let best = topCandidates(probs, used)
+		let total = float32(0)
+		for let (_, ex) in best {
+			total += probs[ex]
+		}
+		total = total.max(float32(0.00006103515625))
+		totals[i] = total
+		for let k = 0; k < used; k++ {
+			picked[i * used + k] = best[k]
+			weights[i * used + k] = probs[best[k]] / total
+		}
+	}
+
+	// Token i's row of the router logits' gradient from its picks'
+	// weight gradients dw (see routeToken): through the picked weights'
+	// softmax, or their share of the picked sum and the logits' softmax.
+	def routeBack(i int, used int, pickFirst bool, picked int[], weights float32[], dw float32[], probs float32[], total float32, row float32[]) {
+		let sum = float32(0)
+		for let k = 0; k < used; k++ {
+			sum += weights[i * used + k] * dw[i * used + k]
+		}
+		if pickFirst {
+			for let k = 0; k < used; k++ {
+				row[picked[i * used + k]] = weights[i * used + k] * (dw[i * used + k] - sum)
+			}
+			return
+		}
+		let count = probs.len()
+		let clamped = total == float32(0.00006103515625)
+		// The gradient of each picked probability, then the softmax's.
+		let dp float32[]
+		dp.len(count)
+		for let k = 0; k < used; k++ {
+			dp[picked[i * used + k]] = (clamped ?? (dw[i * used + k], dw[i * used + k] - sum)) / total
+		}
+		let along = float32(0)
+		for let c = 0; c < count; c++ {
+			along += probs[c] * dp[c]
+		}
+		for let c = 0; c < count; c++ {
+			row[c] = probs[c] * (dp[c] - along)
+		}
+	}
+
+	// (act(x), act'(x)) for SiLU, or GELU in its tanh form.
+	def activation(x float32, gelu bool) (float32, float32) {
+		if gelu {
+			let k = 0.7978845608028654
+			let c = 0.044715
+			let v = float(x)
+			let t = math.tanh(k * (v + c * v * v * v))
+			return (float32(0.5 * v * (1.0 + t)), float32(0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * k * (1.0 + 3.0 * c * v * v)))
+		}
+		let s = 1.0 / (1.0 + math.E ** (-float(x)))
+		return (float32(float(x) * s), float32(s * (1.0 + float(x) * (1.0 - s))))
+	}
+
+	// into[from…from+n] += the gradient of x = values[from…from+n] through
+	// y = x / √(Σx² + eps) given y's gradient dy[from…]: r·dy − x·r³·(x·dy).
+	def l2Back(values float32[], from int, n int, eps float32, dy float32[], into float32[]) {
+		let squares = 0.0
+		let along = 0.0
+		for let i = from; i < from + n; i++ {
+			squares += float(values[i]) * float(values[i])
+			along += float(values[i]) * float(dy[i])
+		}
+		let r = 1.0 / (squares + float(eps)) ** 0.5
+		let c = float32(r * r * r * along)
+		let rs = float32(r)
+		for let i = from; i < from + n; i++ {
+			into[i] += rs * dy[i] - c * values[i]
+		}
+	}
+
+	// into += the gradient of x through y = rmsNorm(x, w) given y's
+	// gradient dy: r·w·dy − x·r³·Σ(w·dy·x)/n, r = 1/rms(x).
+	def rmsBack(x float32[], w float32[], eps float32, dy float32[], into float32[]) {
+		let n = dy.len().min(w.len())
+		let squares = 0.0
+		let weighted = 0.0
+		for let i = 0; i < n; i++ {
+			squares += float(x[i]) * float(x[i])
+			weighted += float(w[i]) * float(dy[i]) * float(x[i])
+		}
+		let r = 1.0 / math.sqrt(squares / float(n) + float(eps))
+		let c = float32(r * r * r * weighted / float(n))
+		let rs = float32(r)
+		for let i = 0; i < n; i++ {
+			into[i] += rs * w[i] * dy[i] - c * x[i]
+		}
+	}
+
+	// `to` += every adapter of `list` on the first n rows of `from`.
+	def adaptList(list Adapted[], from matrix<float32>, to matrix<float32>, n int, rows int) {
+		for let (_, adapted) in list {
+			applyPair(adapted, from, to, n, rows)
+		}
+	}
+
+	// Back through the adapters of `layer`'s `slot` (see adaptListBack).
+	def adaptBack(layer Layer, slot int, x matrix<float32>, dy matrix<float32>, dx matrix<float32>, n int, rows int) {
+		return unless slot < layer.adapters.len()
+		adaptListBack(layer.adapters[slot], x, dy, dx, n, rows)
+	}
+
+	// Back through `list`, given the input x of the multiply they add to
+	// and the gradient dy of its output (first `rows` columns, n rows):
+	// the gradient through each pair is added to dx, and a pair being
+	// trained adds the gradients of its A and B to theirs.
+	def adaptListBack(list Adapted[], x matrix<float32>, dy matrix<float32>, dx matrix<float32>, n int, rows int) {
+		for let (_, adapted) in list {
+			let pair = adapted.pair
+			let r = pair.rank
+			let cols = pair.a.cols
+			let b = pair.b.data()
+			let a = pair.a.data()
+			let ao = adapted.aFrom * cols
+			let dlow float32[]
+			dlow.len(n * r)
+			gemm(n, r, rows, pair.scale, dy.data(), 0, dy.cols, false, b, adapted.from * r, r, false, float32(0), dlow, 0, r)
+			if pair.gradA.len() > 0 {
+				let low float32[]
+				low.len(n * r)
+				gemm(n, r, cols, float32(1), x.data(), 0, x.cols, false, a, ao, cols, true, float32(0), low, 0, r)
+				gemm(rows, r, n, pair.scale, dy.data(), 0, dy.cols, true, low, 0, r, false, float32(1), pair.gradB, adapted.from * r, r)
+				gemm(r, cols, n, float32(1), dlow, 0, r, true, x.data(), 0, x.cols, false, float32(1), pair.gradA, ao, cols)
+			}
+			gemm(n, cols, r, float32(1), dlow, 0, r, false, a, ao, cols, false, float32(1), dx.data(), 0, dx.cols)
+		}
+	}
+
+	def sumSquares(values float32[]) float {
+		let sum = 0.0
+		for let (_, v) in values {
+			sum += float(v) * float(v)
+		}
+		return sum
+	}
+
+	// One AdamW update of `values` from `grads` (times `scale`), with the
+	// moments `mean` and `variance` and their bias corrections.
+	def adamW(values float32[], grads float32[], mean float32[], variance float32[], scale float, rate float, decay float, fix1 float, fix2 float) {
+		for let i = 0; i < values.len(); i++ {
+			let gr = float(grads[i]) * scale
+			let m = 0.9 * float(mean[i]) + 0.1 * gr
+			let s = 0.999 * float(variance[i]) + 0.001 * gr * gr
+			mean[i] = float32(m)
+			variance[i] = float32(s)
+			let w = float(values[i])
+			values[i] = float32(w - rate * ((m / fix1) / (math.sqrt(s / fix2) + 1e-8) + decay * w))
+		}
+	}
+}

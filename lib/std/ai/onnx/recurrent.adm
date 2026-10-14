@@ -1,0 +1,1761 @@
+partial module std.ai.onnx {
+	use (
+		std.ai.tensor.gemm::*
+		std.simd
+		std.math
+		std.formats.ai.onnx::(ElementType, Attribute)
+		std.ai.tensor::(Tensor, storageOf, Storage, bfloatBits)
+	)
+
+	// Runs the recurrent (RNN, GRU, LSTM) and attention operators; false for an operator this family does not have.
+	// Fails when the operator fails on its inputs.
+	internal def applyRecurrent(c Call) !bool {
+		match c.step.op {
+			case "RNN":
+				try recurrent(c, RecCell.Rnn)
+			case "GRU":
+				try recurrent(c, RecCell.Gru)
+			case "LSTM":
+				try recurrent(c, RecCell.Lstm)
+			case "Attention":
+				try attention(c)
+			case "RotaryEmbedding":
+				try rotaryEmbedding(c)
+			case "LinearAttention":
+				try linearAttention(c)
+			case "SwiGLU":
+				try swiglu(c)
+			default:
+				return false
+		}
+		return true
+	}
+
+	// Fails unless `t` holds floating-point values: float32 storage, or
+	// Double when `double` allows it.
+	internal def recFloatInput(c Call, t Tensor, double bool) !none {
+		let s = storageOf(t.element)
+		fail c.about() + "takes floating-point tensors, not {t.element.name}" unless s == Storage.Floats || (double && s == Storage.Doubles)
+		return none
+	}
+
+	// Runs `block(from, n)` over 0..total in one piece, or in pieces on
+	// several tasks when total / perTask allows.
+	internal def recSplit(total int, perTask int, block def(int, int)) {
+		let tasks = (total / perTask.max(1)).clamp(1, 32)
+		if tasks == 1 {
+			block(0, total)
+			return
+		}
+		forall let t in 0..tasks {
+			let from = total * t / tasks
+			block(from, total * (t + 1) / tasks - from)
+		}
+	}
+
+	// to[to0 + i] = from[from0 + i] for i < n.
+	internal def recCopy(from float32[], from0 int, to float32[], to0 int, n int) {
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(to, to0 + i, simd.load8<float32>(from, from0 + i))
+		}
+		for; i < n; i++ {
+			to[to0 + i] = from[from0 + i]
+		}
+	}
+
+	// out[oo + i] = a[ao + i] + bias[i] for i < n.
+	internal def recAddRow(a float32[], ao int, bias float32[], out float32[], oo int, n int) {
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(out, oo + i, simd.load8<float32>(a, ao + i) + simd.load8<float32>(bias, i))
+		}
+		for; i < n; i++ {
+			out[oo + i] = a[ao + i] + bias[i]
+		}
+	}
+
+	// out[oo + i] = a[ao + i] · b[bo + i] for i < n.
+	internal def recMul(a float32[], ao int, b float32[], bo int, out float32[], oo int, n int) {
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(out, oo + i, simd.load8<float32>(a, ao + i) * simd.load8<float32>(b, bo + i))
+		}
+		for; i < n; i++ {
+			out[oo + i] = a[ao + i] * b[bo + i]
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// RNN, GRU, LSTM
+	// ---------------------------------------------------------------
+
+	// The cells of the recurrent operators.
+	internal enum RecCell {
+		Rnn,
+		Gru,
+		Lstm,
+	}
+
+	// An activation function of a recurrent cell: an elementwise function
+	// with its parameters, or Affine (alpha·x + beta) or ScaledTanh
+	// (alpha·tanh(beta·x)).
+	internal struct RecAct {
+		fn     Unary
+		affine bool
+		scaled bool
+		alpha  float32
+		beta   float32
+	}
+
+	// Everything a direction of a recurrent operator reads and writes.
+	internal struct RecPlan {
+		cell        RecCell
+		seq         int
+		batch       int
+		input       int
+		hidden      int
+		gates       int
+		dirs        int
+		layout      int
+		reverse     bool
+		lbr         bool
+		inputForget bool
+		clip        float32
+		acts        RecAct[]
+		perDir      int
+		lens        int[]
+		x           Tensor
+		w           Tensor
+		r           Tensor
+		b           ?Tensor
+		h0          ?Tensor
+		c0          ?Tensor
+		p           ?Tensor
+		y           Tensor
+		yh          Tensor
+		yc          Tensor
+	}
+
+	// RNN, GRU and LSTM, every version: directions forward, reverse and
+	// bidirectional, sequence lengths, layouts 0 and 1, initial states,
+	// the activations named by `activations` (with `activation_alpha` and
+	// `activation_beta`), `clip`, GRU's `linear_before_reset`, LSTM's
+	// peepholes and `input_forget`. A batch entry's steps past its
+	// sequence length leave Y zero and its state as it was.
+	// Fails when an input has the wrong type or shape, or an attribute an
+	// unknown value.
+	internal def recurrent(c Call, cell RecCell) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(1)
+		let r = try c.tensor(2)
+		try recFloatInput(c, x, true)
+		fail c.about() + "X, W and R must have one type" unless w.element == x.element && r.element == x.element
+		fail c.about() + "X, W and R must be 3-D" unless x.rank() == 3 && w.rank() == 3 && r.rank() == 3
+		let direction = c.text("direction", "forward")
+		fail c.about() + "unknown direction {direction}" unless direction := "forward" || "reverse" || "bidirectional"
+		let dirs = direction == "bidirectional" ?? (2, 1)
+		fail c.about() + "W has {w.shape[0]} directions, {direction} needs {dirs}" unless w.shape[0] == dirs && r.shape[0] == dirs
+		let layout = c.int("layout", 0)
+		let seq = layout == 0 ?? (x.shape[0], x.shape[1])
+		let batch = layout == 0 ?? (x.shape[1], x.shape[0])
+		let hidden = r.shape[2]
+		let gates = cell == RecCell.Rnn ?? (1, cell == RecCell.Gru ?? (3, 4))
+		fail c.about() + "W is {w.shape}, expected [{dirs}, {gates * hidden}, {x.shape[2]}]" unless w.shape[1] == gates * hidden && w.shape[2] == x.shape[2]
+		fail c.about() + "R is {r.shape}, expected [{dirs}, {gates * hidden}, {hidden}]" unless r.shape[1] == gates * hidden
+		let lens int[]
+		if c.has(4) {
+			lens = try c.ints(4)
+			fail c.about() + "sequence_lens has {lens.len()} values for a batch of {batch}" unless lens.len() == batch
+			for let i = 0; i < batch; i++ {
+				fail c.about() + "sequence length {lens[i]} is outside 0..{seq}" unless lens[i] >= 0 && lens[i] <= seq
+			}
+		} else {
+			for let i = 0; i < batch; i++ {
+				lens.push(seq)
+			}
+		}
+		let stateShape = layout == 0 ?? (int[dirs, batch, hidden], int[batch, dirs, hidden])
+		let plan = RecPlan{cell: cell, seq: seq, batch: batch, input: x.shape[2], hidden: hidden, gates: gates, dirs: dirs, layout: layout, lens: lens, x: x, w: w, r: r}
+		plan.reverse = direction == "reverse"
+		plan.lbr = cell == RecCell.Gru && c.int("linear_before_reset", 0) != 0
+		plan.inputForget = cell == RecCell.Lstm && c.int("input_forget", 0) != 0
+		let clip = c.attribute("clip")
+		plan.clip = clip is Attribute ?? (clip.f, float32(1.0 / 0.0))
+		plan.perDir = cell == RecCell.Rnn ?? (1, cell == RecCell.Gru ?? (2, 3))
+		plan.acts = try recActs(c, cell, plan.perDir, dirs)
+		if c.has(3) {
+			let b = try c.tensor(3)
+			fail c.about() + "B is {b.shape}, expected [{dirs}, {2 * gates * hidden}]" unless b.count() == dirs * 2 * gates * hidden && b.element == x.element
+			plan.b = b
+		}
+		if c.has(5) {
+			let h0 = try c.tensor(5)
+			fail c.about() + "initial_h is {h0.shape}, expected {stateShape}" unless h0.count() == dirs * batch * hidden && h0.element == x.element
+			plan.h0 = h0
+		}
+		if cell == RecCell.Lstm {
+			if c.has(6) {
+				let c0 = try c.tensor(6)
+				fail c.about() + "initial_c is {c0.shape}, expected {stateShape}" unless c0.count() == dirs * batch * hidden && c0.element == x.element
+				plan.c0 = c0
+			}
+			if c.has(7) {
+				let p = try c.tensor(7)
+				fail c.about() + "P is {p.shape}, expected [{dirs}, {3 * hidden}]" unless p.count() == dirs * 3 * hidden && p.element == x.element
+				plan.p = p
+			}
+		}
+		plan.y = zerosLike(x.element, layout == 0 ?? (int[seq, dirs, batch, hidden], int[batch, seq, dirs, hidden]))
+		plan.yh = zerosLike(x.element, stateShape)
+		plan.yc = zerosLike(x.element, stateShape)
+		let doubles = storageOf(x.element) == Storage.Doubles
+		if dirs == 1 {
+			if doubles {
+				recDirectionDoubles(plan, 0)
+			} else {
+				recDirection(plan, 0)
+			}
+		} else {
+			forall let d in 0..2 {
+				if doubles {
+					recDirectionDoubles(plan, d)
+				} else {
+					recDirection(plan, d)
+				}
+			}
+		}
+		roundTo(plan.y)
+		roundTo(plan.yh)
+		roundTo(plan.yc)
+		c.out(0, plan.y)
+		c.out(1, plan.yh)
+		c.out(2, plan.yc) when cell == RecCell.Lstm
+		return none
+	}
+
+	// The activation functions of every direction (`per` each), from the
+	// `activations`, `activation_alpha` and `activation_beta` attributes:
+	// the alpha and beta values are taken in order by the functions that
+	// use them, the ONNX operators' defaults once a list runs out.
+	// Fails for an unknown function or a list of the wrong length.
+	internal def recActs(c Call, cell RecCell, per int, dirs int) !RecAct[] {
+		let names string[]
+		let a = c.attribute("activations")
+		if a is Attribute {
+			for let (_, s) in a.strings {
+				names.push(string(s))
+			}
+		}
+		if names.len() == 0 {
+			for let d = 0; d < dirs; d++ {
+				match cell {
+					case RecCell.Rnn:
+						names.push("Tanh")
+					case RecCell.Gru:
+						names.push("Sigmoid", "Tanh")
+					default:
+						names.push("Sigmoid", "Tanh", "Tanh")
+				}
+			}
+		}
+		// One direction's list serves both directions.
+		if names.len() == per && dirs == 2 {
+			for let i = 0; i < per; i++ {
+				names.push(names[i])
+			}
+		}
+		fail c.about() + "{names.len()} activations, expected {per * dirs}" unless names.len() == per * dirs
+		let alphas = c.floats("activation_alpha", float32[])
+		let betas = c.floats("activation_beta", float32[])
+		let (ai, bi) = (0, 0)
+		let acts RecAct[]
+		for let (_, name) in names {
+			let act = RecAct{fn: Unary.Tanh, alpha: float32(0), beta: float32(0)}
+			let (usesAlpha, usesBeta) = (false, false)
+			match name.lower() {
+				case "relu":
+					act.fn = Unary.Relu
+				case "tanh":
+					act.fn = Unary.Tanh
+				case "sigmoid":
+					act.fn = Unary.Sigmoid
+				case "affine":
+					act.affine = true
+					(act.alpha, act.beta) = (float32(1), float32(0))
+					(usesAlpha, usesBeta) = (true, true)
+				case "leakyrelu":
+					act.fn = Unary.LeakyRelu
+					act.alpha = float32(0.01)
+					usesAlpha = true
+				case "thresholdedrelu":
+					act.fn = Unary.ThresholdedRelu
+					act.alpha = float32(1)
+					usesAlpha = true
+				case "scaledtanh":
+					act.scaled = true
+					(act.alpha, act.beta) = (float32(1), float32(1))
+					(usesAlpha, usesBeta) = (true, true)
+				case "hardsigmoid":
+					act.fn = Unary.HardSigmoid
+					(act.alpha, act.beta) = (float32(0.2), float32(0.5))
+					(usesAlpha, usesBeta) = (true, true)
+				case "elu":
+					act.fn = Unary.Elu
+					act.alpha = float32(1)
+					usesAlpha = true
+				case "softsign":
+					act.fn = Unary.Softsign
+				case "softplus":
+					act.fn = Unary.Softplus
+				default:
+					fail c.about() + "unknown activation {name}"
+			}
+			if usesAlpha && ai < alphas.len() {
+				act.alpha = alphas[ai]
+				ai++
+			}
+			if usesBeta && bi < betas.len() {
+				act.beta = betas[bi]
+				bi++
+			}
+			acts.push(act)
+		}
+		return acts
+	}
+
+	// `act` on n values of x from `from`, in place, the inputs first held
+	// within ±clip (an infinite clip does not clip).
+	internal def recApply(act RecAct, x float32[], from int, n int, clip float32) {
+		let end = from + n
+		if clip < float32(1.0 / 0.0) {
+			let lo = simd.splat8<float32>(-clip)
+			let hi = simd.splat8<float32>(clip)
+			let i = from
+			for; i + 8 <= end; i += 8 {
+				simd.store8<float32>(x, i, simd.clamp(simd.load8<float32>(x, i), lo, hi))
+			}
+			for; i < end; i++ {
+				x[i] = x[i].clamp(-clip, clip)
+			}
+		}
+		if act.affine || act.scaled {
+			// Affine: alpha·x + beta; ScaledTanh: beta·x first.
+			let m = simd.splat8<float32>(act.affine ?? (act.alpha, act.beta))
+			let add = simd.splat8<float32>(act.affine ?? (act.beta, float32(0)))
+			let i = from
+			for; i + 8 <= end; i += 8 {
+				simd.store8<float32>(x, i, simd.fma(simd.load8<float32>(x, i), m, add))
+			}
+			for; i < end; i++ {
+				x[i] = act.affine ?? (x[i] * act.alpha + act.beta, x[i] * act.beta)
+			}
+			return when act.affine
+		}
+		unaryFloats(act.scaled ?? (Unary.Tanh, act.fn), UnaryParams{alpha: act.alpha, beta: act.beta}, x, x, from, n)
+		if act.scaled {
+			let m = simd.splat8<float32>(act.alpha)
+			let i = from
+			for; i + 8 <= end; i += 8 {
+				simd.store8<float32>(x, i, simd.load8<float32>(x, i) * m)
+			}
+			for; i < end; i++ {
+				x[i] *= act.alpha
+			}
+		}
+	}
+
+	// `act` on one double, clipped first as recApply does.
+	internal def recApplyDouble(act RecAct, v float, clip float32) float {
+		let x = clip < float32(1.0 / 0.0) ?? (v.clamp(-float(clip), float(clip)), v)
+		return float(act.alpha) * x + float(act.beta) when act.affine
+		return float(act.alpha) * math.tanh(float(act.beta) * x) when act.scaled
+		return unaryDouble(act.fn, UnaryParams{alpha: act.alpha, beta: act.beta}, x)
+	}
+
+	// Offset of the state of direction d, batch b in initial_h, Y_h, Y_c.
+	internal def recStateAt(p RecPlan, d int, b int) int {
+		return p.layout == 0 ?? ((d * p.batch + b) * p.hidden, (b * p.dirs + d) * p.hidden)
+	}
+
+	// Offset of Y's row for step t, direction d, batch b.
+	internal def recOutputAt(p RecPlan, t int, d int, b int) int {
+		return p.layout == 0 ?? (((t * p.dirs + d) * p.batch + b) * p.hidden, ((b * p.seq + t) * p.dirs + d) * p.hidden)
+	}
+
+	// The row of X (and of X·Wᵀ) holding step t of batch b.
+	internal def recInputRow(p RecPlan, t int, b int) int {
+		return p.layout == 0 ?? (t * p.batch + b, b * p.seq + t)
+	}
+
+	// Runs direction d of a recurrent operator on float32 values: X·Wᵀ of
+	// every step in one product, then per step the batch's H·Rᵀ in one
+	// product and the gates row by row.
+	internal def recDirection(p RecPlan, d int) {
+		let (seq, batch, input, hidden) = (p.seq, p.batch, p.input, p.hidden)
+		let gh = p.gates * hidden
+		let reverse = p.reverse || d == 1
+		let one = float32(1)
+		let zero = float32(0)
+		let xw float32[]
+		xw.len(seq * batch * gh)
+		gemm(seq * batch, gh, input, one, p.x.floats, 0, input, false, p.w.floats, d * gh * input, input, true, zero, xw, 0, gh)
+		// Rᵀ, hidden × gh, so each step's product reads it along rows.
+		let rt = transposed(p.r.floats, d * gh * hidden, hidden, gh, hidden)
+		// Wb + Rb per gate; GRU with linear_before_reset keeps Rbh apart.
+		let bias float32[]
+		bias.len(gh)
+		let rbh float32[]
+		rbh.len(hidden)
+		let bt = p.b
+		if bt is Tensor {
+			let base = d * 2 * gh
+			for let g = 0; g < gh; g++ {
+				let (wb, rb) = (bt.floats[base + g], bt.floats[base + gh + g])
+				if p.lbr && g >= 2 * hidden {
+					bias[g] = wb
+					rbh[g - 2 * hidden] = rb
+				} else {
+					bias[g] = wb + rb
+				}
+			}
+		}
+		let peep float32[]
+		let pt = p.p
+		peep = pt.floats[d * 3 * hidden:(d + 1) * 3 * hidden].clone() when pt is Tensor
+		let h float32[]
+		h.len(batch * hidden)
+		let cs float32[]
+		cs.len(batch * hidden)
+		let h0 = p.h0
+		let c0 = p.c0
+		for let b = 0; b < batch; b++ {
+			let at = recStateAt(p, d, b)
+			recCopy(h0.floats, at, h, b * hidden, hidden) when h0 is Tensor
+			recCopy(c0.floats, at, cs, b * hidden, hidden) when c0 is Tensor
+		}
+		let gt float32[]
+		gt.len(batch * gh)
+		let hn float32[]
+		hn.len(batch * hidden)
+		let cn float32[]
+		cn.len(batch * hidden)
+		let scratch float32[]
+		scratch.len(batch * hidden)
+		let acts = p.acts
+		let a0 = d * p.perDir
+		for let k = 0; k < seq; k++ {
+			for let b = 0; b < batch; b++ {
+				continue unless k < p.lens[b]
+				let t = reverse ?? (p.lens[b] - 1 - k, k)
+				recAddRow(xw, recInputRow(p, t, b) * gh, bias, gt, b * gh, gh)
+			}
+			match p.cell {
+				case RecCell.Rnn:
+					gemm(batch, gh, hidden, one, h, 0, hidden, false, rt, 0, gh, false, one, gt, 0, gh)
+					for let b = 0; b < batch; b++ {
+						continue unless k < p.lens[b]
+						recApply(acts[a0], gt, b * gh, hidden, p.clip)
+						recCopy(gt, b * gh, hn, b * hidden, hidden)
+					}
+				case RecCell.Gru:
+					// z and r: X·Wᵀ + H·Rᵀ + biases.
+					gemm(batch, 2 * hidden, hidden, one, h, 0, hidden, false, rt, 0, gh, false, one, gt, 0, gh)
+					for let b = 0; b < batch; b++ {
+						continue unless k < p.lens[b]
+						recApply(acts[a0], gt, b * gh, 2 * hidden, p.clip)
+					}
+					if p.lbr {
+						gemm(batch, hidden, hidden, one, h, 0, hidden, false, rt, 2 * hidden, gh, false, zero, scratch, 0, hidden)
+						for let b = 0; b < batch; b++ {
+							continue unless k < p.lens[b]
+							recGruLinear(gt, b * gh, hidden, scratch, b * hidden, rbh)
+						}
+					} else {
+						for let b = 0; b < batch; b++ {
+							recMul(gt, b * gh + hidden, h, b * hidden, scratch, b * hidden, hidden)
+						}
+						gemm(batch, hidden, hidden, one, scratch, 0, hidden, false, rt, 2 * hidden, gh, false, one, gt, 2 * hidden, gh)
+					}
+					for let b = 0; b < batch; b++ {
+						continue unless k < p.lens[b]
+						recApply(acts[a0 + 1], gt, b * gh + 2 * hidden, hidden, p.clip)
+						recGruState(gt, b * gh, hidden, h, b * hidden, hn)
+					}
+				default:
+					gemm(batch, gh, hidden, one, h, 0, hidden, false, rt, 0, gh, false, one, gt, 0, gh)
+					for let b = 0; b < batch; b++ {
+						continue unless k < p.lens[b]
+						recLstmRow(gt, b * gh, hidden, cs, b * hidden, peep, hn, cn, acts[a0], acts[a0 + 1], acts[a0 + 2], p.clip, p.inputForget)
+					}
+			}
+			for let b = 0; b < batch; b++ {
+				continue unless k < p.lens[b]
+				let t = reverse ?? (p.lens[b] - 1 - k, k)
+				recCopy(hn, b * hidden, h, b * hidden, hidden)
+				recCopy(hn, b * hidden, p.y.floats, recOutputAt(p, t, d, b), hidden)
+				recCopy(cn, b * hidden, cs, b * hidden, hidden) when p.cell == RecCell.Lstm
+			}
+		}
+		for let b = 0; b < batch; b++ {
+			let at = recStateAt(p, d, b)
+			recCopy(h, b * hidden, p.yh.floats, at, hidden)
+			recCopy(cs, b * hidden, p.yc.floats, at, hidden) when p.cell == RecCell.Lstm
+		}
+	}
+
+	// GRU with linear_before_reset: the h gate's input (X·Whᵀ + Wbh, at
+	// go + 2·hidden) gains r · (H·Rhᵀ + Rbh).
+	internal def recGruLinear(g float32[], go int, hidden int, hr float32[], ho int, rbh float32[]) {
+		let (r, hh) = (go + hidden, go + 2 * hidden)
+		let i = 0
+		for; i + 8 <= hidden; i += 8 {
+			let v = simd.load8<float32>(hr, ho + i) + simd.load8<float32>(rbh, i)
+			simd.store8<float32>(g, hh + i, simd.fma(simd.load8<float32>(g, r + i), v, simd.load8<float32>(g, hh + i)))
+		}
+		for; i < hidden; i++ {
+			g[hh + i] += g[r + i] * (hr[ho + i] + rbh[i])
+		}
+	}
+
+	// GRU's new state: (1 − z) · h̃ + z · H.
+	internal def recGruState(g float32[], go int, hidden int, h float32[], ho int, out float32[]) {
+		let hh = go + 2 * hidden
+		let one = simd.splat8<float32>(float32(1))
+		let i = 0
+		for; i + 8 <= hidden; i += 8 {
+			let z = simd.load8<float32>(g, go + i)
+			simd.store8<float32>(out, ho + i, (one - z) * simd.load8<float32>(g, hh + i) + z * simd.load8<float32>(h, ho + i))
+		}
+		for; i < hidden; i++ {
+			let z = g[go + i]
+			out[ho + i] = (float32(1) - z) * g[hh + i] + z * h[ho + i]
+		}
+	}
+
+	// One LSTM row: gates i, o, f, c at g[go..], the previous cell at
+	// cs[so..]; writes the new hidden state and cell to hn and cn at so.
+	internal def recLstmRow(g float32[], go int, hidden int, cs float32[], so int, peep float32[], hn float32[], cn float32[], f RecAct, gAct RecAct, hAct RecAct, clip float32, inputForget bool) {
+		let (gi, gOut, gf, gc) = (go, go + hidden, go + 2 * hidden, go + 3 * hidden)
+		let peepholes = peep.len() > 0
+		if peepholes {
+			let i = 0
+			for; i + 8 <= hidden; i += 8 {
+				let prev = simd.load8<float32>(cs, so + i)
+				simd.store8<float32>(g, gi + i, simd.fma(simd.load8<float32>(peep, i), prev, simd.load8<float32>(g, gi + i)))
+				simd.store8<float32>(g, gf + i, simd.fma(simd.load8<float32>(peep, 2 * hidden + i), prev, simd.load8<float32>(g, gf + i)))
+			}
+			for; i < hidden; i++ {
+				g[gi + i] += peep[i] * cs[so + i]
+				g[gf + i] += peep[2 * hidden + i] * cs[so + i]
+			}
+		}
+		recApply(f, g, gi, hidden, clip)
+		if inputForget {
+			let one = simd.splat8<float32>(float32(1))
+			let i = 0
+			for; i + 8 <= hidden; i += 8 {
+				simd.store8<float32>(g, gf + i, one - simd.load8<float32>(g, gi + i))
+			}
+			for; i < hidden; i++ {
+				g[gf + i] = float32(1) - g[gi + i]
+			}
+		} else {
+			recApply(f, g, gf, hidden, clip)
+		}
+		recApply(gAct, g, gc, hidden, clip)
+		let i = 0
+		for; i + 8 <= hidden; i += 8 {
+			let c = simd.fma(simd.load8<float32>(g, gf + i), simd.load8<float32>(cs, so + i), simd.load8<float32>(g, gi + i) * simd.load8<float32>(g, gc + i))
+			simd.store8<float32>(cn, so + i, c)
+			simd.store8<float32>(g, gOut + i, simd.fma(simd.load8<float32>(peep, hidden + i), c, simd.load8<float32>(g, gOut + i))) when peepholes
+		}
+		for; i < hidden; i++ {
+			let c = g[gf + i] * cs[so + i] + g[gi + i] * g[gc + i]
+			cn[so + i] = c
+			g[gOut + i] += peepholes ?? (peep[hidden + i] * c, float32(0))
+		}
+		recApply(f, g, gOut, hidden, clip)
+		recCopy(cn, so, hn, so, hidden)
+		recApply(hAct, hn, so, hidden, float32(1.0 / 0.0))
+		recMul(hn, so, g, gOut, hn, so, hidden)
+	}
+
+	// Runs direction d of a recurrent operator on Double values.
+	internal def recDirectionDoubles(p RecPlan, d int) {
+		let (seq, batch, input, hidden) = (p.seq, p.batch, p.input, p.hidden)
+		let gh = p.gates * hidden
+		let reverse = p.reverse || d == 1
+		let (x, w, r) = (p.x.doubles, p.w.doubles, p.r.doubles)
+		let (wo, ro) = (d * gh * input, d * gh * hidden)
+		let wb float[]
+		wb.len(gh)
+		let rb float[]
+		rb.len(gh)
+		let bt = p.b
+		if bt is Tensor {
+			for let g = 0; g < gh; g++ {
+				wb[g] = bt.doubles[d * 2 * gh + g]
+				rb[g] = bt.doubles[d * 2 * gh + gh + g]
+			}
+		}
+		let peep float[]
+		peep.len(3 * hidden)
+		let pt = p.p
+		if pt is Tensor {
+			for let j = 0; j < 3 * hidden; j++ {
+				peep[j] = pt.doubles[d * 3 * hidden + j]
+			}
+		}
+		let h float[]
+		h.len(batch * hidden)
+		let cs float[]
+		cs.len(batch * hidden)
+		let h0 = p.h0
+		let c0 = p.c0
+		for let b = 0; b < batch; b++ {
+			let at = recStateAt(p, d, b)
+			for let j = 0; j < hidden; j++ {
+				h[b * hidden + j] = h0 is Tensor ?? (h0.doubles[at + j], 0.0)
+				cs[b * hidden + j] = c0 is Tensor ?? (c0.doubles[at + j], 0.0)
+			}
+		}
+		let a0 = d * p.perDir
+		let f = p.acts[a0]
+		let gx float[]
+		gx.len(gh)
+		let gr float[]
+		gr.len(gh)
+		let hn float[]
+		hn.len(hidden)
+		let cn float[]
+		cn.len(hidden)
+		for let k = 0; k < seq; k++ {
+			for let b = 0; b < batch; b++ {
+				continue unless k < p.lens[b]
+				let t = reverse ?? (p.lens[b] - 1 - k, k)
+				let xo = recInputRow(p, t, b) * input
+				let ho = b * hidden
+				// X·Wᵀ + Wb and H·Rᵀ + Rb, per gate row.
+				for let g = 0; g < gh; g++ {
+					let acc = wb[g]
+					for let i = 0; i < input; i++ {
+						acc += x[xo + i] * w[wo + g * input + i]
+					}
+					gx[g] = acc
+					let rec = rb[g]
+					for let j = 0; j < hidden; j++ {
+						rec += h[ho + j] * r[ro + g * hidden + j]
+					}
+					gr[g] = rec
+				}
+				match p.cell {
+					case RecCell.Rnn:
+						for let j = 0; j < hidden; j++ {
+							hn[j] = recApplyDouble(f, gx[j] + gr[j], p.clip)
+						}
+					case RecCell.Gru:
+						let gAct = p.acts[a0 + 1]
+						// z into gx[0..hidden], r into gx[hidden..2·hidden].
+						for let j = 0; j < 2 * hidden; j++ {
+							gx[j] = recApplyDouble(f, gx[j] + gr[j], p.clip)
+						}
+						for let j = 0; j < hidden; j++ {
+							let pre = 0.0
+							if p.lbr {
+								pre = gx[2 * hidden + j] + gx[hidden + j] * gr[2 * hidden + j]
+							} else {
+								// (r ⊙ H)·Rhᵀ + Rbh.
+								let acc = rb[2 * hidden + j]
+								for let i = 0; i < hidden; i++ {
+									acc += gx[hidden + i] * h[ho + i] * r[ro + (2 * hidden + j) * hidden + i]
+								}
+								pre = gx[2 * hidden + j] + acc
+							}
+							let z = gx[j]
+							hn[j] = (1.0 - z) * recApplyDouble(gAct, pre, p.clip) + z * h[ho + j]
+						}
+					default:
+						let (gAct, hAct) = (p.acts[a0 + 1], p.acts[a0 + 2])
+						for let j = 0; j < hidden; j++ {
+							let prev = cs[ho + j]
+							let ig = recApplyDouble(f, gx[j] + gr[j] + peep[j] * prev, p.clip)
+							let fg = p.inputForget ?? (1.0 - ig, recApplyDouble(f, gx[2 * hidden + j] + gr[2 * hidden + j] + peep[2 * hidden + j] * prev, p.clip))
+							let cg = recApplyDouble(gAct, gx[3 * hidden + j] + gr[3 * hidden + j], p.clip)
+							let cell = fg * prev + ig * cg
+							let og = recApplyDouble(f, gx[hidden + j] + gr[hidden + j] + peep[hidden + j] * cell, p.clip)
+							hn[j] = og * recApplyDouble(hAct, cell, float32(1.0 / 0.0))
+							cn[j] = cell
+						}
+						for let j = 0; j < hidden; j++ {
+							cs[ho + j] = cn[j]
+						}
+				}
+				// Row b's state is read by row b only: update it in place.
+				let yo = recOutputAt(p, t, d, b)
+				for let j = 0; j < hidden; j++ {
+					h[ho + j] = hn[j]
+					p.y.doubles[yo + j] = hn[j]
+				}
+			}
+		}
+		for let b = 0; b < batch; b++ {
+			let at = recStateAt(p, d, b)
+			for let j = 0; j < hidden; j++ {
+				p.yh.doubles[at + j] = h[b * hidden + j]
+				p.yc.doubles[at + j] = cs[b * hidden + j] when p.cell == RecCell.Lstm
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// SwiGLU, CausalConvWithState, RotaryEmbedding
+	// ---------------------------------------------------------------
+
+	// SwiGLU: A · sigmoid(alpha · A) · B, A and B of one shape and type.
+	// A narrow float type rounds the sigmoid, the gate and the product as
+	// the operator's own type would.
+	// Fails when the inputs differ in shape or type.
+	internal def swiglu(c Call) !none {
+		let a = try c.tensor(0)
+		let b = try c.tensor(1)
+		try recFloatInput(c, a, true)
+		fail c.about() + "A is {a.element.name} {a.shape}, B {b.element.name} {b.shape}" unless a.element == b.element && a.shape.equals(b.shape)
+		let alpha = c.float("alpha", float32(1))
+		let out = zerosLike(a.element, a.shape)
+		let n = a.count()
+		if storageOf(a.element) == Storage.Doubles {
+			let al = float(alpha)
+			for let i = 0; i < n; i++ {
+				let x = a.doubles[i]
+				out.doubles[i] = x * (1.0 / (1.0 + math.E ** (-al * x))) * b.doubles[i]
+			}
+		} else if a.element == ElementType.Float {
+			recSplit(n, parallelFrom, def (from int, count int) {
+				swigluBlock(0, a.floats, b.floats, out.floats, alpha, from, count)
+			})
+		} else {
+			for let stage = 1; stage <= 3; stage++ {
+				recSplit(n, parallelFrom, def (from int, count int) {
+					swigluBlock(stage, a.floats, b.floats, out.floats, alpha, from, count)
+				})
+				roundTo(out)
+			}
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// One stage of SwiGLU on n values from `from`: 0 the whole product,
+	// 1 the sigmoid, 2 times A, 3 times B.
+	internal def swigluBlock(stage int, a float32[], b float32[], out float32[], alpha float32, from int, n int) {
+		let end = from + n
+		let one = simd.splat8<float32>(float32(1))
+		let zero = simd.splat8<float32>(float32(0))
+		let al = simd.splat8<float32>(alpha)
+		let i = from
+		for; i + 8 <= end; i += 8 {
+			let x = simd.load8<float32>(a, i)
+			let r = x
+			match stage {
+				case 0:
+					r = x * (one / (one + simd.exp(zero - al * x))) * simd.load8<float32>(b, i)
+				case 1:
+					r = one / (one + simd.exp(zero - al * x))
+				case 2:
+					r = x * simd.load8<float32>(out, i)
+				default:
+					r = simd.load8<float32>(out, i) * simd.load8<float32>(b, i)
+			}
+			simd.store8<float32>(out, i, r)
+		}
+		for; i < end; i++ {
+			let x = a[i]
+			let sig = float32(1.0 / (1.0 + math.E ** (-float(alpha) * float(x))))
+			match stage {
+				case 0:
+					out[i] = x * sig * b[i]
+				case 1:
+					out[i] = sig
+				case 2:
+					out[i] = x * out[i]
+				default:
+					out[i] = out[i] * b[i]
+			}
+		}
+	}
+
+	// RotaryEmbedding: rotates the first rotary_embedding_dim values of
+	// each head (all of them by default) by the cos and sin caches, at
+	// position_ids or at each token's own row of 3-D caches; halves or
+	// (interleaved) even and odd values are the two coordinates.
+	// Fails when the shapes do not fit.
+	internal def rotaryEmbedding(c Call) !none {
+		let x = try c.tensor(0)
+		let cos = try c.tensor(1)
+		let sin = try c.tensor(2)
+		try recFloatInput(c, x, false)
+		fail c.about() + "the caches must be of the input's type" unless cos.element == x.element && sin.element == x.element
+		fail c.about() + "input must be 3-D or 4-D, not {x.shape}" unless x.rank() == 3 || x.rank() == 4
+		let rank3 = x.rank() == 3
+		let batch = x.shape[0]
+		let heads = rank3 ?? (c.int("num_heads", 0), x.shape[1])
+		fail c.about() + "a 3-D input needs num_heads dividing {x.shape[2]}" unless heads > 0 && (!rank3 || x.shape[2] % heads == 0)
+		let seq = rank3 ?? (x.shape[1], x.shape[2])
+		let head = rank3 ?? (x.shape[2] / heads, x.shape[3])
+		let rd = c.int("rotary_embedding_dim", 0)
+		rd = head when rd == 0
+		fail c.about() + "rotary_embedding_dim {rd} must be even and at most {head}" unless rd % 2 == 0 && rd <= head && rd > 0
+		let half = rd / 2
+		let interleaved = c.int("interleaved", 0) != 0
+		fail c.about() + "the caches' last dimension is {cos.shape[cos.rank() - 1]}, expected {half}" unless cos.shape[cos.rank() - 1] == half && sin.count() == cos.count()
+		let positions int[]
+		if c.has(3) {
+			positions = try c.ints(3)
+			fail c.about() + "position_ids has {positions.len()} values, expected {batch * seq}" unless positions.len() == batch * seq
+			let limit = cos.count() / half
+			for let (_, p) in positions {
+				fail c.about() + "position {p} is outside the caches' {limit} rows" unless p >= 0 && p < limit
+			}
+		} else {
+			fail c.about() + "without position_ids the caches must be [{batch}, {seq}, {half}]" unless cos.count() == batch * seq * half
+		}
+		let out = zerosLike(x.element, x.shape)
+		out.floats = x.floats.clone()
+		recSplit(batch * seq * heads, parallelFrom / head.max(1), def (from int, n int) {
+			for let row = from; row < from + n; row++ {
+				let h = row % heads
+				let bs = row / heads
+				let (b, s) = (bs / seq, bs % seq)
+				let o = rank3 ?? (row * head, ((b * heads + h) * seq + s) * head)
+				let cr = positions.len() > 0 ?? (positions[bs], bs)
+				rotaryRow(out.floats, o, cos.floats, sin.floats, cr * half, half, interleaved)
+			}
+		})
+		roundTo(out)
+		c.out(0, out)
+		return none
+	}
+
+	// Rotates one head's values at x[o..] by cos and sin at co.
+	internal def rotaryRow(x float32[], o int, cos float32[], sin float32[], co int, half int, interleaved bool) {
+		if interleaved {
+			for let j = 0; j < half; j++ {
+				let (x1, x2) = (x[o + 2 * j], x[o + 2 * j + 1])
+				let (cv, sv) = (cos[co + j], sin[co + j])
+				x[o + 2 * j] = cv * x1 - sv * x2
+				x[o + 2 * j + 1] = sv * x1 + cv * x2
+			}
+			return
+		}
+		let j = 0
+		for; j + 8 <= half; j += 8 {
+			let x1 = simd.load8<float32>(x, o + j)
+			let x2 = simd.load8<float32>(x, o + half + j)
+			let cv = simd.load8<float32>(cos, co + j)
+			let sv = simd.load8<float32>(sin, co + j)
+			simd.store8<float32>(x, o + j, cv * x1 - sv * x2)
+			simd.store8<float32>(x, o + half + j, sv * x1 + cv * x2)
+		}
+		for; j < half; j++ {
+			let (x1, x2) = (x[o + j], x[o + half + j])
+			let (cv, sv) = (cos[co + j], sin[co + j])
+			x[o + j] = cv * x1 - sv * x2
+			x[o + half + j] = sv * x1 + cv * x2
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// LinearAttention
+	// ---------------------------------------------------------------
+
+	// What one LinearAttention node computes, readied.
+	internal struct LinAttnPlan {
+		batch     int
+		steps     int
+		qHeads    int
+		kvHeads   int
+		dk        int
+		dv        int
+		gating    bool
+		delta     bool
+		scale     float32
+		q         float32[]
+		k         float32[]
+		v         float32[]
+		past      float32[]
+		decay     float32[]
+		perHead   bool
+		beta      float32[]
+		betaWidth int
+		out       float32[]
+		state     float32[]
+	}
+
+	// LinearAttention: the recurrence of update_rule ("linear", "gated",
+	// "delta" or "gated_delta") run token by token over each key/value
+	// head's dk × dv state (float32), read by the head's query heads.
+	// Fails when the shapes do not fit or an input the rule needs (or
+	// forbids) is missing (or given).
+	internal def linearAttention(c Call) !none {
+		let q = try c.tensor(0)
+		let k = try c.tensor(1)
+		let v = try c.tensor(2)
+		try recFloatInput(c, q, false)
+		fail c.about() + "query, key and value must be 3-D of one type" unless q.rank() == 3 && k.rank() == 3 && v.rank() == 3 && k.element == q.element && v.element == q.element
+		let rule = c.text("update_rule", "gated_delta")
+		fail c.about() + "unknown update_rule {rule}" unless rule := "linear" || "gated" || "delta" || "gated_delta"
+		let gating = rule == "gated" || rule == "gated_delta"
+		let delta = rule == "delta" || rule == "gated_delta"
+		let hq = c.int("q_num_heads", 0)
+		let hkv = c.int("kv_num_heads", 0)
+		fail c.about() + "q_num_heads ({hq}) must be a positive multiple of kv_num_heads ({hkv})" unless hq > 0 && hkv > 0 && hq % hkv == 0
+		let (batch, steps) = (q.shape[0], q.shape[1])
+		fail c.about() + "the hidden sizes do not divide by the heads" unless q.shape[2] % hq == 0 && v.shape[2] % hkv == 0
+		let dk = q.shape[2] / hq
+		let dv = v.shape[2] / hkv
+		fail c.about() + "key is {k.shape}, expected [{batch}, {steps}, {hkv * dk}]" unless k.shape.equals(int[batch, steps, hkv * dk])
+		fail c.about() + "value is {v.shape}, expected [{batch}, {steps}, {hkv * dv}]" unless v.shape[0] == batch && v.shape[1] == steps
+		let plan = LinAttnPlan{batch: batch, steps: steps, qHeads: hq, kvHeads: hkv, dk: dk, dv: dv, gating: gating, delta: delta, q: q.floats, k: k.floats, v: v.floats}
+		let stateElement = q.element
+		if c.has(3) {
+			let past = try c.tensor(3)
+			try recFloatInput(c, past, false)
+			fail c.about() + "past_state is {past.shape}, expected [{batch}, {hkv}, {dk}, {dv}]" unless past.shape.equals(int[batch, hkv, dk, dv])
+			plan.past = past.floats
+			stateElement = past.element
+		}
+		fail c.about() + "update_rule {rule} " + (gating ?? ("needs", "forbids")) + " decay" unless c.has(4) == gating
+		fail c.about() + "update_rule {rule} " + (delta ?? ("needs", "forbids")) + " beta" unless c.has(5) == delta
+		if gating {
+			let decay = try c.tensor(4)
+			fail c.about() + "decay is {decay.shape}, expected [{batch}, {steps}, {hkv} or {hkv * dk}]" unless decay.rank() == 3 && decay.shape[0] == batch && decay.shape[1] == steps && (decay.shape[2] == hkv || decay.shape[2] == hkv * dk) && decay.element == q.element
+			plan.decay = decay.floats
+			plan.perHead = decay.shape[2] == hkv
+		}
+		if delta {
+			let beta = try c.tensor(5)
+			fail c.about() + "beta is {beta.shape}, expected [{batch}, {steps}, {hkv} or 1]" unless beta.rank() == 3 && beta.shape[0] == batch && beta.shape[1] == steps && (beta.shape[2] == hkv || beta.shape[2] == 1) && beta.element == q.element
+			plan.beta = beta.floats
+			plan.betaWidth = beta.shape[2]
+		}
+		let scale = c.float("scale", float32(0))
+		plan.scale = scale == float32(0) ?? (float32(1.0 / math.sqrt(float(dk))), scale)
+		let out = zerosLike(q.element, int[batch, steps, hq * dv])
+		let present = zerosLike(stateElement, int[batch, hkv, dk, dv])
+		plan.out = out.floats
+		plan.state = present.floats
+		recSplit(batch * hkv, parallelFrom / (steps * dk * dv * (hq / hkv + 2)).max(1), def (from int, n int) {
+			let vt float32[]
+			vt.len(dv)
+			for let item = from; item < from + n; item++ {
+				linAttnHead(plan, item, vt)
+			}
+		})
+		roundTo(out)
+		roundTo(present)
+		c.out(0, out)
+		c.out(1, present)
+		return none
+	}
+
+	// Runs the recurrence of key/value head `item` (batch · kvHeads + head)
+	// over every token, its state in plan.state.
+	internal def linAttnHead(p LinAttnPlan, item int, vt float32[]) {
+		let (dk, dv) = (p.dk, p.dv)
+		let b = item / p.kvHeads
+		let hk = item % p.kvHeads
+		let s = p.state
+		let so = item * dk * dv
+		recCopy(p.past, so, s, so, dk * dv) when p.past.len() > 0
+		let group = p.qHeads / p.kvHeads
+		let scale = simd.splat8<float32>(p.scale)
+		for let t = 0; t < p.steps; t++ {
+			let bt = b * p.steps + t
+			let ko = (bt * p.kvHeads + hk) * dk
+			let vo = (bt * p.kvHeads + hk) * dv
+			if p.gating {
+				// S ← exp(g) · S, per head or per key dimension (row).
+				for let d = 0; d < dk; d++ {
+					let g = p.perHead ?? (p.decay[bt * p.kvHeads + hk], p.decay[ko + d])
+					let e = float32(math.E ** float(g))
+					let ev = simd.splat8<float32>(e)
+					let ro = so + d * dv
+					let m = 0
+					for; m + 8 <= dv; m += 8 {
+						simd.store8<float32>(s, ro + m, simd.load8<float32>(s, ro + m) * ev)
+					}
+					for; m < dv; m++ {
+						s[ro + m] *= e
+					}
+				}
+			}
+			if p.delta {
+				// vt ← β · (v − Sᵀ·k).
+				for let m = 0; m < dv; m++ {
+					vt[m] = float32(0)
+				}
+				for let d = 0; d < dk; d++ {
+					let kv = simd.splat8<float32>(p.k[ko + d])
+					let ro = so + d * dv
+					let m = 0
+					for; m + 8 <= dv; m += 8 {
+						simd.store8<float32>(vt, m, simd.fma(kv, simd.load8<float32>(s, ro + m), simd.load8<float32>(vt, m)))
+					}
+					for; m < dv; m++ {
+						vt[m] += p.k[ko + d] * s[ro + m]
+					}
+				}
+				let beta = p.beta[bt * p.betaWidth + (p.betaWidth == 1 ?? (0, hk))]
+				let bv = simd.splat8<float32>(beta)
+				let m = 0
+				for; m + 8 <= dv; m += 8 {
+					simd.store8<float32>(vt, m, bv * (simd.load8<float32>(p.v, vo + m) - simd.load8<float32>(vt, m)))
+				}
+				for; m < dv; m++ {
+					vt[m] = beta * (p.v[vo + m] - vt[m])
+				}
+			} else {
+				recCopy(p.v, vo, vt, 0, dv)
+			}
+			// S ← S + k ⊗ vt.
+			for let d = 0; d < dk; d++ {
+				let kv = simd.splat8<float32>(p.k[ko + d])
+				let ro = so + d * dv
+				let m = 0
+				for; m + 8 <= dv; m += 8 {
+					simd.store8<float32>(s, ro + m, simd.fma(kv, simd.load8<float32>(vt, m), simd.load8<float32>(s, ro + m)))
+				}
+				for; m < dv; m++ {
+					s[ro + m] += p.k[ko + d] * vt[m]
+				}
+			}
+			// o = scale · qᵀ·S for each query head reading this state.
+			for let i = 0; i < group; i++ {
+				let h = hk * group + i
+				let qo = (bt * p.qHeads + h) * dk
+				let oo = (bt * p.qHeads + h) * dv
+				let m = 0
+				for; m + 8 <= dv; m += 8 {
+					let acc = simd.splat8<float32>(float32(0))
+					for let d = 0; d < dk; d++ {
+						acc = simd.fma(simd.splat8<float32>(p.q[qo + d]), simd.load8<float32>(s, so + d * dv + m), acc)
+					}
+					simd.store8<float32>(p.out, oo + m, acc * scale)
+				}
+				for; m < dv; m++ {
+					let acc = float32(0)
+					for let d = 0; d < dk; d++ {
+						acc += p.q[qo + d] * s[so + d * dv + m]
+					}
+					p.out[oo + m] = acc * p.scale
+				}
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// Attention
+	// ---------------------------------------------------------------
+
+	// What one Attention node computes, readied: sizes, where head h of
+	// batch b starts in Q, K, V and Y (b·xB + h·xH) and the distance
+	// between their rows (xLd), and the mask's parts.
+	internal struct AttnPlan {
+		element     ElementType
+		batch       int
+		qHeads      int
+		kvHeads     int
+		qLen        int
+		total       int
+		past        int
+		head        int
+		vHead       int
+		q           Tensor
+		k           Tensor
+		v           Tensor
+		y           Tensor
+		qB          int
+		qH          int
+		qLd         int
+		kB          int
+		kH          int
+		kLd         int
+		vB          int
+		vH          int
+		vLd         int
+		yB          int
+		yH          int
+		yLd         int
+		// sqrt(scale), rounded to the input's type.
+		factor      float
+		softcap     float
+		causal      bool
+		left        int
+		right       int
+		// nonpad_kv_seqlen per batch entry, empty without it.
+		lens        int[]
+		mask        ?Tensor
+		maskBool    bool
+		mB          int
+		mH          int
+		mQ          int
+		maskLen     int
+		mode        int
+		qk          ?Tensor
+		// softmax_precision, when it names a type narrower than float32
+		// storage keeps (Float16, BFloat16) or Float for Double inputs.
+		precision   ?ElementType
+		// softmax_precision asks for float32 or wider on a narrow input.
+		wideSoftmax bool
+	}
+
+	// The scratch one task's heads reuse: the scores and bias of a head
+	// (qLen × total), the transposed keys of the last key head and which
+	// one it was, which rows have a key to attend, row sums. A narrow
+	// type also keeps the head's scaled queries, and tensors over these
+	// buffers round them to the input's type (`inType`, `keysType`,
+	// `queriesType`) and to the type softmax runs in (`soft`, `sums`;
+	// none when that keeps float32).
+	internal struct AttnWork {
+		s           float32[]
+		bias        float32[]
+		kt          float32[]
+		qs          float32[]
+		rowSums     float32[]
+		key         int
+		allowed     bool[]
+		inType      Tensor
+		keysType    Tensor
+		queriesType Tensor
+		soft        ?Tensor
+		sums        ?Tensor
+		sd          float[]
+		bd          float[]
+	}
+
+	// Attention (opsets 23 to 25): scaled dot-product attention of 3-D or
+	// 4-D Q, K, V with grouped key/value heads, past and present keys and
+	// values, a boolean or additive mask (shorter masks padded with
+	// disallowed keys), offset-aware causal masking, sliding windows,
+	// nonpad_kv_seqlen, softcap, softmax_precision and the four
+	// qk_matmul_output modes. A row with no key to attend is zero.
+	// Fails when the shapes do not fit.
+	internal def attention(c Call) !none {
+		let q = try c.tensor(0)
+		let k = try c.tensor(1)
+		let v = try c.tensor(2)
+		try recFloatInput(c, q, true)
+		fail c.about() + "Q and K must have one type" unless k.element == q.element
+		fail c.about() + "V of {v.element.name} with Q of {q.element.name}" unless storageOf(v.element) == storageOf(q.element)
+		fail c.about() + "Q, K and V must all be 3-D or all 4-D" unless (q.rank() == 3 || q.rank() == 4) && k.rank() == q.rank() && v.rank() == q.rank()
+		let rank3 = q.rank() == 3
+		let batch = q.shape[0]
+		let (qHeads, kvHeads) = (0, 0)
+		if rank3 {
+			qHeads = c.int("q_num_heads", 0)
+			kvHeads = c.int("kv_num_heads", 0)
+			fail c.about() + "3-D inputs need q_num_heads and kv_num_heads" unless qHeads > 0 && kvHeads > 0
+			fail c.about() + "the hidden sizes do not divide by the heads" unless q.shape[2] % qHeads == 0 && k.shape[2] % kvHeads == 0 && v.shape[2] % kvHeads == 0
+		} else {
+			qHeads = q.shape[1]
+			kvHeads = k.shape[1]
+			fail c.about() + "K has {kvHeads} heads, V {v.shape[1]}" unless v.shape[1] == kvHeads
+		}
+		fail c.about() + "q_num_heads {qHeads} is not a multiple of kv_num_heads {kvHeads}" unless qHeads % kvHeads == 0
+		let qLen = rank3 ?? (q.shape[1], q.shape[2])
+		let kvLen = rank3 ?? (k.shape[1], k.shape[2])
+		let head = rank3 ?? (q.shape[2] / qHeads, q.shape[3])
+		let kHead = rank3 ?? (k.shape[2] / kvHeads, k.shape[3])
+		let vHead = rank3 ?? (v.shape[2] / kvHeads, v.shape[3])
+		fail c.about() + "Q's head size {head} differs from K's {kHead}" unless kHead == head
+		fail c.about() + "K and V differ in batch or length" unless k.shape[0] == batch && v.shape[0] == batch && (rank3 ?? (v.shape[1], v.shape[2])) == kvLen
+		fail c.about() + "past_key and past_value go together" unless c.has(4) == c.has(5)
+		let past = 0
+		let presentK = k
+		let presentV = v
+		// Whether the keys and values computed with are the 4-D presents.
+		let (packedK, packedV) = (false, false)
+		if c.has(4) {
+			let pk = try c.tensor(4)
+			let pv = try c.tensor(5)
+			fail c.about() + "past_key is {pk.shape}, expected [{batch}, {kvHeads}, P, {head}]" unless pk.rank() == 4 && pk.shape[0] == batch && pk.shape[1] == kvHeads && pk.shape[3] == head && pk.element == k.element
+			past = pk.shape[2]
+			fail c.about() + "past_value is {pv.shape}, expected [{batch}, {kvHeads}, {past}, {vHead}]" unless pv.shape.equals(int[batch, kvHeads, past, vHead]) && pv.element == v.element
+			presentK = attnConcat(pk, k, rank3, batch, kvHeads, kvLen, head)
+			presentV = attnConcat(pv, v, rank3, batch, kvHeads, kvLen, vHead)
+			(packedK, packedV) = (true, true)
+		} else if rank3 {
+			if c.wants(1) {
+				presentK = attnConcat(none, k, true, batch, kvHeads, kvLen, head)
+				packedK = true
+			}
+			if c.wants(2) {
+				presentV = attnConcat(none, v, true, batch, kvHeads, kvLen, vHead)
+				packedV = true
+			}
+		}
+		let total = past + kvLen
+		let plan = AttnPlan{element: q.element, batch: batch, qHeads: qHeads, kvHeads: kvHeads, qLen: qLen, total: total, past: past, head: head, vHead: vHead, q: q, k: k, v: v, y: q}
+		if rank3 {
+			(plan.qB, plan.qH, plan.qLd) = (qLen * qHeads * head, head, qHeads * head)
+			(plan.yB, plan.yH, plan.yLd) = (qLen * qHeads * vHead, vHead, qHeads * vHead)
+		} else {
+			(plan.qB, plan.qH, plan.qLd) = (qHeads * qLen * head, qLen * head, head)
+			(plan.yB, plan.yH, plan.yLd) = (qHeads * qLen * vHead, qLen * vHead, vHead)
+		}
+		if packedK {
+			plan.k = presentK
+			(plan.kB, plan.kH, plan.kLd) = (kvHeads * total * head, total * head, head)
+		} else if rank3 {
+			(plan.kB, plan.kH, plan.kLd) = (kvLen * kvHeads * head, head, kvHeads * head)
+		} else {
+			(plan.kB, plan.kH, plan.kLd) = (kvHeads * kvLen * head, kvLen * head, head)
+		}
+		if packedV {
+			plan.v = presentV
+			(plan.vB, plan.vH, plan.vLd) = (kvHeads * total * vHead, total * vHead, vHead)
+		} else if rank3 {
+			(plan.vB, plan.vH, plan.vLd) = (kvLen * kvHeads * vHead, vHead, kvHeads * vHead)
+		} else {
+			(plan.vB, plan.vH, plan.vLd) = (kvHeads * kvLen * vHead, kvLen * vHead, vHead)
+		}
+		// The scale's square root scales Q and K alike, in Q's type.
+		let scaleAttr = c.attribute("scale")
+		let scale = scaleAttr is Attribute ?? (float(scaleAttr.f), 1.0 / math.sqrt(float(head)))
+		plan.factor = math.sqrt(scale)
+		if storageOf(q.element) == Storage.Floats {
+			let f = zerosLike(q.element, int[1])
+			f.floats[0] = float32(plan.factor)
+			roundTo(f)
+			plan.factor = float(f.floats[0])
+		}
+		plan.softcap = float(c.float("softcap", float32(0)))
+		plan.causal = c.int("is_causal", 0) != 0
+		plan.left = c.int("left_window_size", -1)
+		plan.right = c.int("right_window_size", -1)
+		if c.has(6) {
+			plan.lens = try c.ints(6)
+			fail c.about() + "nonpad_kv_seqlen has {plan.lens.len()} values for a batch of {batch}" unless plan.lens.len() == batch
+			fail c.about() + "nonpad_kv_seqlen cannot go with past_key" unless past == 0
+		}
+		if c.has(3) {
+			let mask = try c.tensor(3)
+			let r = mask.rank()
+			fail c.about() + "attn_mask must have 1 to 4 dimensions, not {mask.shape}" unless r >= 1 && r <= 4
+			plan.maskLen = mask.shape[r - 1]
+			fail c.about() + "attn_mask's last dimension {plan.maskLen} is longer than the {total} keys" unless plan.maskLen <= total
+			let full = int[batch, qHeads, qLen]
+			let strides int[]
+			strides.len(3)
+			let stride = plan.maskLen
+			for let a = 2; a >= 0; a-- {
+				let m = a - (4 - r)
+				let dim = m >= 0 ?? (mask.shape[m], 1)
+				fail c.about() + "attn_mask {mask.shape} does not broadcast to [{batch}, {qHeads}, {qLen}, {total}]" unless dim == 1 || dim == full[a]
+				strides[a] = dim == 1 ?? (0, stride)
+				stride *= dim
+			}
+			(plan.mB, plan.mH, plan.mQ) = (strides[0], strides[1], strides[2])
+			plan.maskBool = mask.element == ElementType.Bool
+			fail c.about() + "attn_mask of {mask.element.name}" when storageOf(mask.element) == Storage.Strings
+			plan.mask = mask
+		}
+		plan.mode = c.int("qk_matmul_output_mode", 0)
+		fail c.about() + "unknown qk_matmul_output_mode {plan.mode}" unless plan.mode >= 0 && plan.mode <= 3
+		plan.qk = zerosLike(q.element, int[batch, qHeads, qLen, total]) when c.wants(3)
+		let precision = c.attribute("softmax_precision")
+		if precision is Attribute {
+			let sp = ElementType(precision.i)
+			fail c.about() + "softmax_precision {precision.i} is not a floating-point type" unless sp := ElementType.Float || ElementType.Float16 || ElementType.Double || ElementType.BFloat16
+			// Softmax in a type narrower than the one computed in rounds to it.
+			if (sp := ElementType.Float16 || ElementType.BFloat16) || (sp == ElementType.Float && q.element == ElementType.Double) {
+				plan.precision = sp
+			}
+			plan.wideSoftmax = sp := ElementType.Float || ElementType.Double
+		}
+		let y = zerosLike(q.element, rank3 ?? (int[batch, qLen, qHeads * vHead], int[batch, qHeads, qLen, vHead]))
+		plan.y = y
+		let items = batch * qHeads
+		let work = items * qLen * total * (head + vHead + 8)
+		let tasks = (work / (1 << 18)).clamp(1, 32).min(items.max(1))
+		let doubles = storageOf(q.element) == Storage.Doubles
+		if tasks == 1 {
+			let wk = attnWork(plan)
+			for let item = 0; item < items; item++ {
+				if doubles {
+					attnHeadDoubles(plan, item / qHeads, item % qHeads, wk)
+				} else {
+					attnHead(plan, item / qHeads, item % qHeads, wk)
+				}
+			}
+		} else {
+			forall let t in 0..tasks {
+				let wk = attnWork(plan)
+				for let item = items * t / tasks; item < items * (t + 1) / tasks; item++ {
+					if doubles {
+						attnHeadDoubles(plan, item / qHeads, item % qHeads, wk)
+					} else {
+						attnHead(plan, item / qHeads, item % qHeads, wk)
+					}
+				}
+			}
+		}
+		roundTo(y)
+		c.out(0, y)
+		c.out(1, presentK)
+		c.out(2, presentV)
+		let qk = plan.qk
+		if qk is Tensor {
+			roundTo(qk)
+			c.out(3, qk)
+		}
+		return none
+	}
+
+	// The 4-D (batch, heads, past + len, size) concatenation of `past`
+	// (none for no past) and the keys or values `x` (3-D packed when
+	// `rank3`).
+	internal def attnConcat(past ?Tensor, x Tensor, rank3 bool, batch int, heads int, len int, size int) Tensor {
+		let p = past is Tensor ?? (past.shape[2], 0)
+		let total = p + len
+		let out = zerosLike(x.element, int[batch, heads, total, size])
+		let doubles = storageOf(x.element) == Storage.Doubles
+		for let b = 0; b < batch; b++ {
+			for let h = 0; h < heads; h++ {
+				let o = (b * heads + h) * total * size
+				if past is Tensor {
+					let po = (b * heads + h) * p * size
+					if doubles {
+						for let i = 0; i < p * size; i++ {
+							out.doubles[o + i] = past.doubles[po + i]
+						}
+					} else {
+						recCopy(past.floats, po, out.floats, o, p * size)
+					}
+				}
+				for let s = 0; s < len; s++ {
+					let xo = rank3 ?? (((b * len + s) * heads + h) * size, ((b * heads + h) * len + s) * size)
+					let to = o + (p + s) * size
+					if doubles {
+						for let i = 0; i < size; i++ {
+							out.doubles[to + i] = x.doubles[xo + i]
+						}
+					} else {
+						recCopy(x.floats, xo, out.floats, to, size)
+					}
+				}
+			}
+		}
+		return out
+	}
+
+	// One task's scratch for `p`.
+	internal def attnWork(p AttnPlan) AttnWork {
+		let n = p.qLen * p.total
+		let wk = AttnWork{key: -1}
+		wk.s.len(n)
+		wk.allowed.len(p.qLen)
+		wk.rowSums.len(p.qLen)
+		if storageOf(p.element) == Storage.Doubles {
+			wk.sd.len(n)
+			wk.bd.len(n)
+		} else {
+			wk.bias.len(n)
+			wk.kt.len(p.head * p.total)
+			wk.qs.len(p.qLen * p.head)
+		}
+		wk.inType = new Tensor(int[n], wk.s, p.element)
+		wk.keysType = new Tensor(int[wk.kt.len()], wk.kt, p.element)
+		wk.queriesType = new Tensor(int[wk.qs.len()], wk.qs, p.element)
+		let sp = p.precision
+		if sp is ElementType {
+			wk.soft = new Tensor(int[n], wk.s, sp)
+			wk.sums = new Tensor(int[p.qLen], wk.rowSums, sp)
+		} else if storageOf(p.element) == Storage.Floats && p.element != ElementType.Float && !p.wideSoftmax {
+			wk.soft = wk.inType
+			wk.sums = new Tensor(int[p.qLen], wk.rowSums, p.element)
+		}
+		return wk
+	}
+
+	// The keys query row i of batch b may attend: lo..hi (empty when lo >
+	// hi), from the causal frontier, the window and nonpad_kv_seqlen.
+	internal def attnRange(p AttnPlan, b int, i int) (int, int) {
+		let offset = p.lens.len() > 0 ?? (p.lens[b] - p.qLen, p.past)
+		let at = i + offset
+		let (lo, hi) = (0, p.total - 1)
+		hi = hi.min(at) when p.causal
+		lo = lo.max(at - p.left) when p.left >= 0
+		hi = hi.min(at + p.right) when p.right >= 0
+		hi = hi.min(p.lens[b] - 1) when p.lens.len() > 0
+		return (lo, hi)
+	}
+
+	// Fills the additive bias of query row i of head h, batch b into
+	// row[ro..ro + total]: 0 (or the mask's value) for an attended key,
+	// −inf elsewhere. Returns whether some key is attended.
+	internal def attnBias(p AttnPlan, b int, h int, i int, row float32[], ro int) bool {
+		let ninf = float32(-1.0 / 0.0)
+		let (lo, hi) = attnRange(p, b, i)
+		let fill = simd.splat8<float32>(ninf)
+		let j = 0
+		for; j + 8 <= p.total; j += 8 {
+			simd.store8<float32>(row, ro + j, fill)
+		}
+		for; j < p.total; j++ {
+			row[ro + j] = ninf
+		}
+		let mask = p.mask
+		if !(mask is Tensor) {
+			for let x = lo; x <= hi; x++ {
+				row[ro + x] = float32(0)
+			}
+			return lo <= hi
+		}
+		let mo = b * p.mB + h * p.mH + i * p.mQ
+		let end = hi.min(p.maskLen - 1)
+		let any = false
+		match storageOf(mask.element) {
+			case Storage.Floats:
+				for let x = lo; x <= end; x++ {
+					let m = mask.floats[mo + x]
+					row[ro + x] = m
+					any = any || m > ninf
+				}
+			case Storage.Doubles:
+				for let x = lo; x <= end; x++ {
+					let m = float32(mask.doubles[mo + x])
+					row[ro + x] = m
+					any = any || m > ninf
+				}
+			default:
+				for let x = lo; x <= end; x++ {
+					let m = mask.ints[mo + x]
+					if p.maskBool {
+						row[ro + x] = m != 0 ?? (float32(0), ninf)
+						any = any || m != 0
+					} else {
+						row[ro + x] = float32(m)
+						any = true
+					}
+				}
+		}
+		return any
+	}
+
+	// The bias row of attnBias in doubles.
+	internal def attnBiasDouble(p AttnPlan, b int, h int, i int, row float[], ro int) bool {
+		let ninf = -1.0 / 0.0
+		let (lo, hi) = attnRange(p, b, i)
+		for let j = 0; j < p.total; j++ {
+			row[ro + j] = ninf
+		}
+		let mask = p.mask
+		if !(mask is Tensor) {
+			for let x = lo; x <= hi; x++ {
+				row[ro + x] = 0.0
+			}
+			return lo <= hi
+		}
+		let mo = b * p.mB + h * p.mH + i * p.mQ
+		let end = hi.min(p.maskLen - 1)
+		let any = false
+		for let x = lo; x <= end; x++ {
+			let m = 0.0
+			match storageOf(mask.element) {
+				case Storage.Floats:
+					m = float(mask.floats[mo + x])
+				case Storage.Doubles:
+					m = mask.doubles[mo + x]
+				default:
+					m = p.maskBool ?? (mask.ints[mo + x] != 0 ?? (0.0, ninf), float(mask.ints[mo + x]))
+			}
+			row[ro + x] = m
+			any = any || m > ninf
+		}
+		return any
+	}
+
+	// Head h of batch b on float32 values: scores by one product with the
+	// key head's transposed keys, softcap, bias, softmax row by row, then
+	// the product with the values into Y. A narrow type rounds each
+	// step's result to the type, as the operator computes in it: Q and K
+	// scaled, the scores, the softcap's steps, the biased scores, the
+	// softmax's steps and the probabilities.
+	internal def attnHead(p AttnPlan, b int, h int, wk AttnWork) {
+		let (sq, total, d) = (p.qLen, p.total, p.head)
+		let n = sq * total
+		let kvh = h / (p.qHeads / p.kvHeads)
+		let key = b * p.kvHeads + kvh
+		let narrow = p.element != ElementType.Float
+		let f = float32(p.factor)
+		if wk.key != key {
+			let ko = b * p.kB + kvh * p.kH
+			for let t = 0; t < total; t++ {
+				for let e = 0; e < d; e++ {
+					wk.kt[e * total + t] = p.k.floats[ko + t * p.kLd + e] * f
+				}
+			}
+			roundTo(wk.keysType) when narrow
+			wk.key = key
+		}
+		// Q and K each scaled by sqrt(scale), as the operator defines it.
+		let s = wk.s
+		let qo = b * p.qB + h * p.qH
+		let fv = simd.splat8<float32>(f)
+		for let i = 0; i < sq; i++ {
+			let (from, to) = (qo + i * p.qLd, i * d)
+			let e = 0
+			for; e + 8 <= d; e += 8 {
+				simd.store8<float32>(wk.qs, to + e, simd.load8<float32>(p.q.floats, from + e) * fv)
+			}
+			for; e < d; e++ {
+				wk.qs[to + e] = p.q.floats[from + e] * f
+			}
+		}
+		roundTo(wk.queriesType) when narrow
+		gemm(sq, total, d, float32(1), wk.qs, 0, d, false, wk.kt, 0, total, false, float32(0), s, 0, total)
+		roundTo(wk.inType) when narrow
+		let qk = p.qk
+		let ko = (b * p.qHeads + h) * n
+		recCopy(s, 0, qk.floats, ko, n) when qk is Tensor && p.mode == 0
+		attnSoftcap(s, n, float32(p.softcap), narrow ?? (wk.inType, none)) when p.softcap > 0.0
+		recCopy(s, 0, qk.floats, ko, n) when qk is Tensor && p.mode == 1
+		for let i = 0; i < sq; i++ {
+			wk.allowed[i] = attnBias(p, b, h, i, wk.bias, i * total)
+		}
+		recAddRow(s, 0, wk.bias, s, 0, n)
+		roundTo(wk.inType) when narrow
+		recCopy(s, 0, qk.floats, ko, n) when qk is Tensor && p.mode == 2
+		attnSoftmax(wk, sq, total)
+		recCopy(s, 0, qk.floats, ko, n) when qk is Tensor && p.mode == 3
+		roundTo(wk.inType) when narrow
+		gemm(sq, p.vHead, total, float32(1), s, 0, total, false, p.v.floats, b * p.vB + kvh * p.vH, p.vLd, false, float32(0), p.y.floats, b * p.yB + h * p.yH, p.yLd)
+	}
+
+	// Softmax of each of the rows × n scores in wk.s, in place: zeros for
+	// a row with no key to attend. With wk.soft each step's result is
+	// rounded to its type: the scores, minus the row's maximum, their
+	// exponentials, the row sums, the quotients.
+	internal def attnSoftmax(wk AttnWork, rows int, n int) {
+		let x = wk.s
+		let soft = wk.soft
+		let sums = wk.sums
+		let zero = simd.splat8<float32>(float32(0))
+		let ninf = float32(-1.0 / 0.0)
+		roundTo(soft) when soft is Tensor
+		for let r = 0; r < rows; r++ {
+			let o = r * n
+			if !wk.allowed[r] {
+				let i = 0
+				for; i + 8 <= n; i += 8 {
+					simd.store8<float32>(x, o + i, zero)
+				}
+				for; i < n; i++ {
+					x[o + i] = float32(0)
+				}
+				continue
+			}
+			let mv = simd.splat8<float32>(ninf)
+			let i = 0
+			for; i + 8 <= n; i += 8 {
+				mv = simd.max(mv, simd.load8<float32>(x, o + i))
+			}
+			let m = simd.maxLane(mv)
+			for; i < n; i++ {
+				m = m.max(x[o + i])
+			}
+			m = float32(0) when m == ninf
+			let mx = simd.splat8<float32>(m)
+			i = 0
+			for; i + 8 <= n; i += 8 {
+				simd.store8<float32>(x, o + i, simd.load8<float32>(x, o + i) - mx)
+			}
+			for; i < n; i++ {
+				x[o + i] -= m
+			}
+		}
+		roundTo(soft) when soft is Tensor
+		for let r = 0; r < rows; r++ {
+			continue unless wk.allowed[r]
+			let o = r * n
+			let i = 0
+			for; i + 8 <= n; i += 8 {
+				simd.store8<float32>(x, o + i, simd.exp(simd.load8<float32>(x, o + i)))
+			}
+			for; i < n; i++ {
+				x[o + i] = float32(math.E ** float(x[o + i]))
+			}
+		}
+		roundTo(soft) when soft is Tensor
+		// BFloat16 adds one value at a time, each sum rounded (numpy's
+		// reduction of a non-native type); the others sum in float32.
+		let sequential = soft is Tensor && soft.element == ElementType.BFloat16
+		for let r = 0; r < rows; r++ {
+			continue unless wk.allowed[r]
+			let o = r * n
+			if sequential {
+				let sum = float32(0)
+				for let i = 0; i < n; i++ {
+					sum = __bitcast_f32_from_u32(uint32(bfloatBits(sum + x[o + i]) << 16))
+				}
+				wk.rowSums[r] = sum
+				continue
+			}
+			let acc = zero
+			let i = 0
+			for; i + 8 <= n; i += 8 {
+				acc = acc + simd.load8<float32>(x, o + i)
+			}
+			let sum = simd.sum(acc)
+			for; i < n; i++ {
+				sum += x[o + i]
+			}
+			wk.rowSums[r] = sum
+		}
+		roundTo(sums) when sums is Tensor
+		for let r = 0; r < rows; r++ {
+			continue unless wk.allowed[r]
+			let o = r * n
+			let sum = wk.rowSums[r] == float32(0) ?? (float32(1), wk.rowSums[r])
+			let sv = simd.splat8<float32>(sum)
+			let i = 0
+			for; i + 8 <= n; i += 8 {
+				simd.store8<float32>(x, o + i, simd.load8<float32>(x, o + i) / sv)
+			}
+			for; i < n; i++ {
+				x[o + i] /= sum
+			}
+		}
+		roundTo(soft) when soft is Tensor
+	}
+
+	// cap · tanh(x / cap) on n values, in place; with `round` each of the
+	// three steps' results is rounded to its type.
+	internal def attnSoftcap(x float32[], n int, cap float32, round ?Tensor) {
+		let c = simd.splat8<float32>(cap)
+		if round is Tensor {
+			for let stage = 0; stage < 3; stage++ {
+				let i = 0
+				for; i + 8 <= n; i += 8 {
+					let v = simd.load8<float32>(x, i)
+					simd.store8<float32>(x, i, stage == 0 ?? (v / c, stage == 1 ?? (simd.tanh(v), v * c)))
+				}
+				for; i < n; i++ {
+					x[i] = stage == 0 ?? (x[i] / cap, stage == 1 ?? (float32(math.tanh(float(x[i]))), x[i] * cap))
+				}
+				roundTo(round)
+			}
+			return
+		}
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(x, i, c * simd.tanh(simd.load8<float32>(x, i) / c))
+		}
+		for; i < n; i++ {
+			x[i] = cap * float32(math.tanh(float(x[i] / cap)))
+		}
+	}
+
+	// Head h of batch b on Double values, the steps of attnHead.
+	internal def attnHeadDoubles(p AttnPlan, b int, h int, wk AttnWork) {
+		let (sq, total, d, dv) = (p.qLen, p.total, p.head, p.vHead)
+		let n = sq * total
+		let kvh = h / (p.qHeads / p.kvHeads)
+		let (q, k, v) = (p.q.doubles, p.k.doubles, p.v.doubles)
+		let (qo, ko, vo) = (b * p.qB + h * p.qH, b * p.kB + kvh * p.kH, b * p.vB + kvh * p.vH)
+		let s = wk.sd
+		let alpha = p.factor * p.factor
+		for let i = 0; i < sq; i++ {
+			for let t = 0; t < total; t++ {
+				let acc = 0.0
+				for let e = 0; e < d; e++ {
+					acc += q[qo + i * p.qLd + e] * k[ko + t * p.kLd + e]
+				}
+				s[i * total + t] = alpha * acc
+			}
+		}
+		let qk = p.qk
+		let qko = (b * p.qHeads + h) * n
+		if qk is Tensor && p.mode == 0 {
+			for let i = 0; i < n; i++ {
+				qk.doubles[qko + i] = s[i]
+			}
+		}
+		if p.softcap > 0.0 {
+			for let i = 0; i < n; i++ {
+				s[i] = p.softcap * math.tanh(s[i] / p.softcap)
+			}
+		}
+		if qk is Tensor && p.mode == 1 {
+			for let i = 0; i < n; i++ {
+				qk.doubles[qko + i] = s[i]
+			}
+		}
+		for let i = 0; i < sq; i++ {
+			wk.allowed[i] = attnBiasDouble(p, b, h, i, wk.bd, i * total)
+		}
+		for let i = 0; i < n; i++ {
+			s[i] += wk.bd[i]
+		}
+		if qk is Tensor && p.mode == 2 {
+			for let i = 0; i < n; i++ {
+				qk.doubles[qko + i] = s[i]
+			}
+		}
+		let soft = wk.soft
+		attnRoundDoubles(s, wk.s, soft) when soft is Tensor
+		for let i = 0; i < sq; i++ {
+			let o = i * total
+			if !wk.allowed[i] {
+				for let t = 0; t < total; t++ {
+					s[o + t] = 0.0
+				}
+				continue
+			}
+			let m = -1.0 / 0.0
+			for let t = 0; t < total; t++ {
+				m = m.max(s[o + t])
+			}
+			m = 0.0 when m == -1.0 / 0.0
+			let sum = 0.0
+			for let t = 0; t < total; t++ {
+				s[o + t] = math.E ** (s[o + t] - m)
+				sum += s[o + t]
+			}
+			sum = 1.0 when sum == 0.0
+			for let t = 0; t < total; t++ {
+				s[o + t] /= sum
+			}
+		}
+		attnRoundDoubles(s, wk.s, soft) when soft is Tensor
+		if qk is Tensor && p.mode == 3 {
+			for let i = 0; i < n; i++ {
+				qk.doubles[qko + i] = s[i]
+			}
+		}
+		let yo = b * p.yB + h * p.yH
+		for let i = 0; i < sq; i++ {
+			for let m = 0; m < dv; m++ {
+				let acc = 0.0
+				for let t = 0; t < total; t++ {
+					acc += s[i * total + t] * v[vo + t * p.vLd + m]
+				}
+				p.y.doubles[yo + i * p.yLd + m] = acc
+			}
+		}
+	}
+
+	// Rounds doubles to the type of `t` (a tensor over `via`, float32
+	// storage of that type).
+	internal def attnRoundDoubles(s float[], via float32[], t Tensor) {
+		for let i = 0; i < s.len(); i++ {
+			via[i] = float32(s[i])
+		}
+		roundTo(t)
+		for let i = 0; i < s.len(); i++ {
+			s[i] = float(via[i])
+		}
+	}
+}

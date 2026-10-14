@@ -1,0 +1,771 @@
+internal std partial module std.text.regex {
+	// What a node of a parsed pattern is.
+	enum NodeKind {
+		Empty,
+		Literal,
+		Class,
+		AnyChar,
+		AnyByte,
+		Concat,
+		Alternate,
+		Repeat,
+		Capture,
+		Assert,
+	}
+
+	// The zero-width assertions, as the `a` operand of an assertion
+	// instruction.
+	const (
+		beginText       = 0
+		endText         = 1
+		beginLine       = 2
+		endLine         = 3
+		wordBoundary    = 4
+		notWordBoundary = 5
+	)
+
+	// The longest repetition count RE2 accepts, also the bound on the
+	// product of nested counts.
+	const repeatLimit = 1000
+
+	// How deeply groups may nest, as in RE2.
+	const nestingLimit = 1000
+
+	// One node of a parsed pattern. A literal is one code point; a capture
+	// holds its group number in `index`; a repeat runs `subs[0]` between
+	// `min` and `max` times (-1 for no upper bound).
+	type Node {
+		kind      NodeKind
+		ch        int
+		caseless  bool
+		set       ?CharClass
+		subs      Node[]
+		min       int
+		max       int
+		greedy    bool
+		counted   bool
+		index     int
+		zeroWidth int
+		dotAll    bool
+		// Where the node's instructions were first emitted, -1 before
+		// then.
+		first     int
+		last      int
+
+		def new(kind NodeKind) {
+			self.kind = kind
+			first = -1
+		}
+
+		// Whether the node can match the empty text.
+		def nullable() bool {
+			match kind {
+				case NodeKind.Empty, NodeKind.Assert:
+					return true
+				case NodeKind.Concat:
+					for let (_, s) in subs {
+						return false unless s.nullable()
+					}
+					return true
+				case NodeKind.Alternate:
+					for let (_, s) in subs {
+						return true when s.nullable()
+					}
+					return false
+				case NodeKind.Repeat:
+					return min == 0 || subs[0].nullable()
+				case NodeKind.Capture:
+					return subs[0].nullable()
+				default:
+					return false
+			}
+		}
+
+		// Clears the record of where the node and those under it were
+		// emitted, before the tree is emitted into another program.
+		def forget() {
+			first = -1
+			for let (_, s) in subs {
+				s.forget()
+			}
+		}
+
+		// Appends to `out` the UTF-8 bytes every match starts with (as far
+		// as plain literals go); returns whether the whole node was such a
+		// literal, so the bytes after it continue the prefix.
+		def literalPrefix(out int[]) bool {
+			match kind {
+				case NodeKind.Empty:
+					return true
+				case NodeKind.Literal:
+					return false when caseless
+					let bytes int[]
+					encodeUtf8(ch, bytes)
+					out.push(...bytes)
+					return true
+				case NodeKind.Capture:
+					return subs[0].literalPrefix(out)
+				case NodeKind.Concat:
+					for let (_, s) in subs {
+						return false unless s.literalPrefix(out)
+					}
+					return true
+				default:
+					return false
+			}
+		}
+
+		// Whether every match of the node starts at the start of the text
+		// (a leading \A, or ^ without the m flag).
+		def startsAtText() bool {
+			match kind {
+				case NodeKind.Assert:
+					return zeroWidth == beginText
+				case NodeKind.Capture:
+					return subs[0].startsAtText()
+				case NodeKind.Concat:
+					return subs.len() > 0 && subs[0].startsAtText()
+				case NodeKind.Alternate:
+					for let (_, s) in subs {
+						return false unless s.startsAtText()
+					}
+					return true
+				default:
+					return false
+			}
+		}
+
+		// The largest product of nested counted repetitions below and at
+		// this node.
+		def repeatProduct() int {
+			let most = 1
+			for let (_, s) in subs {
+				let p = s.repeatProduct()
+				most = p when p > most
+			}
+			return most unless kind == NodeKind.Repeat && counted
+			let n = max < 0 ?? (min, max)
+			return n > 0 ?? (most * n, most)
+		}
+	}
+
+	// A Unicode property a class names: a general category ("L", "Lu"), a
+	// script by its Unicode name ("Greek") or Any.
+	struct Property {
+		name    string
+		negated bool
+	}
+
+	// A character class as written: code point ranges (pairs of first and
+	// last), Unicode properties and nested classes (\D, [:^alpha:] inside
+	// brackets), the whole negated or not, caseless or not.
+	type CharClass {
+		ranges     int[]
+		properties Property[]
+		nested     CharClass[]
+		negated    bool
+		caseless   bool
+
+		def range(lo int, hi int) {
+			ranges.push(lo, hi)
+		}
+
+		// The code points of the class as sorted, disjoint ranges. Folding
+		// applies to each part before its own negation, as RE2 does: (?i)[^k]
+		// matches neither K nor the Kelvin sign.
+		def resolve() int[] {
+			let all = caseless ?? (foldRanges(ranges), normalize(ranges))
+			for let (_, p) in properties {
+				let r = propertyRanges(p.name)
+				r = foldRanges(r) when caseless
+				r = negateRanges(r) when p.negated
+				all.push(...r)
+			}
+			for let (_, n) in nested {
+				all.push(...n.resolve())
+			}
+			all = normalize(all)
+			return negated ?? (negateRanges(all), all)
+		}
+	}
+
+	// A recursive-descent parser of RE2 syntax over the pattern's code
+	// points, tracking the flags in effect: i (caseless), m (multi-line ^
+	// and $), s (dot matches \n) and U (lazy and greedy swapped).
+	type Parser {
+		src       int[]
+		pos       int
+		caseless  bool
+		multiLine bool
+		dotAll    bool
+		ungreedy  bool
+		depth     int
+		// Group names by number; names[0] is the whole match's.
+		names     string[]
+
+		def new(source string) {
+			for let (_, ch) in source {
+				src.push(int(ch))
+			}
+			names.push("")
+		}
+
+		internal def more() bool {
+			return pos < src.len()
+		}
+
+		internal def peek() int {
+			return pos < src.len() ?? (src[pos], -1)
+		}
+
+		// The pattern text from code point `from` to the current position,
+		// for error messages.
+		internal def text(from int) string {
+			let out = ""
+			for let i = from; i < pos && i < src.len(); i++ {
+				out += string(char(src[i]))
+			}
+			return out
+		}
+
+		// alternation := concatenation ('|' concatenation)*
+		def alternation() !Node {
+			let first = try concatenation()
+			return first unless peek() == 124
+			let node = new Node(NodeKind.Alternate)
+			node.subs.push(first)
+			for peek() == 124 {
+				pos++
+				node.subs.push(try concatenation())
+			}
+			return node
+		}
+
+		// concatenation := (atom repetition*)*
+		def concatenation() !Node {
+			let node = new Node(NodeKind.Concat)
+			for more() && peek() != 124 && peek() != 41 {
+				if peek() == 92 && pos + 1 < src.len() && src[pos + 1] == 81 {
+					// \Q...\E: literal text; a quantifier after it takes its
+					// last character.
+					pos += 2
+					let quoted Node[]
+					for more() && !(peek() == 92 && pos + 1 < src.len() && src[pos + 1] == 69) {
+						quoted.push(literal(src[pos]))
+						pos++
+					}
+					pos += 2 when more()
+					for let (i, q) in quoted {
+						node.subs.push(i + 1 < quoted.len() ?? (q, try repetitions(q)))
+					}
+					continue
+				}
+				let a = try atom()
+				node.subs.push(try repetitions(a)) when a is Node
+			}
+			return node
+		}
+
+		// The quantifiers after an atom.
+		internal def repetitions(atom Node) !Node {
+			let node = atom
+			let repeated = false
+			for more() {
+				let start = pos
+				let ch = peek()
+				let (min, max) = (0, 0)
+				let counted = false
+				if ch == 42 {
+					(min, max) = (0, -1)
+					pos++
+				} else if ch == 43 {
+					(min, max) = (1, -1)
+					pos++
+				} else if ch == 63 {
+					(min, max) = (0, 1)
+					pos++
+				} else if ch == 123 {
+					let c = countedRepeat()
+					break unless c.0
+					(min, max) = (c.1, c.2)
+					counted = true
+					fail "invalid repeat count: `{text(start)}`" when (max >= 0 && max < min) || min > repeatLimit || max > repeatLimit
+				} else {
+					break
+				}
+				let greedy = true
+				if peek() == 63 {
+					greedy = false
+					pos++
+				}
+				fail "bad repetition operator: `{text(start)}`" when repeated
+				repeated = true
+				let r = new Node(NodeKind.Repeat)
+				r.subs.push(node)
+				(r.min, r.max, r.greedy, r.counted) = (min, max, greedy != ungreedy, counted)
+				node = r
+			}
+			return node
+		}
+
+		// {n}, {n,} or {n,m} at `pos`: (true, min, max) and past it, or
+		// (false, 0, 0) where the brace is a literal.
+		internal def countedRepeat() (bool, int, int) {
+			let at = pos + 1
+			let min = 0
+			let digits = 0
+			for at < src.len() && src[at] >= 48 && src[at] <= 57 {
+				min = min * 10 + src[at] - 48
+				at++
+				digits++
+			}
+			return (false, 0, 0) when digits == 0 || digits > 8 || at >= src.len()
+			let max = min
+			if src[at] == 44 {
+				at++
+				let more = 0
+				let m = 0
+				for at < src.len() && src[at] >= 48 && src[at] <= 57 {
+					m = m * 10 + src[at] - 48
+					at++
+					more++
+				}
+				return (false, 0, 0) when more > 8
+				max = more > 0 ?? (m, -1)
+			}
+			return (false, 0, 0) unless at < src.len() && src[at] == 125
+			pos = at + 1
+			return (true, min, max)
+		}
+
+		// One atom; none for a group that only sets flags.
+		internal def atom() !?Node {
+			let ch = src[pos]
+			match ch {
+				case 40:
+					return try group()
+				case 91:
+					let start = pos
+					pos++
+					let node = new Node(NodeKind.Class)
+					node.set = try bracket(start)
+					return node
+				case 46:
+					pos++
+					let node = new Node(NodeKind.AnyChar)
+					node.dotAll = dotAll
+					return node
+				case 94:
+					pos++
+					return assertion(multiLine ?? (beginLine, beginText))
+				case 36:
+					pos++
+					return assertion(multiLine ?? (endLine, endText))
+				case 92:
+					return try escape()
+				case 42, 43, 63:
+					fail "missing argument to repetition operator: `{string(char(ch))}`"
+				case 123:
+					let start = pos
+					fail "missing argument to repetition operator: `{text(start)}`" when countedRepeat().0
+					pos++
+					return literal(ch)
+				default:
+					pos++
+					return literal(ch)
+			}
+		}
+
+		internal def literal(ch int) Node {
+			let node = new Node(NodeKind.Literal)
+			node.ch = ch
+			node.caseless = caseless
+			return node
+		}
+
+		internal def assertion(a int) Node {
+			let node = new Node(NodeKind.Assert)
+			node.zeroWidth = a
+			return node
+		}
+
+		internal def classNode(k CharClass) Node {
+			let node = new Node(NodeKind.Class)
+			k.caseless = k.caseless || caseless
+			node.set = k
+			return node
+		}
+
+		// A parenthesised group, or a flag setting `(?flags)`.
+		internal def group() !?Node {
+			let start = pos
+			pos++
+			depth++
+			fail "expression nests too deeply" when depth > nestingLimit
+			let (savedCase, savedLines, savedDot, savedLazy) = (caseless, multiLine, dotAll, ungreedy)
+			let capture = -1
+			if peek() == 63 {
+				pos++
+				let c = peek()
+				if c := 80 || 60 {
+					// (?P<name>...) or (?<name>...)
+					pos++
+					if c == 80 {
+						fail "invalid named capture group: `{text(start)}`" unless peek() == 60
+						pos++
+					} else if peek() := 61 || 33 {
+						fail "invalid or unsupported Perl syntax: `{text(start)}`"
+					}
+					let nameStart = pos
+					for more() && peek() != 62 {
+						fail "invalid named capture group: `{text(start)}`" unless isWordChar(peek())
+						pos++
+					}
+					fail "invalid named capture group: `{text(start)}`" unless pos > nameStart && peek() == 62
+					let name = text(nameStart)
+					pos++
+					fail "duplicate capture group name: `{name}`" when names.includes(name)
+					capture = names.len()
+					names.push(name)
+				} else {
+					// Flags, then ')' (for the rest of the enclosing group) or ':'.
+					let negate = false
+					let seen = false
+					let open = true
+					for open {
+						fail "missing closing ): `{text(start)}`" unless more()
+						let f = peek()
+						pos++
+						if f := 41 || 58 {
+							fail "invalid or unsupported Perl syntax: `{text(start)}`" when negate && !seen
+							if f == 41 {
+								depth--
+								return none
+							}
+							open = false
+						} else if f == 45 {
+							fail "invalid or unsupported Perl syntax: `{text(start)}`" when negate
+							negate = true
+							seen = false
+						} else {
+							fail "invalid or unsupported Perl syntax: `{text(start)}`" unless f := 105 || 109 || 115 || 85
+							caseless = !negate when f == 105
+							multiLine = !negate when f == 109
+							dotAll = !negate when f == 115
+							ungreedy = !negate when f == 85
+							seen = true
+						}
+					}
+				}
+			} else {
+				capture = names.len()
+				names.push("")
+			}
+			let inner = try alternation()
+			fail "missing closing ): `{text(start)}`" unless peek() == 41
+			pos++
+			depth--
+			(caseless, multiLine, dotAll, ungreedy) = (savedCase, savedLines, savedDot, savedLazy)
+			return inner when capture < 0
+			let node = new Node(NodeKind.Capture)
+			node.index = capture
+			node.subs.push(inner)
+			return node
+		}
+
+		// An escape outside brackets.
+		internal def escape() !Node {
+			let start = pos
+			pos++
+			fail "trailing backslash at end of expression" unless more()
+			let ch = peek()
+			match ch {
+				case 100, 68, 115, 83, 119, 87:
+					pos++
+					return classNode(perlClass(ch))
+				case 112, 80:
+					pos++
+					return classNode(try unicodeClass(ch == 80, start))
+				case 98:
+					pos++
+					return assertion(wordBoundary)
+				case 66:
+					pos++
+					return assertion(notWordBoundary)
+				case 65:
+					pos++
+					return assertion(beginText)
+				case 122:
+					pos++
+					return assertion(endText)
+				case 67:
+					pos++
+					return new Node(NodeKind.AnyByte)
+				default:
+					return literal(try escapedChar(start))
+			}
+		}
+
+		// The code point an escape stands for, after the backslash at
+		// `start`.
+		internal def escapedChar(start int) !int {
+			let ch = src[pos]
+			pos++
+			match ch {
+				case 97:
+					return 7
+				case 102:
+					return 12
+				case 116:
+					return 9
+				case 110:
+					return 10
+				case 114:
+					return 13
+				case 118:
+					return 11
+				case 120:
+					return try hexEscape(start)
+				default:
+					if ch >= 48 && ch <= 55 {
+						// \0 starts an octal code; \1-\7 must have more digits
+						// (alone they would be backreferences).
+						fail "invalid escape sequence: `{text(start)}`" when ch != 48 && !(peek() >= 48 && peek() <= 55)
+						let v = ch - 48
+						for let k = 0; k < 2 && peek() >= 48 && peek() <= 55; k++ {
+							v = v * 8 + peek() - 48
+							pos++
+						}
+						return v
+					}
+					fail "invalid escape sequence: `{text(start)}`" unless ch < 0x80 && !isWordChar(ch)
+					return ch
+			}
+		}
+
+		// \xHH or \x{H...}, after the x.
+		internal def hexEscape(start int) !int {
+			let v = 0
+			if peek() == 123 {
+				pos++
+				let digits = 0
+				for more() && peek() != 125 {
+					let d = hexDigit(peek())
+					pos++
+					fail "invalid escape sequence: `{text(start)}`" when d < 0
+					v = v * 16 + d
+					fail "invalid escape sequence: `{text(start)}`" when v > 0x10FFFF
+					digits++
+				}
+				fail "invalid escape sequence: `{text(start)}`" unless digits > 0 && peek() == 125
+				pos++
+				return v
+			}
+			for let k = 0; k < 2; k++ {
+				let d = hexDigit(peek())
+				pos++ when more()
+				fail "invalid escape sequence: `{text(start)}`" when d < 0
+				v = v * 16 + d
+			}
+			return v
+		}
+
+		// \pX, \p{Name}, \p{^Name} (negated with \P), after the p of the
+		// escape at `start`.
+		internal def unicodeClass(negated bool, start int) !CharClass {
+			fail "invalid character class range: `{text(start)}`" unless more()
+			let name = ""
+			let negate = negated
+			if peek() == 123 {
+				pos++
+				if peek() == 94 {
+					negate = !negate
+					pos++
+				}
+				for more() && peek() != 125 {
+					name += string(char(peek()))
+					pos++
+				}
+				fail "invalid character class range: `{text(start)}`" unless peek() == 125
+				pos++
+			} else {
+				name = string(char(peek()))
+				pos++
+			}
+			fail "invalid character class range: `{text(start)}`" unless knownProperty(name)
+			let k = new CharClass()
+			k.caseless = caseless
+			k.properties.push(Property{name: name, negated: negate})
+			return k
+		}
+
+		// A bracketed class whose '[' is at `start`, after the '['.
+		internal def bracket(start int) !CharClass {
+			let k = new CharClass()
+			k.caseless = caseless
+			if peek() == 94 {
+				k.negated = true
+				pos++
+			}
+			let first = true
+			for {
+				fail "missing closing ]: `{text(start)}`" unless more()
+				let ch = peek()
+				break when ch == 93 && !first
+				first = false
+				if ch == 91 && pos + 1 < src.len() && src[pos + 1] == 58 {
+					let named = try posixClass()
+					if named is CharClass {
+						named.caseless = caseless
+						k.nested.push(named)
+						continue
+					}
+				}
+				let lo = 0
+				let itemStart = pos
+				if ch == 92 {
+					pos++
+					fail "trailing backslash at end of expression" unless more()
+					let e = peek()
+					if e := 100 || 68 || 115 || 83 || 119 || 87 {
+						pos++
+						let perl = perlClass(e)
+						perl.caseless = caseless
+						k.nested.push(perl)
+						continue
+					}
+					if e := 112 || 80 {
+						pos++
+						k.nested.push(try unicodeClass(e == 80, itemStart))
+						continue
+					}
+					lo = try escapedChar(itemStart)
+				} else {
+					lo = ch
+					pos++
+				}
+				let hi = lo
+				if peek() == 45 && pos + 1 < src.len() && src[pos + 1] != 93 {
+					pos++
+					let h = peek()
+					if h == 92 {
+						pos++
+						fail "trailing backslash at end of expression" unless more()
+						hi = try escapedChar(pos - 1)
+					} else {
+						hi = h
+						pos++
+					}
+					fail "invalid character class range: `{text(itemStart)}`" when hi < lo
+				}
+				k.range(lo, hi)
+			}
+			pos++
+			return k
+		}
+
+		// [:name:] or [:^name:] at `pos`: the class and past it, or none
+		// when the text is not one.
+		// Fails on a name POSIX does not have.
+		internal def posixClass() !?CharClass {
+			let start = pos
+			let at = pos + 2
+			let negate = false
+			if at < src.len() && src[at] == 94 {
+				negate = true
+				at++
+			}
+			let name = ""
+			for at < src.len() && src[at] != 58 && src[at] != 93 {
+				name += string(char(src[at]))
+				at++
+			}
+			return none unless at + 1 < src.len() && src[at] == 58 && src[at + 1] == 93
+			let k = new CharClass()
+			match name {
+				case "alnum":
+					k.range(48, 57)
+					k.range(65, 90)
+					k.range(97, 122)
+				case "alpha":
+					k.range(65, 90)
+					k.range(97, 122)
+				case "ascii":
+					k.range(0, 127)
+				case "blank":
+					k.range(9, 9)
+					k.range(32, 32)
+				case "cntrl":
+					k.range(0, 31)
+					k.range(127, 127)
+				case "digit":
+					k.range(48, 57)
+				case "graph":
+					k.range(33, 126)
+				case "lower":
+					k.range(97, 122)
+				case "print":
+					k.range(32, 126)
+				case "punct":
+					k.range(33, 47)
+					k.range(58, 64)
+					k.range(91, 96)
+					k.range(123, 126)
+				case "space":
+					k.range(9, 13)
+					k.range(32, 32)
+				case "upper":
+					k.range(65, 90)
+				case "word":
+					k.range(48, 57)
+					k.range(65, 90)
+					k.range(97, 122)
+					k.range(95, 95)
+				case "xdigit":
+					k.range(48, 57)
+					k.range(65, 70)
+					k.range(97, 102)
+				default:
+					pos = at + 2
+					fail "invalid character class range: `{text(start)}`"
+			}
+			k.negated = negate
+			pos = at + 2
+			return k
+		}
+	}
+
+	// The class of a Perl escape: \d, \s, \w (ASCII, as RE2 has them) or
+	// their negations \D, \S, \W.
+	def perlClass(letter int) CharClass {
+		let k = new CharClass()
+		match letter {
+			case 100, 68:
+				k.range(48, 57)
+			case 115, 83:
+				k.range(9, 10)
+				k.range(12, 13)
+				k.range(32, 32)
+			default:
+				k.range(48, 57)
+				k.range(65, 90)
+				k.range(97, 122)
+				k.range(95, 95)
+		}
+		k.negated = letter := 68 || 83 || 87
+		return k
+	}
+
+	// Whether `ch` is an ASCII word character, as \b and \w see it.
+	def isWordChar(ch int) bool {
+		return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95
+	}
+
+	// The value of hexadecimal digit `ch`, -1 when it is not one.
+	def hexDigit(ch int) int {
+		return ch - 48 when ch >= 48 && ch <= 57
+		return ch - 55 when ch >= 65 && ch <= 70
+		return ch - 87 when ch >= 97 && ch <= 102
+		return -1
+	}
+}

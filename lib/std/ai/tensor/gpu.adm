@@ -41,23 +41,68 @@ internal std.ai partial module std.ai.tensor.gpu {
 		// For `n` tokens: out[oo + t · os + r] = row r · x[xo + t · xs:] for
 		// every row r and token t < n. `work` holds at least `splitWork`
 		// values: too few tiles to fill the GPU split their columns, and
-		// the parts are added in a fixed order.
+		// the parts are added in a fixed order. With `first` and `count`
+		// the matrix is rows first .. first + count − 1 (one expert of a
+		// stack); out's rows then count from 0.
 		// Fails with the driver's error when a launch does.
-		def multiplyTokens(x gpu.DeviceBuffer<float32>, xo int, xs int, out gpu.DeviceBuffer<float32>, oo int, os int, n int, work gpu.DeviceBuffer<float32>) !none {
+		def multiplyTokens(x gpu.DeviceBuffer<float32>, xo int, xs int, out gpu.DeviceBuffer<float32>, oo int, os int, n int, work gpu.DeviceBuffer<float32>, first int = 0, count int = -1) !none {
+			let height = count < 0 ?? (rows, count)
+			let tiles = ((height + tileSize - 1) / tileSize) * ((n + tileSize - 1) / tileSize)
+			let splits = (splitTarget / tiles).min(cols / 32).max(1)
+			let span = (cols / splits + 31) / 32 * 32
+			splits = (cols + span - 1) / span
+			return multiplyTiles(data, form(kind), first, x, xo, xs, out, oo, os, height, cols, n, span, tiles * splits * 256) when splits == 1
+			try multiplyTiles(data, form(kind), first, x, xo, xs, work, 0, height, height, cols, n, span, tiles * splits * 256)
+			return sumSplits(work, out, oo, os, height, n, splits, height * n)
+		}
+
+		// For `n` tokens: dx[xo + t · xs + c] += the sum over rows r of
+		// dy[yo + t · ys + r] · W[r][c], for every column c and token t < n:
+		// how a gradient goes back through multiplyTokens. `work` holds at
+		// least `splitWork` values: too few tiles to fill the GPU split
+		// their rows, and the parts are added in a fixed order.
+		// Fails with the driver's error when a launch does.
+		// With `first` and `count`, the matrix is those rows (see
+		// multiplyTokens), and dy's rows count from 0.
+		def multiplyBack(dy gpu.DeviceBuffer<float32>, yo int, ys int, dx gpu.DeviceBuffer<float32>, xo int, xs int, n int, work gpu.DeviceBuffer<float32>, first int = 0, count int = -1) !none {
+			let height = count < 0 ?? (rows, count)
+			let tiles = ((cols + tileSize - 1) / tileSize) * ((n + tileSize - 1) / tileSize)
+			let splits = (splitTarget / tiles).min(height / 32).min(splitWork / (n * cols)).max(1)
+			let span = (height / splits + 31) / 32 * 32
+			splits = (height + span - 1) / span
+			return multiplyTilesBack(data, form(kind), first, dy, yo, ys, dx, xo, xs, height, cols, n, span, 1, tiles * splits * 256) when splits == 1
+			try multiplyTilesBack(data, form(kind), first, dy, yo, ys, work, 0, cols, height, cols, n, span, 0, tiles * splits * 256)
+			return addSplits(work, dx, xo, xs, cols, n, splits, cols * n)
+		}
+
+		// Whether multiplyRounded reads this matrix: quantized weights whose
+		// rows are whole blocks of 32 values.
+		def rounds() bool {
+			return (kind := TensorType.Q4_K || TensorType.Q5_K || TensorType.Q6_K || TensorType.Q8_0 || TensorType.Q4_0 || TensorType.MXFP4) && cols % 32 == 0
+		}
+
+		// multiplyTokens on activations rounded to 8 bits (see roundRows:
+		// `q` and `scales` hold the `n` rows this multiplies, one after
+		// another): integer dot products, about three times as fast, with
+		// results that differ from multiplyTokens' by the rounding. Needs
+		// `rounds()`.
+		// Fails with the driver's error when a launch does.
+		def multiplyRounded(q gpu.DeviceBuffer<byte>, scales gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, oo int, os int, n int, work gpu.DeviceBuffer<float32>) !none {
 			let tiles = ((rows + tileSize - 1) / tileSize) * ((n + tileSize - 1) / tileSize)
 			let splits = (splitTarget / tiles).min(cols / 32).max(1)
 			let span = (cols / splits + 31) / 32 * 32
 			splits = (cols + span - 1) / span
-			return multiplyTiles(data, form(kind), x, xo, xs, out, oo, os, rows, cols, n, span, tiles * splits * 256) when splits == 1
-			try multiplyTiles(data, form(kind), x, xo, xs, work, 0, rows, rows, cols, n, span, tiles * splits * 256)
+			return multiplyTilesRounded(data, form(kind), q, scales, out, oo, os, rows, cols, n, span, tiles * splits * 256) when splits == 1
+			try multiplyTilesRounded(data, form(kind), q, scales, work, 0, rows, rows, cols, n, span, tiles * splits * 256)
 			return sumSplits(work, out, oo, os, rows, n, splits, rows * n)
 		}
 
 		// Warps sharing each row: enough warps in all to keep every SM
-		// busy (about 8192), at most 8 and at most one per 256 values.
+		// busy without a second wave of blocks (48 warps for each of 128 SMs),
+		// at most 8 and at most one per 256 values.
 		internal def warpsPerRow() int {
 			let split = 1
-			for split < 8 && rows * split * 2 <= 8192 && split * 2 * 256 <= cols {
+			for split < 8 && rows * split * 2 <= 6144 && split * 2 * 256 <= cols {
 				split *= 2
 			}
 			return split
@@ -81,9 +126,105 @@ internal std.ai partial module std.ai.tensor.gpu {
 		return multiplyTriple(a.data, form(a.kind), b.data, form(b.kind), c.data, form(c.kind), x, outA, oa, outB, ob, outC, oc, a.rows, b.rows, c.rows, a.cols, split, rows * 32 * split)
 	}
 
+	// The feed-forward halves of the picked experts of `n` tokens. `gate`
+	// and `up` hold experts of `rows` rows each, one after another (see
+	// uploadStack), and slots[e] says which of them expert e is: its rows
+	// start at row slots[e] · rows, and a pick of an expert whose slot is
+	// negative is left out. For token t and its j-th pick e (see pickExperts,
+	// `used` picks per token at picks[po + t · 2 · used:]),
+	// out[oo + (t · used + j) · rows + r] = act(g) · u, where g is expert
+	// e's gate row r times x[xo + t · xs:] plus bias[gateBias + e · rows + r]
+	// and u the same of `up` with upBias (no biases when gateBias < 0).
+	// act is SiLU for mode 0 and GELU (tanh form) for 1; mode 2 is
+	// min(g, 7) · sigmoid(1.702 · min(g, 7)) · (clamp(u, ±7) + 1).
+	// The `n` tokens may be a part of a batch of `of`: `of` decides how
+	// the warps share a row, so the parts give the values of the whole.
+	// Fails with the driver's error when the launch does.
+	def multiplyExperts(gate DeviceWeights, up DeviceWeights, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xo int, xs int, picks gpu.DeviceBuffer<float32>, po int, used int, bias gpu.DeviceBuffer<float32>, gateBias int, upBias int, out gpu.DeviceBuffer<float32>, oo int, rows int, n int, of int, mode int) !none {
+		let split = 1
+		for split < 8 && of * used * rows * split * 2 <= 8192 && split * 2 * 256 <= gate.cols {
+			split *= 2
+		}
+		return multiplyExpertPairs(gate.data, form(gate.kind), up.data, form(up.kind), slots, x, xo, xs, picks, po, used, bias, gateBias, upBias, out, oo, rows, gate.cols, n, mode, split, n * used * rows * 32 * split)
+	}
+
+	// The picked experts' outputs of `n` tokens, weighted and summed.
+	// `down` holds experts of `rows` rows each, one after another, and
+	// `slots` places them as multiplyExperts' does. For token t,
+	// out[oo + t · os + r] is the sum over its picks j, in order, of weight
+	// j times (expert e's down row r times
+	// x[xo + (t · used + j) · down.cols:] plus bias[downBias + e · rows + r]),
+	// e the j-th pick (no bias when downBias < 0). `of` is the batch the
+	// `n` tokens are a part of, as multiplyExperts'.
+	// Fails with the driver's error when the launch does.
+	def sumExperts(down DeviceWeights, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xo int, picks gpu.DeviceBuffer<float32>, po int, used int, bias gpu.DeviceBuffer<float32>, downBias int, out gpu.DeviceBuffer<float32>, oo int, os int, rows int, n int, of int) !none {
+		let split = 1
+		for split < 8 && split * 2 <= used && of * rows * split * 2 <= 8192 {
+			split *= 2
+		}
+		return multiplyExpertsDown(down.data, form(down.kind), slots, x, xo, picks, po, used, bias, downBias, out, oo, os, rows, down.cols, n, split, n * rows * 32 * split)
+	}
+
+	// Whether a batch of `n` tokens picking `used` of `experts` experts
+	// each is faster through mixExpertTiles than through multiplyExperts
+	// and sumExperts: a tile dequantizes its expert's rows however few
+	// tokens share the expert.
+	def groupsPay(n int, used int, experts int) bool {
+		return n * used >= groupedFrom * experts
+	}
+
+	// The values of mixExpertTiles' `groups` buffer for `n` tokens.
+	def groupsSize(n int, experts int) int {
+		return experts * (n + 1)
+	}
+
+	// What multiplyExperts and sumExperts compute for `n` tokens, with the
+	// tokens of each expert multiplied together (multiplyGrouped): the
+	// result is that of the two up to the order of the additions. `slots`
+	// places the `experts` experts as multiplyExperts' does. The halves
+	// and the outputs of the picks whose expert has a negative slot keep
+	// what `halves` and `parts` held, and the sums take them: a caller
+	// that holds the experts in turn runs this once per set, and the last
+	// run's sums are the result. `ups` holds n · used · down.cols values,
+	// `parts` n · used · gate.cols, `groups` groupsSize(n, experts); `x`
+	// rows are `xs` apart, the outputs `os`.
+	// Fails with the driver's error when a launch does.
+	def mixExpertTiles(gate DeviceWeights, up DeviceWeights, down DeviceWeights, slots gpu.DeviceBuffer<float32>, experts int, x gpu.DeviceBuffer<float32>, xs int, picks gpu.DeviceBuffer<float32>, used int, bias gpu.DeviceBuffer<float32>, gateBias int, upBias int, downBias int, halves gpu.DeviceBuffer<float32>, ups gpu.DeviceBuffer<float32>, parts gpu.DeviceBuffer<float32>, groups gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, os int, n int, mode int) !none {
+		let rows = down.cols
+		let width = gate.cols
+		let tokenTiles = (n + tileSize - 1) / tileSize
+		try groupPicks(picks, used, n, slots, groups, experts, experts * 256)
+		let tiles = experts * ((rows + tileSize - 1) / tileSize) * tokenTiles
+		try multiplyGrouped(gate.data, form(gate.kind), slots, x, xs, used, groups, experts, halves, rows, gate.cols, n, tiles * 256)
+		try multiplyGrouped(up.data, form(up.kind), slots, x, xs, used, groups, experts, ups, rows, up.cols, n, tiles * 256)
+		try activateExperts(halves, ups, picks, used, slots, bias, gateBias, upBias, rows, mode, n * used * rows)
+		try multiplyGrouped(down.data, form(down.kind), slots, halves, rows, 1, groups, experts, parts, width, down.cols, n, experts * ((width + tileSize - 1) / tileSize) * tokenTiles * 256)
+		return sumPicked(parts, picks, used, bias, downBias, out, os, width, n * width)
+	}
+
+	// mixExpertTiles on activations rounded to 8 bits (see roundRows and
+	// DeviceWeights.multiplyRounded): `q` holds n · max(x's width, used ·
+	// rows) bytes and `scales` a sixteenth as many values. The three
+	// expert matrices must be `rounds()`.
+	// Fails with the driver's error when a launch does.
+	def mixExpertTilesRounded(gate DeviceWeights, up DeviceWeights, down DeviceWeights, slots gpu.DeviceBuffer<float32>, experts int, x gpu.DeviceBuffer<float32>, xs int, picks gpu.DeviceBuffer<float32>, used int, bias gpu.DeviceBuffer<float32>, gateBias int, upBias int, downBias int, halves gpu.DeviceBuffer<float32>, ups gpu.DeviceBuffer<float32>, parts gpu.DeviceBuffer<float32>, groups gpu.DeviceBuffer<float32>, q gpu.DeviceBuffer<byte>, scales gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, os int, n int, mode int) !none {
+		let rows = down.cols
+		let width = gate.cols
+		let tokenTiles = (n + tileSize - 1) / tileSize
+		try groupPicks(picks, used, n, slots, groups, experts, experts * 256)
+		let tiles = experts * ((rows + tileSize - 1) / tileSize) * tokenTiles
+		try roundRows(x, 0, xs, q, scales, gate.cols, n, n * gate.cols)
+		try multiplyGroupedRounded(gate.data, form(gate.kind), slots, q, scales, used, groups, experts, halves, rows, gate.cols, n, tiles * 256)
+		try multiplyGroupedRounded(up.data, form(up.kind), slots, q, scales, used, groups, experts, ups, rows, up.cols, n, tiles * 256)
+		try activateExperts(halves, ups, picks, used, slots, bias, gateBias, upBias, rows, mode, n * used * rows)
+		try roundRows(halves, 0, rows, q, scales, rows, n * used, n * used * rows)
+		try multiplyGroupedRounded(down.data, form(down.kind), slots, q, scales, 1, groups, experts, parts, width, down.cols, n, experts * ((width + tileSize - 1) / tileSize) * tokenTiles * 256)
+		return sumPicked(parts, picks, used, bias, downBias, out, os, width, n * width)
+	}
+
 	// Whether weights of `kind` can be multiplied on the GPU.
 	def onDevice(kind TensorType) bool {
-		return kind := TensorType.Q4_K || TensorType.Q6_K || TensorType.Q8_0 || TensorType.F32 || TensorType.F16 || TensorType.BF16
+		return kind := TensorType.Q4_K || TensorType.Q5_K || TensorType.Q6_K || TensorType.Q8_0 || TensorType.Q4_0 || TensorType.MXFP4 || TensorType.F32 || TensorType.F16 || TensorType.BF16
 	}
 
 	// Copies `w` to the GPU.
@@ -94,7 +235,706 @@ internal std.ai partial module std.ai.tensor.gpu {
 		return new DeviceWeights(w.kind, w.rows, w.cols, try gpu.upload(w.data))
 	}
 
-	// The storage form rowDot reads: 0 F32, 1 F16, 2 BF16, 3 Q4_K, 4 Q6_K, 5 Q8_0.
+	// Copies `count` matrices of the shape and type of `first`, stored one
+	// after another in `data`, to the GPU as one matrix of all their rows.
+	// Fails when the type has no GPU kernel or the device memory cannot be
+	// allocated.
+	def uploadStack(first Weights, count int, data byte[]) !DeviceWeights {
+		fail "tensor: {first.kind.name} weights have no GPU kernel" unless onDevice(first.kind)
+		return new DeviceWeights(first.kind, first.rows * count, first.cols, try gpu.upload(data))
+	}
+
+	// A table for the kernels that names the places of a few experts and
+	// leaves every other expert out, changed by queued launches.
+	type ExpertWindow {
+		table          gpu.DeviceBuffer<float32>
+		internal shown int[]
+
+		def new(table gpu.DeviceBuffer<float32>) {
+			self.table = table
+		}
+
+		// Makes the table name `places[i]` for `experts[i]` (distinct)
+		// and no place for any other expert. Queued like any launch.
+		// Fails with the driver's error when a launch does.
+		def show(experts int[], places int[]) !none {
+			// Per changed entry the expert and its value: those shown
+			// before and not now, then the new ones.
+			let changed int[]
+			for let (_, e) in shown {
+				changed.push(e, -1) unless experts.includes(e)
+			}
+			for let (i, e) in experts {
+				changed.push(e, places[i])
+			}
+			shown = experts.clone()
+			for let i = 0; i < changed.len(); i += 4 {
+				let second = i + 2 < changed.len() ?? (changed[i + 2], -1)
+				try showSlots(table, changed[i], float32(changed[i + 1]), second, second < 0 ?? (float32(-1), float32(changed[i + 3])))
+			}
+			return none
+		}
+
+		// Frees the device memory.
+		def dispose() {
+			table.dispose()
+		}
+	}
+
+	// A window for layers of at most `experts` experts, naming none.
+	// Fails when the device memory cannot be allocated.
+	def expertWindow(experts int) !ExpertWindow {
+		let shown float32[]
+		for let e = 0; e < experts; e++ {
+			shown.push(float32(-1))
+		}
+		return new ExpertWindow(try gpu.upload(shown))
+	}
+
+	// Room on the GPU for `places` experts, which the layers of a model
+	// share whatever the shape and type of their experts: a batch that
+	// names more experts than a layer has slots runs those outside the
+	// slots from here, `places` at a time (`DeviceExperts.lend` and
+	// `lent`), and the slots keep what they hold. `window` holds the table
+	// the kernels take with these weights: the place of each expert the
+	// last `lend` put here.
+	type ExpertArena {
+		gate           gpu.DeviceBuffer<byte>
+		up             gpu.DeviceBuffer<byte>
+		down           gpu.DeviceBuffer<byte>
+		window         ExpertWindow
+		places         int
+		// The weights `weights` made so far. They free the arena's memory
+		// when they go, so they stay as long as the arena.
+		internal views DeviceWeights[]
+
+		def new(gate gpu.DeviceBuffer<byte>, up gpu.DeviceBuffer<byte>, down gpu.DeviceBuffer<byte>, window ExpertWindow, places int) {
+			self.gate = gate
+			self.up = up
+			self.down = down
+			self.window = window
+			self.places = places
+		}
+
+		// `places` matrices shaped and typed as `like` in the arena's
+		// gate, up or down memory (`which` 0, 1, 2), for a kernel to read
+		// the experts a `lend` put there. They belong to the arena.
+		def weights(which int, like Weights) DeviceWeights {
+			let data = which == 0 ?? (gate, which == 1 ?? (up, down))
+			for let (_, held) in views {
+				return held when held.data == data && held.kind == like.kind && held.rows == like.rows * places && held.cols == like.cols
+			}
+			let made = new DeviceWeights(like.kind, like.rows * places, like.cols, data)
+			views.push(made)
+			return made
+		}
+
+		// Makes the launches queued from now on wait for the copies a
+		// `lend` queued into the arena so far.
+		// Fails with the driver's error.
+		def join() !none {
+			try gate.join()
+			try up.join()
+			return down.join()
+		}
+
+		// Frees the device memory.
+		def dispose() {
+			gate.dispose()
+			up.dispose()
+			down.dispose()
+			window.dispose()
+		}
+	}
+
+	// An arena for `places` experts whose gate, up and down matrices take
+	// at most `gateBytes`, `upBytes` and `downBytes` bytes, of layers of at
+	// most `experts` experts.
+	// Fails when the device memory cannot be allocated.
+	def expertArena(gateBytes int, upBytes int, downBytes int, places int, experts int) !ExpertArena {
+		let room byte[]
+		room.len(places * gateBytes)
+		let gate = try gpu.upload(room)
+		room.len(places * upBytes)
+		let up = try gpu.upload(room)
+		room.len(places * downBytes)
+		let down = try gpu.upload(room)
+		return new ExpertArena(gate, up, down, try expertWindow(experts), places)
+	}
+
+	// The task that makes the cache of a DeviceExperts: its result is the
+	// cache, or none when the driver grants no page-locked memory.
+	internal type ExpertCaching {
+		job async !?gpu.HostBuffer<byte>
+
+		def new(job async !?gpu.HostBuffer<byte>) {
+			self.job = job
+		}
+	}
+
+	// The task that fills the cache entries of a DeviceExperts.
+	internal type ExpertFiller {
+		job async !none
+
+		def new(job async !none) {
+			self.job = job
+		}
+	}
+
+	// The experts of a mixture-of-experts layer on the GPU: `gate`, `up`
+	// and `down` hold `slots()` of them at a time, one after another, and
+	// `table` (one value per expert) the slot each is in, negative for an
+	// expert the kernels are to leave out. The experts outside the slots
+	// stay in host memory and take a slot when `hold` asks for them.
+	//
+	// Experts are also kept in page-locked memory (`cache`, one entry of
+	// gate, up and down bytes each), from where a copy to a slot is queued
+	// and costs the transfer alone; from the model's own bytes the driver
+	// first copies them on the host, while the caller waits. With half the
+	// experts or more in slots, the cache holds those outside the slots:
+	// an expert that leaves a slot gets the entry of the one that took it,
+	// filled by a task of its own (`fillExperts`) while the caller goes on,
+	// and until then it is copied from the model's bytes. With fewer in
+	// slots, experts change places so often that those fills slow the
+	// transfers, and the cache holds every expert from the start.
+	//
+	// A cache of fewer entries than that (`uploadExperts`' `entries`, for
+	// models larger than host memory) holds the experts outside the slots
+	// asked for most recently: one asked for or leaving a slot takes the
+	// entry of the expert outside the slots asked for longest ago, when
+	// that one was asked for before it.
+	//
+	// Page-locking takes about as long as the upload of the same bytes, so
+	// a task makes the cache (`cacheExperts`, started by `startCache`)
+	// while the caller uploads the rest of the model and may already run
+	// it: `hold` takes the cache over once it is there. Until then, and
+	// without page-locked memory, every copy comes from the model's bytes.
+	type DeviceExperts {
+		gate              DeviceWeights
+		up                DeviceWeights
+		down              DeviceWeights
+		table             gpu.DeviceBuffer<float32>
+		internal hostGate Weights[]
+		internal hostUp   Weights[]
+		internal hostDown Weights[]
+		// Per expert its slot or -1, per slot its expert, and per slot
+		// the `clock` of the last `hold` that asked for its expert.
+		internal slotOf   int[]
+		internal expertAt int[]
+		internal usedAt   int[]
+		internal clock    int
+		// The table as the device holds it, the experts of the running
+		// `hold`, and the table entries it changes.
+		internal shown    float32[]
+		internal asked    bool[]
+		internal changed  int[]
+		// The task making the cache, until `settle` takes its result.
+		internal caching  ?ExpertCaching
+		// Per expert its cache entry or -1, and per entry its expert or
+		// -1 (none, or being filled). A fill is ordered on `orders` as
+		// entry · count() + expert and answered with the same value on
+		// `filled`; `taken` says per entry and `filling` per expert
+		// whether one is under way.
+		internal cache    ?gpu.HostBuffer<byte>
+		internal entryOf  int[]
+		internal cached   int[]
+		internal orders   channel<int>
+		internal filled   channel<int>
+		internal filler   ?ExpertFiller
+		internal taken    bool[]
+		internal filling  bool[]
+		// The cache's entries, and per expert the `clock` of the last
+		// `hold` or `lend` that asked for it.
+		internal entries  int
+		internal askedAt  int[]
+		// Experts outside the slots without an entry that may take one:
+		// those that left a slot or were copied from the model's bytes
+		// since the last `refill`.
+		internal wanting  int[]
+
+		internal def new(gate DeviceWeights, up DeviceWeights, down DeviceWeights, table gpu.DeviceBuffer<float32>, shown float32[], hostGate Weights[], hostUp Weights[], hostDown Weights[], slots int, entries int) {
+			self.gate = gate
+			self.up = up
+			self.down = down
+			self.table = table
+			self.shown = shown
+			self.hostGate = hostGate
+			self.hostUp = hostUp
+			self.hostDown = hostDown
+			for let e = 0; e < hostGate.len(); e++ {
+				slotOf.push(e < slots ?? (e, -1))
+				entryOf.push(-1)
+				askedAt.push(0)
+			}
+			for let s = 0; s < slots; s++ {
+				expertAt.push(s)
+				usedAt.push(0)
+			}
+			self.entries = slots == hostGate.len() ?? (0, entries)
+			// No more fills are under way than there are entries, so
+			// neither channel makes its sender wait.
+			orders = new channel<int>(size = entries.max(1))
+			filled = new channel<int>(size = entries.max(1))
+			asked.len(hostGate.len())
+			filling.len(hostGate.len())
+		}
+
+		// The experts of the layer.
+		def count() int {
+			return slotOf.len()
+		}
+
+		// The experts the GPU holds at a time.
+		def slots() int {
+			return expertAt.len()
+		}
+
+		// Whether the GPU holds every expert, so that `hold` has nothing
+		// to do.
+		def whole() bool {
+			return expertAt.len() == slotOf.len()
+		}
+
+		// Whether the GPU holds expert `e` now.
+		def holds(e int) bool {
+			return slotOf[e] >= 0
+		}
+
+		// Whether the table the GPU holds now names a slot for each of
+		// `wanted`, so that a kernel queued before the next `hold` computes
+		// them all. A held expert is not shown after a `hold` with `only`
+		// that did not name it.
+		def shows(wanted int[]) bool {
+			for let (_, e) in wanted {
+				return false when shown[e] < float32(0)
+			}
+			return true
+		}
+
+		// Bytes of one cache entry: an expert's gate, up and down bytes.
+		internal def entryBytes() int {
+			return hostGate[0].data.len() + hostUp[0].data.len() + hostDown[0].data.len()
+		}
+
+		// Whether the cache holds every expert, so that nothing fills it.
+		internal def holdsAll() bool {
+			return entries == count()
+		}
+
+		// Starts the task that page-locks the experts the cache starts
+		// with: the first of those the layer began with outside its slots,
+		// or all of them (`holdsAll`). Call it once, before any `hold`; it
+		// does nothing for a layer the GPU holds whole or without entries.
+		def startCache() {
+			return when whole() || entries == 0 || caching is ExpertCaching || cache is gpu.HostBuffer<byte>
+			let first = holdsAll() ?? (0, slots())
+			caching = new ExpertCaching(async cacheExperts(first, startsWith(), entries, hostGate, hostUp, hostDown))
+		}
+
+		// How many experts the cache starts with: all of them, or those the
+		// layer began with outside its slots up to the entries (a bounded
+		// cache may have more entries than there are such experts; the
+		// others start empty).
+		internal def startsWith() int {
+			return holdsAll() ?? (entries, entries.min(count() - slots()))
+		}
+
+		// Whether a cache is still being made.
+		def awaitsCache() bool {
+			return caching is ExpertCaching
+		}
+
+		// Waits for the cache being made and takes it over, see `settle`.
+		// Fails with the error of the task that made it.
+		def awaitCache() !none {
+			let task = caching
+			return none unless task is ExpertCaching
+			caching = none
+			let room = try await task.job
+			adopt(room) when room is gpu.HostBuffer<byte>
+			return none
+		}
+
+		// Takes over the cache `room` as its task filled it: with the
+		// experts in the order of `startCache`. Those that took a slot
+		// since then leave their entries to the ones that left a slot,
+		// which the next `refill` orders.
+		internal def adopt(room gpu.HostBuffer<byte>) {
+			cache = room
+			if holdsAll() {
+				for let e = 0; e < entryOf.len(); e++ {
+					entryOf[e] = e
+				}
+				return
+			}
+			for let e = slots(); e < slots() + startsWith(); e++ {
+				entryOf[e] = cached.len()
+				cached.push(e)
+			}
+			for cached.len() < entries {
+				cached.push(-1)
+			}
+			taken.len(cached.len())
+			filler = new ExpertFiller(async fillExperts(room, hostGate, hostUp, hostDown, orders, filled))
+			for let e = 0; e < count(); e++ {
+				wanting.push(e) when slotOf[e] < 0 && entryOf[e] < 0
+			}
+		}
+
+		// Takes the cache once its task has made it, and the fills that
+		// ended: their entries hold their experts from now on.
+		// Fails with the error of the task that makes the cache or of the
+		// one that fills, when it failed.
+		internal def settle() !none {
+			let making = caching
+			try awaitCache() when making is ExpertCaching && making.job.done()
+			for filled.len() > 0 {
+				let order = <-filled
+				let entry = order / slotOf.len()
+				let e = order % slotOf.len()
+				taken[entry] = false
+				filling[e] = false
+				cached[entry] = e
+				entryOf[e] = entry
+			}
+			let task = filler
+			if task is ExpertFiller && task.job.done() {
+				filler = none
+				try await task.job
+			}
+			return none
+		}
+
+		// Orders fills for the experts `wanting` an entry, the one asked
+		// for most recently first: into an entry whose expert is in a slot
+		// or that holds none, else into that of the expert outside the
+		// slots asked for longest ago, when it was asked for earlier. With
+		// an entry for every expert outside the slots there is always one
+		// of the first kind.
+		internal def refill() {
+			// Few experts want an entry at a time: an insertion sort.
+			for let i = 1; i < wanting.len(); i++ {
+				let e = wanting[i]
+				let j = i
+				for j > 0 && askedAt[wanting[j - 1]] < askedAt[e] {
+					wanting[j] = wanting[j - 1]
+					j--
+				}
+				wanting[j] = e
+			}
+			for let (_, e) in wanting {
+				continue when slotOf[e] >= 0 || entryOf[e] >= 0 || filling[e]
+				let entry = -1
+				let oldest = -1
+				for let k = 0; k < cached.len(); k++ {
+					continue when taken[k]
+					let held = cached[k]
+					if held < 0 || slotOf[held] >= 0 {
+						entry = k
+						break
+					}
+					oldest = k when oldest < 0 || askedAt[held] < askedAt[cached[oldest]]
+				}
+				entry = oldest when entry < 0 && oldest >= 0 && askedAt[cached[oldest]] < askedAt[e]
+				continue when entry < 0 || !orders.offer(entry * slotOf.len() + e)
+				entryOf[cached[entry]] = -1 when cached[entry] >= 0
+				cached[entry] = -1
+				taken[entry] = true
+				filling[e] = true
+			}
+			wanting.len(0)
+		}
+
+		// Of `wanted`, the experts neither a slot nor the page-locked cache
+		// holds: a copy of one would go through pageable memory, so a
+		// token computes it on the host instead. Each is asked for, as
+		// `hold` asks for the experts it copies, and wants a cache entry,
+		// which a task fills beside the tokens to come.
+		// Fails with the error of a cache or fill task that ended in one.
+		def uncached(wanted int[]) !int[] {
+			try settle()
+			let out int[]
+			let room = cache
+			for let (_, e) in wanted {
+				continue when slotOf[e] >= 0
+				continue when room is gpu.HostBuffer<byte> && entryOf[e] >= 0
+				out.push(e)
+				askedAt[e] = clock
+				wanting.push(e) unless filling[e]
+			}
+			refill() when wanting.len() > 0 && filler is ExpertFiller
+			return out
+		}
+
+		// Puts the experts `wanted` (distinct, at most `slots()`) in
+		// slots: each one the GPU lacks replaces the expert asked for
+		// longest ago that `wanted` does not name. With `only`, the table
+		// then names the slots of `wanted` alone and leaves every other
+		// expert out; else those of every expert held. The copies and the
+		// table's changes are queued behind the launches queued before, and
+		// `hold` returns without waiting for them; it waits for those
+		// launches only to copy an expert that has no cache entry, or a
+		// table that changed in many places. With `beside`, the copies
+		// from the cache wait for the launches queued before, which may
+		// still read the slots, and run beside those queued after: none of
+		// these may read the slots before `join()`.
+		// Fails with the driver's error when a copy does.
+		def hold(wanted int[], only bool, beside bool = false) !none {
+			clock++
+			try settle()
+			for let (_, e) in wanted {
+				asked[e] = true
+				askedAt[e] = clock
+			}
+			let room = cache
+			for let (_, e) in wanted {
+				if slotOf[e] >= 0 {
+					usedAt[slotOf[e]] = clock
+					continue
+				}
+				let slot = -1
+				for let s = 0; s < expertAt.len(); s++ {
+					continue when asked[expertAt[s]]
+					slot = s when slot < 0 || usedAt[s] < usedAt[slot]
+				}
+				let gateLen = hostGate[e].data.len()
+				let upLen = hostUp[e].data.len()
+				let downLen = hostDown[e].data.len()
+				if room is gpu.HostBuffer<byte> && entryOf[e] >= 0 {
+					let at = entryOf[e] * entryBytes()
+					try gate.data.write(room, at, gateLen, slot * gateLen, overlap = beside)
+					try up.data.write(room, at + gateLen, upLen, slot * upLen, overlap = beside)
+					try down.data.write(room, at + gateLen + upLen, downLen, slot * downLen, overlap = beside)
+				} else {
+					try gate.data.write(hostGate[e].data, slot * gateLen)
+					try up.data.write(hostUp[e].data, slot * upLen)
+					try down.data.write(hostDown[e].data, slot * downLen)
+				}
+				slotOf[expertAt[slot]] = -1
+				wanting.push(expertAt[slot]) when entryOf[expertAt[slot]] < 0
+				slotOf[e] = slot
+				expertAt[slot] = e
+				usedAt[slot] = clock
+			}
+			refill() when wanting.len() > 0 && filler is ExpertFiller
+			changed.len(0)
+			for let e = 0; e < slotOf.len(); e++ {
+				let v = float32(only && !asked[e] ?? (-1, slotOf[e]))
+				changed.push(e) when shown[e] != v
+				shown[e] = v
+			}
+			for let (_, e) in wanted {
+				asked[e] = false
+			}
+			// A few entries are set by queued launches, which wait for
+			// nothing; more of them cost less as one copy of the table.
+			if changed.len() > 2 * wanted.len() {
+				try table.write(shown)
+				return none
+			}
+			for let i = 0; i < changed.len(); i += 2 {
+				let second = i + 1 < changed.len() ?? (changed[i + 1], -1)
+				try showSlots(table, changed[i], shown[changed[i]], second, second < 0 ?? (float32(-1), shown[second]))
+			}
+			return none
+		}
+
+		// Whether `arena` takes experts of this layer: `places` of them
+		// fit its memory, and its table has an entry for each expert.
+		def fits(arena ExpertArena) bool {
+			let places = arena.places
+			return count() <= arena.window.table.len() && places * hostGate[0].data.len() <= arena.gate.len() && places * hostUp[0].data.len() <= arena.up.len() && places * hostDown[0].data.len() <= arena.down.len()
+		}
+
+		// The gate, up and down weights of the experts `lend` puts in
+		// `arena`, for the kernels to take with the arena's table.
+		def lent(arena ExpertArena) DeviceWeights[] {
+			return DeviceWeights[arena.weights(0, hostGate[0]), arena.weights(1, hostUp[0]), arena.weights(2, hostDown[0])]
+		}
+
+		// Makes the launches queued from now on wait for the copies a
+		// `hold` with `beside` queued into the slots so far.
+		// Fails with the driver's error.
+		def join() !none {
+			try gate.data.join()
+			try up.data.join()
+			return down.data.join()
+		}
+
+		// The experts outside the slots.
+		def outside() int {
+			return count() - slots()
+		}
+
+		// Copies the experts `wanted` (outside the slots, distinct, at
+		// most `arena.places`) into `arena`, which `fits`, and makes its
+		// window name them alone: kernels given the weights `lent(arena)`
+		// and that table then compute those experts, as those given
+		// `gate`, `up`, `down` and `table` compute the ones in slots. The
+		// copies wait for the launches queued before, which may still read
+		// the arena, and run beside those queued after: none of these may
+		// read the arena's weights before `arena.join()`. The call itself
+		// waits for the launches queued before only to copy an expert that
+		// has no cache entry.
+		// Fails with the driver's error when a copy or a launch does.
+		def lend(arena ExpertArena, wanted int[]) !none {
+			try settle()
+			let room = cache
+			let gateLen = hostGate[0].data.len()
+			let upLen = hostUp[0].data.len()
+			let downLen = hostDown[0].data.len()
+			let places int[]
+			for let (place, e) in wanted {
+				places.push(place)
+				askedAt[e] = clock
+				if room is gpu.HostBuffer<byte> && entryOf[e] >= 0 {
+					let at = entryOf[e] * entryBytes()
+					try arena.gate.write(room, at, gateLen, place * gateLen, overlap = true)
+					try arena.up.write(room, at + gateLen, upLen, place * upLen, overlap = true)
+					try arena.down.write(room, at + gateLen + upLen, downLen, place * downLen, overlap = true)
+				} else {
+					try arena.gate.write(hostGate[e].data, place * gateLen)
+					try arena.up.write(hostUp[e].data, place * upLen)
+					try arena.down.write(hostDown[e].data, place * downLen)
+					wanting.push(e) when entryOf[e] < 0 && !filling[e]
+				}
+			}
+			refill() when wanting.len() > 0 && filler is ExpertFiller
+			return arena.window.show(wanted, places)
+		}
+
+		// The slots of `experts`, which the GPU holds.
+		def slotsOf(experts int[]) int[] {
+			let slots int[]
+			for let (_, e) in experts {
+				slots.push(slotOf[e])
+			}
+			return slots
+		}
+
+		// Waits for the cache being made and the fill under way, and frees
+		// the device memory and the cache.
+		def dispose() {
+			awaitCache() onerror recover none
+			orders.close()
+			let task = filler
+			if task is ExpertFiller {
+				await task.job onerror recover none
+			}
+			filler = none
+			let room = cache
+			room.dispose() when room is gpu.HostBuffer<byte>
+			cache = none
+			gate.dispose()
+			up.dispose()
+			down.dispose()
+			table.dispose()
+		}
+	}
+
+	// The experts `gate`, `up` and `down` (one matrix per expert, of one
+	// shape and type each, stored one after another in `gateBytes`,
+	// `upBytes` and `downBytes`) with `slots` of them on the GPU, the
+	// first ones to start with; `slots` is taken up to `atLeast` (the
+	// experts a token uses, which must fit together) and down to the
+	// number of experts. With `cached`, a task copies the others to
+	// page-locked memory as well (all of them when fewer than half are on
+	// the GPU), when the driver grants it, and goes on after the call
+	// returns: until it ends, and without that memory, they are copied
+	// from `gateBytes`, `upBytes` and `downBytes` when asked for, which
+	// takes longer. `entries` >= 0 caps the experts that memory holds
+	// (`DeviceExperts`).
+	// Fails when a type has no GPU kernel or the device memory cannot be
+	// allocated.
+	def uploadExperts(gate Weights[], up Weights[], down Weights[], gateBytes byte[], upBytes byte[], downBytes byte[], slots int, atLeast int, cached bool = true, entries int = -1) !DeviceExperts {
+		let held = slots.max(atLeast).min(gate.len())
+		let room = cacheRoom(held, gate.len())
+		let shown float32[]
+		for let e = 0; e < gate.len(); e++ {
+			shown.push(float32(e < held ?? (e, -1)))
+		}
+		let dGate = try uploadStack(gate[0], held, gateBytes[0:held * gate[0].data.len()])
+		let dUp = try uploadStack(up[0], held, upBytes[0:held * up[0].data.len()])
+		let dDown = try uploadStack(down[0], held, downBytes[0:held * down[0].data.len()])
+		let experts = new DeviceExperts(dGate, dUp, dDown, try gpu.upload(shown), shown, gate, up, down, held, entries < 0 ?? (room, room.min(entries)))
+		experts.startCache() when cached
+		return experts
+	}
+
+	// Page-locked memory of `entries` entries (an expert's `gate`, `up`
+	// and `down` bytes each), the first `filled` holding the experts from
+	// `first` on, or none when the driver grants none. Runs as a task
+	// beside the one that uploads.
+	// Fails when an expert's bytes do not fit its entry.
+	internal def cacheExperts(first int, filled int, entries int, gate Weights[], up Weights[], down Weights[]) !?gpu.HostBuffer<byte> {
+		let cache = expertCache(entries * (gate[0].data.len() + up[0].data.len() + down[0].data.len()))
+		if cache is gpu.HostBuffer<byte> {
+			for let e = first; e < first + filled; e++ {
+				try cacheExpert(cache, e - first, gate[e], up[e], down[e])
+			}
+		}
+		return cache
+	}
+
+	// Whether the page-locked cache of a layer with `slots` of `experts` on
+	// the GPU holds every expert: when fewer than half are in slots, and
+	// not when all are.
+	internal def cachesAll(slots int, experts int) bool {
+		return slots * 2 < experts
+	}
+
+	// The entries of the page-locked cache of a layer with `slots` of
+	// `experts` on the GPU, without a bound: every expert (`cachesAll`),
+	// or those outside the slots.
+	def cacheRoom(slots int, experts int) int {
+		return cachesAll(slots, experts) ?? (experts, experts - slots)
+	}
+
+	// Copies an expert's `gate`, `up` and `down` bytes, in that order, into
+	// entry `entry` of `room`.
+	// Fails when the entry lies outside `room`.
+	internal def cacheExpert(room gpu.HostBuffer<byte>, entry int, gate Weights, up Weights, down Weights) !none {
+		let at = entry * (gate.data.len() + up.data.len() + down.data.len())
+		try room.write(gate.data, at)
+		try room.write(up.data, at + gate.data.len())
+		try room.write(down.data, at + gate.data.len() + up.data.len())
+		return none
+	}
+
+	// Fills entries of `room` until `orders` closes: an order is
+	// entry · experts + expert, and is sent back on `filled` once the
+	// entry holds the expert. Runs as a task beside the one that asks.
+	// Fails when an order names an entry outside `room`.
+	internal def fillExperts(room gpu.HostBuffer<byte>, gate Weights[], up Weights[], down Weights[], orders channel<int>, filled channel<int>) !none {
+		for let order in orders {
+			let e = order % gate.len()
+			try cacheExpert(room, order / gate.len(), gate[e], up[e], down[e])
+			filled <- order
+		}
+		return none
+	}
+
+	// Page-locked memory of `bytes` bytes, or none for no bytes and when
+	// the driver grants none.
+	internal def expertCache(bytes int) ?gpu.HostBuffer<byte> {
+		return none when bytes == 0
+		let room = gpu.hostBuffer<byte>(bytes) onerror (err error) {
+			return none
+		}
+		return room
+	}
+
+	// table[first] = firstSlot and table[second] = secondSlot; a negative
+	// `second` names no entry.
+	@launch(block = 256, cpu = false)
+	cuda def showSlots(table gpu.DeviceBuffer<float32>, first int, firstSlot float32, second int, secondSlot float32) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i == first) table[i] = firstSlot;
+		if (i == second) table[i] = secondSlot;
+	}
+
+	// The storage form rowDot reads: 0 F32, 1 F16, 2 BF16, 3 Q4_K, 4 Q6_K,
+	// 5 Q8_0, 6 Q4_0, 7 Q5_K, 8 MXFP4.
 	def form(kind TensorType) int {
 		match kind {
 			case TensorType.F16:
@@ -107,6 +947,12 @@ internal std.ai partial module std.ai.tensor.gpu {
 				return 4
 			case TensorType.Q8_0:
 				return 5
+			case TensorType.Q4_0:
+				return 6
+			case TensorType.Q5_K:
+				return 7
+			case TensorType.MXFP4:
+				return 8
 			default:
 				return 0
 		}
@@ -139,6 +985,14 @@ internal std.ai partial module std.ai.tensor.gpu {
 	// under splitTarget tiles.
 	const splitWork = splitTarget * tileSize * tileSize
 
+	// Experts pickExperts can pick per token: it ranks them in shared
+	// memory.
+	const maxExpertsUsed = 64
+
+	// Tokens per expert, on average, from which groupsPay (Qwen3-30B-A3B,
+	// 128 experts, 8 used: tiles lose at 1 to 2 per expert and win at 4).
+	const groupedFrom = 4
+
 	// Helpers pasted into the kernels.
 
 	// The IEEE half at p[0..1], little-endian.
@@ -170,6 +1024,87 @@ internal std.ai partial module std.ai.tensor.gpu {
 		return s;
 	}
 
+	// The largest of a 256-thread block's values, in every thread; `shared`
+	// (`shared`) holds 8 floats of shared memory.
+	@kernelOnly
+	cuda def blockMax(v float32, shared float32[]) float32 {
+		for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+		__syncthreads();
+		if ((threadIdx.x & 31) == 0) shared[threadIdx.x >> 5] = v;
+		__syncthreads();
+		float m = shared[0];
+		for (int k = 1; k < 8; k++) m = fmaxf(m, shared[k]);
+		return m;
+	}
+
+	// This lane's share of one Q4_K block (144 bytes: half d, half dmin, 12
+	// bytes of 6-bit scales and mins, 128 bytes of nibbles) times the 256
+	// values the block covers: `xs` is this lane's 8 of them, those of
+	// sub-block lane / 4 (32 values under one scale and min) from
+	// (lane % 4) · 8 on. The scale is picked without a branch, which would
+	// split the warp's halves.
+	@kernelOnly
+	cuda def q4Share(blk byte[], xs float32[], lane int) float32 {
+		int j = lane >> 2, shift = (j & 1) * 4, high = -(j >> 2);
+		uint2 q = *(uint2*) (blk + 16 + (j >> 1) * 32 + (lane & 3) * 8);
+		uint32_t scales = *(uint32_t*) blk;
+		float d, dmin;
+		asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(d): "h"((unsigned short) scales));
+		asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(dmin): "h"((unsigned short) (scales >> 16)));
+		uint8_t * sc = blk + 4 + (j & 3);
+		int b0 = sc[0], b1 = sc[4], b2 = sc[8];
+		int s = ((b0 & 63) & ~high) | (((b2 & 0xF) | ((b0 >> 6) << 4)) & high);
+		int m = ((b1 & 63) & ~high) | (((b2 >> 4) | ((b1 >> 6) << 4)) & high);
+		q.x >>= shift;
+		q.y >>= shift;
+		float4 a = *(float4*) xs;
+		float4 c = *(float4*) (xs + 4);
+		float dot = (float) (q.x & 0xF) * a.x + (float) ((q.x >> 8) & 0xF) * a.y + (float) ((q.x >> 16) & 0xF) * a.z + (float) ((q.x >> 24) & 0xF) * a.w;
+		dot += (float) (q.y & 0xF) * c.x + (float) ((q.y >> 8) & 0xF) * c.y + (float) ((q.y >> 16) & 0xF) * c.z + (float) ((q.y >> 24) & 0xF) * c.w;
+		return d * (float) s * dot - dmin * (float) m * ((a.x + a.y) + (a.z + a.w) + (c.x + c.y) + (c.z + c.w));
+	}
+
+	// q4Share for one Q5_K block (176 bytes: half d, half dmin, 12 bytes of
+	// 6-bit scales and mins, 32 bytes of fifth bits, 128 bytes of nibbles):
+	// value l of sub-block j has bit j of byte l of the fifth bits as its
+	// bit 4.
+	@kernelOnly
+	cuda def q5Share(blk byte[], xs float32[], lane int) float32 {
+		int j = lane >> 2, shift = (j & 1) * 4, high = -(j >> 2);
+		uint2 q = *(uint2*) (blk + 48 + (j >> 1) * 32 + (lane & 3) * 8);
+		uint2 h = *(uint2*) (blk + 16 + (lane & 3) * 8);
+		uint32_t scales = *(uint32_t*) blk;
+		float d, dmin;
+		asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(d): "h"((unsigned short) scales));
+		asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }": "=f"(dmin): "h"((unsigned short) (scales >> 16)));
+		uint8_t * sc = blk + 4 + (j & 3);
+		int b0 = sc[0], b1 = sc[4], b2 = sc[8];
+		int s = ((b0 & 63) & ~high) | (((b2 & 0xF) | ((b0 >> 6) << 4)) & high);
+		int m = ((b1 & 63) & ~high) | (((b2 >> 4) | ((b1 >> 6) << 4)) & high);
+		q.x = ((q.x >> shift) & 0x0F0F0F0Fu) | (((h.x >> j) & 0x01010101u) << 4);
+		q.y = ((q.y >> shift) & 0x0F0F0F0Fu) | (((h.y >> j) & 0x01010101u) << 4);
+		float4 a = *(float4*) xs;
+		float4 c = *(float4*) (xs + 4);
+		float dot = (float) (q.x & 0xFF) * a.x + (float) ((q.x >> 8) & 0xFF) * a.y + (float) ((q.x >> 16) & 0xFF) * a.z + (float) (q.x >> 24) * a.w;
+		dot += (float) (q.y & 0xFF) * c.x + (float) ((q.y >> 8) & 0xFF) * c.y + (float) ((q.y >> 16) & 0xFF) * c.z + (float) (q.y >> 24) * c.w;
+		return d * (float) s * dot - dmin * (float) m * ((a.x + a.y) + (a.z + a.w) + (c.x + c.y) + (c.z + c.w));
+	}
+
+	// The doubled E2M1 value of 4-bit index n (MXFP4): 0, 1, 2, 3, 4, 6,
+	// 8, 12, then the same negated.
+	@kernelOnly
+	cuda def fp4(n int) int {
+		int v = (int) ((0x0C08060403020100ull >> (8 * (n & 7))) & 0xFF);
+		return (n & 8) ? -v: v;
+	}
+
+	// Half the E8M0 scale e of an MXFP4 block, as std.formats.ai's
+	// e8m0Half reads it.
+	@kernelOnly
+	cuda def e8m0Half(e int) float32 {
+		return __int_as_float(e < 2 ? 0x00200000 << e: (e - 1) << 23);
+	}
+
 	// This lane's share of row `row` of w (stored as `form`, see `form`)
 	// times x, over the 256-value spans part, part + split, ...: the shares
 	// of `split` warps' lanes add up to the dot product. Each lane takes 8
@@ -178,30 +1113,15 @@ internal std.ai partial module std.ai.tensor.gpu {
 	cuda def rowDot(w byte[], form int, row int, cols int, x float32[], lane int, part int, split int) float32 {
 		float acc = 0.0f;
 		if (form == 3) {
-			// Q4_K: 144-byte blocks of 256; half d, half dmin, 12 bytes of
-			// 6-bit scales and mins, 128 bytes of nibbles.
 			int64_t blocks = cols / 256;
-			int g = lane >> 3, sub = lane & 7;
-			int j0 = 2 * g, j1 = 2 * g + 1;
-			for (int64_t b = part; b < blocks; b += split) {
-				uint8_t * blk = w + (row * blocks + b) * 144;
-				float d = half(blk, 2), dmin = half(blk + 2, 2);
-				uint8_t * sc = blk + 4;
-				int s0, m0, s1, m1;
-				if (j0 < 4) {
-					s0 = sc[j0] & 63; m0 = sc[j0 + 4] & 63;
-					s1 = sc[j1] & 63; m1 = sc[j1 + 4] & 63;
-				} else {
-					s0 = (sc[j0 + 4] & 0xF) | ((sc[j0 - 4] >> 6) << 4); m0 = (sc[j0 + 4] >> 4) | ((sc[j0] >> 6) << 4);
-					s1 = (sc[j1 + 4] & 0xF) | ((sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((sc[j1] >> 6) << 4);
-				}
-				uint32_t q = *(uint32_t*) (blk + 16 + g * 32 + sub * 4);
-				float4 a = *(float4*) (x + b * 256 + g * 64 + sub * 4);
-				float4 c = *(float4*) (x + b * 256 + g * 64 + 32 + sub * 4);
-				float lo = (float) (q & 0xF) * a.x + (float) ((q >> 8) & 0xF) * a.y + (float) ((q >> 16) & 0xF) * a.z + (float) ((q >> 24) & 0xF) * a.w;
-				float hi = (float) ((q >> 4) & 0xF) * c.x + (float) ((q >> 12) & 0xF) * c.y + (float) ((q >> 20) & 0xF) * c.z + (float) ((q >> 28) & 0xF) * c.w;
-				acc += d * (s0 * lo + s1 * hi) - dmin * (m0 * (a.x + a.y + a.z + a.w) + m1 * (c.x + c.y + c.z + c.w));
-			}
+			uint8_t * blk = w + (row * blocks + part) * 144;
+			float * xs = x + part * 256 + (lane >> 2) * 32 + (lane & 3) * 8;
+			for (int64_t b = part; b < blocks; b += split, blk += 144 * split, xs += 256 * split) acc += q4Share(blk, 144, xs, 8, lane);
+		} else if (form == 7) {
+			int64_t blocks = cols / 256;
+			uint8_t * blk = w + (row * blocks + part) * 176;
+			float * xs = x + part * 256 + (lane >> 2) * 32 + (lane & 3) * 8;
+			for (int64_t b = part; b < blocks; b += split, blk += 176 * split, xs += 256 * split) acc += q5Share(blk, 176, xs, 8, lane);
 		} else if (form == 4) {
 			// Q6_K: 210-byte blocks of 256; 128 bytes of low nibbles, 64 of
 			// high bit pairs, 16 signed 8-bit scales, half d.
@@ -234,10 +1154,45 @@ internal std.ai partial module std.ai.tensor.gpu {
 				for (int k = 0; k < 8; k++) part += qs[k] * xs[k];
 				acc += half(blk, 2) * part;
 			}
+		} else if (form == 6) {
+			// Q4_0: 18-byte blocks of 32; half d, 16 bytes whose low nibbles
+			// are values 0-15 and high nibbles 16-31, each less 8. A lane
+			// takes a quarter of a block, a warp 8 blocks at a time.
+			int64_t blocks = cols / 32;
+			int quarter = lane & 3, shift = (quarter >> 1) * 4;
+			for (int64_t b = (lane >> 2) + 8 * part; b < blocks; b += 8 * split) {
+				uint8_t * blk = w + (row * blocks + b) * 18;
+				uint8_t * qs = blk + 2 + (quarter & 1) * 8;
+				float * xs = x + b * 32 + quarter * 8;
+				float part = 0.0f;
+				for (int k = 0; k < 8; k++) part += (float) (((qs[k] >> shift) & 0xF) - 8) * xs[k];
+				acc += half(blk, 2) * part;
+			}
+		} else if (form == 8) {
+			// MXFP4: 17-byte blocks of 32; an E8M0 scale, then indices of
+			// fp4 values laid out as Q4_0's.
+			int64_t blocks = cols / 32;
+			int quarter = lane & 3, shift = (quarter >> 1) * 4;
+			for (int64_t b = (lane >> 2) + 8 * part; b < blocks; b += 8 * split) {
+				uint8_t * blk = w + (row * blocks + b) * 17;
+				uint8_t * qs = blk + 1 + (quarter & 1) * 8;
+				float * xs = x + b * 32 + quarter * 8;
+				float part = 0.0f;
+				for (int k = 0; k < 8; k++) part += (float) fp4(qs[k] >> shift) * xs[k];
+				acc += e8m0Half(blk[0]) * part;
+			}
 		} else if (form == 0) {
+			// A lane takes 8 values in a row of every 256, as two reads of
+			// four where the rows start on a multiple of four values.
 			float * r = (float*) w + row * cols;
-			for (int64_t c0 = 256 * part; c0 < cols; c0 += 256 * split) {
-				for (int64_t c = c0 + lane; c < c0 + 256 && c < cols; c += 32) acc += r[c] * x[c];
+			for (int64_t c = 256 * part + lane * 8; c < cols; c += 256 * split) {
+				if ((cols & 3) == 0 && c + 8 <= cols) {
+					float4 a = *(float4*) (r + c), b = *(float4*) (r + c + 4);
+					float4 p = *(float4*) (x + c), q = *(float4*) (x + c + 4);
+					acc += (a.x * p.x + a.y * p.y) + (a.z * p.z + a.w * p.w) + (b.x * q.x + b.y * q.y) + (b.z * q.z + b.w * q.w);
+				} else {
+					for (int64_t k = c; k < c + 8 && k < cols; k++) acc += r[k] * x[k];
+				}
 			}
 		} else {
 			unsigned short * r = (unsigned short*) w + row * cols;
@@ -272,6 +1227,30 @@ internal std.ai partial module std.ai.tensor.gpu {
 			int q = blk[16 + (j >> 1) * 32 + (i & 31)];
 			q = (j & 1) ? q >> 4: q & 0xF;
 			return half(blk, 2) * s * q - half(blk + 2, 2) * m;
+		}
+		if (form == 7) {
+			uint8_t * blk = w + (row * (cols / 256) + c / 256) * 176;
+			int i = c & 255, j = i >> 5;
+			uint8_t * sc = blk + 4;
+			int s, m;
+			if (j < 4) {
+				s = sc[j] & 63; m = sc[j + 4] & 63;
+			} else {
+				s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+			}
+			int q = blk[48 + (j >> 1) * 32 + (i & 31)];
+			q = ((j & 1) ? q >> 4: q & 0xF) | (((blk[16 + (i & 31)] >> j) & 1) << 4);
+			return half(blk, 2) * s * q - half(blk + 2, 2) * m;
+		}
+		if (form == 6) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 18;
+			int i = c & 31, q = blk[2 + (i & 15)];
+			return half(blk, 2) * (float) (((i >> 4) ? q >> 4: q & 0xF) - 8);
+		}
+		if (form == 8) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 17;
+			int i = c & 31, q = blk[1 + (i & 15)];
+			return e8m0Half(blk[0]) * (float) fp4((i >> 4) ? q >> 4: q);
 		}
 		if (form == 4) {
 			uint8_t * blk = w + (row * (cols / 256) + c / 256) * 210;
@@ -314,6 +1293,42 @@ internal std.ai partial module std.ai.tensor.gpu {
 				v[k] = d * ((q.x >> (8 * k + shift)) & 0xF) - dm;
 				v[k + 4] = d * ((q.y >> (8 * k + shift)) & 0xF) - dm;
 			}
+			return;
+		}
+		if (form == 7) {
+			uint8_t * blk = w + (row * (cols / 256) + c / 256) * 176;
+			int i = c & 255, j = i >> 5;
+			uint8_t * sc = blk + 4;
+			int s, m;
+			if (j < 4) {
+				s = sc[j] & 63; m = sc[j + 4] & 63;
+			} else {
+				s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+			}
+			float d = half(blk, 2) * s, dm = half(blk + 2, 2) * m;
+			uint2 q = *(uint2*) (blk + 48 + (j >> 1) * 32 + (i & 31));
+			uint2 h = *(uint2*) (blk + 16 + (i & 31));
+			int shift = (j & 1) * 4;
+			for (int k = 0; k < 4; k++) {
+				v[k] = d * (((q.x >> (8 * k + shift)) & 0xF) | (((h.x >> (8 * k + j)) & 1) << 4)) - dm;
+				v[k + 4] = d * (((q.y >> (8 * k + shift)) & 0xF) | (((h.y >> (8 * k + j)) & 1) << 4)) - dm;
+			}
+			return;
+		}
+		if (form == 6) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 18;
+			int i = c & 31, shift = (i >> 4) * 4;
+			float d = half(blk, 2);
+			uint8_t * qs = blk + 2 + (i & 15);
+			for (int k = 0; k < 8; k++) v[k] = d * (float) (((qs[k] >> shift) & 0xF) - 8);
+			return;
+		}
+		if (form == 8) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 17;
+			int i = c & 31, shift = (i >> 4) * 4;
+			float d = e8m0Half(blk[0]);
+			uint8_t * qs = blk + 1 + (i & 15);
+			for (int k = 0; k < 8; k++) v[k] = d * (float) fp4(qs[k] >> shift);
 			return;
 		}
 		if (form == 4) {
@@ -364,14 +1379,14 @@ internal std.ai partial module std.ai.tensor.gpu {
 		if (lane == 0 && row < rows) out[oo + row] = acc;
 	}
 
-	// out[oo + t · os + r] = row r of w · x[xo + t · xs:] for `rows` rows
-	// and `n` tokens. Each block takes a tile of 64 rows by 64 tokens
+	// out[oo + t · os + r] = row base + r of w · x[xo + t · xs:] for `rows`
+	// rows and `n` tokens. Each block takes a tile of 64 rows by 64 tokens
 	// (4 × 4 per thread) over `span` columns (a multiple of 32),
 	// dequantizing 32 columns of its rows at a time into shared memory;
 	// the blocks of column span s (after the first) write their sums at
 	// out[oo + s · n · os + ...].
 	@launch(block = 256, x = "threads", cpu = false)
-	cuda def multiplyTiles(w gpu.DeviceBuffer<byte>, form int, x gpu.DeviceBuffer<float32>, xo, xs int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, threads int) !none {
+	cuda def multiplyTiles(w gpu.DeviceBuffer<byte>, form int, base int, x gpu.DeviceBuffer<float32>, xo, xs int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, threads int) !none {
 		__shared__ __align__(16) float ws[32][68];
 		__shared__ __align__(16) float xt[32][68];
 		int64_t tiles = (rows + 63) / 64, tokenTiles = (n + 63) / 64;
@@ -389,7 +1404,7 @@ internal std.ai partial module std.ai.tensor.gpu {
 		float v[8];
 		for (int64_t k0 = from; k0 < to; k0 += 32) {
 			if (r0 + li < rows && k0 + lk < to) {
-				weightsAt(w, w_len, form, r0 + li, cols, k0 + lk, v, 8);
+				weightsAt(w, w_len, form, base + r0 + li, cols, k0 + lk, v, 8);
 			} else {
 				for (int q = 0; q < 8; q++) v[q] = 0.0f;
 			}
@@ -398,8 +1413,8 @@ internal std.ai partial module std.ai.tensor.gpu {
 			for (int q = 0; q < 8; q++) xt[lk + q][li] = t0 + li < n && k0 + lk + q < to ? xr[q]: 0.0f;
 			__syncthreads();
 			for (int k = 0; k < 32; k++) {
-				float4 a = *(float4*) &ws[k][tr];
-				float4 c = *(float4*) &xt[k][tt];
+				float4 a = *(float4*) & ws[k][tr];
+				float4 c = *(float4*) & xt[k][tt];
 				float av[4] = {a.x, a.y, a.z, a.w};
 				float bv[4] = {c.x, c.y, c.z, c.w};
 				for (int i = 0; i < 4; i++) {
@@ -427,6 +1442,190 @@ internal std.ai partial module std.ai.tensor.gpu {
 		float acc = 0.0f;
 		for (int64_t s = 0; s < splits; s++) acc += work[(s * n + t) * rows + r];
 		out[oo + t * os + r] = acc;
+	}
+
+	// Values c .. c + 7 of row `row` of w (stored as `form`: 3 Q4_K,
+	// 4 Q6_K, 5 Q8_0, 6 Q4_0, 7 Q5_K, 8 MXFP4 (doubled E2M1 values); c a
+	// multiple of 8) as stored, before
+	// their scale: 8 signed bytes at q, in order. Each value is s[0] times
+	// its byte, less s[1] (the K-quants' min; 0 for the others).
+	@kernelOnly
+	cuda def quantsAt(w byte[], form int, row int, cols int, c int, q byte[], s float32[]) {
+		unsigned * words = (unsigned*) q;
+		s[1] = 0.0f;
+		if (form == 3 || form == 7) {
+			int size = form == 3 ? 144: 176, at = form == 3 ? 16: 48;
+			uint8_t * blk = w + (row * (cols / 256) + c / 256) * size;
+			int i = c & 255, j = i >> 5;
+			uint8_t * sc = blk + 4;
+			int scale, m;
+			if (j < 4) {
+				scale = sc[j] & 63; m = sc[j + 4] & 63;
+			} else {
+				scale = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+			}
+			s[0] = half(blk, 2) * scale;
+			s[1] = half(blk + 2, 2) * m;
+			uint2 v = *(uint2*) (blk + at + (j >> 1) * 32 + (i & 31));
+			int shift = (j & 1) * 4;
+			words[0] = (v.x >> shift) & 0x0F0F0F0Fu;
+			words[1] = (v.y >> shift) & 0x0F0F0F0Fu;
+			if (form == 7) {
+				uint2 h = *(uint2*) (blk + 16 + (i & 31));
+				words[0] |= ((h.x >> j) & 0x01010101u) << 4;
+				words[1] |= ((h.y >> j) & 0x01010101u) << 4;
+			}
+			return;
+		}
+		unsigned lo = 0, hi = 0;
+		if (form == 4) {
+			uint8_t * blk = w + (row * (cols / 256) + c / 256) * 210;
+			int i = c & 255, h = i >> 7, qd = (i & 127) >> 5, l = i & 31;
+			s[0] = half(blk + 208, 2) * (float) ((int8_t) blk[192 + 8 * h + l / 16 + 2 * qd]);
+			uint8_t * ql = blk + 64 * h + l + (qd & 1) * 32;
+			uint8_t * qh = blk + 128 + 32 * h + l;
+			int shift = qd >= 2 ? 4: 0;
+			for (int k = 0; k < 4; k++) {
+				lo |= (unsigned) ((((ql[k] >> shift) & 0xF) | (((qh[k] >> (2 * qd)) & 3) << 4)) - 32 & 0xFF) << (8 * k);
+				hi |= (unsigned) ((((ql[k + 4] >> shift) & 0xF) | (((qh[k + 4] >> (2 * qd)) & 3) << 4)) - 32 & 0xFF) << (8 * k);
+			}
+		} else if (form == 6) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 18;
+			int i = c & 31, shift = (i >> 4) * 4;
+			s[0] = half(blk, 2);
+			uint8_t * qs = blk + 2 + (i & 15);
+			for (int k = 0; k < 4; k++) {
+				lo |= (unsigned) ((((qs[k] >> shift) & 0xF) - 8) & 0xFF) << (8 * k);
+				hi |= (unsigned) ((((qs[k + 4] >> shift) & 0xF) - 8) & 0xFF) << (8 * k);
+			}
+		} else if (form == 8) {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 17;
+			int i = c & 31, shift = (i >> 4) * 4;
+			s[0] = e8m0Half(blk[0]);
+			uint8_t * qs = blk + 1 + (i & 15);
+			for (int k = 0; k < 4; k++) {
+				lo |= (unsigned) (fp4(qs[k] >> shift) & 0xFF) << (8 * k);
+				hi |= (unsigned) (fp4(qs[k + 4] >> shift) & 0xFF) << (8 * k);
+			}
+		} else {
+			uint8_t * blk = w + (row * (cols / 32) + c / 32) * 34;
+			s[0] = half(blk, 2);
+			uint8_t * qs = blk + 2 + (c & 31);
+			for (int k = 0; k < 4; k++) {
+				lo |= (unsigned) qs[k] << (8 * k);
+				hi |= (unsigned) qs[k + 4] << (8 * k);
+			}
+		}
+		words[0] = lo;
+		words[1] = hi;
+	}
+
+	// Rows of activations rounded to 8 bits, in blocks of 32 values: for
+	// row t < n of `cols` values (a multiple of 32) at x[xo + t · xs:],
+	// block b gets d = its largest magnitude / 127 at
+	// scales[2 · (t · cols / 32 + b)], d times the sum of its rounded
+	// values after it, and its values / d, rounded to nearest, as signed
+	// bytes at q[t · cols + 32 · b:]. One warp per block; threads = n · cols.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def roundRows(x gpu.DeviceBuffer<float32>, xo, xs int, q gpu.DeviceBuffer<byte>, scales gpu.DeviceBuffer<float32>, cols, n, threads int) !none {
+		int64_t at = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		int64_t per = cols / 32;
+		if (at >= n * per) return;
+		int64_t t = at / per, b = at % per;
+		float v = x[xo + t * xs + b * 32 + lane];
+		float top = fabsf(v);
+		for (int o = 16; o > 0; o >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+		float d = top / 127.0f;
+		int r = d > 0.0f ? (int) rintf(v / d): 0;
+		q[t * cols + b * 32 + lane] = (uint8_t) r;
+		int sum = r;
+		for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+		if (lane != 0) return;
+		scales[2 * at] = d;
+		scales[2 * at + 1] = d * (float) sum;
+	}
+
+	// multiplyTiles on rounded activations (see roundRows; row t of `q`
+	// and `scales` is token t): out[oo + t · os + r] = row r of w times
+	// the rounded row t. A block dequantizes nothing: per 32 columns it
+	// holds its rows' stored bytes and its tokens' bytes in shared memory,
+	// a thread takes 4 × 4 integer dot products of 4 bytes at a time, and
+	// the scales multiply the sums of each 16 columns. w is `rounds()`.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyTilesRounded(w gpu.DeviceBuffer<byte>, form int, q gpu.DeviceBuffer<byte>, scales gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, threads int) !none {
+		__shared__ __align__(16) int wq[8][68];
+		__shared__ __align__(16) int xq[8][68];
+		__shared__ float ws[2][68];
+		__shared__ float wm[68];
+		__shared__ float xd[68];
+		__shared__ float xm[68];
+		int64_t tiles = (rows + 63) / 64, tokenTiles = (n + 63) / 64;
+		int64_t b = blockIdx.x % (tiles * tokenTiles), s = blockIdx.x / (tiles * tokenTiles);
+		int64_t r0 = (b % tiles) * 64, t0 = (b / tiles) * 64;
+		int64_t from = s * span, to = from + span < cols ? from + span: cols;
+		oo += s * n * os;
+		int tid = threadIdx.x, tr = (tid & 15) * 4, tt = (tid >> 4) * 4;
+		// This thread's 8 columns of the chunk, of row or token `li`.
+		int li = tid >> 2, part = tid & 3;
+		int64_t per = cols / 32;
+		float acc[4][4];
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+		}
+		unsigned words[2];
+		float sm[2];
+		for (int64_t k0 = from; k0 < to; k0 += 32) {
+			words[0] = 0;
+			words[1] = 0;
+			sm[0] = 0.0f;
+			sm[1] = 0.0f;
+			if (r0 + li < rows) quantsAt(w, w_len, form, r0 + li, cols, k0 + part * 8, (uint8_t*) words, 8, sm, 2);
+			wq[part * 2][li] = (int) words[0];
+			wq[part * 2 + 1][li] = (int) words[1];
+			if ((part & 1) == 0) ws[part >> 1][li] = sm[0];
+			if (part == 0) wm[li] = sm[1];
+			uint2 v = make_uint2(0, 0);
+			bool held = t0 + li < n;
+			if (held) v = *(uint2*) (q + (t0 + li) * cols + k0 + part * 8);
+			xq[part * 2][li] = (int) v.x;
+			xq[part * 2 + 1][li] = (int) v.y;
+			if (part == 0) {
+				float * sc = scales + 2 * ((t0 + li) * per + k0 / 32);
+				xd[li] = held ? sc[0]: 0.0f;
+				xm[li] = held ? sc[1]: 0.0f;
+			}
+			__syncthreads();
+			for (int h = 0; h < 2; h++) {
+				int sums[4][4];
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) sums[i][j] = 0;
+				}
+				for (int k = h * 4; k < h * 4 + 4; k++) {
+					int4 a = *(int4*) & wq[k][tr];
+					int4 c = *(int4*) & xq[k][tt];
+					int av[4] = {a.x, a.y, a.z, a.w};
+					int bv[4] = {c.x, c.y, c.z, c.w};
+					for (int i = 0; i < 4; i++) {
+						for (int j = 0; j < 4; j++) sums[i][j] = __dp4a(av[i], bv[j], sums[i][j]);
+					}
+				}
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) acc[i][j] += ws[h][tr + i] * xd[tt + j] * (float) sums[i][j];
+				}
+			}
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) acc[i][j] -= wm[tr + i] * xm[tt + j];
+			}
+			__syncthreads();
+		}
+		for (int j = 0; j < 4; j++) {
+			int64_t t = t0 + tt + j;
+			if (t >= n) continue;
+			for (int i = 0; i < 4; i++) {
+				if (r0 + tr + i < rows) out[oo + t * os + r0 + tr + i] = acc[i][j];
+			}
+		}
 	}
 
 	// Three matrices of one width times the same x in one launch: rows
@@ -491,6 +1690,354 @@ internal std.ai partial module std.ai.tensor.gpu {
 		if (lane == 0 && row < rows) out[row] = act(g, gelu) * u;
 	}
 
+	// Mixture-of-experts routing, one block per token: from token t's
+	// `experts` scores at scores[so + t · experts:], the `used` largest
+	// (the earlier of equal ones first, at most maxExpertsUsed) go to
+	// picks[po + t · 2 · used:] as `used` expert numbers, largest first,
+	// then their `used` weights times `scale`. The weights are the softmax
+	// of the picked scores when pickFirst is 1, else the softmax of all the
+	// scores divided by the picked ones' sum (at least 2⁻¹⁴).
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def pickExperts(scores gpu.DeviceBuffer<float32>, so, experts, used, pickFirst int, scale float32, picks gpu.DeviceBuffer<float32>, po int, threads int) !none {
+		__shared__ int ids[64];
+		__shared__ float weights[64];
+		__shared__ float held[256];
+		__shared__ float partial[8];
+		int t = threadIdx.x;
+		float * s = scores + so + (int64_t) blockIdx.x * experts;
+		float * p = picks + po + (int64_t) blockIdx.x * 2 * used;
+		// Up to 256 scores are ranked from shared memory.
+		if (experts <= 256) {
+			if (t < experts) held[t] = s[t];
+			__syncthreads();
+			s = held;
+		}
+		for (int64_t i = t; i < experts; i += 256) {
+			float v = s[i];
+			int rank = 0;
+			for (int64_t j = 0; j < experts; j++) rank += s[j] > v || (s[j] == v && j < i);
+			if (rank < used) ids[rank] = (int) i;
+		}
+		__syncthreads();
+		float top = s[ids[0]];
+		float all = 1.0f;
+		if (!pickFirst) {
+			float acc = 0.0f;
+			for (int64_t i = t; i < experts; i += 256) acc += expf(s[i] - top);
+			all = blockSum(acc, partial, 8);
+		}
+		if (t < used) weights[t] = expf(s[ids[t]] - top) / all;
+		__syncthreads();
+		if (t >= used) return;
+		float total = 0.0f;
+		for (int j = 0; j < used; j++) total += weights[j];
+		if (!pickFirst && total < 0.00006103515625f) total = 0.00006103515625f;
+		p[t] = (float) ids[t];
+		p[used + t] = weights[t] / total * scale;
+	}
+
+	// multiplyExperts' launch: one warp (`split` of them sharing the
+	// columns) per token, pick and row.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyExpertPairs(gate gpu.DeviceBuffer<byte>, formGate int, up gpu.DeviceBuffer<byte>, formUp int, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xo, xs int, picks gpu.DeviceBuffer<float32>, po, used int, bias gpu.DeviceBuffer<float32>, gateBias, upBias int, out gpu.DeviceBuffer<float32>, oo, rows, cols, n, mode, split, threads int) !none {
+		__shared__ float sums[2][8];
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		int64_t at = (int64_t) blockIdx.x * (8 / split) + warp / split;
+		int part = warp % split;
+		bool live = at < (int64_t) n * used * rows;
+		int64_t t = at / (used * rows), j = at / rows % used, r = at % rows;
+		int64_t row = 0, biased = 0;
+		float g = 0.0f, u = 0.0f;
+		if (live) {
+			int64_t e = (int64_t) picks[po + t * 2 * used + j];
+			int64_t slot = (int64_t) slots[e];
+			live   = slot >= 0;
+			row    = slot * rows + r;
+			biased = e * rows + r;
+		}
+		if (live) {
+			if (formGate == 3 && formUp == 3) {
+				// Both rows in one pass: they share the reads of x.
+				int64_t blocks = cols / 256;
+				uint8_t * gb = gate + (row * blocks + part) * 144;
+				uint8_t * ub = up + (row * blocks + part) * 144;
+				float * xl = x + xo + t * xs + part * 256 + (lane >> 2) * 32 + (lane & 3) * 8;
+				for (int64_t b = part; b < blocks; b += split, gb += 144 * split, ub += 144 * split, xl += 256 * split) {
+					g += q4Share(gb, 144, xl, 8, lane);
+					u += q4Share(ub, 144, xl, 8, lane);
+				}
+				g = warpSum(g);
+				u = warpSum(u);
+			} else {
+				g = warpSum(rowDot(gate, gate_len, formGate, row, cols, x + xo + t * xs, cols, lane, part, split));
+				u = warpSum(rowDot(up, up_len, formUp, row, cols, x + xo + t * xs, cols, lane, part, split));
+			}
+		}
+		if (split > 1) {
+			if (lane == 0) {
+				sums[0][warp] = g;
+				sums[1][warp] = u;
+			}
+			__syncthreads();
+			if (part != 0) return;
+			for (int k = 1; k < split; k++) {
+				g += sums[0][warp + k];
+				u += sums[1][warp + k];
+			}
+		}
+		if (lane != 0 || !live) return;
+		if (gateBias >= 0) {
+			g += bias[gateBias + biased];
+			u += bias[upBias + biased];
+		}
+		if (mode == 2) {
+			g = fminf(g, 7.0f);
+			out[oo + at] = g / (1.0f + expf(-1.702f * g)) * (fmaxf(fminf(u, 7.0f), -7.0f) + 1.0f);
+		} else {
+			out[oo + at] = act(g, mode) * u;
+		}
+	}
+
+	// sumExperts' launch: `split` warps per token and row, warp p taking
+	// the picks p, p + split, ...; their sums are added in warp order.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyExpertsDown(down gpu.DeviceBuffer<byte>, form int, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xo int, picks gpu.DeviceBuffer<float32>, po, used int, bias gpu.DeviceBuffer<float32>, downBias int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, split, threads int) !none {
+		__shared__ float sums[8];
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		int64_t at = (int64_t) blockIdx.x * (8 / split) + warp / split;
+		int part = warp % split;
+		bool live = at < (int64_t) n * rows;
+		int64_t t = at / rows, r = at % rows;
+		float acc = 0.0f;
+		if (live) {
+			float * p = picks + po + t * 2 * used;
+			for (int j = part; j < used; j += split) {
+				int64_t e = (int64_t) p[j];
+				int64_t slot = (int64_t) slots[e];
+				if (slot < 0) continue;
+				float v = warpSum(rowDot(down, down_len, form, slot * rows + r, cols, x + xo + (t * used + j) * cols, cols, lane, 0, 1));
+				if (downBias >= 0) v += bias[downBias + e * rows + r];
+				acc += p[used + j] * v;
+			}
+		}
+		if (split > 1) {
+			if (lane == 0) sums[warp] = acc;
+			__syncthreads();
+			if (part != 0) return;
+			for (int k = 1; k < split; k++) acc += sums[warp + k];
+		}
+		if (lane == 0 && live) out[oo + t * os + r] = acc;
+	}
+
+	// The picks of `n` tokens by expert, one block per expert e:
+	// groups[e] = how many of the n · used picks at picks[t · 2 · used + j]
+	// are e, and groups[experts + e · n:] those picks' numbers t · used + j,
+	// ascending. An expert whose slots[e] is negative gets no picks.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def groupPicks(picks gpu.DeviceBuffer<float32>, used, n int, slots gpu.DeviceBuffer<float32>, groups gpu.DeviceBuffer<float32>, experts, threads int) !none {
+		__shared__ int counts[256];
+		int t = threadIdx.x;
+		int64_t e = blockIdx.x, all = (int64_t) n * used;
+		int64_t chunk = (all + 255) / 256;
+		int64_t from = t * chunk, to = from + chunk < all ? from + chunk: all;
+		if (slots[e] < 0.0f) to = from;
+		int found = 0;
+		for (int64_t q = from; q < to; q++) found += (int64_t) picks[q / used * 2 * used + q % used] == e;
+		counts[t] = found;
+		__syncthreads();
+		int64_t at = 0;
+		for (int k = 0; k < t; k++) at += counts[k];
+		if (t == 255) groups[e] = (float) (at + found);
+		float * list = groups + experts + e * n;
+		for (int64_t q = from; q < to; q++) {
+			if ((int64_t) picks[q / used * 2 * used + q % used] == e) list[at++] = (float) q;
+		}
+	}
+
+	// multiplyTiles over the picks of each expert (see groupPicks): w holds
+	// experts of `rows` rows each, one after another, expert e at slots[e];
+	// for pick q of expert e, out[q · rows + r] = e's row r times
+	// x[q / per · xs:]. Each block takes a tile of 64 rows by 64 picks of
+	// one expert, and returns at once past the expert's picks.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyGrouped(w gpu.DeviceBuffer<byte>, form int, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xs, per int, groups gpu.DeviceBuffer<float32>, experts int, out gpu.DeviceBuffer<float32>, rows, cols, n, threads int) !none {
+		__shared__ __align__(16) float ws[32][68];
+		__shared__ __align__(16) float xt[32][68];
+		int64_t tiles = (rows + 63) / 64, tokenTiles = (n + 63) / 64;
+		int64_t e = blockIdx.x / (tiles * tokenTiles), b = blockIdx.x % (tiles * tokenTiles);
+		int64_t r0 = (b % tiles) * 64, t0 = (b / tiles) * 64;
+		int64_t count = (int64_t) groups[e];
+		if (t0 >= count) return;
+		int64_t first = (int64_t) slots[e] * rows;
+		float * list = groups + experts + e * n + t0;
+		int tid = threadIdx.x, tr = (tid & 15) * 4, tt = (tid >> 4) * 4;
+		// This thread's 8 columns of the chunk, of row or pick `li`.
+		int li = tid >> 2, lk = (tid & 3) * 8;
+		bool held = t0 + li < count;
+		float * xr = x + (held ? (int64_t) list[li] / per * xs: 0) + lk;
+		float acc[4][4];
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+		}
+		float v[8];
+		for (int64_t k0 = 0; k0 < cols; k0 += 32) {
+			if (r0 + li < rows && k0 + lk < cols) {
+				weightsAt(w, w_len, form, first + r0 + li, cols, k0 + lk, v, 8);
+			} else {
+				for (int q = 0; q < 8; q++) v[q] = 0.0f;
+			}
+			for (int q = 0; q < 8; q++) ws[lk + q][li] = v[q];
+			for (int q = 0; q < 8; q++) xt[lk + q][li] = held && k0 + lk + q < cols ? xr[k0 + q]: 0.0f;
+			__syncthreads();
+			// Threads whose four picks are past the expert's last only
+			// fill the shared chunk.
+			for (int k = 0; k < 32 && t0 + tt < count; k++) {
+				float4 a = *(float4*) & ws[k][tr];
+				float4 c = *(float4*) & xt[k][tt];
+				float av[4] = {a.x, a.y, a.z, a.w};
+				float bv[4] = {c.x, c.y, c.z, c.w};
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bv[j];
+				}
+			}
+			__syncthreads();
+		}
+		for (int j = 0; j < 4; j++) {
+			if (t0 + tt + j >= count) continue;
+			float * o = out + (int64_t) list[tt + j] * rows + r0 + tr;
+			for (int i = 0; i < 4; i++) {
+				if (r0 + tr + i < rows) o[i] = acc[i][j];
+			}
+		}
+	}
+
+	// multiplyGrouped on rounded activations (see roundRows and
+	// multiplyTilesRounded): for pick q of expert e, out[q · rows + r] =
+	// e's row r times rounded row q / per of `x` and `scales`.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyGroupedRounded(w gpu.DeviceBuffer<byte>, form int, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<byte>, scales gpu.DeviceBuffer<float32>, per int, groups gpu.DeviceBuffer<float32>, experts int, out gpu.DeviceBuffer<float32>, rows, cols, n, threads int) !none {
+		__shared__ __align__(16) int wq[8][68];
+		__shared__ __align__(16) int xq[8][68];
+		__shared__ float ws[2][68];
+		__shared__ float wm[68];
+		__shared__ float xd[68];
+		__shared__ float xm[68];
+		int64_t tiles = (rows + 63) / 64, tokenTiles = (n + 63) / 64;
+		int64_t e = blockIdx.x / (tiles * tokenTiles), b = blockIdx.x % (tiles * tokenTiles);
+		int64_t r0 = (b % tiles) * 64, t0 = (b / tiles) * 64;
+		int64_t count = (int64_t) groups[e];
+		if (t0 >= count) return;
+		int64_t first = (int64_t) slots[e] * rows;
+		float * list = groups + experts + e * n + t0;
+		int tid = threadIdx.x, tr = (tid & 15) * 4, tt = (tid >> 4) * 4;
+		// This thread's 8 columns of the chunk, of row or pick `li`.
+		int li = tid >> 2, part = tid & 3;
+		bool held = t0 + li < count;
+		int64_t from = held ? (int64_t) list[li] / per: 0;
+		uint8_t * xr = x + from * cols + part * 8;
+		float * sc = scales + 2 * from * (cols / 32);
+		float acc[4][4];
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+		}
+		unsigned words[2];
+		float sm[2];
+		for (int64_t k0 = 0; k0 < cols; k0 += 32) {
+			words[0] = 0;
+			words[1] = 0;
+			sm[0] = 0.0f;
+			sm[1] = 0.0f;
+			if (r0 + li < rows) quantsAt(w, w_len, form, first + r0 + li, cols, k0 + part * 8, (uint8_t*) words, 8, sm, 2);
+			wq[part * 2][li] = (int) words[0];
+			wq[part * 2 + 1][li] = (int) words[1];
+			if ((part & 1) == 0) ws[part >> 1][li] = sm[0];
+			if (part == 0) wm[li] = sm[1];
+			uint2 v = make_uint2(0, 0);
+			if (held) v = *(uint2*) (xr + k0);
+			xq[part * 2][li] = (int) v.x;
+			xq[part * 2 + 1][li] = (int) v.y;
+			if (part == 0) {
+				xd[li] = held ? sc[k0 / 16]: 0.0f;
+				xm[li] = held ? sc[k0 / 16 + 1]: 0.0f;
+			}
+			__syncthreads();
+			// Threads whose four picks are past the expert's last only
+			// fill the shared chunk.
+			for (int h = 0; h < 2 && t0 + tt < count; h++) {
+				int sums[4][4];
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) sums[i][j] = 0;
+				}
+				for (int k = h * 4; k < h * 4 + 4; k++) {
+					int4 a = *(int4*) & wq[k][tr];
+					int4 c = *(int4*) & xq[k][tt];
+					int av[4] = {a.x, a.y, a.z, a.w};
+					int bv[4] = {c.x, c.y, c.z, c.w};
+					for (int i = 0; i < 4; i++) {
+						for (int j = 0; j < 4; j++) sums[i][j] = __dp4a(av[i], bv[j], sums[i][j]);
+					}
+				}
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) acc[i][j] += ws[h][tr + i] * xd[tt + j] * (float) sums[i][j];
+				}
+			}
+			for (int i = 0; i < 4; i++) {
+				for (int j = 0; j < 4; j++) acc[i][j] -= wm[tr + i] * xm[tt + j];
+			}
+			__syncthreads();
+		}
+		for (int j = 0; j < 4; j++) {
+			if (t0 + tt + j >= count) continue;
+			float * o = out + (int64_t) list[tt + j] * rows + r0 + tr;
+			for (int i = 0; i < 4; i++) {
+				if (r0 + tr + i < rows) o[i] = acc[i][j];
+			}
+		}
+	}
+
+	// g[i] = act(g[i] + its gate bias) · (u[i] + its up bias) for the
+	// `rows` values of each pick, as multiplyExperts' biases and modes;
+	// i < n. The picks of an expert whose slots[e] is negative keep their
+	// values.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def activateExperts(g gpu.DeviceBuffer<float32>, u gpu.DeviceBuffer<float32>, picks gpu.DeviceBuffer<float32>, used int, slots gpu.DeviceBuffer<float32>, bias gpu.DeviceBuffer<float32>, gateBias, upBias, rows, mode, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t q = i / rows;
+		int64_t e = (int64_t) picks[q / used * 2 * used + q % used];
+		if (slots[e] < 0.0f) return;
+		float a = g[i], c = u[i];
+		if (gateBias >= 0) {
+			int64_t row = e * rows + i % rows;
+			a += bias[gateBias + row];
+			c += bias[upBias + row];
+		}
+		if (mode == 2) {
+			a = fminf(a, 7.0f);
+			g[i] = a / (1.0f + expf(-1.702f * a)) * (fmaxf(fminf(c, 7.0f), -7.0f) + 1.0f);
+		} else {
+			g[i] = act(a, mode) * c;
+		}
+	}
+
+	// out[t · os + r] = the sum over token t's picks j, in order, of weight
+	// j times (parts[(t · used + j) · rows + r] plus its down bias), as
+	// sumExperts; n = tokens · rows.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def sumPicked(parts gpu.DeviceBuffer<float32>, picks gpu.DeviceBuffer<float32>, used int, bias gpu.DeviceBuffer<float32>, downBias int, out gpu.DeviceBuffer<float32>, os, rows, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t t = i / rows, r = i % rows;
+		float * p = picks + t * 2 * used;
+		float acc = 0.0f;
+		for (int j = 0; j < used; j++) {
+			float v = parts[(t * used + j) * rows + r];
+			if (downBias >= 0) v += bias[downBias + (int64_t) p[j] * rows + r];
+			acc += p[used + j] * v;
+		}
+		out[t * os + r] = acc;
+	}
+
 	// dst row r = src row r · inScale / rms(src row r · inScale) · weight,
 	// over rows of n values; wo < 0 for no weight. src may be dst.
 	@launch(block = 256, x = "threads", cpu = false)
@@ -521,7 +2068,7 @@ internal std.ai partial module std.ai.tensor.gpu {
 	// i + dims/2; `magnitude` multiplies the turned values. Run by a whole
 	// 256-thread block; `shared` holds 8 floats of shared memory.
 	@kernelOnly
-	cuda def prepareHead(h float32[], hs int, norm int, weight float32[], wo int, epsilon float32, turn int, position int, table float32[], to, dims, halves int, magnitude float32, shared float32[]) {
+	cuda def prepareHead(h float32[], hs int, norm int, weight float32[], wo int, epsilon float32, turn int, position int, ph int, pw int, sections int, table float32[], to, dims, halves int, magnitude float32, shared float32[]) {
 		int t = threadIdx.x;
 		if (norm) {
 			float acc = 0.0f;
@@ -533,8 +2080,22 @@ internal std.ai partial module std.ai.tensor.gpu {
 		}
 		if (!turn) return;
 		int64_t pairs = dims / 2;
+		// Multi-axis RoPE: each pair turns by one of the positions (see
+		// axisOf); `sections` packs s0, s1, s2 and the interleaved flag.
+		int s0 = sections & 255, s1 = (sections >> 8) & 255, s2 = (sections >> 16) & 255, inter = (sections >> 24) & 1;
 		for (int64_t i = t; i < pairs; i += 256) {
-			double theta = (double) position * ((double) table[to + 2 * i] + (double) table[to + 2 * i + 1]);
+			int p = position;
+			if (sections) {
+				int sector = (int) (i % (s0 + s1 + s2));
+				if (inter) {
+					if (sector % 3 == 1 && sector < 3 * s1) p = ph;
+					else if (sector % 3 == 2 && sector < 3 * s2) p = pw;
+				} else {
+					if (sector >= s0 && sector < s0 + s1) p = ph;
+					else if (sector >= s0 + s1) p = pw;
+				}
+			}
+			double theta = (double) p * ((double) table[to + 2 * i] + (double) table[to + 2 * i + 1]);
 			theta -= 6.283185307179586 * rint(theta * 0.15915494309189535);
 			float sn, cs;
 			sincosf((float) theta, &sn, &cs);
@@ -549,11 +2110,21 @@ internal std.ai partial module std.ai.tensor.gpu {
 	}
 
 	// prepareHead on each head of hs values at x[xo:], `heads` heads per
-	// token, the tokens at positions from `position` on. One block per head.
+	// token, the tokens at positions from `position` on. With axesAt >= 0
+	// token t turns by the three positions at axes[(axesAt + t) · 3:]
+	// instead, its pairs split among them by `sections` (multi-axis RoPE,
+	// see prepareHead). One block per head.
 	@launch(block = 256, x = "threads", cpu = false)
-	cuda def prepareHeads(x gpu.DeviceBuffer<float32>, xo int, hs, heads int, norm int, weight gpu.DeviceBuffer<float32>, wo int, epsilon float32, turn int, position int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, threads int) !none {
+	cuda def prepareHeads(x gpu.DeviceBuffer<float32>, xo int, hs, heads int, norm int, weight gpu.DeviceBuffer<float32>, wo int, epsilon float32, turn int, position int, axes gpu.DeviceBuffer<float32>, axesAt, sections int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, threads int) !none {
 		__shared__ float partial[8];
-		prepareHead(x + xo + (int64_t) blockIdx.x * hs, hs, hs, norm, weight, weight_len, wo, epsilon, turn, position + blockIdx.x / heads, table, table_len, to, dims, halves, magnitude, partial, 8);
+		int64_t token = blockIdx.x / heads;
+		int pt = position + (int) token, ph = pt, pw = pt;
+		if (axesAt >= 0) {
+			pt = (int) axes[(axesAt + token) * 3];
+			ph = (int) axes[(axesAt + token) * 3 + 1];
+			pw = (int) axes[(axesAt + token) * 3 + 2];
+		}
+		prepareHead(x + xo + (int64_t) blockIdx.x * hs, hs, hs, norm, weight, weight_len, wo, epsilon, turn, pt, ph, pw, axesAt >= 0 ? sections: 0, table, table_len, to, dims, halves, magnitude, partial, 8);
 	}
 
 	// The query, key and value heads of tokens at positions from
@@ -562,21 +2133,27 @@ internal std.ai partial module std.ai.tensor.gpu {
 	// the kvHeads key heads at keys[at + t · kvHeads · hs:] (norm with kn
 	// when kn >= 0, then RoPE) and, when vn >= 0, the value heads at the
 	// same place in values (norm with vn, no RoPE); see prepareHead. One
-	// block per head.
+	// block per head. Positions from `axes` as in prepareHeads.
 	@launch(block = 256, x = "threads", cpu = false)
-	cuda def prepareQkv(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, at, heads, kvHeads, hs int, weight gpu.DeviceBuffer<float32>, qn, kn, vn int, epsilon float32, position int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, threads int) !none {
+	cuda def prepareQkv(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, at, heads, kvHeads, hs int, weight gpu.DeviceBuffer<float32>, qn, kn, vn int, epsilon float32, position int, axes gpu.DeviceBuffer<float32>, axesAt, sections int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, threads int) !none {
 		__shared__ float partial[8];
 		int64_t per = heads + kvHeads + (vn >= 0 ? kvHeads: 0);
 		int64_t t = blockIdx.x / per, b = blockIdx.x % per;
 		q += t * heads * hs;
 		at += t * kvHeads * hs;
-		position += t;
+		int pt = position + (int) t, ph = pt, pw = pt;
+		if (axesAt >= 0) {
+			pt = (int) axes[(axesAt + t) * 3];
+			ph = (int) axes[(axesAt + t) * 3 + 1];
+			pw = (int) axes[(axesAt + t) * 3 + 2];
+		}
+		int sect = axesAt >= 0 ? sections: 0;
 		if (b < heads) {
-			prepareHead(q + b * hs, hs, hs, qn >= 0, weight, weight_len, qn, epsilon, 1, position, table, table_len, to, dims, halves, magnitude, partial, 8);
+			prepareHead(q + b * hs, hs, hs, qn >= 0, weight, weight_len, qn, epsilon, 1, pt, ph, pw, sect, table, table_len, to, dims, halves, magnitude, partial, 8);
 		} else if (b < heads + kvHeads) {
-			prepareHead(keys + at + (b - heads) * hs, hs, hs, kn >= 0, weight, weight_len, kn, epsilon, 1, position, table, table_len, to, dims, halves, magnitude, partial, 8);
+			prepareHead(keys + at + (b - heads) * hs, hs, hs, kn >= 0, weight, weight_len, kn, epsilon, 1, pt, ph, pw, sect, table, table_len, to, dims, halves, magnitude, partial, 8);
 		} else if (vn >= 0) {
-			prepareHead(values + at + (b - heads - kvHeads) * hs, hs, hs, 1, weight, weight_len, vn, epsilon, 0, position, table, table_len, to, dims, halves, magnitude, partial, 8);
+			prepareHead(values + at + (b - heads - kvHeads) * hs, hs, hs, 1, weight, weight_len, vn, epsilon, 0, pt, ph, pw, sect, table, table_len, to, dims, halves, magnitude, partial, 8);
 		}
 	}
 
@@ -589,12 +2166,13 @@ internal std.ai partial module std.ai.tensor.gpu {
 	// capped to ±cap by tanh when cap > 0), their softmax, and the sum of
 	// the cached values they weight, into out. The caches hold kvHeads
 	// heads of hs values per position; `work` holds at least
-	// partsSize(heads, hs, count) values.
+	// partsSize(heads, hs, count) values. With so >= 0, head h's sink
+	// logit sinks[so + h] joins each softmax and weights no value (gpt-oss).
 	// Fails with the driver's error when a launch does.
-	def attention(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, work gpu.DeviceBuffer<float32>, heads int, kvHeads int, hs int, first int, count int, scale float32, cap float32) !none {
+	def attention(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, work gpu.DeviceBuffer<float32>, heads int, kvHeads int, hs int, first int, count int, scale float32, cap float32, sinks gpu.DeviceBuffer<float32>, so int) !none {
 		let chunks = (count + attentionChunk - 1) / attentionChunk
 		try attendPart(q, keys, values, work, heads, kvHeads, hs, first, count, attentionChunk, chunks, scale, cap, heads * chunks * 256)
-		return attendCombine(work, out, hs, chunks, heads * 256)
+		return attendCombine(work, out, hs, chunks, sinks, so, heads * 256)
 	}
 
 	// The values attention's `work` buffer needs for `count` positions.
@@ -651,64 +2229,135 @@ internal std.ai partial module std.ai.tensor.gpu {
 	// Attention of the tokens at positions from `start` on, one block per
 	// token and query head (token-major): each attends to the cached
 	// positions up to its own, only the last `window` of them when
-	// window > 0, scores as in `attention`, into out[(t · heads + h) · hs:].
-	// Queries are laid out the same way. hs is at most 512.
+	// window > 0, or to all `start` positions without `causal` (an encoder's
+	// patches), scores and sinks as in `attention`, into
+	// out[(t · heads + h) · hs:].
+	// Queries are laid out the same way. With lo >= 0 each softmax's log
+	// sum (its sink included) goes to lse[lo + t · heads + h], which a
+	// gradient back through the attention reads. hs is at most 512. A block takes
+	// 256 positions at a time, a thread scoring one, with an online softmax
+	// between the chunks; where hs / 4 divides 256, a thread sums four
+	// weighted values of the head over its share of the positions, the
+	// shares added in order at the end.
 	@launch(block = 256, x = "threads", cpu = false)
-	cuda def attendTokens(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, heads, kvHeads, hs, start, window int, scale, cap float32, threads int) !none {
-		__shared__ float sc[64];
-		int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+	cuda def attendTokens(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, heads, kvHeads, hs, start, window int, scale, cap float32, sinks gpu.DeviceBuffer<float32>, so, causal int, lse gpu.DeviceBuffer<float32>, lo, threads int) !none {
+		__shared__ __align__(16) float qs[512];
+		__shared__ float sc[256];
+		__shared__ float partial[8];
+		__shared__ float4 parts[256];
+		int tid = threadIdx.x;
 		int64_t t = blockIdx.x / heads, h = blockIdx.x % heads;
 		int64_t pos = start + t;
-		int64_t first = window > 0 && pos - window + 1 > 0 ? pos - window + 1: 0;
-		int64_t count = pos + 1 - first;
+		int64_t first = causal && window > 0 && pos - window + 1 > 0 ? pos - window + 1: 0;
+		int64_t count = causal ? pos + 1 - first: start;
 		int64_t kvSize = kvHeads * hs, kv = (h / (heads / kvHeads)) * hs;
 		float * qh = q + (t * heads + h) * hs;
+		int width = (int) hs;
+		for (int i = tid; i < width; i += 256) qs[i] = qh[i];
+		__syncthreads();
+		// Threads per four values of the head, each taking the positions p
+		// with p % shares == its share; 0 where a thread takes single
+		// values (tid and tid + 256) over every position.
+		int fours = width / 4;
+		int shares = (width & 3) == 0 && 256 % fours == 0 ? 256 / fours: 0;
+		int dim = shares ? (tid % fours) * 4: tid, share = shares ? tid / fours: 0;
 		float m = -INFINITY, sum = 0.0f, a0 = 0.0f, a1 = 0.0f;
-		for (int64_t p0 = 0; p0 < count; p0 += 64) {
-			int nn = count - p0 < 64 ? (int) (count - p0): 64;
-			for (int p = warp; p < nn; p += 8) {
-				float * key = keys + (first + p0 + p) * kvSize + kv;
+		float4 four = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+		for (int64_t p0 = 0; p0 < count; p0 += 256) {
+			int nn = count - p0 < 256 ? (int) (count - p0): 256;
+			float v = -INFINITY;
+			if (tid < nn) {
+				float * key = keys + (first + p0 + tid) * kvSize + kv;
 				float acc = 0.0f;
-				for (int64_t i = lane; i < hs; i += 32) acc += qh[i] * key[i];
-				acc = warpSum(acc);
-				if (lane == 0) {
-					float v = acc * scale;
-					if (cap > 0.0f) v = cap * tanhf(v / cap);
-					sc[p] = v;
+				if ((width & 3) == 0) {
+					for (int i = 0; i < width; i += 4) {
+						float4 a = *(float4*) (key + i);
+						float4 b = *(float4*) (qs + i);
+						acc += (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w * b.w);
+					}
+				} else {
+					for (int i = 0; i < width; i++) acc += key[i] * qs[i];
 				}
+				v = acc * scale;
+				if (cap > 0.0f) v = cap * tanhf(v / cap);
 			}
-			__syncthreads();
-			float top = m;
-			for (int p = 0; p < nn; p++) top = fmaxf(top, sc[p]);
-			__syncthreads();
-			if (tid < nn) sc[tid] = expf(sc[tid] - top);
-			__syncthreads();
-			float fade = expf(m - top), s = 0.0f;
-			for (int p = 0; p < nn; p++) s += sc[p];
+			float top = fmaxf(m, blockMax(v, partial, 8));
+			float w = tid < nn ? expf(v - top): 0.0f;
+			sc[tid] = w;
+			float s = blockSum(w, partial, 8);
+			float fade = expf(m - top);
 			sum = sum * fade + s;
 			a0 *= fade;
 			a1 *= fade;
-			float * v = values + (first + p0) * kvSize + kv;
-			for (int p = 0; p < nn; p++) {
-				if (tid < hs) a0 += sc[p] * v[p * kvSize + tid];
-				if (tid + 256 < hs) a1 += sc[p] * v[p * kvSize + tid + 256];
+			four.x *= fade;
+			four.y *= fade;
+			four.z *= fade;
+			four.w *= fade;
+			float * vs = values + (first + p0) * kvSize + kv;
+			if (shares) {
+				for (int p = share; p < nn; p += shares) {
+					float4 c = *(float4*) (vs + p * kvSize + dim);
+					float f = sc[p];
+					four.x += f * c.x;
+					four.y += f * c.y;
+					four.z += f * c.z;
+					four.w += f * c.w;
+				}
+			} else {
+				for (int p = 0; p < nn; p++) {
+					if (dim < width) a0 += sc[p] * vs[p * kvSize + dim];
+					if (dim + 256 < width) a1 += sc[p] * vs[p * kvSize + dim + 256];
+				}
 			}
 			m = top;
 			__syncthreads();
 		}
+		if (so >= 0) {
+			float sink = sinks[so + h], top = fmaxf(m, sink), fade = expf(m - top);
+			sum = sum * fade + expf(sink - top);
+			a0 *= fade;
+			a1 *= fade;
+			four.x *= fade;
+			four.y *= fade;
+			four.z *= fade;
+			four.w *= fade;
+			m = top;
+		}
+		if (lo >= 0 && tid == 0) lse[lo + t * heads + h] = m + logf(sum);
 		float * o = out + (t * heads + h) * hs;
-		if (tid < hs) o[tid] = a0 / sum;
-		if (tid + 256 < hs) o[tid + 256] = a1 / sum;
+		if (shares) {
+			parts[tid] = four;
+			__syncthreads();
+			if (share != 0) return;
+			for (int k = 1; k < shares; k++) {
+				float4 c = parts[k * fours + tid];
+				four.x += c.x;
+				four.y += c.y;
+				four.z += c.z;
+				four.w += c.w;
+			}
+			four.x /= sum;
+			four.y /= sum;
+			four.z /= sum;
+			four.w /= sum;
+			*(float4*) (o + dim) = four;
+			return;
+		}
+		if (dim < width) o[dim] = a0 / sum;
+		if (dim + 256 < width) o[dim + 256] = a1 / sum;
 	}
 
-	// Joins a head's chunks (one block each) into out[head · hs:].
+	// Joins a head's chunks (one block each) into out[head · hs:], with
+	// the head's sink logit sinks[so + head] in the softmax when so >= 0.
 	@launch(block = 256, x = "threads", cpu = false)
-	cuda def attendCombine(work gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, hs, chunks, threads int) !none {
+	cuda def attendCombine(work gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, hs, chunks int, sinks gpu.DeviceBuffer<float32>, so, threads int) !none {
 		int64_t h = blockIdx.x;
 		float * base = work + h * chunks * (hs + 2);
 		float top = base[hs];
 		for (int64_t k = 1; k < chunks; k++) top = fmaxf(top, base[k * (hs + 2) + hs]);
-		float sum = 0.0f;
+		float sink = so >= 0 ? sinks[so + h]: -INFINITY;
+		top = fmaxf(top, sink);
+		float sum = so >= 0 ? expf(sink - top): 0.0f;
 		for (int64_t k = 0; k < chunks; k++) sum += base[k * (hs + 2) + hs + 1] * expf(base[k * (hs + 2) + hs] - top);
 		float inv = 1.0f / sum;
 		for (int64_t c = threadIdx.x; c < hs; c += 256) {
@@ -735,8 +2384,34 @@ internal std.ai partial module std.ai.tensor.gpu {
 			for (int64_t i = t; i < n; i += 256) acc += p[i] * p[i];
 			scale = 1.0f / sqrtf(blockSum(acc, partial, 8) / (float) n + epsilon);
 		}
+		// A thread takes values next to each other, so its reads share
+		// their memory sectors.
+		int64_t per = (n + 255) / 256;
+		int64_t from = t * per, to = from + per < n ? from + per: n;
 		float acc = 0.0f;
-		for (int64_t i = t; i < n; i += 256) {
+		if ((per & 3) == 0 && per * 256 == n && wo < 0 && nw >= 0 && (nw & 3) == 0) {
+			// Four values a read: the common shape, a plain add and a norm.
+			for (int64_t i = from; i < to; i += 4) {
+				float4 a = *(float4*) (x + i), b = *(float4*) (p + i);
+				a.x = (a.x + b.x) * after;
+				a.y = (a.y + b.y) * after;
+				a.z = (a.z + b.z) * after;
+				a.w = (a.w + b.w) * after;
+				*(float4*) (x + i) = a;
+				acc += (a.x * a.x + a.y * a.y) + (a.z * a.z + a.w * a.w);
+			}
+			float s = 1.0f / sqrtf(blockSum(acc, partial, 8) / (float) n + epsilon);
+			for (int64_t i = from; i < to; i += 4) {
+				float4 a = *(float4*) (x + i), b = *(float4*) (weight + nw + i);
+				a.x = a.x * s * b.x;
+				a.y = a.y * s * b.y;
+				a.z = a.z * s * b.z;
+				a.w = a.w * s * b.w;
+				*(float4*) (normed + i) = a;
+			}
+			return;
+		}
+		for (int64_t i = from; i < to; i++) {
 			float v = wo >= 0 ? p[i] * scale * weight[wo + i]: p[i];
 			float r = (x[i] + v) * after;
 			x[i] = r;
@@ -744,7 +2419,7 @@ internal std.ai partial module std.ai.tensor.gpu {
 		}
 		if (nw < 0) return;
 		float s = 1.0f / sqrtf(blockSum(acc, partial, 8) / (float) n + epsilon);
-		for (int64_t i = t; i < n; i += 256) normed[i] = x[i] * s * weight[nw + i];
+		for (int64_t i = from; i < to; i++) normed[i] = x[i] * s * weight[nw + i];
 	}
 
 	// a[ao + t · aStride + i] = act(that) · b[bo + t · bStride + i] for
@@ -780,5 +2455,1341 @@ internal std.ai partial module std.ai.tensor.gpu {
 		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 		if (i >= n) return;
 		x[i] = cap * tanhf(x[i] / cap);
+	}
+
+	// Gated DeltaNet's causal convolution (Qwen 3.5) over `channels`
+	// channels of n tokens: channel c of token t, x[t · xs + c], weighted by
+	// w[wo + c · width + width − 1], plus the width − 1 inputs before it,
+	// oldest first, by the channel's other weights: those inputs come from
+	// `state` (width − 1 rows of `channels`) and the tokens before t. The
+	// sum through SiLU goes to y[t · channels + c], and `state` keeps the
+	// last width − 1 inputs. One thread per channel; width is at most 9.
+	@launch(block = 256, x = "channels", cpu = false)
+	cuda def deltaConv(x gpu.DeviceBuffer<float32>, xs int, w gpu.DeviceBuffer<float32>, wo int, state gpu.DeviceBuffer<float32>, y gpu.DeviceBuffer<float32>, channels, width, n int) !none {
+		int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (c >= channels) return;
+		float hist[8];
+		int keep = width - 1;
+		for (int k = 0; k < keep; k++) hist[k] = state[k * channels + c];
+		float * wc = w + wo + c * width;
+		for (int64_t t = 0; t < n; t++) {
+			float v = x[t * xs + c];
+			float sum = wc[keep] * v;
+			for (int k = 0; k < keep; k++) sum += wc[k] * hist[k];
+			for (int k = 0; k + 1 < keep; k++) hist[k] = hist[k + 1];
+			if (keep > 0) hist[keep - 1] = v;
+			y[t * channels + c] = sum / (1.0f + expf(-sum));
+		}
+		for (int k = 0; k < keep; k++) state[k * channels + c] = hist[k];
+	}
+
+	// Each of the kHeads query heads, then the kHeads key heads, of hs
+	// values at the start of each token's row of `channels` in y, divided
+	// by sqrt(Σv² + eps). One warp per head; threads = n · 2 · kHeads · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaNorms(y gpu.DeviceBuffer<float32>, channels, kHeads, hs, n int, eps float32, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= n * 2 * kHeads) return;
+		float * p = y + (w / (2 * kHeads)) * channels + (w % (2 * kHeads)) * hs;
+		float sum = 0.0f;
+		for (int i = lane; i < hs; i += 32) sum += p[i] * p[i];
+		float scale = rsqrtf(warpSum(sum) + eps);
+		for (int i = lane; i < hs; i += 32) p[i] *= scale;
+	}
+
+	// Gated DeltaNet's recurrence over n tokens. Token t's row of y holds
+	// kHeads query heads, kHeads key heads and vHeads value heads of hs
+	// values (see deltaConv, deltaNorms); value head h reads query and key
+	// head h % kHeads. Row j of head h's state (hs × hs at
+	// state[(h · hs + j) · hs:]) decays by exp(softplus(alpha + dt) · a),
+	// with alpha[t · vHeads + h], dt = v[dtAt + h] and a = v[decayAt + h];
+	// then delta = (value j − row · key) · sigmoid(beta[t · vHeads + h]),
+	// row += key · delta, and out[t · vHeads · hs + h · hs + j] =
+	// row · query / sqrt(hs). One warp per state row, which stays in its
+	// registers over the tokens; hs is a multiple of 32, at most 256.
+	// threads = vHeads · hs · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaRecur(y gpu.DeviceBuffer<float32>, channels, kHeads, vHeads, hs int, alpha gpu.DeviceBuffer<float32>, beta gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, dtAt, decayAt int, state gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, n, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= vHeads * hs) return;
+		int h = (int) (w / hs), j = (int) (w % hs), per = hs >> 5;
+		float s[8];
+		float * row = state + w * hs;
+		for (int i = 0; i < per; i++) s[i] = row[lane + 32 * i];
+		int64_t keyDim = (int64_t) kHeads * hs, qo = (int64_t) (h % kHeads) * hs, ko = keyDim + qo, vo = 2 * keyDim + (int64_t) h * hs + j;
+		float scale = rsqrtf((float) hs), dt = v[dtAt + h], a = v[decayAt + h];
+		for (int64_t t = 0; t < n; t++) {
+			float * yt = y + t * channels;
+			float g = alpha[t * vHeads + h] + dt;
+			float decay = expf((g > 20.0f ? g: log1pf(expf(g))) * a);
+			float b = 1.0f / (1.0f + expf(-beta[t * vHeads + h]));
+			float kv = 0.0f;
+			for (int i = 0; i < per; i++) {
+				s[i] *= decay;
+				kv += s[i] * yt[ko + lane + 32 * i];
+			}
+			float delta = (yt[vo] - warpSum(kv)) * b;
+			float o = 0.0f;
+			for (int i = 0; i < per; i++) {
+				s[i] += yt[ko + lane + 32 * i] * delta;
+				o += s[i] * yt[qo + lane + 32 * i];
+			}
+			o = warpSum(o);
+			if (lane == 0) out[(t * vHeads + h) * hs + j] = o * scale;
+		}
+		for (int i = 0; i < per; i++) row[lane + 32 * i] = s[i];
+	}
+
+	// Each value head of hs values in out (rows of vHeads heads per token)
+	// RMS-normed with weight v[normAt:] and multiplied by SiLU of the same
+	// values of z. One warp per head; threads = n · vHeads · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaGate(out gpu.DeviceBuffer<float32>, z gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, normAt, vHeads, hs, n int, eps float32, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= n * vHeads) return;
+		float * p = out + w * hs;
+		float * g = z + w * hs;
+		float sum = 0.0f;
+		for (int i = lane; i < hs; i += 32) sum += p[i] * p[i];
+		float scale = rsqrtf(warpSum(sum) / (float) hs + eps);
+		for (int i = lane; i < hs; i += 32) p[i] = p[i] * scale * v[normAt + i] * (g[i] / (1.0f + expf(-g[i])));
+	}
+
+	// Splits gated queries (Qwen 3.5): per token and head, qg holds hs
+	// query values then hs gate values; q and gate get them in rows of
+	// heads · hs. n = tokens · heads · hs.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def splitGated(qg gpu.DeviceBuffer<float32>, q gpu.DeviceBuffer<float32>, gate gpu.DeviceBuffer<float32>, hs, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t head = i / hs, k = i % hs;
+		q[i] = qg[head * 2 * hs + k];
+		gate[i] = qg[head * 2 * hs + hs + k];
+	}
+
+	// a[i] *= sigmoid(gate[i]) for i < n.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def gateValues(a gpu.DeviceBuffer<float32>, gate gpu.DeviceBuffer<float32>, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		a[i] = a[i] / (1.0f + expf(-gate[i]));
+	}
+
+	// A shared expert's output added to each token's experts' (Qwen 3.5
+	// MoE): out[t · e + i] += sigmoid(normed row t · v[routerAt:]) ·
+	// shared[t · e + i]. One block per token; threads = n · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def addShared(out gpu.DeviceBuffer<float32>, shared gpu.DeviceBuffer<float32>, normed gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, routerAt, e, threads int) !none {
+		__shared__ float partial[8];
+		int64_t t = blockIdx.x;
+		float acc = 0.0f;
+		for (int64_t i = threadIdx.x; i < e; i += 256) acc += normed[t * e + i] * v[routerAt + i];
+		float g = 1.0f / (1.0f + expf(-blockSum(acc, partial, 8)));
+		for (int64_t i = threadIdx.x; i < e; i += 256) out[t * e + i] += g * shared[t * e + i];
+	}
+
+	// LayerNorm of each of n rows of `width` values from x into out (they
+	// may be the same): (v − mean) / sqrt(variance + eps) · v[wAt + i] +
+	// v[bAt + i]. One block per row; threads = n · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def layerNormRows(x gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, width int, v gpu.DeviceBuffer<float32>, wAt, bAt int, eps float32, threads int) !none {
+		__shared__ float partial[8];
+		int64_t r = blockIdx.x;
+		float * row = x + r * width;
+		float * dst = out + r * width;
+		float acc = 0.0f;
+		for (int64_t i = threadIdx.x; i < width; i += 256) acc += row[i];
+		float mean = blockSum(acc, partial, 8) / (float) width;
+		acc = 0.0f;
+		for (int64_t i = threadIdx.x; i < width; i += 256) acc += (row[i] - mean) * (row[i] - mean);
+		float scale = rsqrtf(blockSum(acc, partial, 8) / (float) width + eps);
+		for (int64_t i = threadIdx.x; i < width; i += 256) dst[i] = (row[i] - mean) * scale * v[wAt + i] + v[bAt + i];
+	}
+
+	// 2D RoPE of a vision encoder's queries and keys (rows of `heads`
+	// heads of hs values per patch): value j < hs/2 of a head pairs with
+	// j + hs/2 and turns by the patch's row (pairs below hs/4) or column
+	// (the others), at base 10000 over hs/2 values; places holds each
+	// patch's row and column. One thread per pair; n = patches · heads ·
+	// hs/2.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def visionTurn(q gpu.DeviceBuffer<float32>, k gpu.DeviceBuffer<float32>, places gpu.DeviceBuffer<float32>, heads, hs, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int half = hs / 2, quarter = half / 2;
+		int64_t patch = i / ((int64_t) heads * half);
+		int64_t rest = i % ((int64_t) heads * half);
+		int64_t head = rest / half;
+		int j = (int) (rest % half);
+		float p = places[2 * patch + (j < quarter ? 0:1)];
+		double theta = (double) p * pow(10000.0, -2.0 * (double) (j % quarter) / (double) half);
+		float sn, cs;
+		sincosf((float) theta, &sn, &cs);
+		int64_t a = (patch * heads + head) * hs + j, b = a + half;
+		float qa = q[a], qb = q[b], ka = k[a], kb = k[b];
+		q[a] = qa * cs - qb * sn;
+		q[b] = qa * sn + qb * cs;
+		k[a] = ka * cs - kb * sn;
+		k[b] = ka * sn + kb * cs;
+	}
+
+	// GELU (tanh form) of a[i] for i < n.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def geluValues(a gpu.DeviceBuffer<float32>, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		a[i] = act(a[i], 1);
+	}
+	// The kernels a gradient goes back through.
+
+	// dx tile of multiplyBack: each block takes 64 columns by 64 tokens
+	// (4 × 4 per thread) over `span` rows (a multiple of 32), expanding 32
+	// rows of its columns at a time into shared memory. With add 1 the
+	// sums are added to out, else written; the blocks of row span s
+	// (after the first) write at out[oo + s · n · os + ...].
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def multiplyTilesBack(w gpu.DeviceBuffer<byte>, form int, base int, dy gpu.DeviceBuffer<float32>, yo, ys int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, add, threads int) !none {
+		__shared__ __align__(16) float ws[32][68];
+		__shared__ __align__(16) float yt[32][68];
+		int64_t colTiles = (cols + 63) / 64, tokenTiles = (n + 63) / 64;
+		int64_t b = blockIdx.x % (colTiles * tokenTiles), s = blockIdx.x / (colTiles * tokenTiles);
+		int64_t c0 = (b % colTiles) * 64, t0 = (b / colTiles) * 64;
+		int64_t from = s * span, to = from + span < rows ? from + span: rows;
+		oo += s * n * os;
+		int tid = threadIdx.x, tc = (tid & 15) * 4, tt = (tid >> 4) * 4;
+		// This thread's 8 columns of a weight row (li), and 8 rows of a
+		// token's gradient (ti).
+		int li = tid >> 3, lk = (tid & 7) * 8;
+		int ti = tid >> 2, lr = (tid & 3) * 8;
+		float acc[4][4];
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+		}
+		float v[8];
+		for (int64_t r0 = from; r0 < to; r0 += 32) {
+			if (r0 + li < to && c0 + lk < cols) {
+				weightsAt(w, w_len, form, base + r0 + li, cols, c0 + lk, v, 8);
+			} else {
+				for (int q = 0; q < 8; q++) v[q] = 0.0f;
+			}
+			for (int q = 0; q < 8; q++) ws[li][lk + q] = v[q];
+			float * yr = dy + yo + (t0 + ti) * ys + r0 + lr;
+			for (int q = 0; q < 8; q++) yt[lr + q][ti] = t0 + ti < n && r0 + lr + q < to ? yr[q]: 0.0f;
+			__syncthreads();
+			for (int k = 0; k < 32; k++) {
+				float4 a = *(float4*) & ws[k][tc];
+				float4 c = *(float4*) & yt[k][tt];
+				float av[4] = {a.x, a.y, a.z, a.w};
+				float bv[4] = {c.x, c.y, c.z, c.w};
+				for (int i = 0; i < 4; i++) {
+					for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bv[j];
+				}
+			}
+			__syncthreads();
+		}
+		for (int j = 0; j < 4; j++) {
+			int64_t t = t0 + tt + j;
+			if (t >= n) continue;
+			for (int i = 0; i < 4; i++) {
+				int64_t c = c0 + tc + i;
+				if (c >= cols) continue;
+				float * o = out + oo + t * os + c;
+				*o = add ? *o + acc[i][j]: acc[i][j];
+			}
+		}
+	}
+
+	// out[oo + t · os + c] += the sum over s < splits of
+	// work[(s · n + t) · cols + c] for c < cols, t < n (n · cols threads).
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def addSplits(work gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, oo, os, cols, n, splits, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= cols * n) return;
+		int64_t t = i / cols, c = i % cols;
+		float acc = 0.0f;
+		for (int64_t s = 0; s < splits; s++) acc += work[(s * n + t) * cols + c];
+		out[oo + t * os + c] += acc;
+	}
+
+	// A LoRA pair's first half on n rows of x: low[t · rank + k] = row k
+	// of A (a[ao + k · cols:]) · x[xo + t · xs:]. One warp per value;
+	// threads = n · rank · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def lowRank(a gpu.DeviceBuffer<float32>, ao int, x gpu.DeviceBuffer<float32>, xo, xs int, low gpu.DeviceBuffer<float32>, n, rank, cols, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= n * rank) return;
+		int64_t t = w / rank, k = w % rank;
+		float * ar = a + ao + k * cols;
+		float * xr = x + xo + t * xs;
+		float acc = 0.0f;
+		for (int64_t c = lane; c < cols; c += 32) acc += ar[c] * xr[c];
+		acc = warpSum(acc);
+		if (lane == 0) low[w] = acc;
+	}
+
+	// A LoRA pair's second half added: out[oo + t · os + o] += scale ·
+	// row o of B (b[bo + o · rank:]) · low[t · rank:]; threads = n · rows.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def addLowRank(b gpu.DeviceBuffer<float32>, bo int, low gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, oo, os, n, rows, rank int, scale float32, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n * rows) return;
+		int64_t t = i / rows, o = i % rows;
+		float * br = b + bo + o * rank;
+		float * lr = low + t * rank;
+		float acc = 0.0f;
+		for (int k = 0; k < rank; k++) acc += br[k] * lr[k];
+		out[oo + t * os + o] += scale * acc;
+	}
+
+	// The gradient of a pair's low values from its output's:
+	// dlow[t · rank + k] = scale · Σ_o dy[yo + t · ys + o] · b[bo + o ·
+	// rank + k]. One warp per value; threads = n · rank · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def lowRankBack(b gpu.DeviceBuffer<float32>, bo int, dy gpu.DeviceBuffer<float32>, yo, ys int, dlow gpu.DeviceBuffer<float32>, n, rows, rank int, scale float32, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= n * rank) return;
+		int64_t t = w / rank, k = w % rank;
+		float * yr = dy + yo + t * ys;
+		float acc = 0.0f;
+		for (int64_t o = lane; o < rows; o += 32) acc += yr[o] * b[bo + o * rank + k];
+		acc = warpSum(acc);
+		if (lane == 0) dlow[w] = scale * acc;
+	}
+
+	// gradB[bo + o · rank + k] += scale · Σ_t dy[yo + t · ys + o] ·
+	// low[t · rank + k]; threads = rows · rank.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def gradLowB(dy gpu.DeviceBuffer<float32>, yo, ys int, low gpu.DeviceBuffer<float32>, gradB gpu.DeviceBuffer<float32>, bo, n, rows, rank int, scale float32, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= rows * rank) return;
+		int64_t o = i / rank, k = i % rank;
+		float acc = 0.0f;
+		for (int64_t t = 0; t < n; t++) acc += dy[yo + t * ys + o] * low[t * rank + k];
+		gradB[bo + i] += scale * acc;
+	}
+
+	// gradA[ao + k · cols + c] += Σ_t dlow[t · rank + k] · x[xo + t · xs
+	// + c]; threads = rank · cols.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def gradLowA(dlow gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xo, xs int, gradA gpu.DeviceBuffer<float32>, ao, n, rank, cols, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= rank * cols) return;
+		int64_t k = i / cols, c = i % cols;
+		float acc = 0.0f;
+		for (int64_t t = 0; t < n; t++) acc += dlow[t * rank + k] * x[xo + t * xs + c];
+		gradA[ao + i] += acc;
+	}
+
+	// The gradient through a pair to its input: dx[xo + t · xs + c] +=
+	// Σ_k dlow[t · rank + k] · a[ao + k · cols + c]; threads = n · cols.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def addLowRankBack(a gpu.DeviceBuffer<float32>, ao int, dlow gpu.DeviceBuffer<float32>, dx gpu.DeviceBuffer<float32>, xo, xs, n, rank, cols, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n * cols) return;
+		int64_t t = i / cols, c = i % cols;
+		float acc = 0.0f;
+		for (int k = 0; k < rank; k++) acc += dlow[t * rank + k] * a[ao + k * cols + c];
+		dx[xo + t * xs + c] += acc;
+	}
+
+	// The gradient of x through y = x / rms(x) · weight, added to `into`,
+	// for `rows` rows of `cols` values: row r is the (r % per)-th of `per`
+	// rows in token r / per, x at xo + token · xs + (r % per) · cols (dy
+	// and into likewise); wo < 0 for no weight. Each row:
+	// into += s·w·dy − x·s³·Σ(w·dy·x)/cols, s = 1/√(Σx²/cols + eps).
+	// One block per row; threads = rows · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def rmsBackRows(x gpu.DeviceBuffer<float32>, xo, xs, per int, weight gpu.DeviceBuffer<float32>, wo int, dy gpu.DeviceBuffer<float32>, yo, ys int, into gpu.DeviceBuffer<float32>, io, iStride, cols int, epsilon float32, threads int) !none {
+		__shared__ float partial[8];
+		int64_t r = blockIdx.x, t = r / per, h = r % per;
+		float * xr = x + xo + t * xs + h * cols;
+		float * yr = dy + yo + t * ys + h * cols;
+		float * ir = into + io + t * iStride + h * cols;
+		int tid = threadIdx.x;
+		float sq = 0.0f, along = 0.0f;
+		for (int64_t i = tid; i < cols; i += 256) {
+			float w = wo >= 0 ? weight[wo + i]: 1.0f;
+			sq += xr[i] * xr[i];
+			along += w * yr[i] * xr[i];
+		}
+		float squares = blockSum(sq, partial, 8);
+		float dot = blockSum(along, partial, 8);
+		float s = 1.0f / sqrtf(squares / (float) cols + epsilon);
+		float c = s * s * s * dot / (float) cols;
+		for (int64_t i = tid; i < cols; i += 256) {
+			float w = wo >= 0 ? weight[wo + i]: 1.0f;
+			ir[i] += s * w * yr[i] - c * xr[i];
+		}
+	}
+
+	// The gradient of x through y = x / √(Σx² + eps), added to `into`, for
+	// rows laid out as rmsBackRows'. One warp per row; threads = rows · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def l2BackRows(x gpu.DeviceBuffer<float32>, xo, xs, per int, dy gpu.DeviceBuffer<float32>, yo, ys int, into gpu.DeviceBuffer<float32>, io, iStride, cols, rows int, epsilon float32, threads int) !none {
+		int64_t r = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (r >= rows) return;
+		int64_t t = r / per, h = r % per;
+		float * xr = x + xo + t * xs + h * cols;
+		float * yr = dy + yo + t * ys + h * cols;
+		float * ir = into + io + t * iStride + h * cols;
+		float sq = 0.0f, along = 0.0f;
+		for (int64_t i = lane; i < cols; i += 32) {
+			sq += xr[i] * xr[i];
+			along += xr[i] * yr[i];
+		}
+		sq    = warpSum(sq);
+		along = warpSum(along);
+		float s = rsqrtf(sq + epsilon);
+		float c = s * s * s * along;
+		for (int64_t i = lane; i < cols; i += 32) ir[i] += s * yr[i] - c * xr[i];
+	}
+
+	// Back through gated products p = act(g) · u (mode 0 SiLU, 1 GELU in
+	// its tanh form, 2 gpt-oss's clamped SwiGLU, as `act` and the expert
+	// kernels compute them) for rows t of `width` values (n values in
+	// all): d[do + t · ds + i] holds the products' gradient and leaves
+	// with the gate's; du gets the up half's.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def gatedBack(g gpu.DeviceBuffer<float32>, go, gs int, u gpu.DeviceBuffer<float32>, uo, us int, d gpu.DeviceBuffer<float32>, dO, dS int, du gpu.DeviceBuffer<float32>, duo, dus, width, n, mode int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t t = i / width, k = i % width;
+		float gv = g[go + t * gs + k], uv = u[uo + t * us + k];
+		float * dp = d + dO + t * dS + k;
+		float dpv = *dp, a, slope;
+		if (mode == 2) {
+			float limited = fminf(gv, 7.0f);
+			float s = 1.0f / (1.0f + expf(-1.702f * limited));
+			float up = fminf(fmaxf(uv, -7.0f), 7.0f) + 1.0f;
+			a = limited * s;
+			*dp = gv < 7.0f ? dpv * (s + 1.702f * limited * s * (1.0f - s)) * up: 0.0f;
+			du[duo + t * dus + k] = uv > -7.0f && uv < 7.0f ? dpv * a: 0.0f;
+			return;
+		}
+		if (mode == 1) {
+			float th = tanhf(0.7978845608028654f * (gv + 0.044715f * gv * gv * gv));
+			a     = 0.5f * gv * (1.0f + th);
+			slope = 0.5f * (1.0f + th) + 0.5f * gv * (1.0f - th * th) * 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * gv * gv);
+		} else {
+			float s = 1.0f / (1.0f + expf(-gv));
+			a     = gv * s;
+			slope = s * (1.0f + gv * (1.0f - s));
+		}
+		*dp = dpv * uv * slope;
+		du[duo + t * dus + k] = dpv * a;
+	}
+
+	// Cross-entropy of rows of logits (logits[r · vocab:], capped to ±cap
+	// by tanh first when cap > 0) against targets[r]: losses[r] = ln Σ e^l
+	// − l[target]. With grad > 0 each row is replaced by grad times the
+	// loss's gradient: (softmax − one-hot target) through the cap's
+	// slope. One block per row; threads = rows · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def softmaxLoss(logits gpu.DeviceBuffer<float32>, vocab int, targets gpu.DeviceBuffer<float32>, losses gpu.DeviceBuffer<float32>, grad, cap float32, threads int) !none {
+		__shared__ float partial[8];
+		int64_t r = blockIdx.x;
+		float * l = logits + r * vocab;
+		int tid = threadIdx.x;
+		if (cap > 0.0f) {
+			for (int64_t i = tid; i < vocab; i += 256) l[i] = cap * tanhf(l[i] / cap);
+			__syncthreads();
+		}
+		float top = -3.4e38f;
+		for (int64_t i = tid; i < vocab; i += 256) top = fmaxf(top, l[i]);
+		top = blockMax(top, partial, 8);
+		float sum = 0.0f;
+		for (int64_t i = tid; i < vocab; i += 256) sum += expf(l[i] - top);
+		sum = blockSum(sum, partial, 8);
+		float lse = top + logf(sum);
+		int64_t target = (int64_t) targets[r];
+		__syncthreads();
+		float picked = l[target];
+		if (tid == 0) losses[r] = lse - picked;
+		__syncthreads();
+		if (grad <= 0.0f) return;
+		for (int64_t i = tid; i < vocab; i += 256) {
+			float v = l[i];
+			float d = (expf(v - lse) - (i == target ? 1.0f: 0.0f)) * grad;
+			if (cap > 0.0f) {
+				float c = v / cap;
+				d *= 1.0f - c * c;
+			}
+			l[i] = d;
+		}
+	}
+
+	// One AdamW step of values[i] for i < n (β 0.9 and 0.999, ε 1e-8):
+	// the gradient grads[i] · gradScale updates the moments, which are
+	// bias-corrected by fix1 and fix2; decay is the decoupled weight decay.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def adamWValues(values gpu.DeviceBuffer<float32>, grads gpu.DeviceBuffer<float32>, mean gpu.DeviceBuffer<float32>, variance gpu.DeviceBuffer<float32>, n int, gradScale, rate, decay, fix1, fix2 float32) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		float g = grads[i] * gradScale;
+		float m = 0.9f * mean[i] + 0.1f * g;
+		float s = 0.999f * variance[i] + 0.001f * g * g;
+		mean[i] = m;
+		variance[i] = s;
+		float w = values[i];
+		values[i] = w - rate * ((m / fix1) / (sqrtf(s / fix2) + 1e-8f) + decay * w);
+	}
+
+	// The sums of squares of x[0:n] in blocks of 16384 values, one per
+	// block into out[oo + block], to be added in a fixed order.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def blockSquares(x gpu.DeviceBuffer<float32>, n int, out gpu.DeviceBuffer<float32>, oo, threads int) !none {
+		__shared__ float partial[8];
+		int64_t from = (int64_t) blockIdx.x * 16384;
+		float acc = 0.0f;
+		for (int64_t i = from + threadIdx.x; i < from + 16384 && i < n; i += 256) acc += x[i] * x[i];
+		acc = blockSum(acc, partial, 8);
+		if (threadIdx.x == 0) out[oo + blockIdx.x] = acc;
+	}
+
+	// dst[do + t · ds + i] = src[so + t · ss + i] for rows t of `width`
+	// values, n values in all.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def copyRows(src gpu.DeviceBuffer<float32>, so, ss int, dst gpu.DeviceBuffer<float32>, dO, dS, width, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t t = i / width, k = i % width;
+		dst[dO + t * dS + k] = src[so + t * ss + k];
+	}
+
+	// a[ao + t · as + i] += b[bo + t · bs + i] · scale for rows t of
+	// `width` values, n values in all.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def addScaledRows(a gpu.DeviceBuffer<float32>, ao, aS int, b gpu.DeviceBuffer<float32>, bo, bS, width, n int, scale float32) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t t = i / width, k = i % width;
+		a[ao + t * aS + k] += b[bo + t * bS + k] * scale;
+	}
+
+	// The attention backward passes below work on tiles: per pair of a
+	// query tile (64 queries) and a key tile (32 keys) they recompute the
+	// scores S = Q·Kᵀ and dP = dO·Vᵀ 16 dimensions at a time in shared
+	// memory, then P = exp(S·scale − lse) and dS = P · (dP − D) · scale
+	// (through the cap's slope), D being a row's dO · o. Keys and values
+	// are laid out (t · kvHeads + kv) · hs, queries, outputs and their
+	// gradients (t · heads + h) · hs, as attendTokens reads them; a block
+	// owns the gradient rows it writes, so sums run in a fixed order.
+
+	// D = dO · o per token and query head: deltas[t · heads + h]. One warp
+	// each; threads = n · heads · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def attentionDeltas(att gpu.DeviceBuffer<float32>, dO gpu.DeviceBuffer<float32>, deltas gpu.DeviceBuffer<float32>, rows, hs, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= rows) return;
+		float acc = 0.0f;
+		for (int64_t i = lane; i < hs; i += 32) acc += att[w * hs + i] * dO[w * hs + i];
+		acc = warpSum(acc);
+		if (lane == 0) deltas[w] = acc;
+	}
+
+	// P and dS of query tile q0 (64 queries) against key tile k0 (32
+	// keys) of query head h into ps and gs ([64][33]): this thread's 2
+	// queries by 4 keys, zero where a query does not see a key (causal,
+	// window). Run by a whole 256-thread block.
+	@kernelOnly
+	cuda def attentionTile(q float32[], keys float32[], values float32[], dO float32[], lse float32[], deltas float32[], h, kh, heads, kvHeads, hs, n, window int, q0, k0 int, scale, cap float32, qc float32[], oc float32[], kc float32[], vc float32[], ps float32[], gs float32[]) {
+		int tid = threadIdx.x, tq = (tid >> 3) * 2, tk = (tid & 7) * 4;
+		float sv[2][4], dp[2][4];
+		for (int a = 0; a < 2; a++) {
+			for (int b = 0; b < 4; b++) {
+				sv[a][b] = 0.0f;
+				dp[a][b] = 0.0f;
+			}
+		}
+		for (int64_t d0 = 0; d0 < hs; d0 += 16) {
+			for (int e = tid; e < 1024; e += 256) {
+				int r = e >> 4, c = e & 15;
+				int64_t qi = q0 + r, d = d0 + c;
+				bool ok = qi < n && d < hs;
+				qc[r * 17 + c] = ok ? q[(qi * heads + h) * hs + d]: 0.0f;
+				oc[r * 17 + c] = ok ? dO[(qi * heads + h) * hs + d]: 0.0f;
+			}
+			for (int e = tid; e < 512; e += 256) {
+				int r = e >> 4, c = e & 15;
+				int64_t kj = k0 + r, d = d0 + c;
+				bool ok = kj < n && d < hs;
+				kc[r * 17 + c] = ok ? keys[(kj * kvHeads + kh) * hs + d]: 0.0f;
+				vc[r * 17 + c] = ok ? values[(kj * kvHeads + kh) * hs + d]: 0.0f;
+			}
+			__syncthreads();
+			for (int c = 0; c < 16; c++) {
+				float qa[2], oa[2], kb[4], vb[4];
+				for (int a = 0; a < 2; a++) {
+					qa[a] = qc[(tq + a) * 17 + c];
+					oa[a] = oc[(tq + a) * 17 + c];
+				}
+				for (int b = 0; b < 4; b++) {
+					kb[b] = kc[(tk + b) * 17 + c];
+					vb[b] = vc[(tk + b) * 17 + c];
+				}
+				for (int a = 0; a < 2; a++) {
+					for (int b = 0; b < 4; b++) {
+						sv[a][b] += qa[a] * kb[b];
+						dp[a][b] += oa[a] * vb[b];
+					}
+				}
+			}
+			__syncthreads();
+		}
+		for (int a = 0; a < 2; a++) {
+			int64_t qi = q0 + tq + a;
+			float lq = qi < n ? lse[qi * heads + h]: 0.0f;
+			float dq = qi < n ? deltas[qi * heads + h]: 0.0f;
+			for (int b = 0; b < 4; b++) {
+				int64_t kj = k0 + tk + b;
+				bool seen = qi < n && kj <= qi && (window <= 0 || qi - kj < window);
+				float p = 0.0f, g = 0.0f;
+				if (seen) {
+					float v = sv[a][b] * scale, slope = 1.0f;
+					if (cap > 0.0f) {
+						v     = cap * tanhf(v / cap);
+						slope = 1.0f - (v / cap) * (v / cap);
+					}
+					p = expf(v - lq);
+					g = p * (dp[a][b] - dq) * slope * scale;
+				}
+				ps[(tq + a) * 33 + tk + b] = p;
+				gs[(tq + a) * 33 + tk + b] = g;
+			}
+		}
+		__syncthreads();
+	}
+
+	// Causal attention of n tokens from position 0 on (the training
+	// forward pass), tiled: one block per query tile (64 queries) and query
+	// head, over the key tiles it sees, with an online softmax per row;
+	// scores, window, cap and sinks as attendTokens', the same layouts, and
+	// each row's log sum (its sink included) into lse[t · heads + h].
+	// Heads wider than 128 values run in passes of 128.
+	// threads = ⌈n / 64⌉ · heads · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def attendTiles(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, lse gpu.DeviceBuffer<float32>, heads, kvHeads, hs, n, window int, scale, cap float32, sinks gpu.DeviceBuffer<float32>, so, threads int) !none {
+		__shared__ float qc[64 * 17];
+		__shared__ float kc[32 * 17];
+		__shared__ float ps[64 * 33];
+		__shared__ float vt[32 * 129];
+		__shared__ float rowMax[64];
+		__shared__ float rowSum[64];
+		__shared__ float fade[64];
+		int tid = threadIdx.x, tq = (tid >> 3) * 2, tk = (tid & 7) * 4;
+		int orow = (tid >> 4) * 4, ocol = (tid & 15) * 8;
+		int64_t tiles = (n + 63) / 64;
+		int64_t q0 = (blockIdx.x % tiles) * 64, h = blockIdx.x / tiles;
+		int64_t kh = h / (heads / kvHeads);
+		int64_t qLast = q0 + 63 < n - 1 ? q0 + 63: n - 1;
+		int64_t kFirst = window > 0 && q0 - window + 1 > 0 ? ((q0 - window + 1) / 32) * 32: 0;
+		for (int64_t c0 = 0; c0 < hs; c0 += 128) {
+			float acc[4][8];
+			for (int a = 0; a < 4; a++) {
+				for (int b = 0; b < 8; b++) acc[a][b] = 0.0f;
+			}
+			if (tid < 64) {
+				rowMax[tid] = -INFINITY;
+				rowSum[tid] = 0.0f;
+			}
+			__syncthreads();
+			for (int64_t k0 = kFirst; k0 <= qLast; k0 += 32) {
+				float sv[2][4];
+				for (int a = 0; a < 2; a++) {
+					for (int b = 0; b < 4; b++) sv[a][b] = 0.0f;
+				}
+				for (int64_t d0 = 0; d0 < hs; d0 += 16) {
+					for (int e = tid; e < 1024; e += 256) {
+						int r = e >> 4, c = e & 15;
+						int64_t qi = q0 + r, d = d0 + c;
+						qc[r * 17 + c] = qi < n && d < hs ? q[(qi * heads + h) * hs + d]: 0.0f;
+					}
+					for (int e = tid; e < 512; e += 256) {
+						int r = e >> 4, c = e & 15;
+						int64_t kj = k0 + r, d = d0 + c;
+						kc[r * 17 + c] = kj < n && d < hs ? keys[(kj * kvHeads + kh) * hs + d]: 0.0f;
+					}
+					__syncthreads();
+					for (int c = 0; c < 16; c++) {
+						float qa0 = qc[tq * 17 + c], qa1 = qc[(tq + 1) * 17 + c];
+						for (int b = 0; b < 4; b++) {
+							float kb = kc[(tk + b) * 17 + c];
+							sv[0][b] += qa0 * kb;
+							sv[1][b] += qa1 * kb;
+						}
+					}
+					__syncthreads();
+				}
+				// Each row's tile max and sum across its 8 threads.
+				for (int a = 0; a < 2; a++) {
+					int64_t qi = q0 + tq + a;
+					float top = -INFINITY;
+					for (int b = 0; b < 4; b++) {
+						int64_t kj = k0 + tk + b;
+						bool seen = qi < n && kj <= qi && (window <= 0 || qi - kj < window);
+						float v = sv[a][b] * scale;
+						if (cap > 0.0f) v = cap * tanhf(v / cap);
+						sv[a][b] = seen ? v: -INFINITY;
+						top = fmaxf(top, sv[a][b]);
+					}
+					for (int o = 1; o < 8; o <<= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+					float old = rowMax[tq + a];
+					float next = fmaxf(old, top);
+					float sum = 0.0f;
+					for (int b = 0; b < 4; b++) {
+						float p = next == -INFINITY ? 0.0f: expf(sv[a][b] - next);
+						ps[(tq + a) * 33 + tk + b] = p;
+						sum += p;
+					}
+					for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+					__syncwarp();
+					if ((tid & 7) == 0) {
+						float f = old == -INFINITY ? 0.0f: expf(old - next);
+						fade[tq + a] = f;
+						rowSum[tq + a] = rowSum[tq + a] * f + sum;
+						rowMax[tq + a] = next;
+					}
+				}
+				for (int e = tid; e < 32 * 128; e += 256) {
+					int r = e >> 7, c = e & 127;
+					int64_t kj = k0 + r, d = c0 + c;
+					vt[r * 129 + c] = kj < n && d < hs ? values[(kj * kvHeads + kh) * hs + d]: 0.0f;
+				}
+				__syncthreads();
+				for (int a = 0; a < 4; a++) {
+					float f = fade[orow + a];
+					for (int b = 0; b < 8; b++) acc[a][b] *= f;
+				}
+				for (int r = 0; r < 32; r++) {
+					float pa[4];
+					for (int a = 0; a < 4; a++) pa[a] = ps[(orow + a) * 33 + r];
+					for (int b = 0; b < 8; b++) {
+						float v = vt[r * 129 + ocol + b];
+						for (int a = 0; a < 4; a++) acc[a][b] += pa[a] * v;
+					}
+				}
+				__syncthreads();
+			}
+			for (int a = 0; a < 4; a++) {
+				int64_t qi = q0 + orow + a;
+				if (qi >= n) continue;
+				float m = rowMax[orow + a], l = rowSum[orow + a], f = 1.0f;
+				if (so >= 0) {
+					float sink = sinks[so + h], top = fmaxf(m, sink);
+					f = expf(m - top);
+					l = l * f + expf(sink - top);
+					m = top;
+				}
+				for (int b = 0; b < 8; b++) {
+					int64_t d = c0 + ocol + b;
+					if (d < hs) out[(qi * heads + h) * hs + d] = acc[a][b] * f / l;
+				}
+				if (c0 == 0 && (tid & 15) == 0) lse[qi * heads + h] = m + logf(l);
+			}
+			__syncthreads();
+		}
+	}
+
+	// The key and value gradients: one block per key tile (32 keys) and
+	// key head, over the query heads of its group and the query tiles
+	// that see the tile: dv += Pᵀ · dO and dk += dSᵀ · Q, added to dk and
+	// dv. threads = ⌈n / 32⌉ · kvHeads · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def attendBackKeys(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, dO gpu.DeviceBuffer<float32>, lse gpu.DeviceBuffer<float32>, deltas gpu.DeviceBuffer<float32>, dk gpu.DeviceBuffer<float32>, dv gpu.DeviceBuffer<float32>, heads, kvHeads, hs, n, window int, scale, cap float32, threads int) !none {
+		__shared__ float qc[64 * 17];
+		__shared__ float oc[64 * 17];
+		__shared__ float kc[32 * 17];
+		__shared__ float vc[32 * 17];
+		__shared__ float ps[64 * 33];
+		__shared__ float gs[64 * 33];
+		__shared__ float big[64 * 65];
+		int tid = threadIdx.x;
+		int64_t tiles = (n + 31) / 32;
+		int64_t k0 = (blockIdx.x % tiles) * 32, kh = blockIdx.x / tiles;
+		int64_t group = heads / kvHeads;
+		int64_t kLast = k0 + 31 < n - 1 ? k0 + 31: n - 1;
+		int64_t qLast = window > 0 && kLast + window - 1 < n - 1 ? kLast + window - 1: n - 1;
+		int ok = (tid >> 4) * 2, od = (tid & 15) * 4;
+		for (int64_t g = 0; g < group; g++) {
+			int64_t h = kh * group + g;
+			for (int64_t q0 = k0; q0 <= qLast; q0 += 64) {
+				attentionTile(q, q_len, keys, keys_len, values, values_len, dO, dO_len, lse, lse_len, deltas, deltas_len, (int) h, (int) kh, heads, kvHeads, hs, n, window, q0, k0, scale, cap, qc, 64 * 17, oc, 64 * 17, kc, 32 * 17, vc, 32 * 17, ps, 64 * 33, gs, 64 * 33);
+				for (int64_t d0 = 0; d0 < hs; d0 += 64) {
+					for (int pass = 0; pass < 2; pass++) {
+						float * src = pass == 0 ? dO: q;
+						for (int e = tid; e < 4096; e += 256) {
+							int r = e >> 6, c = e & 63;
+							int64_t qi = q0 + r, d = d0 + c;
+							big[r * 65 + c] = qi < n && d < hs ? src[(qi * heads + h) * hs + d]: 0.0f;
+						}
+						__syncthreads();
+						float acc[2][4];
+						for (int a = 0; a < 2; a++) {
+							for (int b = 0; b < 4; b++) acc[a][b] = 0.0f;
+						}
+						float * w = pass == 0 ? ps: gs;
+						for (int r = 0; r < 64; r++) {
+							float wa[2] = {w[r * 33 + ok], w[r * 33 + ok + 1]};
+							for (int b = 0; b < 4; b++) {
+								float x = big[r * 65 + od + b];
+								acc[0][b] += wa[0] * x;
+								acc[1][b] += wa[1] * x;
+							}
+						}
+						float * out = pass == 0 ? dv: dk;
+						for (int a = 0; a < 2; a++) {
+							int64_t kj = k0 + ok + a;
+							if (kj >= n) continue;
+							for (int b = 0; b < 4; b++) {
+								int64_t d = d0 + od + b;
+								if (d < hs) out[(kj * kvHeads + kh) * hs + d] += acc[a][b];
+							}
+						}
+						__syncthreads();
+					}
+				}
+			}
+		}
+	}
+
+	// The query gradients: one block per query tile (64 queries) and
+	// query head, over the key tiles it sees: dq = dS · K, written to dq.
+	// threads = ⌈n / 64⌉ · heads · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def attendBackQueries(q gpu.DeviceBuffer<float32>, keys gpu.DeviceBuffer<float32>, values gpu.DeviceBuffer<float32>, dO gpu.DeviceBuffer<float32>, lse gpu.DeviceBuffer<float32>, deltas gpu.DeviceBuffer<float32>, dq gpu.DeviceBuffer<float32>, heads, kvHeads, hs, n, window int, scale, cap float32, threads int) !none {
+		__shared__ float qc[64 * 17];
+		__shared__ float oc[64 * 17];
+		__shared__ float kc[32 * 17];
+		__shared__ float vc[32 * 17];
+		__shared__ float ps[64 * 33];
+		__shared__ float gs[64 * 33];
+		__shared__ float big[32 * 65];
+		int tid = threadIdx.x;
+		int64_t tiles = (n + 63) / 64;
+		int64_t q0 = (blockIdx.x % tiles) * 64, h = blockIdx.x / tiles;
+		int64_t kh = h / (heads / kvHeads);
+		int64_t qLast = q0 + 63 < n - 1 ? q0 + 63: n - 1;
+		int64_t kFirst = window > 0 && q0 - window + 1 > 0 ? ((q0 - window + 1) / 32) * 32: 0;
+		int oq = (tid >> 4) * 4, od = (tid & 15) * 4;
+		for (int64_t d0 = 0; d0 < hs; d0 += 64) {
+			for (int64_t r = tid; r < 64 * 64; r += 256) {
+				int64_t qi = q0 + r / 64, d = d0 + r % 64;
+				if (qi < n && d < hs) dq[(qi * heads + h) * hs + d] = 0.0f;
+			}
+		}
+		__syncthreads();
+		for (int64_t k0 = kFirst; k0 <= qLast; k0 += 32) {
+			attentionTile(q, q_len, keys, keys_len, values, values_len, dO, dO_len, lse, lse_len, deltas, deltas_len, (int) h, (int) kh, heads, kvHeads, hs, n, window, q0, k0, scale, cap, qc, 64 * 17, oc, 64 * 17, kc, 32 * 17, vc, 32 * 17, ps, 64 * 33, gs, 64 * 33);
+			for (int64_t d0 = 0; d0 < hs; d0 += 64) {
+				for (int e = tid; e < 2048; e += 256) {
+					int r = e >> 6, c = e & 63;
+					int64_t kj = k0 + r, d = d0 + c;
+					big[r * 65 + c] = kj < n && d < hs ? keys[(kj * kvHeads + kh) * hs + d]: 0.0f;
+				}
+				__syncthreads();
+				float acc[4][4];
+				for (int a = 0; a < 4; a++) {
+					for (int b = 0; b < 4; b++) acc[a][b] = 0.0f;
+				}
+				for (int r = 0; r < 32; r++) {
+					float wa[4];
+					for (int a = 0; a < 4; a++) wa[a] = gs[(oq + a) * 33 + r];
+					for (int b = 0; b < 4; b++) {
+						float x = big[r * 65 + od + b];
+						for (int a = 0; a < 4; a++) acc[a][b] += wa[a] * x;
+					}
+				}
+				for (int a = 0; a < 4; a++) {
+					int64_t qi = q0 + oq + a;
+					if (qi >= n) continue;
+					for (int b = 0; b < 4; b++) {
+						int64_t d = d0 + od + b;
+						if (d < hs) dq[(qi * heads + h) * hs + d] += acc[a][b];
+					}
+				}
+				__syncthreads();
+			}
+		}
+	}
+
+	// Back through prepareHeads (position 0 on) for each head of hs values
+	// of each token, one block per head: the head's gradient at d[(t ·
+	// heads + h) · hs:] is turned back (by the opposite angle, the same
+	// magnitude: the turn's transpose) when turn is 1, then, when norm is
+	// 1, taken back through the RMSNorm of the head as it was before it
+	// (`pre`, laid out alike) with weight[wo:] (wo < 0 for none). The
+	// head's input gradient goes to `into` (laid out alike; it may be d).
+	// Positions from `axes` as in prepareHeads.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def prepareHeadsBack(d gpu.DeviceBuffer<float32>, pre gpu.DeviceBuffer<float32>, into gpu.DeviceBuffer<float32>, hs, heads, norm int, weight gpu.DeviceBuffer<float32>, wo int, epsilon float32, turn int, axes gpu.DeviceBuffer<float32>, axesAt, sections int, table gpu.DeviceBuffer<float32>, to, dims, halves int, magnitude float32, threads int) !none {
+		__shared__ float partial[8];
+		int64_t token = blockIdx.x / heads;
+		int64_t at = (int64_t) blockIdx.x * hs;
+		float * g = d + at;
+		int tid = threadIdx.x;
+		int pt = (int) token, ph = pt, pw = pt;
+		if (axesAt >= 0) {
+			pt = (int) axes[(axesAt + token) * 3];
+			ph = (int) axes[(axesAt + token) * 3 + 1];
+			pw = (int) axes[(axesAt + token) * 3 + 2];
+		}
+		if (turn) {
+			int64_t pairs = dims / 2;
+			int s0 = sections & 255, s1 = (sections >> 8) & 255, s2 = (sections >> 16) & 255, inter = (sections >> 24) & 1;
+			for (int64_t i = tid; i < pairs; i += 256) {
+				int p = pt;
+				if (axesAt >= 0 && sections) {
+					int sector = (int) (i % (s0 + s1 + s2));
+					if (inter) {
+						if (sector % 3 == 1 && sector < 3 * s1) p = ph;
+						else if (sector % 3 == 2 && sector < 3 * s2) p = pw;
+					} else {
+						if (sector >= s0 && sector < s0 + s1) p = ph;
+						else if (sector >= s0 + s1) p = pw;
+					}
+				}
+				double theta = (double) p * ((double) table[to + 2 * i] + (double) table[to + 2 * i + 1]);
+				theta -= 6.283185307179586 * rint(theta * 0.15915494309189535);
+				float sn, cs;
+				sincosf((float) theta, &sn, &cs);
+				cs *= magnitude;
+				sn *= magnitude;
+				int64_t a = halves ? i: 2 * i;
+				int64_t b = halves ? i + pairs: a + 1;
+				float va = g[a], vb = g[b];
+				g[a] = va * cs + vb * sn;
+				g[b] = vb * cs - va * sn;
+			}
+			__syncthreads();
+		}
+		float * out = into + at;
+		if (!norm) {
+			for (int64_t i = tid; i < hs; i += 256) out[i] = g[i];
+			return;
+		}
+		float * x = pre + at;
+		float sq = 0.0f, along = 0.0f;
+		for (int64_t i = tid; i < hs; i += 256) {
+			float w = wo >= 0 ? weight[wo + i]: 1.0f;
+			sq += x[i] * x[i];
+			along += w * g[i] * x[i];
+		}
+		float squares = blockSum(sq, partial, 8);
+		float dot = blockSum(along, partial, 8);
+		float s = 1.0f / sqrtf(squares / (float) hs + epsilon);
+		float c = s * s * s * dot / (float) hs;
+		for (int64_t i = tid; i < hs; i += 256) {
+			float w = wo >= 0 ? weight[wo + i]: 1.0f;
+			out[i] = s * w * g[i] - c * x[i];
+		}
+	}
+
+	// Back through a = a · sigmoid(gate) (gateValues) for i < n: d[i]
+	// holds the gated values' gradient and leaves with a's; gate[i] is
+	// replaced by its own gradient, d · a · σ'(gate).
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def gateValuesBack(d gpu.DeviceBuffer<float32>, a gpu.DeviceBuffer<float32>, gate gpu.DeviceBuffer<float32>, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		float s = 1.0f / (1.0f + expf(-gate[i]));
+		float g = d[i];
+		gate[i] = g * a[i] * s * (1.0f - s);
+		d[i] = g * s;
+	}
+
+	// The inverse of splitGated: qg gets each head's hs values of q, then
+	// its hs of gate. n = tokens · heads · hs.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def joinGated(q gpu.DeviceBuffer<float32>, gate gpu.DeviceBuffer<float32>, qg gpu.DeviceBuffer<float32>, hs, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t head = i / hs, k = i % hs;
+		qg[head * 2 * hs + k] = q[i];
+		qg[head * 2 * hs + hs + k] = gate[i];
+	}
+
+	// dst row r = src row rows[ro + r] · (scales[ro + r] when so >= 0,
+	// else 1) for r < count (rows of `width` values, rows[] holding row
+	// numbers as floats); n = count · width.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def gatherRows(src gpu.DeviceBuffer<float32>, rows gpu.DeviceBuffer<float32>, ro int, scales gpu.DeviceBuffer<float32>, so int, dst gpu.DeviceBuffer<float32>, width, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t r = i / width, k = i % width;
+		float s = so >= 0 ? scales[so + ro + r]: 1.0f;
+		dst[i] = src[(int64_t) rows[ro + r] * width + k] * s;
+	}
+
+	// dst row rows[ro + r] += src row r · (scales[ro + r] when so >= 0,
+	// else 1) for r < count, in order of r: rows of `width` values; one
+	// thread per column, so rows naming one destination add up in a fixed
+	// order.
+	@launch(block = 256, x = "width", cpu = false)
+	cuda def scatterRows(src gpu.DeviceBuffer<float32>, rows gpu.DeviceBuffer<float32>, ro int, scales gpu.DeviceBuffer<float32>, so int, dst gpu.DeviceBuffer<float32>, width, count int) !none {
+		int64_t k = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (k >= width) return;
+		for (int64_t r = 0; r < count; r++) {
+			float s = so >= 0 ? scales[so + ro + r]: 1.0f;
+			dst[(int64_t) rows[ro + r] * width + k] += src[r * width + k] * s;
+		}
+	}
+
+	// out[oo + t · os + i] = act(g) · u for rows t of `width` values (n
+	// values in all), mode as gatedBack's: 0 SiLU, 1 GELU (tanh form), 2
+	// gpt-oss's clamped SwiGLU.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def gatedValues(g gpu.DeviceBuffer<float32>, gO, gS int, u gpu.DeviceBuffer<float32>, uo, us int, out gpu.DeviceBuffer<float32>, oo, os, width, n, mode int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int64_t t = i / width, k = i % width;
+		float gv = g[gO + t * gS + k], uv = u[uo + t * us + k];
+		float v;
+		if (mode == 2) {
+			float limited = fminf(gv, 7.0f);
+			v = limited / (1.0f + expf(-1.702f * limited)) * (fminf(fmaxf(uv, -7.0f), 7.0f) + 1.0f);
+		} else {
+			v = act(gv, mode) * uv;
+		}
+		out[oo + t * os + k] = v;
+	}
+
+	// Each pick's weight gradient: dw[r] = scale · dy row rows[r] · y row
+	// r (rows of `width`), one warp each; threads = count · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def pickGradients(dy gpu.DeviceBuffer<float32>, y gpu.DeviceBuffer<float32>, rows gpu.DeviceBuffer<float32>, dw gpu.DeviceBuffer<float32>, width, count int, scale float32, threads int) !none {
+		int64_t r = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (r >= count) return;
+		float * a = dy + (int64_t) rows[r] * width;
+		float * b = y + r * width;
+		float acc = 0.0f;
+		for (int64_t i = lane; i < width; i += 32) acc += a[i] * b[i];
+		acc = warpSum(acc);
+		if (lane == 0) dw[r] = scale * acc;
+	}
+
+	// Back through a shared expert's gate (addShared): per token, with
+	// share = sigmoid(normed · v[routerAt:]), dyShared = share · dd (the
+	// sum's gradient) and dn += (dd · shared) · share · (1 − share) ·
+	// v[routerAt:]. One block per token; threads = n · 256.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def sharedGateBack(dd gpu.DeviceBuffer<float32>, shared gpu.DeviceBuffer<float32>, normed gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, routerAt, e int, dn gpu.DeviceBuffer<float32>, dyShared gpu.DeviceBuffer<float32>, threads int) !none {
+		__shared__ float partial[8];
+		int64_t t = blockIdx.x;
+		float * d = dd + t * e;
+		float * o = shared + t * e;
+		float * x = normed + t * e;
+		float along = 0.0f, gate = 0.0f;
+		for (int64_t i = threadIdx.x; i < e; i += 256) {
+			gate += x[i] * v[routerAt + i];
+			along += d[i] * o[i];
+		}
+		float z = blockSum(gate, partial, 8);
+		float dot = blockSum(along, partial, 8);
+		float share = 1.0f / (1.0f + expf(-z));
+		float ds = dot * share * (1.0f - share);
+		for (int64_t i = threadIdx.x; i < e; i += 256) {
+			dyShared[t * e + i] = share * d[i];
+			dn[t * e + i] += ds * v[routerAt + i];
+		}
+	}
+
+	// Gated DeltaNet for training: the kernels below run a sequence from
+	// an empty state and keep what its gradient needs; layouts as
+	// deltaConv's and deltaRecur's.
+
+	// The causal convolution of n tokens from an empty history: pre gets
+	// the sums, ys their SiLU. One thread per channel.
+	@launch(block = 256, x = "channels", cpu = false)
+	cuda def deltaConvKeep(x gpu.DeviceBuffer<float32>, w gpu.DeviceBuffer<float32>, wo int, pre gpu.DeviceBuffer<float32>, ys gpu.DeviceBuffer<float32>, channels, width, n int) !none {
+		int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (c >= channels) return;
+		float * wc = w + wo + c * width;
+		for (int64_t t = 0; t < n; t++) {
+			float sum = wc[width - 1] * x[t * channels + c];
+			for (int k = 0; k < width - 1; k++) {
+				int64_t at = t - (width - 1) + k;
+				if (at >= 0) sum += wc[k] * x[at * channels + c];
+			}
+			pre[t * channels + c] = sum;
+			ys[t * channels + c] = sum / (1.0f + expf(-sum));
+		}
+	}
+
+	// deltaRecur over n tokens from a zero state, without keeping the
+	// state: before every `chunk` tokens each state row goes to
+	// checkpoints[((t / chunk) · vHeads · hs + h · hs + j) · hs:].
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaRecurKeep(y gpu.DeviceBuffer<float32>, channels, kHeads, vHeads, hs int, alpha gpu.DeviceBuffer<float32>, beta gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, dtAt, decayAt int, checkpoints gpu.DeviceBuffer<float32>, chunk int, out gpu.DeviceBuffer<float32>, n, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= vHeads * hs) return;
+		int h = (int) (w / hs), j = (int) (w % hs), per = hs >> 5;
+		float s[8];
+		for (int i = 0; i < per; i++) s[i] = 0.0f;
+		int64_t keyDim = (int64_t) kHeads * hs, qo = (int64_t) (h % kHeads) * hs, ko = keyDim + qo, vo = 2 * keyDim + (int64_t) h * hs + j;
+		float scale = rsqrtf((float) hs), dt = v[dtAt + h], a = v[decayAt + h];
+		for (int64_t t = 0; t < n; t++) {
+			if (t % chunk == 0) {
+				float * cp = checkpoints + ((t / chunk) * vHeads * hs + w) * hs;
+				for (int i = 0; i < per; i++) cp[lane + 32 * i] = s[i];
+			}
+			float * yt = y + t * channels;
+			float g = alpha[t * vHeads + h] + dt;
+			float decay = expf((g > 20.0f ? g: log1pf(expf(g))) * a);
+			float b = 1.0f / (1.0f + expf(-beta[t * vHeads + h]));
+			float kv = 0.0f;
+			for (int i = 0; i < per; i++) {
+				s[i] *= decay;
+				kv += s[i] * yt[ko + lane + 32 * i];
+			}
+			float delta = (yt[vo] - warpSum(kv)) * b;
+			float o = 0.0f;
+			for (int i = 0; i < per; i++) {
+				s[i] += yt[ko + lane + 32 * i] * delta;
+				o += s[i] * yt[qo + lane + 32 * i];
+			}
+			o = warpSum(o);
+			if (lane == 0) out[(t * vHeads + h) * hs + j] = o * scale;
+		}
+	}
+
+	// Back through deltaRecurKeep, one block of 1024 threads per value
+	// head, its tokens last first, a chunk at a time: the chunk's states
+	// are made again from its checkpoint into `states` (the head's
+	// (chunk + 1) · hs · hs values), then each warp carries the state's
+	// gradient for its rows j (hs / 32 of them) back through the tokens.
+	// dRaw holds the outputs' gradient; dq and dk get the query and key
+	// gradients by value head (dq[(h · n + t) · hs:]), dUnit the values'
+	// (at the value channels of each token's row of `channels`), dDecay
+	// and dBeta the gradients of each token's decay and beta (sigmoid's
+	// output) per value head.
+	@launch(block = 1024, x = "threads", cpu = false)
+	cuda def deltaRecurBack(y gpu.DeviceBuffer<float32>, channels, kHeads, vHeads, hs int, alpha gpu.DeviceBuffer<float32>, beta gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, dtAt, decayAt int, checkpoints gpu.DeviceBuffer<float32>, chunk int, states gpu.DeviceBuffer<float32>, dRaw gpu.DeviceBuffer<float32>, dq gpu.DeviceBuffer<float32>, dk gpu.DeviceBuffer<float32>, dUnit gpu.DeviceBuffer<float32>, dDecay gpu.DeviceBuffer<float32>, dBeta gpu.DeviceBuffer<float32>, n, threads int) !none {
+		__shared__ float qs[256];
+		__shared__ float ks[256];
+		__shared__ float vs[256];
+		__shared__ float pq[32 * 256];
+		__shared__ float sums[64];
+		__shared__ double wide[32];
+		int h = blockIdx.x;
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		int per = hs >> 5, rowsPer = (hs + 31) / 32;
+		int64_t keyDim = (int64_t) kHeads * hs, qo = (int64_t) (h % kHeads) * hs, ko = keyDim + qo, vo = 2 * keyDim + (int64_t) h * hs;
+		float scale = rsqrtf((float) hs), dt = v[dtAt + h], a = v[decayAt + h];
+		int64_t size = (int64_t) hs * hs;
+		float * st = states + (int64_t) h * (chunk + 1) * size;
+		float ds[8][8];
+		for (int r = 0; r < 8; r++) {
+			for (int i = 0; i < 8; i++) ds[r][i] = 0.0f;
+		}
+		int64_t chunks = (n + chunk - 1) / chunk;
+		for (int64_t c = chunks - 1; c >= 0; c--) {
+			int64_t first = c * chunk, last = first + chunk < n ? first + chunk: n;
+			// The chunk's states: before its first token, then after each.
+			for (int r = 0; r < rowsPer; r++) {
+				int j = warp + 32 * r;
+				if (j >= hs) continue;
+				float s[8];
+				float * cp = checkpoints + ((c * vHeads + h) * hs + j) * hs;
+				for (int i = 0; i < per; i++) {
+					s[i] = cp[lane + 32 * i];
+					st[(int64_t) j * hs + lane + 32 * i] = s[i];
+				}
+				for (int64_t t = first; t < last; t++) {
+					float * yt = y + t * channels;
+					float g = alpha[t * vHeads + h] + dt;
+					float decay = expf((g > 20.0f ? g: log1pf(expf(g))) * a);
+					float b = 1.0f / (1.0f + expf(-beta[t * vHeads + h]));
+					float kv = 0.0f;
+					for (int i = 0; i < per; i++) {
+						s[i] *= decay;
+						kv += s[i] * yt[ko + lane + 32 * i];
+					}
+					float delta = (yt[vo + j] - warpSum(kv)) * b;
+					for (int i = 0; i < per; i++) {
+						s[i] += yt[ko + lane + 32 * i] * delta;
+						st[((t - first + 1) * hs + j) * hs + lane + 32 * i] = s[i];
+					}
+				}
+			}
+			__syncthreads();
+			for (int64_t t = last - 1; t >= first; t--) {
+				float * yt = y + t * channels;
+				for (int i = threadIdx.x; i < hs; i += 1024) {
+					qs[i] = yt[qo + i];
+					ks[i] = yt[ko + i];
+					vs[i] = yt[vo + i];
+				}
+				for (int i = threadIdx.x; i < 32 * 256; i += 1024) pq[i] = 0.0f;
+				__syncthreads();
+				float g = alpha[t * vHeads + h] + dt;
+				float decay = expf((g > 20.0f ? g: log1pf(expf(g))) * a);
+				float b = 1.0f / (1.0f + expf(-beta[t * vHeads + h]));
+				float dbeta = 0.0f;
+				double dd = 0.0;
+				float * prevAll = st + (t - first) * size;
+				float * afterAll = st + (t - first + 1) * size;
+				float dk_[8];
+				for (int i = 0; i < 8; i++) dk_[i] = 0.0f;
+				for (int r = 0; r < rowsPer; r++) {
+					int j = warp + 32 * r;
+					if (j >= hs) continue;
+					float * prev = prevAll + (int64_t) j * hs;
+					float * after = afterAll + (int64_t) j * hs;
+					float go = dRaw[(t * vHeads + h) * hs + j] * scale;
+					float pk = 0.0f, sk = 0.0f;
+					for (int i = 0; i < per; i++) {
+						int c2 = lane + 32 * i;
+						ds[r][i] += go * qs[c2];
+						pq[warp * 256 + c2] += go * after[c2];
+						pk += decay * prev[c2] * ks[c2];
+						sk += ds[r][i] * ks[c2];
+					}
+					float e = vs[j] - warpSum(pk);
+					float du = warpSum(sk);
+					float u = b * e, de = b * du;
+					dbeta += du * e;
+					double back = 0.0;
+					for (int i = 0; i < per; i++) {
+						int c2 = lane + 32 * i;
+						dk_[i] += u * ds[r][i] - de * decay * prev[c2];
+						ds[r][i] -= de * ks[c2];
+						back += (double) ds[r][i] * (double) prev[c2];
+					}
+					for (int o = 16; o > 0; o >>= 1) back += __shfl_xor_sync(0xffffffffu, back, o);
+					dd += back;
+					if (lane == 0) dUnit[t * channels + vo + j] = de;
+					for (int i = 0; i < per; i++) ds[r][i] *= decay;
+				}
+				// The query and key gradients and the scalars, summed over the
+				// warps in order.
+				__syncthreads();
+				for (int i = threadIdx.x; i < hs; i += 1024) {
+					float acc = 0.0f;
+					for (int k = 0; k < 32; k++) acc += pq[k * 256 + i];
+					dq[((int64_t) h * n + t) * hs + i] = acc;
+				}
+				__syncthreads();
+				for (int i = 0; i < per; i++) pq[warp * 256 + lane + 32 * i] = dk_[i];
+				if (lane == 0) {
+					sums[warp] = dbeta;
+					wide[warp] = dd;
+				}
+				__syncthreads();
+				for (int i = threadIdx.x; i < hs; i += 1024) {
+					float acc = 0.0f;
+					for (int k = 0; k < 32; k++) acc += pq[k * 256 + i];
+					dk[((int64_t) h * n + t) * hs + i] = acc;
+				}
+				if (threadIdx.x == 0) {
+					float sb = 0.0f;
+					double sd = 0.0;
+					for (int k = 0; k < 32; k++) {
+						sb += sums[k];
+						sd += wide[k];
+					}
+					dBeta[t * vHeads + h] = sb;
+					dDecay[t * vHeads + h] = (float) sd;
+				}
+				__syncthreads();
+			}
+		}
+	}
+
+	// The query and key gradients by value head summed into each key
+	// head's channels of dUnit (value heads h ≡ kh mod kHeads, in order).
+	// threads = n · 2 · kHeads · hs.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaHeadsSum(dq gpu.DeviceBuffer<float32>, dk gpu.DeviceBuffer<float32>, dUnit gpu.DeviceBuffer<float32>, channels, kHeads, vHeads, hs, n, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		int64_t per = (int64_t) 2 * kHeads * hs;
+		if (i >= n * per) return;
+		int64_t t = i / per, rest = i % per;
+		int key = rest >= (int64_t) kHeads * hs;
+		int64_t kh = (rest % ((int64_t) kHeads * hs)) / hs, c = rest % hs;
+		float * src = key ? dk: dq;
+		float acc = 0.0f;
+		for (int64_t h = kh; h < vHeads; h += kHeads) acc += src[(h * n + t) * hs + c];
+		dUnit[t * channels + rest] = acc;
+	}
+
+	// Back through deltaGate: per value head of each token, with
+	// nh = RMSNorm(raw head) · v[normAt:] and the gate z, out = nh ·
+	// SiLU(z): dz gets dOut · nh · SiLU'(z) and dRaw the norm's gradient of
+	// dOut · SiLU(z). One warp per head; threads = n · vHeads · 32.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaGateBack(raw gpu.DeviceBuffer<float32>, z gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, normAt int, dOut gpu.DeviceBuffer<float32>, dRaw gpu.DeviceBuffer<float32>, dz gpu.DeviceBuffer<float32>, vHeads, hs, n int, eps float32, threads int) !none {
+		int64_t w = ((int64_t) blockIdx.x * 256 + threadIdx.x) >> 5;
+		int lane = threadIdx.x & 31;
+		if (w >= n * vHeads) return;
+		float * x = raw + w * hs;
+		float * g = z + w * hs;
+		float * d = dOut + w * hs;
+		float sq = 0.0f;
+		for (int i = lane; i < hs; i += 32) sq += x[i] * x[i];
+		float s = rsqrtf(warpSum(sq) / (float) hs + eps);
+		float along = 0.0f;
+		for (int i = lane; i < hs; i += 32) {
+			float sig = 1.0f / (1.0f + expf(-g[i]));
+			float wv = v[normAt + i];
+			float nh = x[i] * s * wv;
+			dz[w * hs + i] = d[i] * nh * sig * (1.0f + g[i] * (1.0f - sig));
+			along += wv * d[i] * g[i] * sig * x[i];
+		}
+		along = warpSum(along);
+		float c = s * s * s * along / (float) hs;
+		for (int i = lane; i < hs; i += 32) {
+			float sig = 1.0f / (1.0f + expf(-g[i]));
+			dRaw[w * hs + i] = s * v[normAt + i] * d[i] * g[i] * sig - c * x[i];
+		}
+	}
+
+	// d[i] *= SiLU'(pre[i]) for i < n.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def siluBack(pre gpu.DeviceBuffer<float32>, d gpu.DeviceBuffer<float32>, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		float x = pre[i], s = 1.0f / (1.0f + expf(-x));
+		d[i] *= s * (1.0f + x * (1.0f - s));
+	}
+
+	// Back through deltaConvKeep's sums: dx[s · channels + c] = Σ over taps
+	// of w · dPre at the tokens that read token s. threads = n · channels.
+	@launch(block = 256, x = "threads", cpu = false)
+	cuda def deltaConvBack(dPre gpu.DeviceBuffer<float32>, w gpu.DeviceBuffer<float32>, wo int, dx gpu.DeviceBuffer<float32>, channels, width, n, threads int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n * channels) return;
+		int64_t t = i / channels, c = i % channels;
+		float * wc = w + wo + c * width;
+		float acc = 0.0f;
+		for (int k = 0; k < width; k++) {
+			int64_t at = t + (width - 1) - k;
+			if (at < n) acc += wc[k] * dPre[at * channels + c];
+		}
+		dx[i] = acc;
+	}
+
+	// The decay's and beta's inputs' gradients in place: dDecay (of
+	// exp(softplus(alpha + dt) · a)) becomes alpha's, dBeta (of sigmoid's
+	// output) beta's. n = tokens · vHeads.
+	@launch(block = 256, x = "n", cpu = false)
+	cuda def deltaGatesBack(alpha gpu.DeviceBuffer<float32>, beta gpu.DeviceBuffer<float32>, v gpu.DeviceBuffer<float32>, dtAt, decayAt int, dDecay gpu.DeviceBuffer<float32>, dBeta gpu.DeviceBuffer<float32>, vHeads, n int) !none {
+		int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+		if (i >= n) return;
+		int h = (int) (i % vHeads);
+		float g = alpha[i] + v[dtAt + h], a = v[decayAt + h];
+		float sp = g > 20.0f ? g: log1pf(expf(g));
+		float slope = g > 20.0f ? 1.0f: 1.0f / (1.0f + expf(-g));
+		dDecay[i] *= expf(sp * a) * a * slope;
+		float b = 1.0f / (1.0f + expf(-beta[i]));
+		dBeta[i] *= b * (1.0f - b);
 	}
 }

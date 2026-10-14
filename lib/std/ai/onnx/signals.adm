@@ -1,0 +1,1062 @@
+partial module std.ai.onnx {
+	use (
+		std.simd
+		std.math
+		std.math.processing::(Fourier)
+		std.formats.ai.onnx::(ElementType, Attribute)
+		std.ai.tensor::(Tensor, storageOf, Storage)
+		std.text.unicode
+		std.text.regex as re2
+		std.crypto
+		std.formats.image as imageformat
+	)
+
+	// Runs the signal, text, random, loss and image decoding operators; false for an operator this family does not have.
+	// Fails when the operator fails on its inputs.
+	internal def applySignals(c Call) !bool {
+		match c.step.op {
+			case "DFT":
+				try dftOp(c)
+			case "STFT":
+				try stftOp(c)
+			case "BlackmanWindow":
+				try windowOp(c, WindowShape.Blackman)
+			case "HammingWindow":
+				try windowOp(c, WindowShape.Hamming)
+			case "HannWindow":
+				try windowOp(c, WindowShape.Hann)
+			case "MelWeightMatrix":
+				try melOp(c)
+			case "StringConcat":
+				try concatOp(c)
+			case "StringNormalizer":
+				try normalizeOp(c)
+			case "StringSplit":
+				try splitOp(c)
+			case "RegexFullMatch":
+				try regexOp(c)
+			case "TfIdfVectorizer":
+				try tfidfOp(c)
+			case "ImageDecoder":
+				try imageOp(c)
+			case "RandomNormal", "RandomUniform", "RandomNormalLike", "RandomUniformLike":
+				try randomOp(c)
+			case "Bernoulli":
+				try bernoulliOp(c)
+			case "Multinomial":
+				try multinomialOp(c)
+			case "NegativeLogLikelihoodLoss":
+				try lossOp(c, false)
+			case "SoftmaxCrossEntropyLoss":
+				try lossOp(c, true)
+			default:
+				return false
+		}
+		return true
+	}
+
+	// ---- shared ---------------------------------------------------------
+
+	// The values of a tensor of a floating-point type as float64.
+	internal def doublesOf(t Tensor) float[] {
+		return t.doubles when storageOf(t.element) == Storage.Doubles
+		let out float[]
+		out.len(t.floats.len())
+		for let i = 0; i < out.len(); i++ {
+			out[i] = float(t.floats[i])
+		}
+		return out
+	}
+
+	// A tensor of the floating-point `element` holding `values` (rounded
+	// to the type when it is narrower than Double).
+	internal def floatTensor(values float[], shape int[], element ElementType) Tensor {
+		if storageOf(element) == Storage.Doubles {
+			let t = new Tensor(shape, values)
+			t.element = element
+			return t
+		}
+		let v float32[]
+		v.len(values.len())
+		for let i = 0; i < v.len(); i++ {
+			v[i] = float32(values[i])
+		}
+		let t = new Tensor(shape, v, element)
+		roundTo(t)
+		return t
+	}
+
+	// The number of values of `shape`.
+	internal def countOf(shape int[]) int {
+		let n = 1
+		for let (_, d) in shape {
+			n *= d
+		}
+		return n
+	}
+
+	// ---- DFT and STFT ---------------------------------------------------
+
+	// The layout of a batch of transforms: the input holds `outer` blocks of
+	// `length` values along the transformed axis, each `inner` lines apart,
+	// of `channels` (1 real, 2 complex) numbers; the output holds
+	// `outLength` values per line of `outChannels` numbers.
+	internal struct DftLayout {
+		outer       int
+		length      int
+		inner       int
+		channels    int
+		size        int
+		outLength   int
+		outChannels int
+		inverse     bool
+		// The input is one half of a Hermitian spectrum (IRFFT).
+		halfInput   bool
+	}
+
+	// DFT: the transform along one axis, forward or inverse, of real or
+	// complex values; one-sided as RFFT (forward) or IRFFT (inverse).
+	internal def dftOp(c Call) !none {
+		let x = try c.tensor(0)
+		let storage = storageOf(x.element)
+		fail c.about() + "takes a floating-point tensor, not {x.element.name}" unless storage := Storage.Floats || Storage.Doubles
+		let rank = x.rank()
+		fail c.about() + "the input needs a signal axis and a last dimension of 1 or 2" unless rank >= 2 && (x.shape[rank - 1] := 1 || 2)
+		let axis = c.int("axis", 1)
+		axis = c.has(2) ?? (scalarInt(try c.tensor(2)), -2) when c.opset >= 20
+		axis += rank when axis < 0
+		fail c.about() + "axis {axis} is not a signal axis of a rank {rank} input" unless axis >= 0 && axis <= rank - 2
+		let inverse = c.int("inverse", 0) == 1
+		let onesided = c.int("onesided", 0) == 1
+		let length = x.shape[axis]
+		let size = inverse && onesided ?? (2 * (length - 1), length)
+		size = scalarInt(try c.tensor(1)) when c.has(1)
+		fail c.about() + "the DFT length {size} is not positive" unless size >= 1
+		let layout = DftLayout{
+			outer:       countOf(x.shape[0:axis]),
+			length:      length,
+			inner:       countOf(x.shape[axis + 1:rank - 1]),
+			channels:    x.shape[rank - 1],
+			size:        size,
+			outLength:   size,
+			outChannels: 2,
+			inverse:     inverse,
+			halfInput:   inverse && onesided,
+		}
+		layout.outLength = size / 2 + 1 when onesided && !inverse
+		layout.outChannels = 1 when layout.halfInput
+		let shape = x.shape.clone()
+		shape[axis] = layout.outLength
+		shape[rank - 1] = layout.outChannels
+		c.out(0, floatTensor(transform(doublesOf(x), layout), shape, x.element))
+		return none
+	}
+
+	// STFT: the DFT of each frame of the signal (frames `frame_step`
+	// apart, weighted by the window), one-sided unless `onesided` is 0.
+	internal def stftOp(c Call) !none {
+		let x = try c.tensor(0)
+		let storage = storageOf(x.element)
+		fail c.about() + "takes a floating-point signal, not {x.element.name}" unless storage := Storage.Floats || Storage.Doubles
+		// [batch][length] is a real signal, as onnxruntime reads it (Kokoro
+		// exports give one).
+		fail c.about() + "the signal must be [batch][length], or [batch][length][1 or 2]" unless x.rank() == 2 || (x.rank() == 3 && (x.shape[2] := 1 || 2))
+		let step = scalarInt(try c.tensor(1))
+		fail c.about() + "the frame step {step} is not positive" unless step >= 1
+		let (batch, length, channels) = (x.shape[0], x.shape[1], x.rank() == 3 ?? (x.shape[2], 1))
+		let window float[]
+		let frameLength = length
+		if c.has(2) {
+			let w = try c.tensor(2)
+			fail c.about() + "the window must be one-dimensional" unless w.rank() == 1
+			window = doublesOf(w)
+			frameLength = w.shape[0]
+		}
+		if c.has(3) {
+			let given = scalarInt(try c.tensor(3))
+			fail c.about() + "the window has {frameLength} values, the frame length is {given}" when c.has(2) && given != frameLength
+			frameLength = given
+		}
+		fail c.about() + "the frame length {frameLength} does not fit the signal of {length}" unless frameLength >= 1 && frameLength <= length
+		if !c.has(2) {
+			window.len(frameLength)
+			for let i = 0; i < frameLength; i++ {
+				window[i] = 1.0
+			}
+		}
+		let frames = (length - frameLength) / step + 1
+		let signal = doublesOf(x)
+		let framed float[]
+		framed.len(batch * frames * frameLength * channels)
+		for let b = 0; b < batch; b++ {
+			for let f = 0; f < frames; f++ {
+				let from = (b * length + f * step) * channels
+				let to = ((b * frames + f) * frameLength) * channels
+				for let k = 0; k < frameLength; k++ {
+					for let t = 0; t < channels; t++ {
+						framed[to + k * channels + t] = signal[from + k * channels + t] * window[k]
+					}
+				}
+			}
+		}
+		let onesided = c.int("onesided", 1) == 1
+		let layout = DftLayout{
+			outer:       batch * frames,
+			length:      frameLength,
+			inner:       1,
+			channels:    channels,
+			size:        frameLength,
+			outLength:   onesided ?? (frameLength / 2 + 1, frameLength),
+			outChannels: 2,
+			inverse:     false,
+			halfInput:   false,
+		}
+		c.out(0, floatTensor(transform(framed, layout), [batch, frames, layout.outLength, 2], x.element))
+		return none
+	}
+
+	// Values transformed per task from which lines are split across tasks.
+	const dftParallelFrom = 1 << 15
+
+	// The transforms `layout` describes of the values `x`.
+	internal def transform(x float[], layout DftLayout) float[] {
+		let out float[]
+		let lines = layout.outer * layout.inner
+		out.len(lines * layout.outLength * layout.outChannels)
+		return out when lines == 0
+		let plan = new Fourier(layout.size, layout.inverse)
+		let tasks = (lines * layout.size / dftParallelFrom).clamp(1, 32)
+		tasks = (lines / 2).clamp(1, tasks)
+		if tasks == 1 {
+			dftLines(x, layout, plan, 0, lines, out)
+			return out
+		}
+		forall let t in 0..tasks {
+			// Bands start on even lines so real lines pair up within one.
+			let from = (lines * t / tasks) & -2
+			let to = t + 1 == tasks ?? (lines, (lines * (t + 1) / tasks) & -2)
+			dftLines(x, layout, plan.copy(), from, to, out)
+		}
+		return out
+	}
+
+	// Transforms lines `from` to `to` of `x` into `out`. Real lines go two
+	// at a time through one complex transform (one as the real part, one
+	// as the imaginary part), and so do the Hermitian spectra of an IRFFT.
+	internal def dftLines(x float[], layout DftLayout, plan Fourier, from int, to int, out float[]) {
+		let n = layout.size
+		let re float[]
+		let im float[]
+		re.len(n)
+		im.len(n)
+		let half = n / 2 + 1
+		let ar float[]
+		let ai float[]
+		let br float[]
+		let bi float[]
+		if layout.halfInput {
+			ar.len(half)
+			ai.len(half)
+			br.len(half)
+			bi.len(half)
+		}
+		let channels = layout.channels
+		let stride = layout.inner * channels
+		let outStride = layout.inner * layout.outChannels
+		let l = from
+		for l < to {
+			let pair = (channels == 1 || layout.halfInput) && l + 1 < to
+			let (o, i) = (l / layout.inner, l % layout.inner)
+			let base = (o * layout.length * layout.inner + i) * channels
+			// The second line of a pair: the next line of the block, or the
+			// first of the next block.
+			let (o2, i2) = ((l + 1) / layout.inner, (l + 1) % layout.inner)
+			let base2 = (o2 * layout.length * layout.inner + i2) * channels
+			if layout.halfInput {
+				halfSpectrum(x, base, stride, channels, layout.length, n, ar, ai)
+				if pair {
+					halfSpectrum(x, base2, stride, channels, layout.length, n, br, bi)
+				} else {
+					for let k = 0; k < half; k++ {
+						br[k] = 0.0
+						bi[k] = 0.0
+					}
+				}
+				// Z = A + iB over the Hermitian completions of A and B.
+				for let k = 0; k < n; k++ {
+					if k < half {
+						re[k] = ar[k] - bi[k]
+						im[k] = ai[k] + br[k]
+					} else {
+						let m = n - k
+						re[k] = ar[m] + bi[m]
+						im[k] = br[m] - ai[m]
+					}
+				}
+			} else {
+				let count = layout.length.clamp(0, n)
+				for let k = 0; k < count; k++ {
+					re[k] = x[base + k * stride]
+					if channels == 2 {
+						im[k] = x[base + k * stride + 1]
+					} else {
+						im[k] = pair ?? (x[base2 + k * stride], 0.0)
+					}
+				}
+				for let k = count; k < n; k++ {
+					re[k] = 0.0
+					im[k] = 0.0
+				}
+			}
+			plan.run(re, im)
+			let ob = (o * layout.outLength * layout.inner + i) * layout.outChannels
+			let ob2 = (o2 * layout.outLength * layout.inner + i2) * layout.outChannels
+			if layout.halfInput {
+				for let k = 0; k < layout.outLength; k++ {
+					out[ob + k * outStride] = re[k]
+				}
+				if pair {
+					for let k = 0; k < layout.outLength; k++ {
+						out[ob2 + k * outStride] = im[k]
+					}
+				}
+			} else if pair {
+				// The spectra of x1 and x2 from that of x1 + i·x2.
+				let h = 0.5
+				for let k = 0; k < layout.outLength; k++ {
+					let m = k == 0 ?? (0, n - k)
+					let (a, b, cr, d) = (re[k], im[k], re[m], im[m])
+					out[ob + k * outStride] = (a + cr) * h
+					out[ob + k * outStride + 1] = (b - d) * h
+					out[ob2 + k * outStride] = (b + d) * h
+					out[ob2 + k * outStride + 1] = (cr - a) * h
+				}
+			} else {
+				for let k = 0; k < layout.outLength; k++ {
+					out[ob + k * outStride] = re[k]
+					out[ob + k * outStride + 1] = im[k]
+				}
+			}
+			l += pair ?? (2, 1)
+		}
+	}
+
+	// Reads the first n/2 + 1 values of a one-sided spectrum (zeros past
+	// what the input holds), dropping the imaginary parts a real signal's
+	// spectrum cannot have at 0 and n/2.
+	internal def halfSpectrum(x float[], base int, stride int, channels int, length int, n int, re float[], im float[]) {
+		let half = n / 2 + 1
+		let count = length.clamp(0, half)
+		for let k = 0; k < count; k++ {
+			re[k] = x[base + k * stride]
+			im[k] = channels == 2 ?? (x[base + k * stride + 1], 0.0)
+		}
+		for let k = count; k < half; k++ {
+			re[k] = 0.0
+			im[k] = 0.0
+		}
+		im[0] = 0.0
+		im[n / 2] = 0.0 when n % 2 == 0
+	}
+
+	// ---- windows and the mel filter bank --------------------------------
+
+	// The window functions.
+	internal enum WindowShape {
+		Blackman,
+		Hamming,
+		Hann,
+	}
+
+	// BlackmanWindow, HammingWindow, HannWindow: the window of `size`
+	// values, periodic (the default) or symmetric, as `output_datatype`.
+	internal def windowOp(c Call, kind WindowShape) !none {
+		let size = scalarInt(try c.tensor(0))
+		fail c.about() + "the size {size} is negative" when size < 0
+		let span = float(c.int("periodic", 1) == 1 ?? (size, size - 1))
+		let values float[]
+		values.len(size)
+		for let n = 0; n < size; n++ {
+			let angle = 2.0 * math.Pi * float(n) / span
+			match kind {
+				case WindowShape.Blackman:
+					values[n] = 0.42 - 0.5 * math.cos(angle) + 0.08 * math.cos(2.0 * angle)
+				case WindowShape.Hamming:
+					values[n] = 25.0 / 46.0 - 21.0 / 46.0 * math.cos(angle)
+				default:
+					let s = math.sin(0.5 * angle)
+					values[n] = s * s
+			}
+		}
+		c.out(0, try cast(new Tensor([size], values), ElementType(c.int("output_datatype", 1)), true))
+		return none
+	}
+
+	// MelWeightMatrix: the [dft_length/2 + 1, num_mel_bins] triangular
+	// filters mapping a spectrum to mel bins between the edge
+	// frequencies, as `output_datatype`.
+	internal def melOp(c Call) !none {
+		let bins = scalarInt(try c.tensor(0))
+		let dftLength = scalarInt(try c.tensor(1))
+		let rate = scalarInt(try c.tensor(2))
+		let low = scalarFloat(try c.tensor(3))
+		let high = scalarFloat(try c.tensor(4))
+		fail c.about() + "needs positive bin counts and sample rate" unless bins > 0 && dftLength > 0 && rate > 0
+		let spectrum = dftLength / 2 + 1
+		let ln10 = math.ln(10.0)
+		let lowMel = 2595.0 * math.ln(1.0 + low / 700.0) / ln10
+		let highMel = 2595.0 * math.ln(1.0 + high / 700.0) / ln10
+		let step = (highMel - lowMel) / float(bins + 2)
+		let points int[]
+		points.len(bins + 2)
+		for let i = 0; i < bins + 2; i++ {
+			let hz = 700.0 * (math.E ** ((float(i) * step + lowMel) / 2595.0 * ln10) - 1.0)
+			points[i] = int((float(dftLength + 1) * hz / float(rate)).floor())
+		}
+		let values float[]
+		values.len(spectrum * bins)
+		for let i = 0; i < bins; i++ {
+			let (left, center, right) = (points[i], points[i + 1], points[i + 2])
+			fail c.about() + "the filters reach past the spectrum" unless left >= 0 && right <= spectrum && center < spectrum
+			if center == left {
+				values[center * bins + i] = 1.0
+			} else {
+				for let j = left; j <= center; j++ {
+					values[j * bins + i] = float(j - left) / float(center - left)
+				}
+			}
+			for let j = center; j < right; j++ {
+				values[j * bins + i] = float(right - j) / float(right - center)
+			}
+		}
+		c.out(0, try cast(new Tensor([spectrum, bins], values), ElementType(c.int("output_datatype", 1)), true))
+		return none
+	}
+
+	// ---- text -----------------------------------------------------------
+
+	// The string tensor input `i`.
+	// Fails when it is missing or not of strings.
+	internal def strings(c Call, i int) !Tensor {
+		let t = try c.tensor(i)
+		fail c.about() + "input {i + 1} must be of strings, not {t.element.name}" unless t.element == ElementType.String
+		return t
+	}
+
+	// StringConcat: the two inputs joined elementwise, broadcast together.
+	internal def concatOp(c Call) !none {
+		let a = try strings(c, 0)
+		let b = try strings(c, 1)
+		let plan = try broadcast(a.shape, b.shape)
+		let out = zerosLike(ElementType.String, plan.shape)
+		for let o = 0; o < plan.outer; o++ {
+			for let i = 0; i < plan.inner; i++ {
+				out.strings[o * plan.inner + i] = a.strings[plan.aOffsets[o] + i * plan.aStep] + b.strings[plan.bOffsets[o] + i * plan.bStep]
+			}
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// StringSplit: each string split at `delimiter` (at runs of whitespace,
+	// leading and trailing whitespace dropped, when it is empty or
+	// absent), at most `maxsplit` times from the left; the pieces padded
+	// with empty strings to the longest count, and the counts.
+	internal def splitOp(c Call) !none {
+		let x = try strings(c, 0)
+		let delimiter = c.text("delimiter", "")
+		let limit = c.int("maxsplit", -1)
+		let n = x.count()
+		let pieces = new map<int, string[]>()
+		let counts int[]
+		counts.len(n)
+		let widest = 0
+		for let i = 0; i < n; i++ {
+			let parts = delimiter.len() == 0 ?? (splitSpaces(x.strings[i], limit), splitAt(x.strings[i], delimiter, limit))
+			pieces.set(i, parts)
+			counts[i] = parts.len()
+			widest = widest.max(parts.len())
+		}
+		let shape = x.shape.clone()
+		shape.push(widest)
+		let out = zerosLike(ElementType.String, shape)
+		for let i = 0; i < n; i++ {
+			let parts = pieces.get(i)
+			continue unless parts is string[]
+			for let (k, p) in parts {
+				out.strings[i * widest + k] = p
+			}
+		}
+		c.out(0, out)
+		c.out(1, new Tensor(x.shape.clone(), counts))
+		return none
+	}
+
+	// `s` split at each `delimiter`, at most `limit` times (no limit when
+	// negative), as Python's str.split(delimiter) does.
+	internal def splitAt(s string, delimiter string, limit int) string[] {
+		let out string[]
+		let start = 0
+		let width = delimiter.len()
+		for limit < 0 || out.len() < limit {
+			let at = s.indexOf(delimiter, start)
+			break when at < 0
+			out.push(s[start:at])
+			start = at + width
+		}
+		out.push(s[start:])
+		return out
+	}
+
+	// `s` split at runs of whitespace, at most `limit` times, as Python's
+	// str.split() does: no empty pieces, and the rest after the last split
+	// keeps its trailing whitespace.
+	internal def splitSpaces(s string, limit int) string[] {
+		let out string[]
+		let chars = unicode.codePoints(s)
+		let n = chars.len()
+		let i = 0
+		for {
+			for i < n && isSpace(int(chars[i])) {
+				i++
+			}
+			break when i >= n
+			if limit >= 0 && out.len() == limit {
+				out.push(s[i:])
+				break
+			}
+			let start = i
+			for i < n && !isSpace(int(chars[i])) {
+				i++
+			}
+			out.push(s[start:i])
+		}
+		return out
+	}
+
+	// Whether code point `ch` is whitespace as Python's str.isspace sees it.
+	internal def isSpace(ch int) bool {
+		return ch == 32 || (ch >= 9 && ch <= 13) || (ch >= 0x1C && ch <= 0x1F) when ch < 0x80
+		return (ch := 0x85 || 0xA0 || 0x1680 || 0x2028 || 0x2029 || 0x202F || 0x205F || 0x3000) || (ch >= 0x2000 && ch <= 0x200A)
+	}
+
+	// StringNormalizer: the strings of a [C] or [1, C] input without the
+	// stop words (compared exactly when `is_case_sensitive`, else
+	// caselessly), then lowercased or uppercased by `case_change_action`;
+	// a single empty string when nothing is left.
+	internal def normalizeOp(c Call) !none {
+		let x = try strings(c, 0)
+		let action = c.text("case_change_action", "NONE")
+		fail c.about() + "case_change_action must be NONE, LOWER or UPPER, not {action}" unless action := "NONE" || "LOWER" || "UPPER"
+		let sensitive = c.int("is_case_sensitive", 0) == 1
+		let rows = x.rank() == 2 ?? (x.shape[0], 1)
+		fail c.about() + "the input must be [C] or [1, C]" unless x.rank() == 1 || (x.rank() == 2 && rows == 1)
+		let stops = new map<string, bool>()
+		let a = c.attribute("stopwords")
+		if a is Attribute {
+			for let (_, w) in a.strings {
+				let word = string(w)
+				stops.set(sensitive ?? (word, unicode.caseFold(word)), true)
+			}
+		}
+		let kept string[]
+		for let (_, s) in x.strings {
+			continue when stops.len() > 0 && stops.get(sensitive ?? (s, unicode.caseFold(s))) is bool
+			match action {
+				case "LOWER":
+					kept.push(unicode.toLower(s))
+				case "UPPER":
+					kept.push(unicode.toUpper(s))
+				default:
+					kept.push(s)
+			}
+		}
+		kept.push("") when kept.len() == 0
+		let shape = x.rank() == 2 ?? ([1, kept.len()], [kept.len()])
+		c.out(0, new Tensor(shape, kept))
+		return none
+	}
+
+	// RegexFullMatch: whether each string matches the RE2 `pattern` as a
+	// whole.
+	internal def regexOp(c Call) !none {
+		let x = try strings(c, 0)
+		let source = c.text("pattern", "")
+		let program = re2.compile(source) onerror (err error) {
+			fail c.about() + "pattern {source}: {err.message}"
+		}
+		let out = zerosLike(ElementType.Bool, x.shape)
+		for let (i, s) in x.strings {
+			out.ints[i] = program.fullMatch(s) ?? (1, 0)
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// ---- TfIdfVectorizer --------------------------------------------------
+
+	// A node of the n-gram pool: the id of the n-gram ending here (0 when
+	// none does) and the n-grams that continue it, by integer or string
+	// item.
+	internal type Gram {
+		id    int
+		ints  map<int, Gram>
+		texts map<string, Gram>
+
+		def new() {
+			ints = new map<int, Gram>()
+			texts = new map<string, Gram>()
+		}
+
+		def leaves() bool {
+			return ints.len() > 0 || texts.len() > 0
+		}
+	}
+
+	// TfIdfVectorizer: per row of the input, the counts of the pool's
+	// n-grams (with up to `max_skip_count` items skipped between their
+	// items), weighted as `mode` says (TF, IDF or TFIDF).
+	internal def tfidfOp(c Call) !none {
+		let x = try c.tensor(0)
+		let texts = x.element == ElementType.String
+		fail c.about() + "takes int32, int64 or string items, not {x.element.name}" unless texts || (x.element := ElementType.Int32 || ElementType.Int64)
+		let mode = c.text("mode", "TF")
+		fail c.about() + "mode must be TF, IDF or TFIDF, not {mode}" unless mode := "TF" || "IDF" || "TFIDF"
+		let minGram = c.int("min_gram_length", 1)
+		let maxGram = c.int("max_gram_length", 1)
+		let maxSkip = c.int("max_skip_count", 0)
+		let counts = c.ints("ngram_counts", int[])
+		let indexes = c.ints("ngram_indexes", int[])
+		let weights = c.floats("weights", float32[])
+		let poolInts = c.ints("pool_int64s", int[])
+		let poolTexts string[]
+		let a = c.attribute("pool_strings")
+		if a is Attribute {
+			for let (_, s) in a.strings {
+				poolTexts.push(string(s))
+			}
+		}
+		fail c.about() + "needs ngram_indexes" when indexes.len() == 0
+		fail c.about() + "needs min_gram_length <= max_gram_length, both positive" unless minGram >= 1 && minGram <= maxGram
+		let width = 0
+		for let (_, v) in indexes {
+			width = width.max(v + 1)
+		}
+		// The pool as a trie of n-grams, numbered from 1 in pool order.
+		let root = new Gram()
+		let total = poolTexts.len() > 0 ?? (poolTexts.len(), poolInts.len())
+		let id = 1
+		for let (g, start) in counts {
+			let end = g + 1 < counts.len() ?? (counts[g + 1], total)
+			let size = g + 1
+			let grams = (end - start) / size
+			if size < minGram || size > maxGram {
+				id += grams
+				continue
+			}
+			for let k = 0; k < grams; k++ {
+				let node = root
+				for let j = 0; j < size; j++ {
+					let at = start + k * size + j
+					fail c.about() + "the pool is shorter than ngram_counts says" when at >= total
+					let next = poolTexts.len() > 0 ?? (node.texts.get(poolTexts[at]), node.ints.get(poolInts[at]))
+					if next is Gram {
+						node = next
+						continue
+					}
+					let made = new Gram()
+					if poolTexts.len() > 0 {
+						node.texts.set(poolTexts[at], made)
+					} else {
+						node.ints.set(poolInts[at], made)
+					}
+					node = made
+				}
+				node.id = id
+				id++
+			}
+		}
+		fail c.about() + "ngram_indexes has {indexes.len()} entries for {id - 1} n-grams" when indexes.len() < id - 1
+		let rows = x.rank() == 2 ?? (x.shape[0], 1)
+		fail c.about() + "the input must be [C] or [N, C]" when x.rank() > 2
+		let columns = x.rank() == 0 ?? (1, x.shape[x.rank() - 1])
+		let frequencies int[]
+		frequencies.len(rows * width)
+		if x.count() > 0 && root.leaves() {
+			for let r = 0; r < rows; r++ {
+				let base = r * columns
+				let start = minGram
+				for let skip = 1; skip <= maxSkip + 1; skip++ {
+					for let first = 0; first < columns; first++ {
+						break when first + skip * (start - 1) >= columns
+						let node = root
+						let size = 1
+						let item = first
+						for node.leaves() && size <= maxGram && item < columns {
+							let next = texts ?? (node.texts.get(x.strings[base + item]), node.ints.get(x.ints[base + item]))
+							break unless next is Gram
+							if size >= start && next.id != 0 {
+								frequencies[r * width + indexes[next.id - 1]]++
+							}
+							node = next
+							size++
+							item += skip
+						}
+					}
+					// Unigrams count once: they do not depend on the skip.
+					if start == 1 {
+						start = 2
+						break when start > maxGram
+					}
+				}
+			}
+		}
+		let out float32[]
+		out.len(rows * width)
+		for let p = 0; p < out.len(); p++ {
+			let f = frequencies[p]
+			let w = weights.len() > 0 ?? (weights[p % width], float32(1))
+			match mode {
+				case "TF":
+					out[p] = float32(f)
+				case "IDF":
+					out[p] = f > 0 ?? (w, float32(0))
+				default:
+					out[p] = w * float32(f)
+			}
+		}
+		let shape = x.rank() == 2 ?? ([rows, width], [width])
+		c.out(0, new Tensor(shape, out))
+		return none
+	}
+
+	// ---- ImageDecoder -----------------------------------------------------
+
+	// ImageDecoder: the image a uint8 tensor encodes (any format
+	// std.formats.image reads), as [height, width, 3] RGB or BGR, or
+	// [height, width, 1] luma (ITU-R 601-2, as Pillow's "L") for
+	// Grayscale.
+	internal def imageOp(c Call) !none {
+		let encoded = try c.tensor(0)
+		fail c.about() + "takes uint8 data, not {encoded.element.name}" unless encoded.element == ElementType.Uint8
+		let format = c.text("pixel_format", "RGB")
+		fail c.about() + "pixel_format must be RGB, BGR or Grayscale, not {format}" unless format := "RGB" || "BGR" || "Grayscale"
+		let data byte[]
+		data.len(encoded.ints.len())
+		for let (i, v) in encoded.ints {
+			data[i] = byte(v)
+		}
+		let picture = imageformat.load(data) onerror (err error) {
+			fail c.about() + "cannot decode the image: {err.message}"
+		}
+		let size = picture.size()
+		let (width, height) = (int(size.width), int(size.height))
+		let stride = picture.stride()
+		let raw = picture.raw()
+		let channels = format == "Grayscale" ?? (1, 3)
+		let out int[]
+		out.len(height * width * channels)
+		for let y = 0; y < height; y++ {
+			for let x = 0; x < width; x++ {
+				let from = y * stride + x * 4
+				let (r, g, b) = (int(raw[from]), int(raw[from + 1]), int(raw[from + 2]))
+				let to = (y * width + x) * channels
+				match format {
+					case "Grayscale":
+						out[to] = (r * 19595 + g * 38470 + b * 7471 + 0x8000) >> 16
+					case "BGR":
+						(out[to], out[to + 1], out[to + 2]) = (b, g, r)
+					default:
+						(out[to], out[to + 1], out[to + 2]) = (r, g, b)
+				}
+			}
+		}
+		c.out(0, new Tensor([height, width, channels], out, ElementType.Uint8))
+		return none
+	}
+
+	// ---- random values --------------------------------------------------
+
+	// The key of a node's random stream: from its `seed` attribute, so the
+	// same seed gives the same values, else from the system's random
+	// source. Value i of a stream is splitmix64 of the key and i, so the
+	// values do not depend on how the work is split across tasks.
+	internal def streamKey(c Call) uint64 {
+		let a = c.attribute("seed")
+		return mix64(uint64(__bitcast_u32_from_f32(a.f)) + uint64(0x6A09E667F3BCC908)) when a is Attribute
+		return crypto.randOf<uint64>()
+	}
+
+	// The splitmix64 finalizer.
+	internal def mix64(v uint64) uint64 {
+		let z = v
+		z = (z ^ (z >> 30)) * uint64(0xBF58476D1CE4E5B9)
+		z = (z ^ (z >> 27)) * uint64(0x94D049BB133111EB)
+		return z ^ (z >> 31)
+	}
+
+	// Fills `out` with uniform values of stream `key` (value i at out[i]):
+	// in [0, 1), or in (0, 1] when `open` is false.
+	internal def uniforms(key uint64, out float[], closedTop bool) {
+		let n = out.len()
+		let tasks = (n / parallelFrom).clamp(1, 32)
+		if tasks == 1 {
+			uniformRange(key, out, 0, n, closedTop)
+			return
+		}
+		forall let t in 0..tasks {
+			uniformRange(key, out, n * t / tasks, n * (t + 1) / tasks, closedTop)
+		}
+	}
+
+	// Values `from` to `to` of `uniforms`, four at a time.
+	internal def uniformRange(key uint64, out float[], from int, to int, closedTop bool) {
+		let gamma = uint64(0x9E3779B97F4A7C15)
+		let c1 = simd.splat4<uint64>(uint64(0xBF58476D1CE4E5B9))
+		let c2 = simd.splat4<uint64>(uint64(0x94D049BB133111EB))
+		let lanes = uint64[uint64(1), uint64(2), uint64(3), uint64(4)]
+		let step = simd.load4<uint64>(lanes, 0)
+		let g = simd.splat4<uint64>(gamma)
+		let k = simd.splat4<uint64>(key)
+		let unit = simd.splat4<float>(1.0 / 9007199254740992.0)
+		let shift = simd.splat4<float>(closedTop ?? (1.0, 0.0))
+		let i = from
+		for; i + 4 <= to; i += 4 {
+			let z = k + (simd.splat4<uint64>(uint64(i)) + step) * g
+			let a = (z ^ (z >> 30)) * c1
+			let b = (a ^ (a >> 27)) * c2
+			let bits = (b ^ (b >> 31)) >> 11
+			simd.store4<float>(out, i, (bits.convert<float>() + shift) * unit)
+		}
+		for; i < to; i++ {
+			let bits = mix64(key + uint64(i + 1) * gamma) >> 11
+			out[i] = (float(bits) + (closedTop ?? (1.0, 0.0))) / 9007199254740992.0
+		}
+	}
+
+	// Fills `out` with standard normal values of stream `key`: value i by
+	// Box-Muller from value i of two uniform streams.
+	internal def gaussians(key uint64, out float[]) {
+		let n = out.len()
+		let radii float[]
+		radii.len(n)
+		uniforms(key, radii, true)
+		uniforms(mix64(key ^ uint64(0x3C6EF372FE94F82B)), out, false)
+		let tasks = (n / parallelFrom).clamp(1, 32)
+		forall let t in 0..tasks {
+			let to = n * (t + 1) / tasks
+			let i = n * t / tasks
+			let minusTwo = simd.splat4<float>(-2.0)
+			let turn = simd.splat4<float>(2.0 * math.Pi)
+			for; i + 4 <= to; i += 4 {
+				let r = (simd.load4<float>(radii, i).log() * minusTwo).sqrt()
+				simd.store4<float>(out, i, r * (simd.load4<float>(out, i) * turn).cos())
+			}
+			for; i < to; i++ {
+				out[i] = math.sqrt(-2.0 * math.ln(radii[i])) * math.cos(2.0 * math.Pi * out[i])
+			}
+		}
+	}
+
+	// The floating-point type a random operator makes: `dtype` when given,
+	// else `otherwise`.
+	// Fails when it is not a floating-point type.
+	internal def randomType(c Call, otherwise ElementType) !ElementType {
+		let element = c.attribute("dtype") is Attribute ?? (ElementType(c.int("dtype", 1)), otherwise)
+		fail c.about() + "makes floating-point values, not {element.name}" unless storageOf(element) := Storage.Floats || Storage.Doubles
+		return element
+	}
+
+	// RandomNormal, RandomUniform and their Like forms: values of a normal
+	// (`mean`, `scale`) or uniform ([`low`, `high`)) distribution, of the
+	// `shape` attribute or the input's shape.
+	internal def randomOp(c Call) !none {
+		let normal = c.step.op.startsWith("RandomNormal")
+		let shape int[]
+		let element = ElementType.Float
+		if c.step.op.endsWith("Like") {
+			let x = try c.tensor(0)
+			shape = x.shape.clone()
+			element = try randomType(c, x.element)
+		} else {
+			fail c.about() + "needs a shape" unless c.attribute("shape") is Attribute
+			shape = c.ints("shape", int[])
+			element = try randomType(c, ElementType.Float)
+		}
+		let values float[]
+		values.len(countOf(shape))
+		let key = streamKey(c)
+		if normal {
+			gaussians(key, values)
+			let (mean, scale) = (float(c.float("mean", float32(0))), float(c.float("scale", float32(1))))
+			for let i = 0; i < values.len(); i++ {
+				values[i] = values[i] * scale + mean
+			}
+		} else {
+			uniforms(key, values, false)
+			let (low, high) = (float(c.float("low", float32(0))), float(c.float("high", float32(1))))
+			for let i = 0; i < values.len(); i++ {
+				values[i] = values[i] * (high - low) + low
+			}
+		}
+		c.out(0, floatTensor(values, shape, element))
+		return none
+	}
+
+	// Bernoulli: 1 with the probability the input gives, else 0, as
+	// `dtype` (the input's type by default).
+	internal def bernoulliOp(c Call) !none {
+		let p = try c.tensor(0)
+		fail c.about() + "takes floating-point probabilities, not {p.element.name}" unless storageOf(p.element) := Storage.Floats || Storage.Doubles
+		let element = c.attribute("dtype") is Attribute ?? (ElementType(c.int("dtype", 1)), p.element)
+		let chances = doublesOf(p)
+		let values float[]
+		values.len(chances.len())
+		uniforms(streamKey(c), values, false)
+		for let i = 0; i < values.len(); i++ {
+			values[i] = values[i] < chances[i] ?? (1.0, 0.0)
+		}
+		c.out(0, try cast(new Tensor(p.shape.clone(), values), element, true))
+		return none
+	}
+
+	// Multinomial: `sample_size` class indices per row of the input's
+	// unnormalized log-probabilities, as `dtype` (Int32 by default).
+	internal def multinomialOp(c Call) !none {
+		let x = try c.tensor(0)
+		fail c.about() + "takes [batch, classes] floating-point log-probabilities" unless x.rank() == 2 && (storageOf(x.element) := Storage.Floats || Storage.Doubles)
+		let element = ElementType(c.int("dtype", 6))
+		fail c.about() + "makes int32 or int64 indices, not {element.name}" unless element := ElementType.Int32 || ElementType.Int64
+		let samples = c.int("sample_size", 1)
+		fail c.about() + "sample_size must be positive" unless samples >= 1
+		let (batch, classes) = (x.shape[0], x.shape[1])
+		let logits = doublesOf(x)
+		let draws float[]
+		draws.len(batch * samples)
+		uniforms(streamKey(c), draws, false)
+		let out int[]
+		out.len(batch * samples)
+		let cumulative float[]
+		cumulative.len(classes)
+		for let b = 0; b < batch; b++ {
+			let top = -1.0 / 0.0
+			for let k = 0; k < classes; k++ {
+				top = top.max(logits[b * classes + k])
+			}
+			let total = 0.0
+			for let k = 0; k < classes; k++ {
+				let v = logits[b * classes + k]
+				total += v == -1.0 / 0.0 ?? (0.0, math.E ** (v - top))
+				cumulative[k] = total
+			}
+			for let s = 0; s < samples; s++ {
+				let target = draws[b * samples + s] * total
+				// The first class whose cumulative weight passes the draw.
+				let (lo, hi) = (0, classes - 1)
+				for lo < hi {
+					let mid = (lo + hi) / 2
+					if cumulative[mid] > target {
+						hi = mid
+					} else {
+						lo = mid + 1
+					}
+				}
+				out[b * samples + s] = lo
+			}
+		}
+		c.out(0, new Tensor([batch, samples], out, element))
+		return none
+	}
+
+	// ---- losses ---------------------------------------------------------
+
+	// NegativeLogLikelihoodLoss (`softmax` false) and
+	// SoftmaxCrossEntropyLoss (true): per [N, C, d...] input and [N, d...]
+	// target, -weight[t]·input[n][t][d] (of the input's log-softmax over
+	// C for the cross-entropy), no loss nor weight where the target is
+	// `ignore_index`; reduced by `reduction` (mean: divided by the sum of
+	// the weights). The cross-entropy's second output is the log-softmax.
+	internal def lossOp(c Call, softmax bool) !none {
+		let x = try c.tensor(0)
+		let target = try c.tensor(1)
+		fail c.about() + "takes floating-point scores, not {x.element.name}" unless storageOf(x.element) := Storage.Floats || Storage.Doubles
+		fail c.about() + "the scores must be [N, C, d...]" unless x.rank() >= 2
+		fail c.about() + "the target must be integers" unless storageOf(target.element) == Storage.Ints
+		let (n, classes) = (x.shape[0], x.shape[1])
+		let rest = countOf(x.shape[2:])
+		fail c.about() + "the target must be [N, d...] of the scores' N and d" unless target.rank() == x.rank() - 1 && target.shape[0] == n && countOf(target.shape) == n * rest
+		let reduction = c.text("reduction", "mean")
+		fail c.about() + "reduction must be none, sum or mean, not {reduction}" unless reduction := "none" || "sum" || "mean"
+		let ignoring = c.attribute("ignore_index") is Attribute
+		let ignored = c.int("ignore_index", 0)
+		let weights float[]
+		if c.has(2) {
+			let w = try c.tensor(2)
+			fail c.about() + "the weights must be [C]" unless w.rank() == 1 && w.shape[0] == classes
+			weights = doublesOf(w)
+		}
+		let scores = doublesOf(x)
+		scores = logSoftmax(scores, n, classes, rest) when softmax
+		let losses float[]
+		losses.len(n * rest)
+		let (sum, weightSum) = (0.0, 0.0)
+		for let i = 0; i < n; i++ {
+			for let d = 0; d < rest; d++ {
+				let t = target.ints[i * rest + d]
+				continue when ignoring && t == ignored
+				fail c.about() + "target {t} is not a class of 0 to {classes - 1}" unless t >= 0 && t < classes
+				let w = weights.len() > 0 ?? (weights[t], 1.0)
+				let loss = -w * scores[(i * classes + t) * rest + d]
+				losses[i * rest + d] = loss
+				sum += loss
+				weightSum += w
+			}
+		}
+		match reduction {
+			case "none":
+				c.out(0, floatTensor(losses, target.shape.clone(), x.element))
+			case "sum":
+				c.out(0, floatTensor([sum], int[], x.element))
+			default:
+				c.out(0, floatTensor([sum / weightSum], int[], x.element))
+		}
+		c.out(1, floatTensor(scores, x.shape.clone(), x.element)) when softmax && c.wants(1)
+		return none
+	}
+
+	// The log-softmax over axis 1 of [n, classes, rest] values.
+	internal def logSoftmax(x float[], n int, classes int, rest int) float[] {
+		let out float[]
+		out.len(x.len())
+		let rows = n * rest
+		let tasks = (x.len() / parallelFrom).clamp(1, 32).clamp(1, rows)
+		forall let t in 0..tasks {
+			let row float[]
+			row.len(classes)
+			for let r = rows * t / tasks; r < rows * (t + 1) / tasks; r++ {
+				let (i, d) = (r / rest, r % rest)
+				let base = i * classes * rest + d
+				let top = -1.0 / 0.0
+				for let k = 0; k < classes; k++ {
+					row[k] = x[base + k * rest]
+					top = top.max(row[k])
+				}
+				let peak = simd.splat4<float>(top)
+				let acc = simd.splat4<float>(0.0)
+				let k = 0
+				for; k + 4 <= classes; k += 4 {
+					acc = acc + (simd.load4<float>(row, k) - peak).exp()
+				}
+				let total = simd.sum(acc)
+				for; k < classes; k++ {
+					total += math.E ** (row[k] - top)
+				}
+				let shift = top + math.ln(total)
+				for let j = 0; j < classes; j++ {
+					out[base + j * rest] = row[j] - shift
+				}
+			}
+		}
+		return out
+	}
+}

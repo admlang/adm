@@ -1,0 +1,715 @@
+partial module std.ai.onnx {
+	use (
+		std.gpu
+		std.formats.ai.onnx::(ElementType, Attribute)
+		std.ai.tensor::(Tensor)
+	)
+
+	// A float32 tensor in GPU memory, row-major. Operators that only
+	// change the shape (Reshape and its kin) share the buffer.
+	internal type DeviceTensor {
+		shape    int[]
+		buffer   gpu.DeviceBuffer<float32>
+		// Whether a GPU operator copied it from a host value (the buffer is
+		// then the slot's own).
+		uploaded bool
+
+		def new(shape int[], buffer gpu.DeviceBuffer<float32>) {
+			self.shape = shape
+			self.buffer = buffer
+		}
+
+		def count() int {
+			let n = 1
+			for let (_, d) in shape {
+				n *= d
+			}
+			return n
+		}
+	}
+
+	// GPU buffers a run's steps freed, by length, for later outputs of the
+	// same length (as Pool does for host arrays).
+	internal type DevicePool {
+		buffers map<int, gpu.DeviceBuffer<float32>[]>
+
+		def new() {
+			buffers = new map<int, gpu.DeviceBuffer<float32>[]>()
+		}
+
+		// A buffer of `n` values whose contents the caller overwrites.
+		// Fails when the device memory runs out.
+		def take(n int) !gpu.DeviceBuffer<float32> {
+			let list = buffers.get(n)
+			return list.pop() when list is gpu.DeviceBuffer<float32>[] && list.len() > 0
+			return gpu.deviceBuffer<float32>(n)
+		}
+
+		def give(b gpu.DeviceBuffer<float32>) {
+			let list = buffers.get(b.len())
+			if list is gpu.DeviceBuffer<float32>[] {
+				list.push(b)
+			} else {
+				let fresh gpu.DeviceBuffer<float32>[]
+				fresh.push(b)
+				buffers.set(b.len(), fresh)
+			}
+		}
+	}
+
+	// A host copy of `d`.
+	// Fails with the driver's error.
+	internal def downloaded(d DeviceTensor) !Tensor {
+		let values float32[]
+		values.len(d.buffer.len())
+		try d.buffer.download(values)
+		values.len(d.count()) when values.len() != d.count()
+		return new Tensor(d.shape.clone(), values, ElementType.Float)
+	}
+
+	// Values a float input must hold before an operator whose inputs are
+	// all in host memory goes to the GPU (copies cost more below it).
+	const deviceFrom = 1 << 16
+
+	// Runs `c`'s operator on the GPU when the model runs there and the
+	// operator has a GPU form for these inputs: float32 tensors in and
+	// out, the outputs left in GPU memory. False leaves it to the CPU.
+	// Fails with the driver's error, or as the operator does on its inputs.
+	internal def runOnDevice(c Call) !bool {
+		return false unless c.model.onDevice && c.step.domain == "" && c.step.function.len() == 0
+		let op = c.step.op
+		let shapeOnly = op := "Reshape" || "Flatten" || "Squeeze" || "Unsqueeze" || "Shape" || "Size" || "Identity"
+		// Only already-device data or heavy work is worth the GPU.
+		if !shapeOnly && !(op := "MatMul" || "Gemm" || "Conv") {
+			let onDevice = false
+			let large = false
+			for let i = 0; i < c.inputs.len(); i++ {
+				onDevice = onDevice || !(c.inputs[i].d is none)
+				let v = c.inputs[i].v
+				large = large || (v is Tensor && v.element == ElementType.Float && v.count() >= deviceFrom)
+			}
+			return false unless onDevice || large
+		}
+		match op {
+			case "Add":
+				return try deviceBinaryOp(c, 0)
+			case "Sub":
+				return try deviceBinaryOp(c, 1)
+			case "Mul":
+				return try deviceBinaryOp(c, 2)
+			case "Div":
+				return try deviceBinaryOp(c, 3)
+			case "Pow":
+				return try devicePow(c)
+			case "MatMul":
+				return try deviceMatMulOp(c)
+			case "Gemm":
+				return try deviceGemmOp(c)
+			case "Conv":
+				return try deviceConvOp(c)
+			case "Softmax", "LogSoftmax":
+				return try deviceSoftmaxOp(c, op == "LogSoftmax")
+			case "LayerNormalization":
+				return try deviceLayerNormOp(c)
+			case "InstanceNormalization":
+				return try deviceInstanceNormOp(c)
+			case "ReduceMean":
+				return try deviceReduceMeanOp(c)
+			case "Transpose":
+				return try deviceTransposeOp(c)
+			case "Slice":
+				return try deviceSliceOp(c)
+			case "Concat":
+				return try deviceConcatOp(c)
+			case "Resize":
+				return try deviceResizeOp(c)
+			case "Cast":
+				let x = c.inputs[0].d
+				return false unless x is DeviceTensor
+				return false unless c.int("to", 1) == 1
+				c.outputs[0].d = x
+				return true
+			default:
+				if shapeOnly {
+					return try deviceShapeOp(c)
+				}
+				let code = unaryCode(op)
+				return false when code < 0
+				return try deviceUnaryOp(c, code)
+		}
+	}
+
+	// The deviceUnary code of an operator, -1 for none.
+	internal def unaryCode(op string) int {
+		match op {
+			case "Sigmoid":
+				return 1
+			case "Tanh":
+				return 2
+			case "Relu":
+				return 3
+			case "Exp":
+				return 4
+			case "Log":
+				return 5
+			case "Sqrt":
+				return 6
+			case "Neg":
+				return 7
+			case "Abs":
+				return 8
+			case "Reciprocal":
+				return 9
+			case "Erf":
+				return 10
+			case "Gelu":
+				return 11
+			case "Sin":
+				return 13
+			case "Cos":
+				return 14
+			case "LeakyRelu":
+				return 15
+			case "Floor":
+				return 16
+			case "Ceil":
+				return 17
+			default:
+				return -1
+		}
+	}
+
+	// Input `i` on the GPU: already there, a float32 initializer copied at
+	// load, or a float32 host tensor copied now; `none` for another type
+	// or an empty tensor.
+	// Fails when the copy does.
+	internal def deviceInput(c Call, i int) !?DeviceTensor {
+		return none unless i < c.inputs.len()
+		let d = c.inputs[i].d
+		return d when d is DeviceTensor
+		let s = c.step.reads[i]
+		let constant = s >= 0 ?? (c.scope.plan.deviceConstants.get(s), none)
+		return constant when constant is DeviceTensor
+		let v = c.inputs[i].v
+		return none unless v is Tensor && v.element == ElementType.Float && v.count() > 0
+		let buffer = try c.scope.root().devicePool.take(v.count())
+		try buffer.write(v.floats)
+		let t = new DeviceTensor(v.shape.clone(), buffer)
+		t.uploaded = true
+		c.inputs[i].d = t
+		// Later readers of the slot use this copy.
+		c.scope.values[s].d = t when s >= 0
+		return t
+	}
+
+	// A device tensor of `shape` for an output, from the run's pool.
+	// Fails when the device memory runs out.
+	internal def deviceOutput(c Call, shape int[]) !DeviceTensor {
+		let n = 1
+		for let (_, d) in shape {
+			n *= d
+		}
+		return new DeviceTensor(shape.clone(), try c.scope.root().devicePool.take(n.max(1)))
+	}
+
+	// Threads for a launch over `n` values.
+	internal def spread(n int) int {
+		return n.max(1)
+	}
+
+	// The axes of a strided walk merged where every operand moves through
+	// them contiguously, padded with leading axes of 1 to six: `dims`,
+	// then each operand's strides in the same order. `none` when more
+	// than six axes remain.
+	internal def deviceAxes(dims int[], strides int[][]) ?int[][] {
+		let d int[]
+		let s int[][]
+		for let o = 0; o < strides.len(); o++ {
+			s.push(int[])
+		}
+		for let k = 0; k < dims.len(); k++ {
+			continue when dims[k] == 1
+			let last = d.len() - 1
+			let merge = last >= 0
+			for let (o, st) in strides {
+				merge = merge && s[o][last] == st[k] * dims[k]
+			}
+			if merge {
+				d[last] *= dims[k]
+				for let (o, st) in strides {
+					s[o][last] = st[k]
+				}
+				continue
+			}
+			d.push(dims[k])
+			for let (o, st) in strides {
+				s[o].push(st[k])
+			}
+		}
+		return none when d.len() > 6
+		// Leading axes of 1 (stride 0) up to six.
+		let out int[][]
+		let dims6 int[]
+		for let k = d.len(); k < 6; k++ {
+			dims6.push(1)
+		}
+		dims6.push(...d)
+		out.push(dims6)
+		for let (_, st) in s {
+			let s6 int[]
+			for let k = st.len(); k < 6; k++ {
+				s6.push(0)
+			}
+			s6.push(...st)
+			out.push(s6)
+		}
+		return out
+	}
+
+	// The strides of a contiguous tensor of `shape`.
+	internal def contiguousStrides(shape int[]) int[] {
+		let out int[]
+		out.len(shape.len())
+		let s = 1
+		for let k = shape.len() - 1; k >= 0; k-- {
+			out[k] = s
+			s *= shape[k]
+		}
+		return out
+	}
+
+	// The strides of `shape` read as broadcast to `target` (0 where a
+	// dimension is 1 or missing).
+	internal def broadcastTo(shape int[], target int[]) int[] {
+		let own = contiguousStrides(shape)
+		let out int[]
+		out.len(target.len())
+		let shift = target.len() - shape.len()
+		for let k = 0; k < shape.len(); k++ {
+			out[shift + k] = shape[k] == 1 && target[shift + k] != 1 ?? (0, own[k])
+		}
+		return out
+	}
+
+	// Copies `src` (from `so`, strides `ss` over `dims`) into `dst` (from
+	// `to`, strides `ts`) on the GPU. False when the walk has more than six
+	// axes after merging.
+	// Fails with the driver's error.
+	internal def deviceStridedCopy(src gpu.DeviceBuffer<float32>, so int, ss int[], dst gpu.DeviceBuffer<float32>, to int, ts int[], dims int[]) !bool {
+		let n = product(dims, 0, dims.len())
+		return true when n == 0
+		let axes = deviceAxes(dims, int[][ss, ts])
+		return false unless axes is int[][]
+		let (d, s, t) = (axes[0], axes[1], axes[2])
+		try deviceCopy(src, so, dst, to, d[0], d[1], d[2], d[3], d[4], d[5], s[0], s[1], s[2], s[3], s[4], s[5], t[0], t[1], t[2], t[3], t[4], t[5], spread(n))
+		return true
+	}
+
+	internal def deviceBinaryOp(c Call, op int) !bool {
+		let a = try deviceInput(c, 0)
+		let b = try deviceInput(c, 1)
+		return false unless a is DeviceTensor && b is DeviceTensor
+		let plan = broadcast(a.shape, b.shape) onerror (err error) {
+			return false
+		}
+		let shape = plan.shape
+		let axes = deviceAxes(shape, int[][broadcastTo(a.shape, shape), broadcastTo(b.shape, shape)])
+		return false unless axes is int[][]
+		let out = try deviceOutput(c, shape)
+		let (d, sa, sb) = (axes[0], axes[1], axes[2])
+		let n = out.count()
+		try deviceBinary(a.buffer, 0, b.buffer, 0, out.buffer, 0, op, d[0], d[1], d[2], d[3], d[4], d[5], sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], spread(n)) when n > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	// Pow: x · x for a constant exponent of 2 (C's pow gives the same),
+	// else powf.
+	internal def devicePow(c Call) !bool {
+		let e = c.inputs[1].v
+		if e is Tensor && e.element == ElementType.Float && e.count() == 1 && e.floats[0] == float32(2) {
+			let x = try deviceInput(c, 0)
+			return false unless x is DeviceTensor
+			let out = try deviceOutput(c, x.shape)
+			let n = out.count()
+			try deviceBinary(x.buffer, 0, x.buffer, 0, out.buffer, 0, 2, 1, 1, 1, 1, 1, n, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, spread(n)) when n > 0
+			c.outputs[0].d = out
+			return true
+		}
+		return try deviceBinaryOp(c, 4)
+	}
+
+	internal def deviceUnaryOp(c Call, code int) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		let op = code == 11 && c.text("approximate", "none") == "tanh" ?? (12, code)
+		let out = try deviceOutput(c, x.shape)
+		let n = out.count()
+		try deviceUnary(x.buffer, 0, out.buffer, 0, op, c.float("alpha", float32(0.01)), spread(n)) when n > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	// Reshape, Flatten, Squeeze, Unsqueeze, Identity: the CPU operator
+	// run on a stand-in of the input's shape without values, its result's
+	// shape over the same buffer. Shape and Size read the shape only.
+	internal def deviceShapeOp(c Call) !bool {
+		let x = c.inputs[0].d
+		return false unless x is DeviceTensor
+		c.inputs[0].v = new Tensor(x.shape.clone(), float32[], ElementType.Float)
+		match c.step.op {
+			case "Shape":
+				try shapeOf(c)
+				return true
+			case "Size":
+				c.out(0, new Tensor(int[], int[x.count()]))
+				return true
+			case "Identity":
+				c.outputs[0].d = x
+				return true
+			case "Reshape":
+				try reshape(c)
+			case "Flatten":
+				try flatten(c)
+			case "Squeeze":
+				try squeeze(c)
+			default:
+				try unsqueeze(c)
+		}
+		let proxy = c.outputs[0].v
+		return false unless proxy is Tensor
+		c.outputs[0].v = none
+		c.outputs[0].d = new DeviceTensor(proxy.shape.clone(), x.buffer)
+		return true
+	}
+
+	// MatMul of float32 tensors of rank 2 or more: one product when B has
+	// no batch dimensions (A's batches become rows), else a batched
+	// launch per run of broadcast batches.
+	internal def deviceMatMulOp(c Call) !bool {
+		let a = try deviceInput(c, 0)
+		let b = try deviceInput(c, 1)
+		return false unless a is DeviceTensor && b is DeviceTensor
+		return false unless a.shape.len() >= 2 && b.shape.len() >= 2
+		let (ra, rb) = (a.shape.len(), b.shape.len())
+		let m = a.shape[ra - 2]
+		let k = a.shape[ra - 1]
+		let n = b.shape[rb - 1]
+		return false unless b.shape[rb - 2] == k
+		let plan = broadcast(a.shape[:ra - 2], b.shape[:rb - 2]) onerror (err error) {
+			return false
+		}
+		let shape = plan.shape.clone()
+		shape.push(m, n)
+		let out = try deviceOutput(c, shape)
+		if rb == 2 {
+			let rows = a.count() / k.max(1)
+			try launchGemm(a.buffer, 0, k, false, 0, b.buffer, 0, n, false, 0, out.buffer, 0, n, 0, rows, n, k, 1, float32(1), float32(0))
+		} else {
+			for let o = 0; o < plan.outer; o++ {
+				try launchGemm(a.buffer, plan.aOffsets[o] * m * k, k, false, plan.aStep * m * k, b.buffer, plan.bOffsets[o] * k * n, n, false, plan.bStep * k * n, out.buffer, o * plan.inner * m * n, n, m * n, m, n, k, plan.inner, float32(1), float32(0))
+			}
+		}
+		c.outputs[0].d = out
+		return true
+	}
+
+	// One deviceGemm launch (see it for the arguments).
+	internal def launchGemm(a gpu.DeviceBuffer<float32>, ao int, lda int, ta bool, sa int, b gpu.DeviceBuffer<float32>, bo int, ldb int, tb bool, sb int, out gpu.DeviceBuffer<float32>, co int, ldc int, sc int, m int, n int, k int, batches int, alpha float32, beta float32) !none {
+		return none when m == 0 || n == 0 || batches == 0
+		let tiles = ((m + 127) / 128) * ((n + 127) / 128)
+		return deviceGemm(a, ao, lda, ta ?? (1, 0), sa, b, bo, ldb, tb ?? (1, 0), sb, out, co, ldc, sc, m, n, k, batches, alpha, beta, tiles * batches * 256)
+	}
+
+	// Gemm: alpha · op(A) · op(B) + beta · C, C broadcast into the output
+	// first.
+	internal def deviceGemmOp(c Call) !bool {
+		let a = try deviceInput(c, 0)
+		let b = try deviceInput(c, 1)
+		return false unless a is DeviceTensor && b is DeviceTensor
+		return false unless a.shape.len() == 2 && b.shape.len() == 2
+		let transA = c.int("transA", 0) != 0
+		let transB = c.int("transB", 0) != 0
+		let alpha = c.float("alpha", float32(1))
+		let beta = c.float("beta", float32(1))
+		let m = transA ?? (a.shape[1], a.shape[0])
+		let k = transA ?? (a.shape[0], a.shape[1])
+		let n = transB ?? (b.shape[0], b.shape[1])
+		let out = try deviceOutput(c, int[m, n])
+		let keep = float32(0)
+		if c.has(2) && beta != float32(0) {
+			let bias = try deviceInput(c, 2)
+			return false unless bias is DeviceTensor
+			return false unless bias.shape.len() <= 2
+			return false unless try deviceStridedCopy(bias.buffer, 0, broadcastTo(bias.shape, int[m, n]), out.buffer, 0, int[n, 1], int[m, n])
+			keep = beta
+		}
+		try launchGemm(a.buffer, 0, a.shape[1], transA, 0, b.buffer, 0, b.shape[1], transB, 0, out.buffer, 0, n, 0, m, n, k, 1, alpha, keep)
+		c.outputs[0].d = out
+		return true
+	}
+
+	// Conv of NCHW images (two spatial axes) with float32 weights; a 1-D
+	// convolution ([batch][channels][length]) runs as one of height 1,
+	// which has the same layout.
+	internal def deviceConvOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		let w = try deviceInput(c, 1)
+		return false unless x is DeviceTensor && w is DeviceTensor
+		let rank = x.shape.len()
+		return false unless (rank == 4 || rank == 3) && w.shape.len() == rank
+		let group = c.int("group", 1)
+		return false unless group > 0 && x.shape[1] % group == 0 && w.shape[0] % group == 0 && w.shape[1] == x.shape[1] / group
+		let win = try windowOf(c, x.shape[2:].clone(), w.shape[2:].clone(), false)
+		if rank == 3 {
+			// Height 1: one row, a kernel of one row, no padding. (The
+			// window's arrays may be the node's attributes: new ones.)
+			win = Window{input: int[1, win.input[0]], output: int[1, win.output[0]], kernel: int[1, win.kernel[0]], strides: int[1, win.strides[0]], dilations: int[1, win.dilations[0]], before: int[0, win.before[0]], after: int[0, win.after[0]]}
+		}
+		let (height, width) = (rank == 4 ?? (x.shape[2], 1), x.shape[rank - 1])
+		let (kh, kw) = (rank == 4 ?? (w.shape[2], 1), w.shape[rank - 1])
+		let (batch, maps) = (x.shape[0], w.shape[0])
+		let shape = rank == 4 ?? (int[batch, maps, win.output[0], win.output[1]], int[batch, maps, win.output[1]])
+		let out = try deviceOutput(c, shape)
+		let bias = c.has(2) ?? (try deviceInput(c, 2), none)
+		let positions = batch * win.output[0] * win.output[1]
+		let mg = maps / group
+		let tiles = ((mg + 127) / 128) * ((positions + 127) / 128)
+		if positions > 0 {
+			try deviceConv(x.buffer, 0, w.buffer, 0, bias is DeviceTensor ?? (bias.buffer, x.buffer), bias is DeviceTensor ?? (0, -1), out.buffer, 0, batch, x.shape[1], height, width, maps, group, kh, kw, win.strides[0], win.strides[1], win.before[0], win.before[1], win.dilations[0], win.dilations[1], win.output[0], win.output[1], tiles * group * 256)
+		}
+		c.outputs[0].d = out
+		return true
+	}
+
+	// Softmax over rows: the trailing axes from `axis` before opset 13, the
+	// last axis from it (another axis stays on the CPU).
+	internal def deviceSoftmaxOp(c Call, log bool) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		return false unless x.shape.len() > 0
+		let rank = x.shape.len()
+		let axis = c.int("axis", c.opset < 13 ?? (1, -1))
+		axis += axis < 0 ?? (rank, 0)
+		return false unless axis >= 0 && axis < rank && (c.opset < 13 || axis == rank - 1)
+		let cols = product(x.shape, axis, rank)
+		let rows = product(x.shape, 0, axis)
+		let out = try deviceOutput(c, x.shape)
+		try deviceSoftmax(x.buffer, 0, out.buffer, 0, cols, rows, log ?? (1, 0), rows * 256) when rows > 0 && cols > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	// LayerNormalization over the axes from `axis`, its Mean and
+	// InvStdDev outputs left to the CPU.
+	internal def deviceLayerNormOp(c Call) !bool {
+		return false when c.wants(1) || c.wants(2)
+		let x = try deviceInput(c, 0)
+		let scale = try deviceInput(c, 1)
+		return false unless x is DeviceTensor && scale is DeviceTensor
+		return false unless x.shape.len() > 0
+		let bias = c.has(2) ?? (try deviceInput(c, 2), none)
+		return false when c.has(2) && bias is none
+		let rank = x.shape.len()
+		let axis = c.int("axis", -1)
+		axis += axis < 0 ?? (rank, 0)
+		return false unless axis >= 0 && axis < rank
+		let cols = product(x.shape, axis, rank)
+		let rows = product(x.shape, 0, axis)
+		return false unless scale.count() == cols && (bias is none || bias.count() == cols)
+		let out = try deviceOutput(c, x.shape)
+		let shift = bias is DeviceTensor ?? (bias.buffer, scale.buffer)
+		try deviceNormalize(x.buffer, 0, out.buffer, 0, scale.buffer, 0, shift, bias is DeviceTensor ?? (0, -1), cols, rows, 0, 1, 0, c.float("epsilon", float32(1e-5)), rows * 256) when rows > 0 && cols > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	// InstanceNormalization: each (image, channel) plane normalized, then
+	// scaled and shifted per channel.
+	internal def deviceInstanceNormOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		let scale = try deviceInput(c, 1)
+		let bias = try deviceInput(c, 2)
+		return false unless x is DeviceTensor && scale is DeviceTensor && bias is DeviceTensor
+		return false unless x.shape.len() >= 3
+		let channels = x.shape[1]
+		let rows = x.shape[0] * channels
+		let cols = product(x.shape, 2, x.shape.len())
+		return false unless scale.count() == channels && bias.count() == channels
+		let out = try deviceOutput(c, x.shape)
+		try deviceNormalize(x.buffer, 0, out.buffer, 0, scale.buffer, 0, bias.buffer, 0, cols, rows, 1, channels, 0, c.float("epsilon", float32(1e-5)), rows * 256) when rows > 0 && cols > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	// ReduceMean over trailing axes (others stay on the CPU).
+	internal def deviceReduceMeanOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		return false unless x.shape.len() > 0
+		let rank = x.shape.len()
+		let given = c.opset < 18 ?? (c.ints("axes", int[]), try intsOr(c, 1, int[]))
+		return false when given.len() == 0
+		let axes bool[]
+		axes.len(rank)
+		for let (_, a) in given {
+			let k = a < 0 ?? (a + rank, a)
+			return false unless k >= 0 && k < rank
+			axes[k] = true
+		}
+		let first = rank
+		for let k = rank - 1; k >= 0 && axes[k]; k-- {
+			first = k
+		}
+		for let k = 0; k < first; k++ {
+			return false when axes[k]
+		}
+		let keep = c.int("keepdims", 1) != 0
+		let shape int[]
+		for let k = 0; k < rank; k++ {
+			if k < first {
+				shape.push(x.shape[k])
+			} else if keep {
+				shape.push(1)
+			}
+		}
+		let rows = product(x.shape, 0, first)
+		let cols = product(x.shape, first, rank)
+		return false when cols == 0
+		let out = try deviceOutput(c, shape)
+		try deviceNormalize(x.buffer, 0, out.buffer, 0, x.buffer, -1, x.buffer, -1, cols, rows, 0, 1, 1, float32(0), rows * 256) when rows > 0
+		c.outputs[0].d = out
+		return true
+	}
+
+	internal def deviceTransposeOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		let rank = x.shape.len()
+		let perm = c.ints("perm", int[])
+		if perm.len() == 0 {
+			for let k = rank - 1; k >= 0; k-- {
+				perm.push(k)
+			}
+		}
+		return false unless perm.len() == rank
+		let own = contiguousStrides(x.shape)
+		let shape int[]
+		let reads int[]
+		for let (_, p) in perm {
+			return false unless p >= 0 && p < rank
+			shape.push(x.shape[p])
+			reads.push(own[p])
+		}
+		let out = try deviceOutput(c, shape)
+		return false unless try deviceStridedCopy(x.buffer, 0, reads, out.buffer, 0, contiguousStrides(shape), shape)
+		c.outputs[0].d = out
+		return true
+	}
+
+	internal def deviceSliceOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		let layout = try sliceLayout(c, x.shape)
+		let out = try deviceOutput(c, layout.shape)
+		return false unless try deviceStridedCopy(x.buffer, layout.base, layout.strides, out.buffer, 0, contiguousStrides(layout.shape), layout.shape)
+		c.outputs[0].d = out
+		return true
+	}
+
+	internal def deviceConcatOp(c Call) !bool {
+		let parts DeviceTensor[]
+		for let i = 0; i < c.inputs.len(); i++ {
+			let p = try deviceInput(c, i)
+			return false unless p is DeviceTensor
+			parts.push(p)
+		}
+		return false when parts.len() == 0
+		let rank = parts[0].shape.len()
+		let axis = c.int("axis", c.opset < 4 ?? (1, 0))
+		axis += axis < 0 ?? (rank, 0)
+		return false unless axis >= 0 && axis < rank
+		let shape = parts[0].shape.clone()
+		shape[axis] = 0
+		for let (_, p) in parts {
+			return false unless p.shape.len() == rank
+			shape[axis] += p.shape[axis]
+		}
+		let out = try deviceOutput(c, shape)
+		let outStrides = contiguousStrides(shape)
+		let at = 0
+		for let (_, p) in parts {
+			return false unless try deviceStridedCopy(p.buffer, 0, contiguousStrides(p.shape), out.buffer, at * outStrides[axis], outStrides, p.shape)
+			at += p.shape[axis]
+		}
+		c.outputs[0].d = out
+		return true
+	}
+
+	// Resize of NCHW images over their two spatial axes: nearest or
+	// linear, any coordinate transformation but tf_crop_and_resize, no
+	// antialiasing.
+	internal def deviceResizeOp(c Call) !bool {
+		let x = try deviceInput(c, 0)
+		return false unless x is DeviceTensor
+		return false unless x.shape.len() == 4 && c.opset >= 11
+		let mode = c.text("mode", "nearest")
+		let transform = c.text("coordinate_transformation_mode", "half_pixel")
+		return false unless (mode := "nearest" || "linear") && c.int("antialias", 0) == 0 && !(c.attribute("axes") is Attribute) && transform != "tf_crop_and_resize"
+		let (ih, iw) = (x.shape[2], x.shape[3])
+		let (oh, ow) = (0, 0)
+		// The scale per axis: the scales input, or output / input sizes.
+		let (fy, fx) = (0.0, 0.0)
+		let sizes = c.has(3) ?? (try c.ints(3), int[])
+		if sizes.len() == 4 {
+			return false unless sizes[0] == x.shape[0] && sizes[1] == x.shape[1]
+			(oh, ow) = (sizes[2], sizes[3])
+			fy = float(oh) / float(ih)
+			fx = float(ow) / float(iw)
+		} else {
+			let s = c.inputs.len() > 2 ?? (c.inputs[2].v, none)
+			return false unless s is Tensor
+			return false unless s.floats.len() == 4 && s.floats[0] == float32(1) && s.floats[1] == float32(1)
+			(fy, fx) = (float(s.floats[2]), float(s.floats[3]))
+			oh = int((float(ih) * fy).floor())
+			ow = int((float(iw) * fx).floor())
+		}
+		let out = try deviceOutput(c, int[x.shape[0], x.shape[1], oh, ow])
+		// in = (out + a) / d - b per axis.
+		let (ay, by, dy) = (0.5, 0.5, fy)
+		let (ax, bx, dx) = (0.5, 0.5, fx)
+		match transform {
+			case "asymmetric":
+				(ay, by, ax, bx) = (0.0, 0.0, 0.0, 0.0)
+			case "align_corners":
+				// The resized length unrounded, as the reference takes it.
+				(ay, by, ax, bx) = (0.0, 0.0, 0.0, 0.0)
+				dy = ih > 1 ?? ((float(ih) * fy - 1.0) / float(ih - 1), 1e300)
+				dx = iw > 1 ?? ((float(iw) * fx - 1.0) / float(iw - 1), 1e300)
+			case "pytorch_half_pixel":
+				(dy, by) = oh > 1 ?? ((dy, by), (1e300, 0.0))
+				(dx, bx) = ow > 1 ?? ((dx, bx), (1e300, 0.0))
+			case "tf_half_pixel_for_nn":
+				(by, bx) = (0.0, 0.0)
+			case "half_pixel_symmetric":
+				// Centred: the output's whole length against its scaled one.
+				by = 0.5 - float(ih) / 2.0 * (1.0 - float(oh) / (float(ih) * fy))
+				bx = 0.5 - float(iw) / 2.0 * (1.0 - float(ow) / (float(iw) * fx))
+			default:
+		}
+		let nearest = 0
+		match c.text("nearest_mode", "round_prefer_floor") {
+			case "round_prefer_ceil":
+				nearest = 1
+			case "floor":
+				nearest = 2
+			case "ceil":
+				nearest = 3
+			default:
+		}
+		let n = out.count()
+		try deviceResize(x.buffer, 0, out.buffer, 0, x.shape[0] * x.shape[1], ih, iw, oh, ow, mode == "nearest" ?? (0, 1), nearest, dy, dx, ay, ax, by, bx, spread(n)) when n > 0
+		c.outputs[0].d = out
+		return true
+	}
+}

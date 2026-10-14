@@ -1,0 +1,189 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.gpu
+		std.ai.tensor::(Weights)
+		std.ai.tensor.gpu::*
+	)
+
+	// One block of a Qwen vision encoder on the GPU, and where its vectors
+	// start in `DeviceVision.vectors`.
+	struct DeviceVisionLayer {
+		query      DeviceWeights
+		key        DeviceWeights
+		value      DeviceWeights
+		output     DeviceWeights
+		up         DeviceWeights
+		down       DeviceWeights
+		norm1      int
+		norm1Bias  int
+		norm2      int
+		norm2Bias  int
+		queryBias  int
+		keyBias    int
+		valueBias  int
+		outputBias int
+		upBias     int
+		downBias   int
+	}
+
+	// A Qwen vision encoder's weights on the GPU (see QwenVisionEncoder),
+	// which runs it there.
+	type DeviceVision {
+		patches       DeviceWeights
+		layers        DeviceVisionLayer[]
+		mergeUp       DeviceWeights
+		mergeDown     DeviceWeights
+		vectors       gpu.DeviceBuffer<float32>
+		patchBias     int
+		postNorm      int
+		postNormBias  int
+		mergeUpBias   int
+		mergeDownBias int
+
+		def new(patches DeviceWeights, layers DeviceVisionLayer[], mergeUp DeviceWeights, mergeDown DeviceWeights, vectors gpu.DeviceBuffer<float32>) {
+			self.patches = patches
+			self.layers = layers
+			self.mergeUp = mergeUp
+			self.mergeDown = mergeDown
+			self.vectors = vectors
+		}
+
+		// The encoder's rows for n patches: `raw` holds each patch's values
+		// (3 · patch² per row, in the encoder's merge order), `added` the
+		// learned position each patch adds, and `places` each patch's row
+		// and column, as QwenVisionEncoder.encodeValues prepares them.
+		// Fails when a launch, copy or allocation fails.
+		def encode(e QwenVisionEncoder, raw matrix<float32>, added matrix<float32>, places float32[]) !matrix<float32> {
+			let n = raw.rows
+			let w = e.width
+			let hs = w / e.heads
+			let ffn = layers.len() > 0 ?? (layers[0].up.rows, 1)
+			let v = vectors
+			let split = try gpu.upload(zeroValues(splitWork))
+			let dRaw = try gpu.upload(raw.data())
+			let x = try gpu.upload(added.data())
+			let normed = try gpu.upload(zeroValues(n * w))
+			let q = try gpu.upload(zeroValues(n * w))
+			let k = try gpu.upload(zeroValues(n * w))
+			let values = try gpu.upload(zeroValues(n * w))
+			let attended = try gpu.upload(zeroValues(n * w))
+			let up = try gpu.upload(zeroValues(n * ffn))
+			let dPlaces = try gpu.upload(places)
+			// x = positions + patches · weights + bias.
+			try patches.multiplyTokens(dRaw, 0, raw.cols, normed, 0, w, n, split)
+			try accumulate(x, 0, normed, 0, n * w, float32(1), float32(1))
+			try addRows(x, 0, v, patchBias, w, n * w)
+			for let (_, l) in layers {
+				try layerNormRows(x, normed, w, v, l.norm1, l.norm1Bias, e.epsilon, n * 256)
+				try l.query.multiplyTokens(normed, 0, w, q, 0, w, n, split)
+				try l.key.multiplyTokens(normed, 0, w, k, 0, w, n, split)
+				try l.value.multiplyTokens(normed, 0, w, values, 0, w, n, split)
+				try addRows(q, 0, v, l.queryBias, w, n * w)
+				try addRows(k, 0, v, l.keyBias, w, n * w)
+				try addRows(values, 0, v, l.valueBias, w, n * w)
+				try visionTurn(q, k, dPlaces, e.heads, hs, n * e.heads * hs / 2)
+				try attendTokens(q, k, values, attended, e.heads, e.heads, hs, n, 0, float32(1.0 / (float(hs)) ** 0.5), float32(0), v, -1, 0, v, -1, n * e.heads * 256)
+				try l.output.multiplyTokens(attended, 0, w, normed, 0, w, n, split)
+				try addRows(normed, 0, v, l.outputBias, w, n * w)
+				try accumulate(x, 0, normed, 0, n * w, float32(1), float32(1))
+				try layerNormRows(x, normed, w, v, l.norm2, l.norm2Bias, e.epsilon, n * 256)
+				try l.up.multiplyTokens(normed, 0, w, up, 0, ffn, n, split)
+				try addRows(up, 0, v, l.upBias, ffn, n * ffn)
+				try geluValues(up, n * ffn)
+				try l.down.multiplyTokens(up, 0, ffn, normed, 0, w, n, split)
+				try addRows(normed, 0, v, l.downBias, w, n * w)
+				try accumulate(x, 0, normed, 0, n * w, float32(1), float32(1))
+			}
+			try layerNormRows(x, x, w, v, postNorm, postNormBias, e.epsilon, n * 256)
+			// Each group's patches side by side are one row of the MLP.
+			let groups = n / (e.merge * e.merge)
+			let joined = e.merge * e.merge * w
+			let hidden = try gpu.upload(zeroValues(groups * mergeUp.rows))
+			let out = try gpu.upload(zeroValues(groups * mergeDown.rows))
+			try mergeUp.multiplyTokens(x, 0, joined, hidden, 0, mergeUp.rows, groups, split)
+			try addRows(hidden, 0, v, mergeUpBias, mergeUp.rows, groups * mergeUp.rows)
+			try geluValues(hidden, groups * mergeUp.rows)
+			try mergeDown.multiplyTokens(hidden, 0, mergeUp.rows, out, 0, mergeDown.rows, groups, split)
+			try addRows(out, 0, v, mergeDownBias, mergeDown.rows, groups * mergeDown.rows)
+			let rows = matrix<float32>[].size(groups, mergeDown.rows)
+			let data = rows.data()
+			try out.download(data)
+			for let (_, buffer) in gpu.DeviceBuffer<float32>[split, dRaw, x, normed, q, k, values, attended, up, dPlaces, hidden, out] {
+				buffer.dispose()
+			}
+			return rows
+		}
+
+		// Frees the device memory.
+		def dispose() {
+			patches.dispose()
+			mergeUp.dispose()
+			mergeDown.dispose()
+			for let (_, l) in layers {
+				for let (_, weights) in DeviceWeights[l.query, l.key, l.value, l.output, l.up, l.down] {
+					weights.dispose()
+				}
+			}
+			vectors.dispose()
+		}
+	}
+
+	// The weights of encoder `e` on the GPU.
+	// Fails when a type has no GPU kernel or the device memory runs out.
+	def uploadVision(e QwenVisionEncoder) !DeviceVision {
+		let all float32[]
+		let layers DeviceVisionLayer[]
+		for let (_, l) in e.layers {
+			layers.push(DeviceVisionLayer{
+				query:      try upload(l.query),
+				key:        try upload(l.key),
+				value:      try upload(l.value),
+				output:     try upload(l.output),
+				up:         try upload(l.up),
+				down:       try upload(l.down),
+				norm1:      place(all, l.norm1),
+				norm1Bias:  place(all, l.norm1Bias),
+				norm2:      place(all, l.norm2),
+				norm2Bias:  place(all, l.norm2Bias),
+				queryBias:  place(all, l.queryBias),
+				keyBias:    place(all, l.keyBias),
+				valueBias:  place(all, l.valueBias),
+				outputBias: place(all, l.outputBias),
+				upBias:     place(all, l.upBias),
+				downBias:   place(all, l.downBias),
+			})
+		}
+		let patchBias = place(all, e.patchBias)
+		let postNorm = place(all, e.postNorm)
+		let postNormBias = place(all, e.postNormBias)
+		let mergeUpBias = place(all, e.mergeUpBias)
+		let mergeDownBias = place(all, e.mergeDownBias)
+		let device = new DeviceVision(try upload(e.patches), layers, try upload(e.mergeUp), try upload(e.mergeDown), try gpu.upload(all))
+		device.patchBias = patchBias
+		device.postNorm = postNorm
+		device.postNormBias = postNormBias
+		device.mergeUpBias = mergeUpBias
+		device.mergeDownBias = mergeDownBias
+		return device
+	}
+
+	// Bytes of device memory encoder `e` takes: its weights, and the
+	// activations of a picture of `reservedPatches` patches.
+	def visionBytes(e QwenVisionEncoder) int {
+		// Each buffer rounded up to the driver's 2 MiB pages.
+		let paged = def (bytes int) int {
+			return (bytes + devicePage - 1) / devicePage * devicePage
+		}
+		let bytes = paged(e.patches.data.len()) + paged(e.mergeUp.data.len()) + paged(e.mergeDown.data.len())
+		let ffn = 0
+		for let (_, l) in e.layers {
+			bytes += paged(l.query.data.len()) + paged(l.key.data.len()) + paged(l.value.data.len()) + paged(l.output.data.len()) + paged(l.up.data.len()) + paged(l.down.data.len())
+			ffn = ffn.max(l.up.rows)
+		}
+		return bytes + 4 * (reservedPatches * (7 * e.width + ffn + 3 * e.patch * e.patch) + splitWork)
+	}
+
+	// Patches whose activations a model on the GPU keeps room for beside
+	// a vision encoder: a picture of 1024 rows.
+	const reservedPatches = 4096
+}

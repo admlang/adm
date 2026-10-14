@@ -1,0 +1,204 @@
+partial module std.ai.diffusion {
+	use (
+		std.simd
+		std.formats.ai
+		std.formats.ai::(ModelFile)
+		std.formats.ai.onnx as onnxfile
+		std.formats.ai.onnx::(ElementType, OnnxModel, TensorData)
+	)
+
+	// A weight a LoRA can change: the initializer and whether it is
+	// stored transposed ([in, out], as MatMul takes it) rather than
+	// [out, in, ...] (Gemm with transB, Conv).
+	internal struct LoraTarget {
+		tensor     TensorData
+		transposed bool
+	}
+
+	// The two halves of one layer's LoRA and its alpha.
+	internal struct LoraPair {
+		down  string = ""
+		up    string = ""
+		alpha string = ""
+	}
+
+	// Adds `lora`'s change to the text encoder's and the UNet's weights:
+	// W += strength · alpha / rank · up · down for every layer it names.
+	// Fails when the file cannot be read, a layer is missing a half, or
+	// names a layer neither model has.
+	internal def mergeLora(lora Lora, text OnnxModel, unet OnnxModel) !none {
+		let file = try ai.load(lora.path)
+		let targets = new map<string, LoraTarget>()
+		indexTargets(unet, string["lora_unet_"], string["unet.", ""], targets)
+		indexTargets(text, string["lora_te_", "lora_te1_"], string["text_encoder."], targets)
+		let pairs = new map<string, LoraPair>()
+		for let (_, t) in file.tensors {
+			let (base, role) = loraRole(t.name)
+			continue when role.len() == 0
+			let pair = pairs.get(base)
+			let p = pair is LoraPair ?? (pair, LoraPair{})
+			match role {
+				case "down":
+					p.down = t.name
+				case "up":
+					p.up = t.name
+				default:
+					p.alpha = t.name
+			}
+			pairs.set(base, p)
+		}
+		for let (base, p) in pairs {
+			fail "diffusion: the LoRA's {base} lacks its down or up half" when p.down.len() == 0 || p.up.len() == 0
+			let target = targets.get(base)
+			fail "diffusion: the LoRA changes {base}, which the model does not have" unless target is LoraTarget
+			let down = try file.readFloats(p.down)
+			let up = try file.readFloats(p.up)
+			let alpha = p.alpha.len() > 0 ?? (float((try file.readFloats(p.alpha))[0]), -1.0)
+			try addProduct(target, down, up, alpha, lora.strength, base)
+		}
+		return none
+	}
+
+	// The layer a LoRA tensor belongs to and its role (down, up or alpha);
+	// an empty role for another tensor.
+	internal def loraRole(name string) (string, string) {
+		for let (_, ending) in string[".lora_down.weight", ".lora_A.weight", ".lora.down.weight", "_lora.down.weight"] {
+			return (canonical(name.slice(0, name.len() - ending.len())), "down") when name.endsWith(ending)
+		}
+		for let (_, ending) in string[".lora_up.weight", ".lora_B.weight", ".lora.up.weight", "_lora.up.weight"] {
+			return (canonical(name.slice(0, name.len() - ending.len())), "up") when name.endsWith(ending)
+		}
+		return (name.slice(0, name.len() - 6), "alpha") when name.endsWith(".alpha")
+		return ("", "")
+	}
+
+	// Older diffusers keys name the attention processor's projections
+	// (attn1.processor.to_q, to_out); the layers are attn1.to_q, to_out.0.
+	internal def canonical(base string) string {
+		let b = base.replace(".processor.", ".", -1)
+		return b.endsWith(".to_out") ?? (b + ".0", b)
+	}
+
+	// Registers every weight of `model` a LoRA can name, under kohya's
+	// keys (prefix + path with _ for .) and diffusers' (prefix + path).
+	internal def indexTargets(model OnnxModel, kohya string[], dotted string[], targets map<string, LoraTarget>) {
+		let named = new map<string, TensorData>()
+		for let (_, t) in model.graph.initializers {
+			named.set(t.name, t)
+		}
+		for let (_, node) in model.graph.nodes {
+			continue unless node.op := "MatMul" || "Gemm" || "Conv"
+			continue when node.inputs.len() < 2
+			let weight = named.get(node.inputs[1])
+			continue unless weight is TensorData
+			let path = weight.name.endsWith(".weight") && !weight.name.startsWith("onnx::") ?? (weight.name.slice(0, weight.name.len() - 7), pathOf(node.name))
+			continue when path.len() == 0
+			let transposed = node.op == "MatMul" || (node.op == "Gemm" && !transB(node))
+			let target = LoraTarget{tensor: weight, transposed: transposed}
+			for let (_, p) in kohya {
+				targets.set(p + path.replace(".", "_", -1), target)
+			}
+			for let (_, p) in dotted {
+				targets.set(p + path, target)
+			}
+		}
+	}
+
+	// The module path of an exported node: "/down_blocks.0/attn1/to_q/MatMul"
+	// is down_blocks.0.attn1.to_q.
+	internal def pathOf(node string) string {
+		let parts = node.split("/")
+		let kept string[]
+		for let (i, part) in parts {
+			kept.push(part) when part.len() > 0 && i < parts.len() - 1
+		}
+		return kept.join(".")
+	}
+
+	internal def transB(node onnxfile.Node) bool {
+		let a = node.attribute("transB")
+		return a is onnxfile.Attribute && a.i == 1
+	}
+
+	// target += scale · up · down, `up` [out, rank] and `down` [rank, in…]
+	// as torch lays them out; scale = strength · alpha / rank (alpha of
+	// rank when the file has none).
+	internal def addProduct(target LoraTarget, down float32[], up float32[], alpha float, strength float, base string) !none {
+		let t = target.tensor
+		fail "diffusion: {base} is {t.element.name}; LoRAs change float weights" unless t.element := ElementType.Float || ElementType.Float16
+		let dims = t.dims
+		fail "diffusion: {base} has {dims.len()} dimensions" when dims.len() < 2
+		let total = t.count()
+		let out = target.transposed ?? (dims[1], dims[0])
+		let inner = total / out
+		fail "diffusion: the LoRA's {base} does not fit its layer" when inner == 0 || down.len() % inner != 0
+		let rank = down.len() / inner
+		fail "diffusion: the LoRA's {base} halves disagree on their rank" unless up.len() == out * rank
+		let scale = float32(strength * (alpha > 0.0 ?? (alpha, float(rank))) / float(rank))
+		let values = try t.floats()
+		let tasks = (out / 64).clamp(1, 32)
+		forall let b in 0..tasks {
+			productBand(values, down, up, out, inner, rank, scale, target.transposed, out * b / tasks, out * (b + 1) / tasks)
+		}
+		t.data = bytesOf(values, t.element)
+		return none
+	}
+
+	// Rows from..to of the product added into `values`.
+	internal def productBand(values float32[], down float32[], up float32[], out int, inner int, rank int, scale float32, transposed bool, from int, to int) {
+		let row float32[]
+		row.len(inner)
+		for let o = from; o < to; o++ {
+			row.fill(float32(0))
+			for let r = 0; r < rank; r++ {
+				let s = simd.splat8<float32>(up[o * rank + r] * scale)
+				let at = r * inner
+				let j = 0
+				for; j + 8 <= inner; j += 8 {
+					simd.store8<float32>(row, j, simd.fma(simd.load8<float32>(down, at + j), s, simd.load8<float32>(row, j)))
+				}
+				for; j < inner; j++ {
+					row[j] += down[at + j] * up[o * rank + r] * scale
+				}
+			}
+			if transposed {
+				for let j = 0; j < inner; j++ {
+					values[j * out + o] += row[j]
+				}
+			} else {
+				let at = o * inner
+				let j = 0
+				for; j + 8 <= inner; j += 8 {
+					simd.store8<float32>(values, at + j, simd.load8<float32>(values, at + j) + simd.load8<float32>(row, j))
+				}
+				for; j < inner; j++ {
+					values[at + j] += row[j]
+				}
+			}
+		}
+	}
+
+	// float32 values as the little-endian bytes of `element` (Float or Float16).
+	internal def bytesOf(values float32[], element ElementType) byte[] {
+		let out byte[]
+		if element == ElementType.Float16 {
+			out.len(2 * values.len())
+			for let (i, v) in values {
+				let half = float16(v).bytes()
+				out[2 * i] = half[0]
+				out[2 * i + 1] = half[1]
+			}
+			return out
+		}
+		out.len(4 * values.len())
+		for let (i, v) in values {
+			let bits = __bitcast_u32_from_f32(v)
+			let a = 4 * i
+			out[a] = byte(bits & uint32(0xFF))
+			out[a + 1] = byte((bits >> uint32(8)) & uint32(0xFF))
+			out[a + 2] = byte((bits >> uint32(16)) & uint32(0xFF))
+			out[a + 3] = byte(bits >> uint32(24))
+		}
+		return out
+	}
+}

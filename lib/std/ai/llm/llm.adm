@@ -29,14 +29,30 @@ partial module std.ai.llm {
 	// Loads a GGUF model, and with `projector` the file holding its image
 	// and audio encoders (llama.cpp's --mmproj file, the `projector` layer
 	// of an Ollama model). `Device.Auto` runs the model on the GPU when one
-	// is in use and has kernels for every part of it, else on the CPU.
+	// is in use and has kernels for every part of it, else on the CPU. A
+	// mixture-of-experts model too large for the GPU's free memory keeps
+	// as many experts of each layer there as fit and the others in host
+	// memory, with the same output, more slowly. `gpuMemory` is the bytes
+	// of GPU memory the model and one session may take, for a GPU shared
+	// with other work; 0 for all that is free. `hostMemory` is the bytes of
+	// host memory the page-locked copies of the experts outside the GPU
+	// may take (they make their copies to the GPU faster); 0 for what the
+	// system has available, less a reserve. The weights themselves are
+	// read from the file as they are needed, so a model larger than host
+	// memory loads, and runs as fast as the disk serves what it misses.
+	// `adapters` are LoRA adapters (GGUF, as llama.cpp reads them) whose
+	// changes every multiply adds, each at its scale.
 	// Fails when the file cannot be read, or its architecture or a weight
 	// type is not supported, or `Device.Gpu` is asked for and there is no
 	// GPU, the GPU has no kernel for a part of the model, or its memory
-	// runs out; or when the projector cannot be read, is not for this
-	// model, or has no encoder this library supports.
-	def load(path string, device Device = Device.Auto, projector string = "") !LanguageModel {
+	// does not hold the model (with the experts one token uses, when it
+	// is a mixture of experts); or when the projector cannot be read, is
+	// not for this model, or has no encoder this library supports; or when
+	// an adapter cannot be read or is not for this model.
+	def load(path string, device Device = Device.Auto, projector string = "", gpuMemory int = 0, hostMemory int = 0, adapters Adapter[] = Adapter[]) !LanguageModel {
 		expects {
+			assert gpuMemory >= 0 onerror fail "llm: gpuMemory is negative"
+			assert hostMemory >= 0 onerror fail "llm: hostMemory is negative"
 			assert device != Device.Gpu || gpu.available() onerror fail "llm: no GPU is in use (see ADM_CUDA)"
 		}
 		let file = try ai.load(path)
@@ -44,12 +60,24 @@ partial module std.ai.llm {
 			file.close()
 			return err
 		}
+		// Ollama keeps Qwen 3.5's image encoder in the model file.
+		let arch = parts.info.architecture
+		if projector.len() == 0 && (arch := "qwen35" || "qwen35moe") && !(file.tensor("v.patch_embed.weight") is none) {
+			let vision = readQwenVision(file, arch, parts.info.embedding) onerror (err error) {
+				file.close()
+				return err
+			}
+			parts.projector = new Projector(vision, none)
+		}
 		file.close()
 		parts.projector = try readProjector(projector, parts.info.embedding) when projector.len() > 0
+		for let (_, adapter) in adapters {
+			try loadAdapter(parts, adapter)
+		}
 		if device == Device.Gpu {
-			parts.device = try uploadModel(parts)
+			parts.device = try uploadFitting(parts, gpuMemory, hostMemory)
 		} else if device == Device.Auto && gpu.available() {
-			parts.device = uploadIfPossible(parts)
+			parts.device = uploadIfPossible(parts, gpuMemory, hostMemory)
 		}
 		return new LanguageModel(parts)
 	}
@@ -111,6 +139,36 @@ partial module std.ai.llm {
 			return session
 		}
 
+		// Starts training a LoRA adapter of `rank` on the `targets` of every
+		// layer, its change scaled by alpha / rank as llama.cpp reads it.
+		// This model's sessions use the adapter as trained so far, and keep
+		// it after the tuning ends. `context` bounds the tokens of one example (0 for
+		// the model's length) and picks the RoPE factors a session of that
+		// context picks. `seed` makes the starting values repeatable.
+		// Fails when the model is already being tuned, rank is below 1, or
+		// the model has layers tuning cannot train yet.
+		def tune(rank int = 16, alpha float = 32.0, targets Target[] = Target[Target.Query, Target.Key, Target.Value, Target.Output, Target.Gate, Target.Up, Target.Down], context int = 0, seed int = 1) !Tuning {
+			expects {
+				assert rank >= 1 onerror fail "llm: a tuning's rank must be at least 1"
+				assert targets.len() > 0 onerror fail "llm: a tuning needs at least one target"
+			}
+			for let (_, layer) in parts.layers {
+				for let (_, list) in layer.adapters {
+					for let (_, adapted) in list {
+						fail "llm: the model is already being tuned" when adapted.pair.gradA.len() > 0
+					}
+				}
+			}
+			let gap = tuningGap(parts)
+			fail "llm: this model cannot be tuned yet: {gap}" unless gap is none
+			let length = (context <= 0 || context > info.contextLength) ?? (info.contextLength, context)
+			let s = session(length)
+			let pairs = newPairs(parts, rank, alpha, targets, seed)
+			let trainer = new Trainer(parts, s.state, pairs)
+			try trainer.prepareDevice()
+			return new Tuning(self, s, trainer, alpha, length)
+		}
+
 		// Releases the model. The weights stay while a session made from
 		// it is still in use, and are freed with the last one.
 		def dispose() {}
@@ -151,6 +209,12 @@ partial module std.ai.llm {
 		// How many prompt tokens run through the model together; 1 feeds them
 		// one at a time. The results are the same either way.
 		batch          int        = 64
+		// Reads prompts faster on the GPU by rounding the values that
+		// flow between the layers to 8 bits while a batch of prompt tokens
+		// runs, as llama.cpp does. The text can then differ from the exact
+		// path's where two tokens are nearly as likely. No effect on the
+		// CPU, on generated tokens or with `batch` 1.
+		fastPrompt     bool       = false
 		// Stops generation when the text ends with one of these.
 		stopAt         string[]
 		// Instructions for the whole conversation. Takes effect at the next
@@ -185,8 +249,7 @@ partial module std.ai.llm {
 		internal produced     string
 		internal generated    int
 		internal finished     bool
-		internal random       uint64
-		internal seeded       bool
+		internal random       ?math.Random
 		internal timing       Stats
 		// The chat: messages from `ask`, `say` and `add`, and the reply
 		// being generated.
@@ -251,6 +314,7 @@ partial module std.ai.llm {
 			let step = batch.max(1)
 			for let from = 0; from < tokens.len(); from += step {
 				let chunk = tokens[from:(from + step).min(tokens.len())]
+				state.rounded = fastPrompt
 				try state.forward(chunk, history.len())
 				history.push(...chunk)
 			}
@@ -351,7 +415,7 @@ partial module std.ai.llm {
 		// the model cannot take (see `info.vision`, `info.audio`).
 		def ask(text string, images Image[] = Image[], audio Audio[] = Audio[], documents Document[] = Document[]) !none {
 			let message = Message{role: Role.User, text: text, images: images, audio: audio, documents: documents}
-			try encodeMedia(message, conversation.len())
+			try encodeMedia(self, message, conversation.len())
 			conversation.push(message)
 			feed(true) onerror (err error) {
 				conversation.pop()
@@ -391,7 +455,7 @@ partial module std.ai.llm {
 					Message{role: Role.System, text: decisionPrompt},
 					Message{role: Role.User, text: schema + requestLine(q.name)},
 				]
-				prompts.push(try promptTokens(asked, open = true, think = false, withTools = false))
+				prompts.push(try promptTokens(self, asked, open = true, think = false, withTools = false))
 			}
 			// The prompts share all but the requested field: that part runs once.
 			let common = prompts[0].len()
@@ -451,7 +515,7 @@ partial module std.ai.llm {
 		// saved conversation, or gives examples. Fails like `append`.
 		// Fails like `append`, and like `ask` for the message's media.
 		def add(message Message) !none {
-			try encodeMedia(message, conversation.len())
+			try encodeMedia(self, message, conversation.len())
 			conversation.push(message)
 			feed(false) onerror (err error) {
 				conversation.pop()
@@ -535,8 +599,9 @@ partial module std.ai.llm {
 			raw.len(0)
 			callFrom = -1
 			released = 0
-			// Bailing's thinking template opens the reply inside <think>.
-			inThinking = marks.thinkOpen >= 0 && history.len() > 0 && history[history.len() - 1] == marks.thinkOpen
+			// Templates of thinking-only models (Bailing, Qwen3 Thinking-2507)
+			// open the reply inside <think>, whatever `thinking` says.
+			inThinking = opensThinking(history, marks.thinkOpen, parts.tokenizer)
 		}
 
 		// After a reply that made calls: runs the calls whose tools have a
@@ -626,101 +691,8 @@ partial module std.ai.llm {
 		// cut back to them first, so an edited `system` or a reply the
 		// template writes differently costs only the tokens after it.
 		internal def feed(open bool) !none {
-			let tokens = try promptTokens(messages(), open, thinking, true)
+			let tokens = try promptTokens(self, messages(), open, thinking, true)
 			return try feedTokens(tokens)
-		}
-
-		// `all` rendered as the model's prompt: by its own template when it
-		// has one (and `format` was left as detected), else by `format`.
-		internal def promptTokens(all Message[], open bool, think bool, withTools bool) !int[] {
-			let template = setup.template
-			let offered = withTools && tools.len() > 0
-			let shown Message[]
-			let hasMedia = false
-			for let (_, m) in all {
-				shown.push(withDocuments(m))
-				hasMedia = hasMedia || m.images.len() > 0 || m.audio.len() > 0
-			}
-			if !(template is none) && format == setup.detected {
-				fail "llm: this model's chat template writes no tool calls" when offered && setup.callFormat.shape == CallShape.None
-				let tokens = try templateTokens(template, shown, open, think, offered)
-				return hasMedia ?? (try placeMedia(tokens), tokens)
-			}
-			fail "llm: images and audio need the model's own chat template" when hasMedia
-			fail "llm: this model's chat format has no tool calls" when offered
-			let quiet = !think && parts.chatTemplate.contains("enable_thinking")
-			let text = render(format, shown, open = open, reasoning = reasoning, quiet = quiet)
-			return parts.tokenizer.encode(text.pieces, text.markup)
-		}
-
-		// Encodes the pictures (the message's and its documents') and sounds
-		// of `m`, the conversation's message `index`, into rows the forward
-		// pass reads.
-		// Fails when the model cannot take them.
-		internal def encodeMedia(m Message, index int) !none {
-			let pictures = picturesOf(m, parts.projector)
-			return none when pictures.len() == 0 && m.audio.len() == 0
-			let projector = parts.projector
-			fail "llm: this model takes no images or audio; load it with its projector" unless projector is Projector
-			let vision = projector.vision
-			let hearing = projector.audio
-			fail "llm: this model's projector has no image encoder" when pictures.len() > 0 && vision is none
-			fail "llm: this model's projector has no audio encoder" when m.audio.len() > 0 && hearing is none
-			let encoded matrix<float32>[]
-			if vision is VisionEncoder {
-				for let (_, picture) in pictures {
-					encoded.push(vision.encode(picture))
-				}
-			}
-			if hearing is AudioEncoder {
-				for let (_, sound) in m.audio {
-					encoded.push(try hearing.encode(sound))
-				}
-			}
-			let runs MediaRun[]
-			for let (k, rows) in encoded {
-				let run = MediaRun{image: k < pictures.len()}
-				for let r = 0; r < rows.rows; r++ {
-					run.ids.push(nextRow)
-					state.rows.set(nextRow, rows.row(r).clone())
-					nextRow--
-				}
-				runs.push(run)
-			}
-			media.set(index, runs)
-			return none
-		}
-
-		// `tokens` with each picture or sound marker of the chat template
-		// replaced by its opening token, its rows and its closing token.
-		// Fails when the template placed a different number of markers than
-		// the conversation holds pictures and sounds.
-		internal def placeMedia(tokens int[]) !int[] {
-			let runs MediaRun[]
-			for let i = 0; i < conversation.len(); i++ {
-				let held = media.get(i)
-				runs.push(...held) unless held is none
-			}
-			let tokenizer = parts.tokenizer
-			let imageMark = single(tokenizer, "<|image|>")
-			let audioMark = single(tokenizer, "<|audio|>")
-			let out int[]
-			let k = 0
-			for let (_, t) in tokens {
-				if t < 0 || !(t == imageMark || t == audioMark) {
-					out.push(t)
-					continue
-				}
-				fail "llm: the chat template placed more pictures and sounds than the messages hold" when k >= runs.len()
-				let run = runs[k]
-				fail "llm: the chat template placed a picture where the messages hold a sound, or the other way" unless run.image == (t == imageMark)
-				out.push(single(tokenizer, run.image ?? ("<|image>", "<|audio>")))
-				out.push(...run.ids)
-				out.push(single(tokenizer, run.image ?? ("<image|>", "<audio|>")))
-				k++
-			}
-			fail "llm: the chat template placed {k} pictures and sounds, the messages hold {runs.len()}" unless k == runs.len()
-			return out
 		}
 
 		// Runs `tokens` through the model, keeping what the context shares
@@ -731,66 +703,11 @@ partial module std.ai.llm {
 			shared = shared.min(tokens.len() - 1).max(0)
 			// Recurrent layers cannot be cut back: resume from the newest saved
 			// state at or before the shared tokens.
-			shared = state.restore(shared) when state.recurrent() && shared < history.len()
+			shared = try state.restore(shared) when state.recurrent() && shared < history.len()
 			history.len(shared)
 			try append(tokens[shared:])
-			state.snapshot(history.len())
+			try state.snapshot(history.len())
 			return none
-		}
-
-		// The conversation rendered by the model's own template. A message
-		// whose text holds control-token text renders as a placeholder and
-		// goes in as plain text, so it cannot forge a turn.
-		internal def templateTokens(template jinja.Template, all Message[], open bool, think bool, offered bool) !int[] {
-			let tokenizer = parts.tokenizer
-			let toolNames = new map<string, string>()
-			let guarded string[]
-			let messageValues any[] = []
-			for let (_, m) in all {
-				for let (_, c) in m.calls {
-					toolNames.set(c.id, c.name)
-				}
-				let text = m.text
-				if !tokenizer.encode(m.text, false).equals(tokenizer.encode(m.text, false, specials = false)) {
-					text = "\uE000{guarded.len()}\uE001"
-					guarded.push(m.text)
-				}
-				messageValues.push(messageValue(m, toolNames, text))
-			}
-			let values = map<string, any>{
-				"messages":              messageValues,
-				"add_generation_prompt": open,
-				"bos_token":             setup.bos,
-				"eos_token":             setup.eos,
-				"enable_thinking":       think,
-				"reasoning_effort":      reasoning == Reasoning.Low ?? ("low", reasoning == Reasoning.High ?? ("high", "medium")),
-			}
-			if offered {
-				let schemas any[] = []
-				for let (_, t) in tools {
-					schemas.push(toolSchema(t))
-				}
-				values.set("tools", schemas)
-			}
-			let text = try template.render(values)
-			let pieces string[]
-			let markup bool[]
-			let rest = text
-			for let (k, original) in guarded {
-				let mark = "\uE000{k}\uE001"
-				let at = rest.indexOf(mark)
-				continue when at < 0
-				pieces.push(rest.slice(0, at))
-				markup.push(true)
-				pieces.push(original)
-				markup.push(false)
-				rest = rest.slice(at + mark.len())
-			}
-			pieces.push(rest)
-			markup.push(true)
-			// A template that writes the start token itself gets no second one.
-			let addStart = !(setup.bos.len() > 0 && text.startsWith(setup.bos))
-			return tokenizer.encode(pieces, markup, addStart)
 		}
 
 		// Where the text of a generated token goes, following the chat
@@ -941,19 +858,189 @@ partial module std.ai.llm {
 			return candidates[keep - 1]
 		}
 
-		// A uniform number in [0, 1) from the session's generator.
+		// A uniform number in [0, 1) from the session's generator, seeded
+		// on first use from `seed`, or the clock when it is 0.
 		internal def uniform() float {
-			if !seeded {
-				random = seed != uint(0) ?? (uint64(seed), uint64(time.wallNs()) | uint64(1))
-				seeded = true
-			}
-			// xorshift64*
-			random = random ^ (random >> 12)
-			random = random ^ (random << 25)
-			random = random ^ (random >> 27)
-			let bits = (random * uint64(0x2545F4914F6CDD1D)) >> 11
-			return float(bits) / 9007199254740992.0
+			let made = random
+			return made.of<float>() when made is math.Random
+			let fresh = new math.Random(seed != uint(0) ?? (int(seed), int(time.wallNs())))
+			random = fresh
+			return fresh.of<float>()
 		}
+	}
+
+	// `all` rendered as the model's prompt: by its own template when it
+	// has one (and `format` was left as detected), else by `format`.
+	internal def promptTokens(s Session, all Message[], open bool, think bool, withTools bool) !int[] {
+		let template = s.setup.template
+		let offered = withTools && s.tools.len() > 0
+		let shown Message[]
+		let hasMedia = false
+		for let (_, m) in all {
+			shown.push(withDocuments(m))
+			hasMedia = hasMedia || m.images.len() > 0 || m.audio.len() > 0
+		}
+		if !(template is none) && s.format == s.setup.detected {
+			fail "llm: this model's chat template writes no tool calls" when offered && s.setup.callFormat.shape == CallShape.None
+			let tokens = try templateTokens(s, template, shown, open, think, offered)
+			return hasMedia ?? (try placeMedia(s, tokens), tokens)
+		}
+		fail "llm: images and audio need the model's own chat template" when hasMedia
+		fail "llm: this model's chat format has no tool calls" when offered
+		let quiet = !think && s.parts.chatTemplate.contains("enable_thinking")
+		let text = render(s.format, shown, open = open, reasoning = s.reasoning, quiet = quiet)
+		return s.parts.tokenizer.encode(text.pieces, text.markup)
+	}
+
+	// Encodes the pictures (the message's and its documents') and sounds
+	// of `m`, the conversation's message `index`, into rows the forward
+	// pass reads.
+	// Fails when the model cannot take them.
+	internal def encodeMedia(s Session, m Message, index int) !none {
+		let pictures = picturesOf(m, s.parts.projector)
+		return none when pictures.len() == 0 && m.audio.len() == 0
+		let projector = s.parts.projector
+		fail "llm: this model takes no images or audio; load it with its projector" unless projector is Projector
+		let vision = projector.vision
+		let hearing = projector.audio
+		fail "llm: this model's projector has no image encoder" when pictures.len() > 0 && vision is none
+		fail "llm: this model's projector has no audio encoder" when m.audio.len() > 0 && hearing is none
+		let encoded matrix<float32>[]
+		let columns int[]
+		if !(vision is none) {
+			for let (_, picture) in pictures {
+				encoded.push(try vision.encode(picture))
+				columns.push(vision.columns(picture))
+			}
+		}
+		if hearing is AudioEncoder {
+			for let (_, sound) in m.audio {
+				encoded.push(try hearing.encode(sound))
+			}
+		}
+		let runs MediaRun[]
+		for let (k, rows) in encoded {
+			let run = MediaRun{image: k < pictures.len()}
+			let grid = k < columns.len() ?? (columns[k], 0)
+			for let r = 0; r < rows.rows; r++ {
+				run.ids.push(s.nextRow)
+				s.state.rows.set(s.nextRow, rows.row(r).clone())
+				s.state.places.set(s.nextRow, int[r, grid, rows.rows]) when grid > 0
+				s.nextRow--
+			}
+			runs.push(run)
+		}
+		s.media.set(index, runs)
+		return none
+	}
+
+	// `tokens` with each picture or sound marker of the chat template
+	// replaced by its opening token, its rows and its closing token.
+	// Fails when the template placed a different number of markers than
+	// the conversation holds pictures and sounds.
+	internal def placeMedia(s Session, tokens int[]) !int[] {
+		let runs MediaRun[]
+		for let i = 0; i < s.conversation.len(); i++ {
+			let held = s.media.get(i)
+			runs.push(...held) unless held is none
+		}
+		let tokenizer = s.parts.tokenizer
+		let imageMark = single(tokenizer, "<|image|>")
+		let audioMark = single(tokenizer, "<|audio|>")
+		// Qwen's templates write <|vision_start|><|image_pad|><|vision_end|>.
+		let padMark = single(tokenizer, "<|image_pad|>")
+		let out int[]
+		let k = 0
+		for let (_, t) in tokens {
+			if t < 0 || !(t == imageMark || t == audioMark || t == padMark) {
+				out.push(t)
+				continue
+			}
+			fail "llm: the chat template placed more pictures and sounds than the messages hold" when k >= runs.len()
+			let run = runs[k]
+			fail "llm: the chat template placed a picture where the messages hold a sound, or the other way" unless run.image == (t != audioMark)
+			if t == padMark {
+				out.push(...run.ids)
+			} else {
+				out.push(single(tokenizer, run.image ?? ("<|image>", "<|audio>")))
+				out.push(...run.ids)
+				out.push(single(tokenizer, run.image ?? ("<image|>", "<audio|>")))
+			}
+			k++
+		}
+		fail "llm: the chat template placed {k} pictures and sounds, the messages hold {runs.len()}" unless k == runs.len()
+		return out
+	}
+
+	// The conversation rendered by the model's own template. A message
+	// whose text holds control-token text renders as a placeholder and
+	// goes in as plain text, so it cannot forge a turn.
+	internal def templateTokens(s Session, template jinja.Template, all Message[], open bool, think bool, offered bool) !int[] {
+		let tokenizer = s.parts.tokenizer
+		let toolNames = new map<string, string>()
+		let guarded string[]
+		let messageValues any[] = []
+		for let (_, m) in all {
+			for let (_, c) in m.calls {
+				toolNames.set(c.id, c.name)
+			}
+			let text = m.text
+			if !tokenizer.encode(m.text, false).equals(tokenizer.encode(m.text, false, specials = false)) {
+				text = "\uE000{guarded.len()}\uE001"
+				guarded.push(m.text)
+			}
+			messageValues.push(messageValue(m, toolNames, text))
+		}
+		let values = map<string, any>{
+			"messages":              messageValues,
+			"add_generation_prompt": open,
+			"bos_token":             s.setup.bos,
+			"eos_token":             s.setup.eos,
+			"enable_thinking":       think,
+			"reasoning_effort":      s.reasoning == Reasoning.Low ?? ("low", s.reasoning == Reasoning.High ?? ("high", "medium")),
+		}
+		if offered {
+			let schemas any[] = []
+			for let (_, t) in s.tools {
+				schemas.push(toolSchema(t))
+			}
+			values.set("tools", schemas)
+		}
+		let text = try template.render(values)
+		let pieces string[]
+		let markup bool[]
+		let rest = text
+		for let (k, original) in guarded {
+			let mark = "\uE000{k}\uE001"
+			let at = rest.indexOf(mark)
+			continue when at < 0
+			pieces.push(rest.slice(0, at))
+			markup.push(true)
+			pieces.push(original)
+			markup.push(false)
+			rest = rest.slice(at + mark.len())
+		}
+		pieces.push(rest)
+		markup.push(true)
+		// A template that writes the start token itself gets no second one.
+		let addStart = !(s.setup.bos.len() > 0 && text.startsWith(s.setup.bos))
+		return tokenizer.encode(pieces, markup, addStart)
+	}
+
+	// Whether `history` ends with `thinkOpen` and nothing after it but
+	// whitespace (`<think>\n`).
+	internal def opensThinking(history int[], thinkOpen int, tokenizer Tokenizer) bool {
+		return false when thinkOpen < 0
+		for let k = history.len() - 1; k >= 0; k-- {
+			let token = history[k]
+			return true when token == thinkOpen
+			let bytes = tokenizer.piece(token)
+			return false when bytes.len() == 0
+			for let (_, b) in bytes {
+				return false unless b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D
+			}
+		}
+		return false
 	}
 
 	// Tokens per second.
@@ -1015,6 +1102,19 @@ internal partial module std.ai.llm.model {
 		expertGate      Weights[]
 		expertUp        Weights[]
 		expertDown      Weights[]
+		// The stored bytes of every expert's gate, up and down, one expert
+		// after another (what `expertGate`, `expertUp` and `expertDown`
+		// share); empty without experts.
+		gateBytes       byte[]
+		upBytes         byte[]
+		downBytes       byte[]
+		// A shared expert every token goes through beside the routed ones,
+		// its output scaled by sigmoid(normed · sharedRouter) (Qwen 3.5
+		// MoE); `none` and empty without one.
+		sharedGate      ?Weights
+		sharedUp        ?Weights
+		sharedDown      ?Weights
+		sharedRouter    float32[]
 		// Biases of the attention output, the router and each expert's
 		// gate, up and down (gpt-oss); empty when the model has none.
 		outputBias      float32[]
@@ -1047,7 +1147,7 @@ internal partial module std.ai.llm.model {
 		headSize        int
 		// The earlier layer whose cached keys and values this one attends
 		// over instead of its own (the last layers of Gemma 4); -1 for its own.
-		sharedCache     int         = -1
+		sharedCache     int           = -1
 		// Weight of an RMSNorm of each value head, all ones (Gemma 4); empty
 		// for none.
 		valueNorm       float32[]
@@ -1058,7 +1158,20 @@ internal partial module std.ai.llm.model {
 		inputProjection ?Weights
 		inputPost       float32[]
 		// Multiplies the residual stream after the layer (Gemma 4).
-		outputScale     float32     = float32(1)
+		outputScale     float32       = float32(1)
+		// By adapter slot (`slotQuery` ...): the GGUF name of the matrix
+		// the slot's multiply reads, "" for none, and the first of that
+		// matrix's rows it uses (Phi-3 splits one matrix into several).
+		sources         string[]
+		sourceRows      int[]
+		// The LoRA adapters each slot's multiply adds, one list per slot;
+		// empty without adapters.
+		adapters        Adapted[][]
+		// The GGUF names of the expert stacks (gate, up, down), and the
+		// adapters of each expert's multiply by stack and expert; empty
+		// without experts or adapters.
+		expertSources   string[]
+		expertAdapters  Adapted[][][]
 	}
 
 	// The weights of a Gated DeltaNet layer: a recurrent state per value
@@ -1084,68 +1197,75 @@ internal partial module std.ai.llm.model {
 
 	// Everything a forward pass needs.
 	struct ModelParts {
-		info            LanguageModelInfo
-		tokenizer       Tokenizer
-		embedding       Weights
-		output          Weights
-		outputNorm      float32[]
-		layers          Layer[]
-		epsilon         float32
-		pairing         RopeStyle
-		headSize        int
+		info              LanguageModelInfo
+		tokenizer         Tokenizer
+		embedding         Weights
+		output            Weights
+		outputNorm        float32[]
+		layers            Layer[]
+		epsilon           float32
+		pairing           RopeStyle
+		headSize          int
 		// Per-pair RoPE frequency divisors (`rope_freqs.weight`); empty
 		// when the model has none.
-		ropeFactors     float32[]
+		ropeFactors       float32[]
 		// LongRoPE's divisors for contexts up to `originalContext` and
 		// beyond it (Phi-3); empty when the model has none.
-		ropeShort       float32[]
-		ropeLong        float32[]
-		originalContext int
+		ropeShort         float32[]
+		ropeLong          float32[]
+		originalContext   int
 		// Head values RoPE turns, 0 for all; what the turned values are
 		// multiplied by.
-		rotated         int
-		ropeMagnitude   float32
+		rotated           int
+		// Multi-axis RoPE (Qwen 3.5): the pairs each of the time, height and
+		// width positions turns, packed as s0 | s1 << 8 | s2 << 16, with
+		// 1 << 24 when they interleave; 0 for one position.
+		ropeSections      int
+		ropeMagnitude     float32
 		// Multiplies the token embedding (√embedding for Gemma).
-		embeddingScale  float32
+		embeddingScale    float32
 		// Multiplies the attention scores.
-		attentionScale  float32
+		attentionScale    float32
 		// GELU feed-forward (Gemma); SiLU otherwise.
-		gelu            bool
+		gelu              bool
 		// Final logits are capped to ±softCap by tanh; 0 for none.
-		softCap         float32
+		softCap           float32
 		// Attention scores are capped the same way (Gemma 2); 0 for none.
-		attentionCap    float32
+		attentionCap      float32
 		// Experts each token goes through, and what their weights are
 		// multiplied by after normalising.
-		expertsUsed     int
-		expertScale     float32
+		expertsUsed       int
+		expertScale       float32
 		// gpt-oss routing: the router's best logits picked first, their
 		// softmax as the weights; otherwise the softmax of all logits,
 		// renormalised over the picked experts.
-		pickThenSoftmax bool
+		pickThenSoftmax   bool
 		// gpt-oss's SwiGLU: gate clamped to 7, up to ±7 plus one, and
 		// sigmoid(1.702·gate).
-		clampedSwiglu   bool
+		clampedSwiglu     bool
 		// Gated DeltaNet shape (Qwen 3.5): key heads, value heads, the size
 		// of each head and the convolution's width; 0 without such layers.
-		deltaKeyHeads   int
-		deltaValueHeads int
-		deltaHeadSize   int
-		convWidth       int
+		deltaKeyHeads     int
+		deltaValueHeads   int
+		deltaHeadSize     int
+		convWidth         int
 		// Gemma 4's per-layer inputs: each token's embedding for every
 		// layer, the projection of the model embedding onto them and its
 		// RMSNorm, and the values per layer; `none` and 0 without.
-		layerEmbedding  ?Weights
-		layerProjection ?Weights
-		layerNorm       float32[]
-		layerWidth      int
+		layerEmbedding    ?Weights
+		layerProjection   ?Weights
+		layerNorm         float32[]
+		layerWidth        int
 		// The Jinja chat template (`tokenizer.chat_template`); empty when
 		// the file has none.
-		chatTemplate    string
+		chatTemplate      string
+		// LoRA adapters on the token embedding and on the output projection.
+		embeddingAdapters LoraPair[]
+		outputAdapters    Adapted[]
 		// The weights on the GPU; `none` to run on the CPU.
-		device          ?DeviceModel
+		device            ?DeviceModel
 		// The image and audio encoders; `none` without a projector.
-		projector       ?Projector
+		projector         ?Projector
 	}
 
 	// Reads the hyperparameters, tokenizer and weights of a Llama-family
@@ -1156,13 +1276,13 @@ internal partial module std.ai.llm.model {
 	def readParts(file ModelFile) !ModelParts {
 		let arch = file.getString("general.architecture")
 		fail "llm: the model file names no architecture" when arch is none
-		fail "llm: the {arch} architecture is not supported yet" unless arch := "llama" || "qwen2" || "qwen3" || "qwen3moe" || "qwen35" || "gemma2" || "gemma3" || "gemma4" || "phi3" || "gpt-oss"
+		fail "llm: the {arch} architecture is not supported yet" unless arch := "llama" || "qwen2" || "qwen3" || "qwen3moe" || "qwen35" || "qwen35moe" || "gemma2" || "gemma3" || "gemma4" || "phi3" || "gpt-oss"
 		let gemma2 = arch == "gemma2"
 		let gemma4 = arch == "gemma4"
 		let oss = arch == "gpt-oss"
 		// Qwen 3.5: Gated DeltaNet layers, every `interval`-th layer gated
 		// full attention.
-		let hybrid = arch == "qwen35"
+		let hybrid = arch := "qwen35" || "qwen35moe"
 		let intervalValue = file.getInt(arch + ".full_attention_interval")
 		let interval = intervalValue is none ?? (4, intervalValue)
 		// Gemma 2 and gpt-oss slide a window over every other layer, turning
@@ -1172,9 +1292,20 @@ internal partial module std.ai.llm.model {
 		let layers = try required(file, arch + ".block_count")
 		let embedding = try required(file, arch + ".embedding_length")
 		let heads = try required(file, arch + ".attention.head_count")
-		fail "llm: key and value heads that differ per layer are not supported yet" when file.metadata.get(arch + ".attention.head_count_kv") is MetaArray
+		// Qwen 3.5 lists key and value heads per layer, 0 for its Gated
+		// DeltaNet layers; its attention layers share one count.
+		let kvList = file.metadata.get(arch + ".attention.head_count_kv")
 		let kvHeadsValue = file.getInt(arch + ".attention.head_count_kv")
 		let kvHeads = kvHeadsValue is none ?? (heads, kvHeadsValue)
+		if kvList is MetaArray {
+			let counts = kvList.getInts()
+			let attending = 0
+			for let (_, c) in counts {
+				fail "llm: key and value heads that differ per layer are not supported yet" when hybrid ?? (c > 0 && attending > 0 && c != attending, attending >= 0 && c != counts[0])
+				attending = c when c > 0
+			}
+			kvHeads = attending > 0 ?? (attending, heads)
+		}
 		let keyLength = file.getInt(arch + ".attention.key_length")
 		let headSize = keyLength is none ?? (embedding / heads, keyLength)
 		let valueLength = file.getInt(arch + ".attention.value_length")
@@ -1254,6 +1385,15 @@ internal partial module std.ai.llm.model {
 			clampedSwiglu:   oss,
 		}
 		parts.output = file.tensor("output.weight") is none ?? (parts.embedding, try loadWeights(file, "output.weight"))
+		// Qwen 3.5 turns image rows by their time, row and column, its
+		// pairs interleaved among the three (llama.cpp's IMRoPE).
+		let sections = file.metadata.get(arch + ".rope.dimension_sections")
+		let sectionList = file.metadata.get(arch + ".rope.mrope_section")
+		let sectionCounts = sections is MetaArray ?? (sections.getInts(), sectionList is MetaArray ?? (sectionList.getInts(), int[]))
+		if hybrid && sectionCounts.len() > 0 {
+			fail "llm: {arch} names {sectionCounts.len()} RoPE sections" unless sectionCounts.len() >= 3 && sectionCounts[0] < 256 && sectionCounts[1] < 256 && sectionCounts[2] < 256
+			parts.ropeSections = sectionCounts[0] | (sectionCounts[1] << 8) | (sectionCounts[2] << 16) | (1 << 24)
+		}
 		if hybrid {
 			parts.deltaKeyHeads = try required(file, arch + ".ssm.group_count")
 			parts.deltaValueHeads = try required(file, arch + ".ssm.time_step_rank")
@@ -1280,7 +1420,13 @@ internal partial module std.ai.llm.model {
 		for let n = 0; n < layers; n++ {
 			let p = "blk.{n}."
 			if hybrid && (n + 1) % interval != 0 {
-				parts.layers.push(try deltaLayer(file, p))
+				let delta = try deltaLayer(file, p)
+				try readExperts(file, p, delta, parts.expertsUsed) unless file.tensor(p + "ffn_gate_inp.weight") is none
+				// Query, key and value adapters all change the mixed projection.
+				let mixed = p + "attn_qkv.weight"
+				let dense = !(file.tensor(p + "ffn_down.weight") is none)
+				setSources(delta, file, p, string[mixed, mixed, mixed, p + "ssm_out.weight", dense ?? (p + "ffn_gate.weight", ""), dense ?? (p + "ffn_up.weight", ""), dense ?? (p + "ffn_down.weight", "")], int[0, 0, 0, 0, 0, 0, 0])
+				parts.layers.push(delta)
 				continue
 			}
 			// Phi-3 stores the query, key and value rows in one matrix, and
@@ -1290,9 +1436,12 @@ internal partial module std.ai.llm.model {
 			let routed = !(file.tensor(p + "ffn_gate_inp.weight") is none)
 			let paired = !routed && file.tensor(p + "ffn_gate.weight") is none
 			let gateUp = paired ?? (try splitRows(file, p + "ffn_up.weight", int[0, 0]), Weights[])
-			let expertGate = routed ?? (try splitExperts(file, p + "ffn_gate_exps.weight"), Weights[])
-			let expertUp = routed ?? (try splitExperts(file, p + "ffn_up_exps.weight"), Weights[])
-			let expertDown = routed ?? (try splitExperts(file, p + "ffn_down_exps.weight"), Weights[])
+			let gateBytes = routed ?? (try file.pages(p + "ffn_gate_exps.weight"), byte[])
+			let upBytes = routed ?? (try file.pages(p + "ffn_up_exps.weight"), byte[])
+			let downBytes = routed ?? (try file.pages(p + "ffn_down_exps.weight"), byte[])
+			let expertGate = routed ?? (try splitExperts(file, p + "ffn_gate_exps.weight", gateBytes), Weights[])
+			let expertUp = routed ?? (try splitExperts(file, p + "ffn_up_exps.weight", upBytes), Weights[])
+			let expertDown = routed ?? (try splitExperts(file, p + "ffn_down_exps.weight", downBytes), Weights[])
 			fail "llm: {p}ffn_gate_inp routes to {expertGate.len()} experts, fewer than the {parts.expertsUsed} used" when routed && expertGate.len() < parts.expertsUsed.max(1)
 			let sliding = (gemma || oss) && window > 0 && (slidingLayers.len() > 0 ?? (slidingLayers[n], pattern == 0 || n % pattern < pattern - 1))
 			let hs = sliding ?? (slidingHeadSize, headSize)
@@ -1328,6 +1477,9 @@ internal partial module std.ai.llm.model {
 				expertGate:      expertGate,
 				expertUp:        expertUp,
 				expertDown:      expertDown,
+				gateBytes:       gateBytes,
+				upBytes:         upBytes,
+				downBytes:       downBytes,
 				outputBias:      try optionalFloats(file, p + "attn_output.bias"),
 				routerBias:      try optionalFloats(file, p + "ffn_gate_inp.bias"),
 				expertGateBias:  try expertBiases(file, p + "ffn_gate_exps.bias", expertGate.len()),
@@ -1343,6 +1495,15 @@ internal partial module std.ai.llm.model {
 				valueNorm:       gemma4 ?? (ones(hs), float32[]),
 			})
 			let layer = parts.layers[n]
+			// Where each adapter slot's rows come from: Phi-3's query, key and
+			// value are row ranges of attn_qkv, its gate and up of ffn_up; a
+			// Gemma 4 layer without value weights reads its keys as values.
+			let q = heads * headSize
+			let kv = kvHeads * headSize
+			let keyName = hasKey ?? (fused ?? (p + "attn_qkv.weight", p + "attn_k.weight"), "")
+			let valueName = hasValue ?? (fused ?? (p + "attn_qkv.weight", p + "attn_v.weight"), source < 0 && gemma4 ?? (keyName, ""))
+			try readSharedExpert(file, p, layer)
+			setSources(layer, file, p, string[fused ?? (p + "attn_qkv.weight", p + "attn_q.weight"), keyName, valueName, p + "attn_output.weight", routed ?? ("", paired ?? (p + "ffn_up.weight", p + "ffn_gate.weight")), routed ?? ("", p + "ffn_up.weight"), routed ?? ("", p + "ffn_down.weight")], int[0, fused ?? (q, 0), fused ?? (q + kv, 0), 0, 0, paired ?? (layer.gate.rows, 0), 0])
 			layer.ropeMagnitude = parts.ropeMagnitude
 			layer.gatedQuery = hybrid
 			yarn(layer, parts, file, arch, ropeScale) when scaling == "yarn"
@@ -1389,17 +1550,21 @@ internal partial module std.ai.llm.model {
 		let mixed = try loadWeights(file, p + "attn_qkv.weight")
 		let out = try loadWeights(file, p + "ssm_out.weight")
 		let recurrent = Recurrent{
-			mixed:  mixed,
-			z:      try loadWeights(file, p + "attn_gate.weight"),
-			conv:   try file.readFloats(p + "ssm_conv1d.weight"),
-			alpha:  try loadWeights(file, p + "ssm_alpha.weight"),
-			dtBias: try file.readFloats(p + "ssm_dt.bias"),
+			mixed: mixed,
+			z:     try loadWeights(file, p + "attn_gate.weight"),
+			conv:  try file.readFloats(p + "ssm_conv1d.weight"),
+			alpha: try loadWeights(file, p + "ssm_alpha.weight"),
+			// Ollama's files name the bias `ssm_dt`.
+			dtBias: try file.readFloats(file.tensor(p + "ssm_dt.bias") is none ?? (p + "ssm_dt", p + "ssm_dt.bias")),
 			decay:  try file.readFloats(p + "ssm_a"),
 			beta:   try loadWeights(file, p + "ssm_beta.weight"),
 			norm:   try file.readFloats(p + "ssm_norm.weight"),
 			output: out,
 		}
-		let down = try loadWeights(file, p + "ffn_down.weight")
+		// A mixture-of-experts file has no dense feed-forward: the output
+		// projection stands in until `readExperts` sets the experts.
+		let dense = !(file.tensor(p + "ffn_down.weight") is none)
+		let down = dense ?? (try loadWeights(file, p + "ffn_down.weight"), out)
 		return Layer{
 			attentionNorm:   try file.readFloats(p + "attn_norm.weight"),
 			query:           mixed,
@@ -1407,8 +1572,8 @@ internal partial module std.ai.llm.model {
 			value:           mixed,
 			output:          out,
 			feedForwardNorm: try file.readFloats(p + "post_attention_norm.weight"),
-			gate:            try loadWeights(file, p + "ffn_gate.weight"),
-			up:              try loadWeights(file, p + "ffn_up.weight"),
+			gate:            dense ?? (try loadWeights(file, p + "ffn_gate.weight"), out),
+			up:              dense ?? (try loadWeights(file, p + "ffn_up.weight"), out),
 			down:            down,
 			router:          none,
 			ropeBase:        float32(10000),
@@ -1418,6 +1583,40 @@ internal partial module std.ai.llm.model {
 		}
 	}
 
+	// The routed experts of the layer at tensor prefix `p` into `layer`
+	// (a Gated DeltaNet layer of Qwen 3.5 MoE): the router, each expert's
+	// gate, up and down over the file's pages, the first expert as the
+	// layer's `gate`, `up` and `down`, and the shared expert.
+	// Fails when a tensor is missing or cannot be read, or the router
+	// routes to fewer experts than `used`.
+	def readExperts(file ModelFile, p string, layer Layer, used int) !none {
+		layer.router = try loadWeights(file, p + "ffn_gate_inp.weight")
+		layer.gateBytes = try file.pages(p + "ffn_gate_exps.weight")
+		layer.upBytes = try file.pages(p + "ffn_up_exps.weight")
+		layer.downBytes = try file.pages(p + "ffn_down_exps.weight")
+		layer.expertGate = try splitExperts(file, p + "ffn_gate_exps.weight", layer.gateBytes)
+		layer.expertUp = try splitExperts(file, p + "ffn_up_exps.weight", layer.upBytes)
+		layer.expertDown = try splitExperts(file, p + "ffn_down_exps.weight", layer.downBytes)
+		fail "llm: {p}ffn_gate_inp routes to {layer.expertGate.len()} experts, fewer than the {used} used" when layer.expertGate.len() < used.max(1)
+		layer.gate = layer.expertGate[0]
+		layer.up = layer.expertUp[0]
+		layer.down = layer.expertDown[0]
+		layer.routerBias = try optionalFloats(file, p + "ffn_gate_inp.bias")
+		return readSharedExpert(file, p, layer)
+	}
+
+	// The shared expert of the layer at tensor prefix `p` into `layer`,
+	// when the file has one (Qwen 3.5 MoE).
+	// Fails when one of its tensors is missing or cannot be read.
+	def readSharedExpert(file ModelFile, p string, layer Layer) !none {
+		return none when file.tensor(p + "ffn_up_shexp.weight") is none
+		layer.sharedGate = try loadWeights(file, p + "ffn_gate_shexp.weight")
+		layer.sharedUp = try loadWeights(file, p + "ffn_up_shexp.weight")
+		layer.sharedDown = try loadWeights(file, p + "ffn_down_shexp.weight")
+		layer.sharedRouter = try file.readFloats(p + "ffn_gate_inp_shexp.weight")
+		return none
+	}
+
 	// The rows of a 2D tensor split into consecutive matrices of `counts`
 	// rows, sharing the tensor's bytes; zero counts split it evenly.
 	// Fails when the counts do not add up to its rows, or the read fails.
@@ -1425,7 +1624,7 @@ internal partial module std.ai.llm.model {
 		let t = file.tensor(name)
 		fail "llm: no tensor named {name}" when t is none
 		fail "llm: {name} has {t.shape.len()} dimensions, weights have 2" unless t.shape.len() == 2
-		let data = try file.read(name)
+		let data = try file.pages(name)
 		let cols = t.shape[0]
 		let rows = t.shape[1]
 		let size = cols / ai.blockSize(t.kind) * ai.blockBytes(t.kind)
@@ -1513,13 +1712,12 @@ internal partial module std.ai.llm.model {
 	}
 
 	// Each expert's matrix of a 3D expert tensor (one 2D matrix per
-	// expert, stored one after another), sharing the tensor's bytes.
-	// Fails when the tensor is missing or not 3D, or the read fails.
-	def splitExperts(file ModelFile, name string) !Weights[] {
+	// expert, stored one after another), sharing `data`, the tensor's bytes.
+	// Fails when the tensor is missing or not 3D.
+	def splitExperts(file ModelFile, name string, data byte[]) !Weights[] {
 		let t = file.tensor(name)
 		fail "llm: no tensor named {name}" when t is none
 		fail "llm: {name} has {t.shape.len()} dimensions, expert weights have 3" unless t.shape.len() == 3
-		let data = try file.read(name)
 		let cols = t.shape[0]
 		let rows = t.shape[1]
 		let size = rows * (cols / ai.blockSize(t.kind) * ai.blockBytes(t.kind))
@@ -1625,15 +1823,26 @@ internal partial module std.ai.llm.model {
 		snapDelta     float32[][][]
 		// The forward pass on the GPU; `none` on the CPU.
 		device        ?DeviceState
+		// Whether a batch on the GPU rounds its activations to 8 bits (see
+		// `Session.fastPrompt`).
+		rounded       bool
 		// The rows negative token ids stand for: pictures and sounds
 		// through the projector's encoders.
 		rows          map<int, float32[]>
+		// With multi-axis RoPE (`ModelParts.ropeSections`): per cache
+		// position its time, height and width positions, and the position
+		// the next text token takes after it; per encoder row its place in
+		// its grid of rows (index, columns, rows in all).
+		axes          float32[]
+		after         int[]
+		places        map<int, int[]>
 
 		def new(parts ModelParts, context int) {
 			self.parts = parts
 			let model = parts.device
 			device = new DeviceState(parts, model, context) when model is DeviceModel
 			rows = new map<int, float32[]>()
+			places = new map<int, int[]>()
 			let info = parts.info
 			let ffn = widestFeedForward()
 			logits.len(parts.output.rows)
@@ -1677,8 +1886,15 @@ internal partial module std.ai.llm.model {
 			let n = tokens.len()
 			return none when n == 0
 			let gpuState = device
+			placeTokens(tokens, start) unless parts.ropeSections == 0
 			if gpuState is DeviceState {
-				return gpuState.forward(tokens, start, logits, rows)
+				gpuState.rounded = rounded
+				if start == 0 && recurrent() {
+					clearRecurrent()
+					try gpuState.loadRecurrent(convStates, deltaStates)
+				}
+				let turns = parts.ropeSections == 0 ?? (float32[], axes[3 * start:3 * (start + n)])
+				return gpuState.forward(tokens, start, logits, rows, turns)
 			}
 			let eps = parts.epsilon
 			shape(n)
@@ -1692,6 +1908,7 @@ internal partial module std.ai.llm.model {
 					continue
 				}
 				parts.embedding.row(t, row)
+				embed(parts.embeddingAdapters, t, row)
 				scaleBy(row, parts.embeddingScale) unless parts.embeddingScale == float32(1)
 			}
 			layerInputs(tokens) when parts.layerWidth > 0
@@ -1705,25 +1922,32 @@ internal partial module std.ai.llm.model {
 				if !(recurrent is none) {
 					times(recurrent.mixed, bn, bmix)
 					times(recurrent.z, bn, bz)
+					adapt(layer, slotQuery, bn, bmix, n, recurrent.mixed.rows)
+					adapt(layer, slotOutputGate, bn, bz, n, recurrent.z.rows)
 					times(recurrent.alpha, bn, balpha)
 					times(recurrent.beta, bn, bbeta)
 					for let i = 0; i < n; i++ {
 						deltaStep(index, recurrent, i)
 					}
 					times(recurrent.output, bdelta, bproj)
+					adapt(layer, slotOutput, bdelta, bproj, n, recurrent.output.rows)
 					finishLayer(index, layer, n)
 					continue
 				}
 				if layer.gatedQuery {
 					times(layer.query, bn, bqg)
+					adapt(layer, slotQuery, bn, bqg, n, layer.query.rows)
 					splitGatedQueries(n)
 				} else {
 					times(layer.query, bn, bq)
+					adapt(layer, slotQuery, bn, bq, n, layer.query.rows)
 				}
 				let own = layer.sharedCache < 0
 				if own {
 					times(layer.key, bn, bk)
 					times(layer.value, bn, bv)
+					adapt(layer, slotKey, bn, bk, n, layer.key.rows)
+					adapt(layer, slotValue, bn, bv, n, layer.value.rows)
 				}
 				for let i = 0; i < n; i++ {
 					store(index, layer, i, start + i, own)
@@ -1746,11 +1970,13 @@ internal partial module std.ai.llm.model {
 					}
 				}
 				times(layer.output, batt, bproj)
+				adapt(layer, slotOutput, batt, bproj, n, layer.output.rows)
 				finishLayer(index, layer, n)
 			}
 			let last = bx.row(n - 1)
 			rmsNorm(last, parts.outputNorm, eps)
 			parts.output.multiply(last, logits)
+			adaptVector(parts.outputAdapters, last, logits, parts.output.rows)
 			softCap(logits, parts.softCap) when parts.softCap > float32(0)
 			return none
 		}
@@ -1778,6 +2004,8 @@ internal partial module std.ai.llm.model {
 			} else {
 				times(layer.gate, bn, bgate)
 				times(layer.up, bn, bup)
+				adapt(layer, slotGate, bn, bgate, n, layer.gate.rows)
+				adapt(layer, slotUp, bn, bup, n, layer.up.rows)
 				let width = layer.gate.rows
 				for let i = 0; i < n; i++ {
 					let activated = bgate.row(i)[:width]
@@ -1789,6 +2017,7 @@ internal partial module std.ai.llm.model {
 					multiplyInto(activated, bup.row(i)[:width])
 				}
 				times(layer.down, bgate, bproj)
+				adapt(layer, slotDown, bgate, bproj, n, layer.down.rows)
 			}
 			for let i = 0; i < n; i++ {
 				let projected = bproj.row(i)
@@ -1825,7 +2054,7 @@ internal partial module std.ai.llm.model {
 		// embedding (scaled by √width) and the projection of its scaled
 		// model embedding (by 1/√embedding, then RMSNorm per layer), summed
 		// and scaled by 1/√2, into `bpl`.
-		internal def layerInputs(tokens int[]) {
+		def layerInputs(tokens int[]) {
 			let embedding = parts.layerEmbedding
 			let projection = parts.layerProjection
 			return unless embedding is Weights && projection is Weights
@@ -1861,7 +2090,7 @@ internal partial module std.ai.llm.model {
 		}
 
 		// Sizes the batch rows for `n` tokens.
-		internal def shape(n int) {
+		def shape(n int) {
 			return when bx.rows == n
 			let info = parts.info
 			let ffn = widestFeedForward()
@@ -1892,10 +2121,12 @@ internal partial module std.ai.llm.model {
 		}
 
 		// The widest feed-forward of any layer (Gemma 4 widens its later ones).
-		internal def widestFeedForward() int {
+		def widestFeedForward() int {
 			let widest = 0
 			for let (_, layer) in parts.layers {
 				widest = widest.max(layer.gate.rows)
+				let shared = layer.sharedGate
+				widest = widest.max(shared.rows) when shared is Weights
 			}
 			return widest
 		}
@@ -1927,9 +2158,13 @@ internal partial module std.ai.llm.model {
 		}
 
 		// Saves the recurrent state as it is after `position` tokens; the
-		// four newest saves are kept.
-		def snapshot(position int) {
-			return unless recurrent()
+		// four newest saves are kept. On the GPU the state is copied to
+		// host memory first.
+		// Fails when that copy fails.
+		def snapshot(position int) !none {
+			return none unless recurrent()
+			let gpuState = device
+			try gpuState.saveRecurrent(convStates, deltaStates) when gpuState is DeviceState
 			let conv float32[][]
 			let delta float32[][]
 			for let k = 0; k < convStates.len(); k++ {
@@ -1944,24 +2179,119 @@ internal partial module std.ai.llm.model {
 				snapConv.remove(0)
 				snapDelta.remove(0)
 			}
+			return none
 		}
 
 		// Restores the newest save at or before `position` and returns the
-		// position it holds; 0 (a cleared state) when there is none.
-		def restore(position int) int {
+		// position it holds; 0 (a cleared state) when there is none. On the
+		// GPU the state is copied back to the device.
+		// Fails when that copy fails.
+		def restore(position int) !int {
 			let best = -1
 			for let (k, at) in snapPositions {
 				best = k when at <= position && (best < 0 || at >= snapPositions[best])
 			}
 			if best < 0 {
 				clearRecurrent()
-				return 0
+			} else {
+				for let k = 0; k < convStates.len(); k++ {
+					snapConv[best][k].copy(convStates[k])
+					snapDelta[best][k].copy(deltaStates[k])
+				}
 			}
-			for let k = 0; k < convStates.len(); k++ {
-				snapConv[best][k].copy(convStates[k])
-				snapDelta[best][k].copy(deltaStates[k])
+			let gpuState = device
+			try gpuState.loadRecurrent(convStates, deltaStates) when gpuState is DeviceState
+			return best < 0 ?? (0, snapPositions[best])
+		}
+
+		// RoPE of `heads` heads of `hs` values in `x` for the token at cache
+		// position `k`: by its position, or with multi-axis RoPE by its
+		// time, height and width positions (see placeTokens), each pair by
+		// the one its section names.
+		def turn(x float32[], heads int, hs int, layer Layer, turns float32[], k int, back bool = false) {
+			let sections = parts.ropeSections
+			// Back turns by the opposite angle with the same magnitude: the
+			// transpose of the turn, which carries a gradient back through it.
+			let sign = back ?? (-1, 1)
+			if sections == 0 {
+				rope(x, sign * k, heads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+				return
 			}
-			return snapPositions[best]
+			let (t, h, w) = (int(axes[3 * k]), int(axes[3 * k + 1]), int(axes[3 * k + 2]))
+			if t == h && t == w {
+				rope(x, sign * t, heads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+				return
+			}
+			let dims = parts.rotated > 0 ?? (parts.rotated, hs)
+			let pairs = dims / 2
+			let (s0, s1, s2) = (sections & 255, (sections >> 8) & 255, (sections >> 16) & 255)
+			let interleaved = (sections >> 24) & 1 == 1
+			let cs float32[]
+			let sn float32[]
+			cs.len(pairs)
+			sn.len(pairs)
+			for let i = 0; i < pairs; i++ {
+				let sector = i % (s0 + s1 + s2)
+				let p = t
+				if interleaved {
+					if sector % 3 == 1 && sector < 3 * s1 {
+						p = h
+					} else if sector % 3 == 2 && sector < 3 * s2 {
+						p = w
+					}
+				} else if sector >= s0 && sector < s0 + s1 {
+					p = h
+				} else if sector >= s0 + s1 {
+					p = w
+				}
+				let theta = float(p) * float(layer.ropeScale) * float(layer.ropeBase) ** (-2.0 * float(i) / float(dims))
+				theta = theta / float(turns[i]) when i < turns.len()
+				theta = -theta when back
+				cs[i] = float32(math.cos(theta)) * layer.ropeMagnitude
+				sn[i] = float32(math.sin(theta)) * layer.ropeMagnitude
+			}
+			for let head = 0; head < heads; head++ {
+				let o = head * hs
+				for let i = 0; i < pairs; i++ {
+					let a = parts.pairing == RopeStyle.Adjacent ?? (o + 2 * i, o + i)
+					let b = parts.pairing == RopeStyle.Adjacent ?? (a + 1, a + pairs)
+					let va = x[a]
+					let vb = x[b]
+					x[a] = va * cs[i] - vb * sn[i]
+					x[b] = va * sn[i] + vb * cs[i]
+				}
+			}
+		}
+
+		// The time, height and width positions of `tokens` from cache
+		// position `start` on, into `axes` (multi-axis RoPE): a text token
+		// takes the position after the token before it on every axis; the
+		// rows of a grid encoder's picture (see `places`) all take the
+		// picture's first position as their time and that plus their row
+		// and column as height and width, and the token after the picture
+		// takes the first position plus the larger of its rows and
+		// columns (llama.cpp's M-RoPE image positions).
+		def placeTokens(tokens int[], start int) {
+			axes.len((start + tokens.len()) * 3)
+			after.len(start + tokens.len())
+			let next = start == 0 ?? (0, after[start - 1])
+			for let (i, token) in tokens {
+				let k = start + i
+				let place = token < 0 ?? (places.get(token), none)
+				if place is int[] {
+					let (index, columns, count) = (place[0], place[1], place[2])
+					axes[3 * k] = float32(next)
+					axes[3 * k + 1] = float32(next + index / columns)
+					axes[3 * k + 2] = float32(next + index % columns)
+					next = next + (count / columns).max(columns) when index == count - 1
+				} else {
+					axes[3 * k] = float32(next)
+					axes[3 * k + 1] = float32(next)
+					axes[3 * k + 2] = float32(next)
+					next++
+				}
+				after[k] = next
+			}
 		}
 
 		// Splits each head's query and gate out of `bqg` into `bq` and `bqgate`.
@@ -2056,7 +2386,7 @@ internal partial module std.ai.llm.model {
 					rmsNorm(query[h * hs:(h + 1) * hs], layer.queryNorm, eps)
 				}
 			}
-			rope(query, position, info.heads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+			turn(query, info.heads, hs, layer, turns, position)
 			return unless own
 			let key = bk.row(i)[:kvSize]
 			let value = bv.row(i)[:kvSize]
@@ -2072,7 +2402,7 @@ internal partial module std.ai.llm.model {
 					rmsNorm(key[h * hs:(h + 1) * hs], layer.keyNorm, eps)
 				}
 			}
-			rope(key, position, info.kvHeads, hs, layer.ropeBase, parts.pairing, layer.ropeScale, turns, parts.rotated, layer.ropeMagnitude)
+			turn(key, info.kvHeads, hs, layer, turns, position)
 			let kc = keys[index]
 			let vc = values[index]
 			let at = position * kvSize
@@ -2150,23 +2480,48 @@ internal partial module std.ai.llm.model {
 			}
 			clearRange(projected, 0, projected.len())
 			for let (k, e) in picked {
-				layer.expertGate[e].multiply(normed, gated)
-				layer.expertUp[e].multiply(normed, upped)
-				if layer.expertGateBias.len() > 0 {
-					addInto(gated, layer.expertGateBias[e])
-					addInto(upped, layer.expertUpBias[e])
-				}
-				if parts.clampedSwiglu {
-					clampedSwiglu(gated, upped)
-				} else {
-					silu(gated)
-					multiplyInto(gated, upped)
-				}
-				layer.expertDown[e].multiply(gated, expertOut)
-				addInto(expertOut, layer.expertDownBias[e]) when layer.expertDownBias.len() > 0
+				expertOutput(parts, layer, e, normed, gated, upped, expertOut)
 				addScaled(projected, 0, expertOut, 0, weights[k] * parts.expertScale, projected.len())
 			}
+			let (sharedGate, sharedUp, sharedDown) = (layer.sharedGate, layer.sharedUp, layer.sharedDown)
+			if sharedGate is Weights && sharedUp is Weights && sharedDown is Weights {
+				let width = sharedGate.rows
+				sharedGate.multiply(normed, gated[:width])
+				sharedUp.multiply(normed, upped[:width])
+				adaptVector(slotAdapted(layer, slotSharedGate), normed, gated, width)
+				adaptVector(slotAdapted(layer, slotSharedUp), normed, upped, width)
+				silu(gated[:width])
+				multiplyInto(gated[:width], upped[:width])
+				sharedDown.multiply(gated[:width], expertOut)
+				adaptVector(slotAdapted(layer, slotSharedDown), gated, expertOut, sharedDown.rows)
+				let share = float32(1.0 / (1.0 + math.E ** (-float(dot(normed, 0, layer.sharedRouter, 0, normed.len())))))
+				addScaled(projected, 0, expertOut, 0, share, projected.len())
+			}
 		}
+	}
+
+	// Expert `e` of `layer` on the vector x into `out` (the model's width):
+	// its gate and up halves (adapters and biases included) into `gated`
+	// and `upped`, their SwiGLU (gpt-oss's clamped one for such models),
+	// and its down projection.
+	def expertOutput(parts ModelParts, layer Layer, e int, x float32[], gated float32[], upped float32[], out float32[]) {
+		layer.expertGate[e].multiply(x, gated)
+		layer.expertUp[e].multiply(x, upped)
+		adaptVector(expertAdapted(layer, 0, e), x, gated, layer.expertGate[e].rows)
+		adaptVector(expertAdapted(layer, 1, e), x, upped, layer.expertUp[e].rows)
+		if layer.expertGateBias.len() > 0 {
+			addInto(gated, layer.expertGateBias[e])
+			addInto(upped, layer.expertUpBias[e])
+		}
+		if parts.clampedSwiglu {
+			clampedSwiglu(gated, upped)
+		} else {
+			silu(gated)
+			multiplyInto(gated, upped)
+		}
+		layer.expertDown[e].multiply(gated, out)
+		adaptVector(expertAdapted(layer, 2, e), gated, out, layer.expertDown[e].rows)
+		addInto(out, layer.expertDownBias[e]) when layer.expertDownBias.len() > 0
 	}
 
 	// gate = min(gate, 7) · sigmoid(1.702 · min(gate, 7)) · (clamp(up, ±7) + 1),

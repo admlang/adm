@@ -1,0 +1,377 @@
+partial module std.ai.llm {
+	// A LoRA adapter in a GGUF file, as llama.cpp's convert_lora_to_gguf.py
+	// and `Tuning.save` write it, and how strongly its change applies: 1 as
+	// trained, 0 not at all, a negative scale takes it away.
+	struct Adapter {
+		path  string
+		scale float  = 1.0
+	}
+
+	// The weight matrices of each layer a tuning changes.
+	enum Target {
+		// The attention's query, key, value and output projections.
+		Query,
+		Key,
+		Value,
+		Output,
+		// The feed-forward's gate, up and down projections.
+		Gate,
+		Up,
+		Down,
+	}
+}
+
+internal partial module std.ai.llm.model {
+	use (
+		std.formats.ai
+		std.formats.ai::(ModelFile, TensorType, TensorInfo)
+		std.ai.tensor::(Weights)
+		std.ai.tensor.gemm::*
+		std.ai.llm::*
+	)
+
+	// The adapter slots of a layer: the multiplies an adapter can add to,
+	// numbered as `Target` orders them.
+	const slotQuery = 0
+	const slotKey = 1
+	const slotValue = 2
+	const slotOutput = 3
+	const slotGate = 4
+	const slotUp = 5
+	const slotDown = 6
+	// A shared expert's gate, up and down (Qwen 3.5 MoE), and a Gated
+	// DeltaNet layer's output gate (`attn_gate`).
+	const slotSharedGate = 7
+	const slotSharedUp = 8
+	const slotSharedDown = 9
+	const slotOutputGate = 10
+	const slotCount = 11
+
+	// A LoRA pair on a weight matrix W of `rows` × `cols`: a multiply by W
+	// gives W·x + scale · B·(A·x), with A `rank` × cols and B rows × `rank`.
+	// A stack of experts' matrices has one pair per expert, held one after
+	// another in `a` and `b`. The token embedding's pair is read the other
+	// way (see `embed`).
+	type LoraPair {
+		// The GGUF name of W ("blk.0.attn_q.weight").
+		name    string
+		a       matrix<float32>
+		b       matrix<float32>
+		scale   float32
+		rank    int
+		// The experts the pair holds pairs for; 1 for a plain matrix.
+		experts int             = 1
+		// While tuning: the gradients of A and B (as their cells), and
+		// Adam's first and second moments of each; empty otherwise.
+		gradA   float32[]
+		gradB   float32[]
+		meanA   float32[]
+		meanB   float32[]
+		varA    float32[]
+		varB    float32[]
+		// The pair on the GPU, for a model there; and whether its values
+		// there are newer than `a` and `b` (tuned on the GPU since they
+		// were read back).
+		device  ?DevicePair
+		stale   bool
+
+		def new(name string, a matrix<float32>, b matrix<float32>, scale float32, rank int, experts int = 1) {
+			self.name = name
+			self.a = a
+			self.b = b
+			self.scale = scale
+			self.rank = rank
+			self.experts = experts
+		}
+	}
+
+	// What one slot's multiply reads of a pair: A's rows from `aFrom` on
+	// (an expert's), and B's rows from `from` on, as many as the slot's
+	// matrix has (Phi-3's query, key and value share the pair of
+	// attn_qkv).
+	struct Adapted {
+		pair  LoraPair
+		from  int
+		aFrom int
+	}
+
+	// `to` (first `rows` columns of its first n rows) += each adapter of
+	// `layer`'s `slot` applied to the first n rows of `from`.
+	def adapt(layer Layer, slot int, from matrix<float32>, to matrix<float32>, n int, rows int) {
+		return unless slot < layer.adapters.len()
+		for let (_, adapted) in layer.adapters[slot] {
+			applyPair(adapted, from, to, n, rows)
+		}
+	}
+
+	// `to` += scale · B·(A·x) for the first n rows of `from` and the
+	// `rows` rows of B from `adapted.from`.
+	def applyPair(adapted Adapted, from matrix<float32>, to matrix<float32>, n int, rows int) {
+		let pair = adapted.pair
+		let r = pair.rank
+		let cols = pair.a.cols
+		let low float32[]
+		low.len(n * r)
+		gemm(n, r, cols, float32(1), from.data(), 0, from.cols, false, pair.a.data(), adapted.aFrom * cols, cols, true, float32(0), low, 0, r)
+		gemm(n, rows, r, pair.scale, low, 0, r, false, pair.b.data(), adapted.from * r, r, true, float32(1), to.data(), 0, to.cols)
+	}
+
+	// The first `rows` values of out += each of `adapters` applied to the
+	// vector x (one token's multiply).
+	def adaptVector(adapters Adapted[], x float32[], out float32[], rows int) {
+		for let (_, adapted) in adapters {
+			let pair = adapted.pair
+			let r = pair.rank
+			let low float32[]
+			low.len(r)
+			for let k = 0; k < r; k++ {
+				low[k] = dot(pair.a.row(adapted.aFrom + k), 0, x, 0, pair.a.cols)
+			}
+			let b = pair.b.data()
+			for let o = 0; o < rows; o++ {
+				out[o] += pair.scale * dot(b, (adapted.from + o) * r, low, 0, r)
+			}
+		}
+	}
+
+	// The token embedding's adapters added to `row`, token `token`'s
+	// embedding: scale · B·a with a the token's row of A (llama.cpp keeps
+	// A as vocabulary × rank and B as width × rank for this tensor).
+	def embed(pairs LoraPair[], token int, row float32[]) {
+		for let (_, pair) in pairs {
+			let a = pair.a.row(token)
+			for let e = 0; e < row.len(); e++ {
+				let b = pair.b.row(e)
+				let sum = float32(0)
+				for let k = 0; k < a.len(); k++ {
+					sum += b[k] * a[k]
+				}
+				row[e] += pair.scale * sum
+			}
+		}
+	}
+
+	// Reads the LoRA adapter `adapter` names and adds its pairs to the
+	// slots of `parts` whose matrices it changes.
+	// Fails when the file cannot be read, is not a LoRA adapter for this
+	// architecture, names a tensor the model has no slot for, or a pair's
+	// shapes do not fit the matrix it changes.
+	def loadAdapter(parts ModelParts, adapter Adapter) !none {
+		let file = try ai.load(adapter.path)
+		defer file.close()
+		let kind = orEmpty(file.getString("general.type"))
+		fail "llm: {adapter.path} is not an adapter (general.type is \"{kind}\")" unless kind == "adapter"
+		let arch = orEmpty(file.getString("general.architecture"))
+		fail "llm: {adapter.path} is an adapter for \"{arch}\", the model is {parts.info.architecture}" unless arch == parts.info.architecture
+		let shape = orEmpty(file.getString("adapter.type"))
+		fail "llm: {adapter.path} is a \"{shape}\" adapter, not LoRA" unless shape == "lora"
+		fail "llm: {adapter.path} is an activated LoRA (adapter.alora.invocation_tokens), which is not supported" unless file.metadata.get("adapter.alora.invocation_tokens") is none
+		let alphaValue = file.getFloat("adapter.lora.alpha")
+		let alpha = alphaValue is none ?? (0.0, alphaValue)
+		let places = slotPlaces(parts)
+		let expertPlaces = expertSlotPlaces(parts)
+		let pairs = new map<string, bool>()
+		for let (_, t) in file.tensors {
+			let name = t.name
+			if name.endsWith(".lora_a") {
+				pairs.set(name.slice(0, name.len() - 7), true)
+			} else if name.endsWith(".lora_b") {
+				pairs.set(name.slice(0, name.len() - 7), true)
+			} else if !name.endsWith("_norm.weight") {
+				// llama.cpp skips norm vectors in adapters too.
+				fail "llm: {adapter.path} holds {name}, which is neither half of a LoRA pair"
+			}
+		}
+		for let (name, _) in pairs {
+			let a = file.tensor(name + ".lora_a")
+			let b = file.tensor(name + ".lora_b")
+			fail "llm: {adapter.path} has {name}.lora_b without its lora_a" when a is none
+			fail "llm: {adapter.path} has {name}.lora_a without its lora_b" when b is none
+			let stacked = a.shape.len() == 3
+			fail "llm: {adapter.path}: {name}'s halves are neither both 2D nor both 3D" unless a.shape.len() == b.shape.len() && (a.shape.len() == 2 || stacked)
+			let experts = stacked ?? (a.shape[2], 1)
+			fail "llm: {adapter.path}: {name}'s halves hold pairs for {experts} and {b.shape[2]} experts" when stacked && b.shape[2] != experts
+			let am = matrix<float32>[].size(a.shape[1] * experts, a.shape[0])
+			let bm = matrix<float32>[].size(b.shape[1] * experts, b.shape[0])
+			(try file.readFloats(name + ".lora_a")).copy(am.data())
+			(try file.readFloats(name + ".lora_b")).copy(bm.data())
+			let rank = a.shape[1]
+			if name == "token_embd.weight" {
+				// A is vocabulary × rank, B width × rank.
+				fail "llm: {adapter.path}: token_embd.weight's halves do not fit the embedding" unless !stacked && am.rows == parts.embedding.rows && bm.rows == parts.embedding.cols && am.cols == bm.cols
+				parts.embeddingAdapters.push(new LoraPair(name, am, bm, scaleOf(alpha, am.cols, adapter.scale), am.cols))
+				continue
+			}
+			fail "llm: {adapter.path}: {name}.lora_a has rank {rank} and lora_b {bm.cols}; they must agree" unless rank == bm.cols
+			let pair = new LoraPair(name, am, bm, scaleOf(alpha, rank, adapter.scale), rank, experts)
+			if name == "output.weight" {
+				fail "llm: {adapter.path}: output.weight's halves do not fit the output projection" unless !stacked && am.cols == parts.output.cols && bm.rows == parts.output.rows
+				parts.outputAdapters.push(Adapted{pair: pair, from: 0})
+				continue
+			}
+			if stacked {
+				let found = expertPlaces.get(name)
+				fail "llm: {adapter.path} changes {name}, which this model has no adapter place for" when found is none
+				let layer = parts.layers[found.layer]
+				let stack = expertWeights(layer, found.slot)
+				fail "llm: {adapter.path}: {name} holds pairs for {experts} experts, the layer has {stack.len()}" unless experts == stack.len()
+				let w = stack[0]
+				let rows = bm.rows / experts
+				fail "llm: {adapter.path}: {name}'s halves do not fit the experts ({am.cols} columns, {rows} rows)" unless am.cols == w.cols && rows == w.rows
+				for let e = 0; e < experts; e++ {
+					addExpertAdapted(layer, found.slot, e, Adapted{pair: pair, from: e * rows, aFrom: e * rank})
+				}
+				continue
+			}
+			let found = places.get(name)
+			fail "llm: {adapter.path} changes {name}, which this model has no adapter place for" when found is none
+			for let (_, place) in found {
+				let layer = parts.layers[place.layer]
+				let w = slotWeights(layer, place.slot)
+				fail "llm: {adapter.path}: {name}'s halves do not fit the matrix ({am.cols} columns, {bm.rows} rows)" unless am.cols == w.cols && place.from + w.rows <= bm.rows
+				addAdapted(layer, place.slot, Adapted{pair: pair, from: place.from})
+			}
+		}
+		return none
+	}
+
+	// The scale llama.cpp gives a pair: alpha / rank times the adapter's
+	// scale, or the adapter's scale alone when the file has no alpha.
+	def scaleOf(alpha float, rank int, scale float) float32 {
+		return float32(alpha == 0.0 ?? (scale, scale * alpha / float(rank)))
+	}
+
+	// A slot of a layer: the place an adapter's pair goes.
+	struct SlotPlace {
+		layer int
+		slot  int
+		from  int
+	}
+
+	// Every slot of every layer by the GGUF name of the matrix it reads.
+	def slotPlaces(parts ModelParts) map<string, SlotPlace[]> {
+		let places = new map<string, SlotPlace[]>()
+		for let (n, layer) in parts.layers {
+			for let (slot, name) in layer.sources {
+				continue when name.len() == 0
+				let list = places.get(name)
+				let held = list is none ?? (SlotPlace[], list)
+				held.push(SlotPlace{layer: n, slot: slot, from: layer.sourceRows[slot]})
+				places.set(name, held)
+			}
+		}
+		return places
+	}
+
+	// The matrix the multiply of `slot` reads.
+	def slotWeights(layer Layer, slot int) Weights {
+		let recurrent = layer.recurrent
+		if recurrent is Recurrent {
+			return recurrent.mixed when slot == slotQuery || slot == slotKey || slot == slotValue
+			return recurrent.output when slot == slotOutput
+			return recurrent.z when slot == slotOutputGate
+		}
+		let (sharedGate, sharedUp, sharedDown) = (layer.sharedGate, layer.sharedUp, layer.sharedDown)
+		return sharedGate when slot == slotSharedGate && sharedGate is Weights
+		return sharedUp when slot == slotSharedUp && sharedUp is Weights
+		return sharedDown when slot == slotSharedDown && sharedDown is Weights
+		return slot == slotQuery ?? (layer.query, slot == slotKey ?? (layer.key, slot == slotValue ?? (layer.value, slot == slotOutput ?? (layer.output, slot == slotGate ?? (layer.gate, slot == slotUp ?? (layer.up, layer.down))))))
+	}
+
+	// The experts' matrices of expert slot `slot` (0 gate, 1 up, 2 down).
+	def expertWeights(layer Layer, slot int) Weights[] {
+		return slot == 0 ?? (layer.expertGate, slot == 1 ?? (layer.expertUp, layer.expertDown))
+	}
+
+	// Every expert stack of every layer by its GGUF name: the layer and
+	// its expert slot.
+	def expertSlotPlaces(parts ModelParts) map<string, SlotPlace> {
+		let places = new map<string, SlotPlace>()
+		for let (n, layer) in parts.layers {
+			for let (slot, name) in layer.expertSources {
+				places.set(name, SlotPlace{layer: n, slot: slot, from: 0}) when name.len() > 0
+			}
+		}
+		return places
+	}
+
+	// Records the GGUF matrices `layer`'s adapter slots read: the
+	// attention's and feed-forward's as the caller gives them in `base`
+	// and `rows` (it knows Phi-3's splits and Gemma 4's missing keys), the
+	// shared expert's, a Gated DeltaNet layer's output gate and the expert
+	// stacks by the names `file` holds at prefix `p`.
+	def setSources(layer Layer, file ModelFile, p string, base string[], rows int[]) {
+		let named = def (name string) string {
+			return file.tensor(p + name) is none ?? ("", p + name)
+		}
+		layer.sources = base.clone()
+		layer.sourceRows = rows.clone()
+		layer.sources.push(named("ffn_gate_shexp.weight"), named("ffn_up_shexp.weight"), named("ffn_down_shexp.weight"), layer.recurrent is none ?? ("", named("attn_gate.weight")))
+		layer.sourceRows.push(0, 0, 0, 0)
+		layer.expertSources = string[named("ffn_gate_exps.weight"), named("ffn_up_exps.weight"), named("ffn_down_exps.weight")] unless layer.router is none
+	}
+
+	// Adds `adapted` to expert `expert` of `layer`'s expert slot `slot`.
+	def addExpertAdapted(layer Layer, slot int, expert int, adapted Adapted) {
+		for layer.expertAdapters.len() < 3 {
+			let lists Adapted[][]
+			for let e = 0; e < layer.expertGate.len(); e++ {
+				lists.push(Adapted[])
+			}
+			layer.expertAdapters.push(lists)
+		}
+		layer.expertAdapters[slot][expert].push(adapted)
+	}
+
+	// The adapters of `layer`'s `slot`.
+	def slotAdapted(layer Layer, slot int) Adapted[] {
+		return slot < layer.adapters.len() ?? (layer.adapters[slot], Adapted[])
+	}
+
+	// The adapters of expert `expert` in `layer`'s expert slot `slot`.
+	def expertAdapted(layer Layer, slot int, expert int) Adapted[] {
+		return Adapted[] unless slot < layer.expertAdapters.len()
+		return layer.expertAdapters[slot][expert]
+	}
+
+	// Adds `adapted` to `layer`'s `slot`.
+	def addAdapted(layer Layer, slot int, adapted Adapted) {
+		for layer.adapters.len() < slotCount {
+			layer.adapters.push(Adapted[])
+		}
+		layer.adapters[slot].push(adapted)
+	}
+
+	// Writes `pairs` as a GGUF LoRA adapter for `arch` with `alpha`: each
+	// pair's A as `<name>.lora_a` and B as `<name>.lora_b`, float32.
+	// Fails when the file cannot be written.
+	def saveAdapter(path string, arch string, alpha float, pairs LoraPair[]) !none {
+		let file = new ModelFile()
+		file.metadata.set("general.type", "adapter")
+		file.metadata.set("general.architecture", arch)
+		file.metadata.set("adapter.type", "lora")
+		file.metadata.set("adapter.lora.alpha", alpha)
+		for let (_, pair) in pairs {
+			let e = pair.experts
+			let aShape = e > 1 ?? (int[pair.a.cols, pair.rank, e], int[pair.a.cols, pair.rank])
+			let bShape = e > 1 ?? (int[pair.rank, pair.b.rows / e, e], int[pair.rank, pair.b.rows])
+			try file.add(TensorInfo{name: pair.name + ".lora_a", kind: TensorType.F32, shape: aShape}, floatBytes(pair.a.data()))
+			try file.add(TensorInfo{name: pair.name + ".lora_b", kind: TensorType.F32, shape: bShape}, floatBytes(pair.b.data()))
+		}
+		return file.save(path)
+	}
+
+	// `values` as little-endian float32 bytes.
+	def floatBytes(values float32[]) byte[] {
+		let out byte[]
+		out.len(values.len() * 4)
+		for let (i, v) in values {
+			let bits = int(__bitcast_u32_from_f32(v))
+			out[4 * i] = byte(bits & 0xFF)
+			out[4 * i + 1] = byte((bits >> 8) & 0xFF)
+			out[4 * i + 2] = byte((bits >> 16) & 0xFF)
+			out[4 * i + 3] = byte((bits >> 24) & 0xFF)
+		}
+		return out
+	}
+}

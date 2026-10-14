@@ -1,5 +1,6 @@
 internal partial module std.ai.llm.model {
 	use (
+		std.os
 		std.gpu
 		std.ai.tensor::(Weights, RopeStyle)
 		std.ai.tensor.gpu::*
@@ -8,6 +9,9 @@ internal partial module std.ai.llm.model {
 
 	// One layer's weights on the GPU, and where its vectors (norm weights,
 	// biases, RoPE divisors) start in `DeviceModel.vectors`; -1 for none.
+	// A mixture-of-experts layer has a `router` and `experts`, whose slots
+	// its `gate`, `up` and `down` are; its expert biases hold every
+	// expert's, one expert after another.
 	struct DeviceLayer {
 		query           DeviceWeights
 		// `none` for a layer attending over an earlier layer's cache.
@@ -19,6 +23,8 @@ internal partial module std.ai.llm.model {
 		down            DeviceWeights
 		inputGate       ?DeviceWeights
 		inputProjection ?DeviceWeights
+		router          ?DeviceWeights
+		experts         ?DeviceExperts
 		attentionNorm   int
 		queryBias       int
 		keyBias         int
@@ -31,6 +37,79 @@ internal partial module std.ai.llm.model {
 		feedForwardNorm int
 		feedForwardPost int
 		inputPost       int
+		routerBias      int
+		expertGateBias  int
+		expertUpBias    int
+		expertDownBias  int
+		sinks           int
+		// A Gated DeltaNet layer's other weights and vectors (Qwen 3.5);
+		// its `query` is the mixed projection and `output` the output one.
+		recurrent       ?DeviceRecurrent
+		// The shared expert and where its router vector starts (Qwen 3.5
+		// MoE); none and -1 without one.
+		sharedGate      ?DeviceWeights
+		sharedUp        ?DeviceWeights
+		sharedDown      ?DeviceWeights
+		sharedRouter    int
+	}
+
+	// A Gated DeltaNet layer on the GPU beside its DeviceLayer: the gate,
+	// alpha and beta projections, and where its convolution weights,
+	// time-step biases, decays and norm weight start in the vectors.
+	struct DeviceRecurrent {
+		z      DeviceWeights
+		alpha  DeviceWeights
+		beta   DeviceWeights
+		conv   int
+		dtBias int
+		decay  int
+		norm   int
+	}
+
+	// The activations of a Gated DeltaNet layer for `rows` tokens: the mixed
+	// projection, its convolution, the gate, alpha and beta projections and
+	// the heads' output.
+	struct DeltaBuffers {
+		mixed gpu.DeviceBuffer<float32>
+		y     gpu.DeviceBuffer<float32>
+		z     gpu.DeviceBuffer<float32>
+		alpha gpu.DeviceBuffer<float32>
+		beta  gpu.DeviceBuffer<float32>
+		out   gpu.DeviceBuffer<float32>
+	}
+
+	// Gated DeltaNet buffers for `n` tokens of `parts`.
+	// Fails when the device memory runs out.
+	def deltaBuffers(parts ModelParts, n int) !DeltaBuffers {
+		let channels = (2 * parts.deltaKeyHeads + parts.deltaValueHeads) * parts.deltaHeadSize
+		let values = parts.deltaValueHeads * parts.deltaHeadSize
+		return DeltaBuffers{
+			mixed: try gpu.upload(zeroValues(n * channels)),
+			y:     try gpu.upload(zeroValues(n * channels)),
+			z:     try gpu.upload(zeroValues(n * values)),
+			alpha: try gpu.upload(zeroValues(n * parts.deltaValueHeads)),
+			beta:  try gpu.upload(zeroValues(n * parts.deltaValueHeads)),
+			out:   try gpu.upload(zeroValues(n * values)),
+		}
+	}
+
+	// Frees the device memory of `b`.
+	def freeDelta(b DeltaBuffers) {
+		for let (_, buffer) in gpu.DeviceBuffer<float32>[b.mixed, b.y, b.z, b.alpha, b.beta, b.out] {
+			buffer.dispose()
+		}
+	}
+
+	// `n` zeros.
+	def zeroValues(n int) float32[] {
+		let out float32[]
+		out.len(n.max(1))
+		return out
+	}
+
+	// The float32 values deltaBuffers allocates per token.
+	def deltaValues(parts ModelParts) int {
+		return 2 * (2 * parts.deltaKeyHeads + parts.deltaValueHeads) * parts.deltaHeadSize + 2 * parts.deltaValueHeads * parts.deltaHeadSize + 2 * parts.deltaValueHeads
 	}
 
 	// A model's weights on the GPU. The token embeddings stay in host
@@ -43,6 +122,14 @@ internal partial module std.ai.llm.model {
 		vectors         gpu.DeviceBuffer<float32>
 		outputNorm      int
 		layerNorm       int
+		// Two arenas when layers hold their experts in part, else none: a
+		// batch runs the experts outside a layer's slots from them,
+		// `arenaPlaces` at a time and the two in turn, so that experts
+		// are copied into one while those in the other are computed.
+		arenas          ExpertArena[]
+		// With the arenas: the table of the experts a batch moves into a
+		// layer's slots.
+		entered         ?ExpertWindow
 
 		def new(layers DeviceLayer[], output DeviceWeights, layerProjection ?DeviceWeights, vectors gpu.DeviceBuffer<float32>) {
 			self.layers = layers
@@ -58,10 +145,22 @@ internal partial module std.ai.llm.model {
 		let projection = parts.layerProjection
 		return "{projection.kind.name} per-layer projection has no GPU kernel" when projection is Weights && !onDevice(projection.kind)
 		for let (n, layer) in parts.layers {
-			return "layer {n} is recurrent (Gated DeltaNet)" unless layer.recurrent is none
-			return "layer {n} routes to experts" unless layer.router is none
-			return "layer {n} has attention sinks" when layer.sinks.len() > 0
-			return "layer {n} gates its attention output" when layer.gatedQuery
+			let recurrent = layer.recurrent
+			if recurrent is Recurrent {
+				return "layer {n} has Gated DeltaNet heads of {parts.deltaHeadSize} values; the GPU kernels take multiples of 32 up to 256" unless parts.deltaHeadSize % 32 == 0 && parts.deltaHeadSize <= 256
+				return "layer {n} has a convolution of {parts.convWidth}; the GPU kernels take up to 9" unless parts.convWidth >= 1 && parts.convWidth <= 9
+				for let (_, w) in Weights[recurrent.mixed, recurrent.z, recurrent.alpha, recurrent.beta, recurrent.output] {
+					return "layer {n} has {w.kind.name} weights, which have no GPU kernel" unless onDevice(w.kind)
+				}
+			}
+			for let (_, shared) in [layer.sharedGate, layer.sharedUp, layer.sharedDown] {
+				return "layer {n} has {shared.kind.name} shared expert weights, which have no GPU kernel" when shared is Weights && !onDevice(shared.kind)
+			}
+			let router = layer.router
+			if router is Weights {
+				return "layer {n} has {router.kind.name} router weights, which have no GPU kernel" unless onDevice(router.kind)
+				return "layer {n} uses {parts.expertsUsed} experts per token, and the GPU kernels take 1 to {maxExpertsUsed}" unless parts.expertsUsed >= 1 && parts.expertsUsed <= maxExpertsUsed
+			}
 			for let (_, w) in Weights[layer.query, layer.key, layer.value, layer.output, layer.gate, layer.up, layer.down] {
 				return "layer {n} has {w.kind.name} weights, which have no GPU kernel" unless onDevice(w.kind)
 			}
@@ -73,27 +172,59 @@ internal partial module std.ai.llm.model {
 		return none
 	}
 
-	// Copies the weights of `parts` to the GPU.
+	// Copies the weights of `parts` to the GPU. A mixture-of-experts layer
+	// keeps `expertSlots` of its experts there at a time (at least those a
+	// token uses; 0 for all of them) and the others in host memory, which
+	// tasks page-lock beside the upload (`DeviceExperts`). Layers held in
+	// part share two arenas of `places` experts for their batches
+	// (`DeviceModel.arenas`): `arenaPlaces` of them when the model has the
+	// layers for it (`sharesArenas`) and none otherwise, unless `places`
+	// says how many. The call waits
+	// for those still at it in the end: once a session queues launches
+	// without pause, the driver may keep such a task waiting for seconds,
+	// and its layer copies from the file meanwhile. With `cacheBytes` >= 0
+	// those caches take at most that many bytes together, each layer a
+	// share in proportion to what it would take without the bound.
 	// Fails when a part has no GPU kernel or the device memory runs out.
-	def uploadModel(parts ModelParts) !DeviceModel {
+	def uploadModel(parts ModelParts, expertSlots int = 0, places int = -1, cacheBytes int = -1) !DeviceModel {
 		let gap = deviceGap(parts)
 		fail "llm: the GPU cannot run this model: {gap}" unless gap is none
+		// The page-locked bytes the caches would take without a bound.
+		let unbounded = 0
+		for let (_, layer) in parts.layers {
+			continue when layer.router is none || expertSlots <= 0
+			let experts = layer.expertGate.len()
+			let held = expertSlots.max(parts.expertsUsed).min(experts)
+			continue when held == experts
+			let room = cacheRoom(held, experts)
+			unbounded += room * (layer.gate.data.len() + layer.up.data.len() + layer.down.data.len())
+		}
+		let bounded = cacheBytes >= 0 && unbounded > cacheBytes
 		let all float32[]
 		let layers DeviceLayer[]
 		for let (_, layer) in parts.layers {
-			let own = layer.sharedCache < 0
+			let recurrent = layer.recurrent
+			let own = layer.sharedCache < 0 && recurrent is none
 			let gate = layer.inputGate
 			let projection = layer.inputProjection
+			let router = layer.router
+			let experts = layer.expertGate.len()
+			let slots = expertSlots > 0 ?? (expertSlots, experts)
+			let room = cacheRoom(slots.max(parts.expertsUsed).min(experts), experts)
+			let entries = bounded ?? (int(float(room) * float(cacheBytes) / float(unbounded)), -1)
+			let held = router is Weights ?? (try uploadExperts(layer.expertGate, layer.expertUp, layer.expertDown, layer.gateBytes, layer.upBytes, layer.downBytes, slots, parts.expertsUsed, entries = entries), none)
 			layers.push(DeviceLayer{
-				query:           try upload(layer.query),
+				query:           try upload(recurrent is Recurrent ?? (recurrent.mixed, layer.query)),
 				key:             own ?? (try upload(layer.key), none),
 				value:           own ?? (try upload(layer.value), none),
-				output:          try upload(layer.output),
-				gate:            try upload(layer.gate),
-				up:              try upload(layer.up),
-				down:            try upload(layer.down),
+				output:          try upload(recurrent is Recurrent ?? (recurrent.output, layer.output)),
+				gate:            held is DeviceExperts ?? (held.gate, try upload(layer.gate)),
+				up:              held is DeviceExperts ?? (held.up, try upload(layer.up)),
+				down:            held is DeviceExperts ?? (held.down, try upload(layer.down)),
 				inputGate:       gate is Weights ?? (try upload(gate), none),
 				inputProjection: projection is Weights ?? (try upload(projection), none),
+				router:          router is Weights ?? (try upload(router), none),
+				experts:         held,
 				attentionNorm:   place(all, layer.attentionNorm),
 				queryBias:       place(all, layer.queryBias),
 				keyBias:         place(all, layer.keyBias),
@@ -106,6 +237,24 @@ internal partial module std.ai.llm.model {
 				feedForwardNorm: place(all, layer.feedForwardNorm),
 				feedForwardPost: place(all, layer.feedForwardPost),
 				inputPost:       place(all, layer.inputPost),
+				routerBias:      place(all, layer.routerBias),
+				expertGateBias:  placeAll(all, layer.expertGateBias),
+				expertUpBias:    placeAll(all, layer.expertUpBias),
+				expertDownBias:  placeAll(all, layer.expertDownBias),
+				sinks:           place(all, layer.sinks),
+				recurrent:       recurrent is Recurrent ?? (DeviceRecurrent{
+					z:      try upload(recurrent.z),
+					alpha:  try upload(recurrent.alpha),
+					beta:   try upload(recurrent.beta),
+					conv:   place(all, recurrent.conv),
+					dtBias: place(all, recurrent.dtBias),
+					decay:  place(all, recurrent.decay),
+					norm:   place(all, recurrent.norm),
+				}, none),
+				sharedGate:   try uploadOptional(layer.sharedGate),
+				sharedUp:     try uploadOptional(layer.sharedUp),
+				sharedDown:   try uploadOptional(layer.sharedDown),
+				sharedRouter: place(all, layer.sharedRouter),
 			})
 		}
 		let outputNorm = place(all, parts.outputNorm)
@@ -115,17 +264,231 @@ internal partial module std.ai.llm.model {
 		let model = new DeviceModel(layers, try upload(parts.output), layerProjection is Weights ?? (try upload(layerProjection), none), try gpu.upload(all))
 		model.outputNorm = outputNorm
 		model.layerNorm = layerNorm
+		// With room for the largest experts of the layers held in part.
+		let (outside, most, gateBytes, upBytes, downBytes) = (0, 0, 0, 0, 0)
+		for let (n, layer) in layers {
+			let held = layer.experts
+			continue unless held is DeviceExperts && !held.whole()
+			let from = parts.layers[n]
+			most = most.max(held.count())
+			outside = outside.max(held.outside())
+			gateBytes = gateBytes.max(from.expertGate[0].data.len())
+			upBytes = upBytes.max(from.expertUp[0].data.len())
+			downBytes = downBytes.max(from.expertDown[0].data.len())
+		}
+		let each = (places < 0 ?? (sharesArenas(parts) ?? (arenaPlaces, 0), places)).min(outside)
+		for let k = 0; k < 2 && each > 0; k++ {
+			model.arenas.push(try expertArena(gateBytes, upBytes, downBytes, each, most))
+		}
+		model.entered = try expertWindow(most) when each > 0
+		for let (_, layer) in layers {
+			let held = layer.experts
+			try held.awaitCache() when held is DeviceExperts
+		}
 		return model
 	}
 
-	// The weights of `parts` on the GPU, or none when the GPU cannot run
-	// them or its memory runs out.
-	def uploadIfPossible(parts ModelParts) ?DeviceModel {
-		return none unless deviceGap(parts) is none
-		let model = uploadModel(parts) onerror (err error) {
+	// The weights of `parts` on the GPU within `budget` bytes of its
+	// memory and `hostBudget` of host memory (see `uploadFitting`), or
+	// none when the GPU cannot run them or they do not fit.
+	def uploadIfPossible(parts ModelParts, budget int, hostBudget int = 0) ?DeviceModel {
+		let model = uploadFitting(parts, budget, hostBudget) onerror (err error) {
 			return none
 		}
 		return model
+	}
+
+	// Copies the weights of `parts` to the GPU, a mixture-of-experts
+	// layer keeping as many of its experts there as fit `budget` bytes of
+	// device memory, or the device's free memory when that is less or
+	// `budget` is 0 (see `expertSlots`), and the page-locked copies of the
+	// others within `hostBudget` bytes, or what the system has available
+	// less a reserve when that is less or `hostBudget` is 0
+	// (`hostCacheBudget`).
+	// Fails when a part has no GPU kernel or that memory does not hold
+	// the model with the experts of one token per layer.
+	def uploadFitting(parts ModelParts, budget int, hostBudget int = 0) !DeviceModel {
+		let gap = deviceGap(parts)
+		fail "llm: the GPU cannot run this model: {gap}" unless gap is none
+		let free = gpu.freeMemory()
+		let room = budget > 0 && (free == 0 || budget < free) ?? (budget, free)
+		// A Qwen image encoder runs on the GPU beside the model.
+		let projector = parts.projector
+		let vision = projector is Projector ?? (projector.vision, none)
+		room -= visionBytes(vision) when room > 0 && vision is QwenVisionEncoder
+		let model = try uploadModel(parts, try expertSlots(parts, room), cacheBytes = hostCacheBudget(hostBudget))
+		vision.device = try uploadVision(vision) when vision is QwenVisionEncoder
+		return model
+	}
+
+	// Bytes of host memory the experts' page-locked caches may take:
+	// `asked` when it is less than the system's available memory less a
+	// reserve, else that; -1 (no bound) when the system does not say what
+	// it has. Page-locked memory can be neither swapped nor reclaimed, so
+	// the reserve, an eighth of all memory and at least 16 GiB, is kept
+	// for the other programs of a machine in use (a tenth of the
+	// available memory, 9 GiB, froze a 125 GiB desktop once its builds
+	// grew; with 16 GiB Qwen 3.5 122B keeps all its experts and the
+	// desktop 28 GiB).
+	def hostCacheBudget(asked int) int {
+		let available = memoryInfo("MemAvailable:")
+		return asked > 0 ?? (asked, -1) when available <= 0
+		let total = memoryInfo("MemTotal:").max(available)
+		let room = (available - (total / 8).max(16 << 30)).max(0)
+		return asked > 0 && asked < room ?? (asked, room)
+	}
+
+	// Bytes of host memory the system can give without swapping (Linux's
+	// MemAvailable, which counts the file pages it can drop), or 0 when
+	// it does not say.
+	def availableMemory() int {
+		return memoryInfo("MemAvailable:")
+	}
+
+	// The bytes /proc/meminfo gives for `field` (with its colon), or 0
+	// when it does not.
+	internal def memoryInfo(field string) int {
+		let text = os.readFile("/proc/meminfo") onerror (err error) {
+			return 0
+		}
+		for let (_, line) in string(text).split("\n") {
+			continue unless line.startsWith(field)
+			let kib = line.slice(field.len()).trim().trimEnd(" kB").trim()
+			return kib.toInt<int>() * 1024
+		}
+		return 0
+	}
+
+	// Whether a model that holds the experts of `parts` in slots gets
+	// arenas for its batches: with more than two mixture-of-experts layers
+	// to share them. With fewer, two arenas take the memory of the slots
+	// they stand in for.
+	def sharesArenas(parts ModelParts) bool {
+		let routed = 0
+		for let (_, layer) in parts.layers {
+			routed++ unless layer.router is none
+		}
+		return routed > 2
+	}
+
+	// Experts in each of the two arenas of a model that holds experts in
+	// slots (`DeviceModel.arenas`). The copies into them run at the rate
+	// of the bus whatever their size, so a few experts do.
+	const arenaPlaces = 16
+
+	// Tokens from which a batch runs the experts outside a layer's slots
+	// from the arenas.
+	const lendFrom = 2
+
+	// Positions of key and value caches, and tokens of a prompt batch, that
+	// `expertSlots` leaves device memory for beside the weights.
+	const reservedContext = 4096
+	const reservedBatch = 512
+
+	// The experts each mixture-of-experts layer of `parts` keeps on the GPU
+	// (`uploadModel`'s `expertSlots`) for the weights to fit `budget` bytes
+	// of device memory with room left for one session of `reservedContext`
+	// positions (or the model's length, if shorter), a batch of
+	// `reservedBatch` tokens and the two arenas (`sharesArenas`):
+	// 0, every expert, when they all fit, when the
+	// model has no such layer, and for a budget of 0 (unknown).
+	// Fails when the budget does not hold the experts of one token per layer.
+	def expertSlots(parts ModelParts, budget int) !int {
+		// Bytes of the weights every layer keeps on the GPU whatever the
+		// slots, of one slot in every routed layer, and of a position in
+		// the caches; `one` holds the largest gate, up and down matrix of
+		// an expert.
+		// The driver hands out device memory in 2 MiB pages, so each buffer
+		// is counted rounded up to them (about 0.6 GiB over the 500-odd
+		// buffers of Qwen 3.5 122B).
+		let paged = def (bytes int) int {
+			return (bytes + devicePage - 1) / devicePage * devicePage
+		}
+		let (fixed, slot, position) = (paged(parts.output.data.len()), 0, 0)
+		let one = int[0, 0, 0]
+		let experts = 0
+		let projection = parts.layerProjection
+		fixed += paged(projection.data.len()) when projection is Weights
+		// Bytes of a session's Gated DeltaNet states.
+		let states = 0
+		for let (_, layer) in parts.layers {
+			let recurrent = layer.recurrent
+			if recurrent is Recurrent {
+				fixed += paged(recurrent.mixed.data.len()) + paged(recurrent.z.data.len()) + paged(recurrent.alpha.data.len()) + paged(recurrent.beta.data.len()) + paged(recurrent.output.data.len())
+				states += 4 * ((parts.convWidth - 1) * (2 * parts.deltaKeyHeads + parts.deltaValueHeads) + parts.deltaValueHeads * parts.deltaHeadSize) * parts.deltaHeadSize
+			} else {
+				fixed += paged(layer.query.data.len()) + paged(layer.output.data.len())
+				if layer.sharedCache < 0 {
+					fixed += paged(layer.key.data.len()) + paged(layer.value.data.len())
+					position += 2 * 4 * parts.info.kvHeads * layer.headSize
+				}
+			}
+			for let (_, shared) in [layer.sharedGate, layer.sharedUp, layer.sharedDown] {
+				fixed += paged(shared.data.len()) when shared is Weights
+			}
+			let (gate, input, router) = (layer.inputGate, layer.inputProjection, layer.router)
+			fixed += paged(gate.data.len()) when gate is Weights
+			fixed += paged(input.data.len()) when input is Weights
+			if router is Weights {
+				// The three expert stacks each end in a part page.
+				fixed += paged(router.data.len()) + 3 * devicePage
+				slot += layer.gate.data.len() + layer.up.data.len() + layer.down.data.len()
+				one[0] = one[0].max(layer.gate.data.len())
+				one[1] = one[1].max(layer.up.data.len())
+				one[2] = one[2].max(layer.down.data.len())
+				experts = experts.max(layer.expertGate.len())
+			} else {
+				fixed += paged(layer.gate.data.len()) + paged(layer.up.data.len()) + paged(layer.down.data.len())
+			}
+		}
+		return 0 when budget <= 0 || slot == 0
+		// A cache grows by doubling, the old one freed after the copy.
+		let session = reservedContext.min(parts.info.contextLength) * position * 3 / 2 + states + 4 * batchValues(parts, reservedBatch)
+		let slots = (budget - fixed - session) / slot
+		return 0 when slots >= experts
+		// The most slots that fit with the two arenas, which hold
+		// `arenaPlaces` experts or all those outside the slots, if fewer.
+		let arena = sharesArenas(parts) ?? (one[0] + one[1] + one[2], 0)
+		slots = experts - 1
+		for slots > 0 && slots * slot + 2 * arenaPlaces.min(experts - slots) * arena > budget - fixed - session {
+			slots--
+		}
+		let least = parts.expertsUsed.max(1)
+		fail "llm: the model needs {(fixed + session + least * slot + 2 * arenaPlaces.min(experts - least) * arena) >> 20} MiB of GPU memory with {least} experts a layer, and {budget >> 20} MiB are free" when slots < least
+		return slots
+	}
+
+	// The unit device memory is allocated in.
+	const devicePage = 2 << 20
+
+	// The float32 values DeviceState.newBatch allocates for `n` tokens.
+	def batchValues(parts ModelParts, n int) int {
+		let info = parts.info
+		let (widest, head, experts, extra) = (0, 0, 0, 0)
+		let (recurrent, gated, shared) = (false, false, false)
+		for let (_, layer) in parts.layers {
+			widest = widest.max(layer.gate.rows * (layer.router is none ?? (1, parts.expertsUsed)))
+			head = head.max(layer.headSize)
+			experts = experts.max(layer.expertGate.len())
+			recurrent = recurrent || !(layer.recurrent is none)
+			gated = gated || layer.gatedQuery
+			shared = shared || !(layer.sharedGate is none)
+		}
+		// DeviceBatch's Gated DeltaNet buffers, gated queries and shared
+		// expert output.
+		extra += deltaValues(parts) when recurrent
+		extra += 3 * info.heads * head when gated
+		extra += info.embedding when shared
+		let perToken = 3 * info.embedding + 2 * info.heads * head + 2 * widest + (2 * info.layers + 1) * parts.layerWidth + experts + 2 * parts.expertsUsed + extra
+		let grouped = groupsPay(n, parts.expertsUsed, experts) ?? (n * parts.expertsUsed * info.embedding, 0)
+		return n * perToken + grouped + groupsSize(n, experts) + splitWork
+	}
+
+	// `w` on the GPU, or none for none.
+	// Fails when the device memory runs out.
+	def uploadOptional(w ?Weights) !?DeviceWeights {
+		return none when w is none
+		return try upload(w)
 	}
 
 	// Appends `v` to `all` and returns where it starts, or -1 when empty.
@@ -136,43 +499,99 @@ internal partial module std.ai.llm.model {
 		return at
 	}
 
+	// Appends the vectors of `each`, one after another, to `all` and
+	// returns where the first starts, or -1 when there are none.
+	def placeAll(all float32[], each float32[][]) int {
+		return -1 when each.len() == 0
+		let at = all.len()
+		for let (_, v) in each {
+			all.push(...v)
+		}
+		return at
+	}
+
 	// A session's forward pass on the GPU: its KV caches and the
 	// activations of the token being run, all resident on the device.
 	type DeviceState {
-		parts     ModelParts
-		model     DeviceModel
-		context   int
+		parts       ModelParts
+		model       DeviceModel
+		context     int
 		// Positions the caches hold room for; they grow up to `context`.
-		capacity  int
+		capacity    int
 		// Per layer, its cached keys and values (one value for a layer
 		// sharing another's cache).
-		keys      gpu.DeviceBuffer<float32>[]
-		values    gpu.DeviceBuffer<float32>[]
+		keys        gpu.DeviceBuffer<float32>[]
+		values      gpu.DeviceBuffer<float32>[]
 		// The residual stream, its normed copy, queries, attention output,
 		// projections, feed-forward halves, per-layer inputs and one
 		// layer's gated input, the token's per-layer embedding, attention's
 		// partial sums and the logits.
-		x         gpu.DeviceBuffer<float32>
-		normed    gpu.DeviceBuffer<float32>
-		q         gpu.DeviceBuffer<float32>
-		attended  gpu.DeviceBuffer<float32>
-		projected gpu.DeviceBuffer<float32>
-		gated     gpu.DeviceBuffer<float32>
-		upped     gpu.DeviceBuffer<float32>
-		inputs    gpu.DeviceBuffer<float32>
-		input     gpu.DeviceBuffer<float32>
-		embedded  gpu.DeviceBuffer<float32>
-		work      gpu.DeviceBuffer<float32>
-		logits    gpu.DeviceBuffer<float32>
+		x           gpu.DeviceBuffer<float32>
+		normed      gpu.DeviceBuffer<float32>
+		q           gpu.DeviceBuffer<float32>
+		attended    gpu.DeviceBuffer<float32>
+		projected   gpu.DeviceBuffer<float32>
+		gated       gpu.DeviceBuffer<float32>
+		upped       gpu.DeviceBuffer<float32>
+		inputs      gpu.DeviceBuffer<float32>
+		input       gpu.DeviceBuffer<float32>
+		embedded    gpu.DeviceBuffer<float32>
+		work        gpu.DeviceBuffer<float32>
+		logits      gpu.DeviceBuffer<float32>
+		// A mixture-of-experts layer's router scores and its picks (see
+		// pickExperts); `gated` then holds each picked expert's half.
+		routed      gpu.DeviceBuffer<float32>
+		picks       gpu.DeviceBuffer<float32>
+		// The picks read back for a layer that holds a part of its
+		// experts, the experts they name, and the readback of `picks` a
+		// token's layers use (see mixExperts); none when every layer holds
+		// all its experts.
+		pickRows    float32[]
+		wanted      int[]
+		pickBack    ?gpu.Readback<float32>
 		// Per layer, its RoPE table (see ropeTable) one after another, and
 		// where each starts.
-		turns     gpu.DeviceBuffer<float32>
-		turnAt    int[]
+		turns       gpu.DeviceBuffer<float32>
+		turnAt      int[]
 		// Host rows the embeddings are read into.
-		row       float32[]
-		layerRow  float32[]
+		row         float32[]
+		layerRow    float32[]
 		// The buffers of a batch of prompt tokens (see `run`).
-		batch     ?DeviceBatch
+		batch       ?DeviceBatch
+		// Whether a batch multiplies activations rounded to 8 bits where
+		// the weights allow it (see DeviceWeights.multiplyRounded).
+		rounded     bool
+		// Per layer, a Gated DeltaNet layer's convolution inputs and head
+		// states (as ForwardState's convStates and deltaStates; one value
+		// for other layers), and one token's buffers for such layers.
+		convStates  gpu.DeviceBuffer<float32>[]
+		deltaStates gpu.DeviceBuffer<float32>[]
+		delta       ?DeltaBuffers
+		// Gated queries (Qwen 3.5): each head's query and gate as the
+		// projection writes them, and the gates.
+		qg          ?gpu.DeviceBuffer<float32>
+		qgate       ?gpu.DeviceBuffer<float32>
+		// A shared expert's output (Qwen 3.5 MoE).
+		shared      ?gpu.DeviceBuffer<float32>
+		// The multi-axis RoPE positions of the tokens being run (three per
+		// token, see ForwardState.placeTokens), and whether there are any.
+		axes        gpu.DeviceBuffer<float32>
+		hasAxes     bool
+		// A token's experts computed on the host (see mixExperts): its normed
+		// row, one expert's halves and output, their weighted sum, and the
+		// device buffer the sum crosses in.
+		hostNormed  float32[]
+		hostGated   float32[]
+		hostUpped   float32[]
+		hostExpert  float32[]
+		hostSum     float32[]
+		awayRoom    ?gpu.DeviceBuffer<float32>
+		// The adapters' low-rank products for a batch; none until a layer
+		// with adapters runs.
+		low         ?gpu.DeviceBuffer<float32>
+		// Layers whose experts have adapters run through this (see
+		// DeviceMixer); none until one runs.
+		mixer       ?DeviceMixer
 
 		def new(parts ModelParts, model DeviceModel, context int) {
 			self.parts = parts
@@ -184,12 +603,8 @@ internal partial module std.ai.llm.model {
 		// Fails when the device memory runs out.
 		def open() !none {
 			let info = parts.info
-			let widest = 0
-			let widestHead = 0
-			for let (_, layer) in parts.layers {
-				widest = widest.max(layer.gate.rows)
-				widestHead = widestHead.max(layer.headSize)
-			}
+			let widest = widestHalves()
+			let widestHead = widestHead()
 			let width = parts.layerWidth
 			x = try zeros(info.embedding)
 			normed = try zeros(info.embedding)
@@ -202,6 +617,14 @@ internal partial module std.ai.llm.model {
 			input = try zeros(width.max(1))
 			embedded = try zeros((info.layers * width).max(1))
 			logits = try zeros(parts.output.rows)
+			routed = try zeros(mostExperts().max(1))
+			picks = try zeros((2 * parts.expertsUsed).max(1))
+			for let (_, layer) in model.layers {
+				let held = layer.experts
+				if held is DeviceExperts {
+					pickBack = try picks.readback(overlap = true) when pickBack is none && !held.whole()
+				}
+			}
 			row.len(info.embedding)
 			layerRow.len(info.layers * width)
 			// The divisors this context calls for, as ForwardState picks them.
@@ -217,25 +640,153 @@ internal partial module std.ai.llm.model {
 			turns = try gpu.upload(tables)
 			capacity = context.min(1024)
 			for let (_, layer) in parts.layers {
-				let size = layer.sharedCache < 0 ?? (capacity * info.kvHeads * layer.headSize, 1)
+				let size = layer.sharedCache < 0 && layer.recurrent is none ?? (capacity * info.kvHeads * layer.headSize, 1)
 				keys.push(try zeros(size))
 				values.push(try zeros(size))
+				let recurrent = !(layer.recurrent is none)
+				convStates.push(try zeros(recurrent ?? ((parts.convWidth - 1) * deltaChannels(), 1)))
+				deltaStates.push(try zeros(recurrent ?? (parts.deltaValueHeads * parts.deltaHeadSize * parts.deltaHeadSize, 1)))
+				delta = try deltaBuffers(parts, 1) when recurrent && delta is none
+				if layer.gatedQuery && qg is none {
+					qg = try zeros(2 * info.heads * widestHead)
+					qgate = try zeros(info.heads * widestHead)
+				}
+				shared = try zeros(info.embedding) when !(layer.sharedGate is none) && shared is none
 			}
-			work = try zeros(partsSize(info.heads, widestHead(), capacity))
+			work = try zeros(partsSize(info.heads, widestHead, capacity))
+			axes = try zeros(3)
 			return none
 		}
 
+		// The channels of a Gated DeltaNet layer's convolution.
+		internal def deltaChannels() int {
+			return (2 * parts.deltaKeyHeads + parts.deltaValueHeads) * parts.deltaHeadSize
+		}
+
+		// The recurrent states into `conv` and `delta` (one array per
+		// layer, as ForwardState keeps them).
+		// Fails when a copy fails.
+		def saveRecurrent(conv float32[][], delta float32[][]) !none {
+			try open() when capacity == 0
+			for let k = 0; k < convStates.len(); k++ {
+				continue when parts.layers[k].recurrent is none
+				try convStates[k].download(conv[k])
+				try deltaStates[k].download(delta[k])
+			}
+			return none
+		}
+
+		// The recurrent states from `conv` and `delta`.
+		// Fails when a copy fails.
+		def loadRecurrent(conv float32[][], delta float32[][]) !none {
+			try open() when capacity == 0
+			for let k = 0; k < convStates.len(); k++ {
+				continue when parts.layers[k].recurrent is none
+				try convStates[k].write(conv[k])
+				try deltaStates[k].write(delta[k])
+			}
+			return none
+		}
+
+		// Layer `index`, a Gated DeltaNet layer, for the n tokens whose
+		// normed rows (of e values) are in `normed`: its output projection
+		// into `projected`, as ForwardState.deltaStep computes it. `split`
+		// is the column-split room of a batch's multiplies.
+		// Fails when a launch fails.
+		internal def deltaLayer(index int, d DeviceLayer, r DeviceRecurrent, normed gpu.DeviceBuffer<float32>, projected gpu.DeviceBuffer<float32>, buffers DeltaBuffers, n int, split ?gpu.DeviceBuffer<float32>) !none {
+			let e = parts.info.embedding
+			let channels = deltaChannels()
+			let (kHeads, vHeads, hs) = (parts.deltaKeyHeads, parts.deltaValueHeads, parts.deltaHeadSize)
+			let values = vHeads * hs
+			try times(d.query, normed, e, buffers.mixed, channels, n, split)
+			try times(r.z, normed, e, buffers.z, values, n, split)
+			let layer = parts.layers[index]
+			try adapted(slotAdapted(layer, slotQuery), normed, 0, e, buffers.mixed, 0, channels, n, channels)
+			try adapted(slotAdapted(layer, slotOutputGate), normed, 0, e, buffers.z, 0, values, n, values)
+			try times(r.alpha, normed, e, buffers.alpha, vHeads, n, split)
+			try times(r.beta, normed, e, buffers.beta, vHeads, n, split)
+			let v = model.vectors
+			try deltaConv(buffers.mixed, channels, v, r.conv, convStates[index], buffers.y, channels, parts.convWidth, n)
+			try deltaNorms(buffers.y, channels, kHeads, hs, n, parts.epsilon, n * 2 * kHeads * 32)
+			try deltaRecur(buffers.y, channels, kHeads, vHeads, hs, buffers.alpha, buffers.beta, v, r.dtBias, r.decay, deltaStates[index], buffers.out, n, values * 32)
+			try deltaGate(buffers.out, buffers.z, v, r.norm, vHeads, hs, n, parts.epsilon, n * vHeads * 32)
+			try times(d.output, buffers.out, values, projected, e, n, split)
+			return adapted(slotAdapted(layer, slotOutput), buffers.out, 0, values, projected, 0, e, n, e)
+		}
+
+		// The mixer for layers whose experts have adapters.
+		internal def adaptedMixer() DeviceMixer {
+			let held = mixer
+			return held when held is DeviceMixer
+			let made = new DeviceMixer(parts, model)
+			mixer = made
+			return made
+		}
+
+		// out (n rows from oo, os apart, `rows` values each) += the adapters
+		// of `list` on the n rows of x (from xo, xs apart).
+		// Fails when a launch fails or the device memory runs out.
+		internal def adapted(list Adapted[], x gpu.DeviceBuffer<float32>, xo int, xs int, out gpu.DeviceBuffer<float32>, oo int, os int, n int, rows int) !none {
+			return none when list.len() == 0
+			let needed = n * widestRank(parts)
+			let held = low
+			let room = held is gpu.DeviceBuffer<float32> && held.len() >= needed ?? (held, try zeros(needed))
+			if !(held is gpu.DeviceBuffer<float32> && held.len() >= needed) {
+				held.dispose() when held is gpu.DeviceBuffer<float32>
+				low = room
+			}
+			return adaptDevice(list, x, xo, xs, out, oo, os, n, rows, room)
+		}
+
+		// w times the n rows of `x` (rows of xs values) into the rows of
+		// `out` (os values each): one row by `multiply`, more by
+		// `multiplyTokens` with the column-split room `split`.
+		// Fails when a launch fails.
+		internal def times(w DeviceWeights, x gpu.DeviceBuffer<float32>, xs int, out gpu.DeviceBuffer<float32>, os int, n int, split ?gpu.DeviceBuffer<float32>) !none {
+			return w.multiply(x, 0, out, 0) when n == 1 || split is none
+			return w.multiplyTokens(x, 0, xs, out, 0, os, n, split)
+		}
+
+		// The shared expert of layer `d` on the n normed rows (of e values)
+		// added to the experts' output in `projected`; `gated` and `upped`
+		// hold its halves and `out` its output on the way.
+		// Fails when a launch fails.
+		internal def addSharedExpert(layer Layer, d DeviceLayer, normed gpu.DeviceBuffer<float32>, projected gpu.DeviceBuffer<float32>, gated gpu.DeviceBuffer<float32>, upped gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, n int, split ?gpu.DeviceBuffer<float32>) !none {
+			let (gate, up, down) = (d.sharedGate, d.sharedUp, d.sharedDown)
+			return none unless gate is DeviceWeights && up is DeviceWeights && down is DeviceWeights
+			let e = parts.info.embedding
+			let width = gate.rows
+			try times(gate, normed, e, gated, width, n, split)
+			try times(up, normed, e, upped, width, n, split)
+			try adapted(slotAdapted(layer, slotSharedGate), normed, 0, e, gated, 0, width, n, width)
+			try adapted(slotAdapted(layer, slotSharedUp), normed, 0, e, upped, 0, width, n, width)
+			try activate(gated, 0, 0, upped, 0, 0, n * width, n * width, 0)
+			try times(down, gated, width, out, e, n, split)
+			try adapted(slotAdapted(layer, slotSharedDown), gated, 0, width, out, 0, e, n, e)
+			return addShared(projected, out, normed, model.vectors, d.sharedRouter, e, n * 256)
+		}
+
 		// Runs `tokens` at positions from `start` on, leaving the last
-		// one's next-token logits in `out`.
+		// one's next-token logits in `out`. With multi-axis RoPE, `turns`
+		// holds each token's time, height and width positions (empty
+		// otherwise).
 		// Fails when a launch or copy fails.
 		// Negative tokens stand for the `rows` they key.
-		def forward(tokens int[], start int, out float32[], rows map<int, float32[]>) !none {
+		def forward(tokens int[], start int, out float32[], rows map<int, float32[]>, turns float32[] = float32[]) !none {
 			try open() when capacity == 0
+			hasAxes = turns.len() > 0
+			if hasAxes {
+				if axes.len() < turns.len() {
+					axes.dispose()
+					axes = try zeros(turns.len())
+				}
+				try axes.write(turns, 0)
+			}
 			if tokens.len() > 1 && widestHead() <= 512 {
 				try run(tokens, start, rows)
 			} else {
 				for let (i, token) in tokens {
-					try step(token, start + i, i == tokens.len() - 1, rows)
+					try step(token, start + i, i == tokens.len() - 1, rows, i)
 				}
 			}
 			try logits.download(out)
@@ -243,7 +794,7 @@ internal partial module std.ai.llm.model {
 		}
 
 		// One token through every layer; the logits only when `last`.
-		internal def step(token int, position int, last bool, rows map<int, float32[]>) !none {
+		internal def step(token int, position int, last bool, rows map<int, float32[]>, axisAt int = 0) !none {
 			let info = parts.info
 			let e = info.embedding
 			let eps = parts.epsilon
@@ -254,6 +805,7 @@ internal partial module std.ai.llm.model {
 				copyInto(held, row) unless held is none
 			} else {
 				parts.embedding.row(token, row)
+				embed(parts.embeddingAdapters, token, row)
 				scaleBy(row, parts.embeddingScale) unless parts.embeddingScale == float32(1)
 			}
 			try x.write(row)
@@ -281,35 +833,73 @@ internal partial module std.ai.llm.model {
 				// `normed` holds the attention norm of x.
 				let key = d.key
 				let value = d.value
-				if key is DeviceWeights && value is DeviceWeights {
+				let recurrent = d.recurrent
+				let (both, gates, buffers) = (qg, qgate, delta)
+				if recurrent is DeviceRecurrent && buffers is DeltaBuffers {
+					try deltaLayer(index, d, recurrent, normed, projected, buffers, 1, none)
+				} else if key is DeviceWeights && value is DeviceWeights {
 					let at = position * kvSize
 					let kc = keys[index]
 					let vc = values[index]
-					try multiplyThree(d.query, key, value, normed, q, 0, kc, at, vc, at)
+					if layer.gatedQuery && both is gpu.DeviceBuffer<float32> && gates is gpu.DeviceBuffer<float32> {
+						try multiplyThree(d.query, key, value, normed, both, 0, kc, at, vc, at)
+						try adapted(slotAdapted(layer, slotQuery), normed, 0, e, both, 0, 0, 1, d.query.rows)
+						try splitGated(both, q, gates, hs, info.heads * hs)
+					} else {
+						try multiplyThree(d.query, key, value, normed, q, 0, kc, at, vc, at)
+						try adapted(slotAdapted(layer, slotQuery), normed, 0, e, q, 0, 0, 1, d.query.rows)
+					}
+					try adapted(slotAdapted(layer, slotKey), normed, 0, e, kc, at, 0, 1, kvSize)
+					try adapted(slotAdapted(layer, slotValue), normed, 0, e, vc, at, 0, 1, kvSize)
 					try bias(q, 0, d.queryBias, info.heads * hs)
 					try bias(kc, at, d.keyBias, kvSize)
 					try bias(vc, at, d.valueBias, kvSize)
 					let blocks = info.heads + info.kvHeads + (d.valueNorm >= 0 ?? (info.kvHeads, 0))
-					try prepareQkv(q, kc, vc, at, info.heads, info.kvHeads, hs, v, d.queryNorm, d.keyNorm, d.valueNorm, eps, position, turns, turnAt, dims, halves, layer.ropeMagnitude, blocks * 256)
+					try prepareQkv(q, kc, vc, at, info.heads, info.kvHeads, hs, v, d.queryNorm, d.keyNorm, d.valueNorm, eps, position, axes, hasAxes ?? (axisAt, -1), parts.ropeSections, turns, turnAt, dims, halves, layer.ropeMagnitude, blocks * 256)
 				} else {
-					try d.query.multiply(normed, 0, q, 0)
+					if layer.gatedQuery && both is gpu.DeviceBuffer<float32> && gates is gpu.DeviceBuffer<float32> {
+						try d.query.multiply(normed, 0, both, 0)
+						try adapted(slotAdapted(layer, slotQuery), normed, 0, e, both, 0, 0, 1, d.query.rows)
+						try splitGated(both, q, gates, hs, info.heads * hs)
+					} else {
+						try d.query.multiply(normed, 0, q, 0)
+						try adapted(slotAdapted(layer, slotQuery), normed, 0, e, q, 0, 0, 1, d.query.rows)
+					}
 					try bias(q, 0, d.queryBias, info.heads * hs)
-					try prepareHeads(q, 0, hs, info.heads, d.queryNorm >= 0 ?? (1, 0), v, d.queryNorm, eps, 1, position, turns, turnAt, dims, halves, layer.ropeMagnitude, info.heads * 256)
+					try prepareHeads(q, 0, hs, info.heads, d.queryNorm >= 0 ?? (1, 0), v, d.queryNorm, eps, 1, position, axes, hasAxes ?? (axisAt, -1), parts.ropeSections, turns, turnAt, dims, halves, layer.ropeMagnitude, info.heads * 256)
 				}
-				let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
-				let first = layer.window > 0 ?? ((position - layer.window + 1).max(0), 0)
-				try attention(q, keys[cache], values[cache], attended, work, info.heads, info.kvHeads, hs, first, position + 1 - first, parts.attentionScale, parts.attentionCap)
-				try d.output.multiply(attended, 0, projected, 0)
-				try bias(projected, 0, d.outputBias, e)
+				if recurrent is none {
+					let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
+					let first = layer.window > 0 ?? ((position - layer.window + 1).max(0), 0)
+					try attention(q, keys[cache], values[cache], attended, work, info.heads, info.kvHeads, hs, first, position + 1 - first, parts.attentionScale, parts.attentionCap, model.vectors, d.sinks)
+					try gateValues(attended, gates, info.heads * hs) when layer.gatedQuery && gates is gpu.DeviceBuffer<float32>
+					try d.output.multiply(attended, 0, projected, 0)
+					try adapted(slotAdapted(layer, slotOutput), attended, 0, 0, projected, 0, 0, 1, e)
+					try bias(projected, 0, d.outputBias, e)
+				}
 				try addNormed(x, projected, e, v, d.attentionPost, eps, float32(1), normed, d.feedForwardNorm, 256)
-				if d.gate.kind == d.up.kind {
+				let router = d.router
+				let held = d.experts
+				if router is DeviceWeights && held is DeviceExperts && layer.expertAdapters.len() > 0 {
+					try adaptedMixer().forward(layer, d, held, normed, projected, 1)
+				} else if router is DeviceWeights && held is DeviceExperts {
+					try router.multiply(normed, 0, routed, 0)
+					try mixExperts(d, layer, held, routed, picks, normed, gated, projected, 1, pickBack, false)
+					let out = shared
+					try addSharedExpert(layer, d, normed, projected, gated, upped, out, 1, none) when out is gpu.DeviceBuffer<float32>
+				} else if d.gate.kind == d.up.kind && slotAdapted(layer, slotGate).len() == 0 && slotAdapted(layer, slotUp).len() == 0 {
 					try d.gate.multiplyGated(d.up, normed, gated, parts.gelu)
 				} else {
 					try d.gate.multiply(normed, 0, gated, 0)
 					try d.up.multiply(normed, 0, upped, 0)
+					try adapted(slotAdapted(layer, slotGate), normed, 0, 0, gated, 0, 0, 1, layer.gate.rows)
+					try adapted(slotAdapted(layer, slotUp), normed, 0, 0, upped, 0, 0, 1, layer.up.rows)
 					try activate(gated, 0, 0, upped, 0, 0, layer.gate.rows, layer.gate.rows, parts.gelu ?? (1, 0))
 				}
-				try d.down.multiply(gated, 0, projected, 0)
+				if router is none {
+					try d.down.multiply(gated, 0, projected, 0)
+					try adapted(slotAdapted(layer, slotDown), gated, 0, 0, projected, 0, 0, 1, e)
+				}
 				// The last residual add of the layer leaves the next norm in `normed`.
 				let next = index + 1 < count ?? (model.layers[index + 1].attentionNorm, model.outputNorm)
 				let gate = d.inputGate
@@ -326,6 +916,7 @@ internal partial module std.ai.llm.model {
 			}
 			return none unless last
 			try model.output.multiply(normed, 0, logits, 0)
+			try adapted(parts.outputAdapters, normed, 0, 0, logits, 0, 0, 1, logits.len())
 			try capValues(logits, logits.len(), parts.softCap) when parts.softCap > float32(0)
 			return none
 		}
@@ -346,6 +937,17 @@ internal partial module std.ai.llm.model {
 			}
 			let b = batch is DeviceBatch ?? (batch, try openBatch(n))
 			batch = b
+			if rounded && b.bytes is none {
+				// Room for the widest rows a multiply reads: the stream, the
+				// attention heads or every picked expert's halves.
+				let widest = b.rows * info.embedding.max(info.heads * widestHead()).max(widestHalves())
+				let room byte[]
+				room.len(widest)
+				b.bytes = try gpu.upload(room)
+				b.scales = try zeros(widest / 16 + 2)
+			}
+			let bytes = rounded ?? (b.bytes, none)
+			let scales = rounded ?? (b.scales, none)
 			let width = parts.layerWidth
 			let perToken = info.layers * width
 			let layerEmbedding = parts.layerEmbedding
@@ -355,6 +957,7 @@ internal partial module std.ai.llm.model {
 					copyInto(held, row) unless held is none
 				} else {
 					parts.embedding.row(token, row)
+					embed(parts.embeddingAdapters, token, row)
 					scaleBy(row, parts.embeddingScale) unless parts.embeddingScale == float32(1)
 				}
 				copyAt(row, b.hostX, i * e)
@@ -382,33 +985,95 @@ internal partial module std.ai.llm.model {
 				let kvSize = info.kvHeads * hs
 				let dims = parts.rotated > 0 ?? (parts.rotated, hs)
 				let turnAt = self.turnAt[index]
-				let key = d.key
-				let value = d.value
-				try d.query.multiplyTokens(b.normed, 0, e, b.q, 0, qSize, n, b.split)
-				try biasRows(b.q, 0, d.queryBias, qSize, n)
-				if key is DeviceWeights && value is DeviceWeights {
-					let at = start * kvSize
-					let kc = keys[index]
-					let vc = values[index]
-					try key.multiplyTokens(b.normed, 0, e, kc, at, kvSize, n, b.split)
-					try value.multiplyTokens(b.normed, 0, e, vc, at, kvSize, n, b.split)
-					try biasRows(kc, at, d.keyBias, kvSize, n)
-					try biasRows(vc, at, d.valueBias, kvSize, n)
-					let blocks = info.heads + info.kvHeads + (d.valueNorm >= 0 ?? (info.kvHeads, 0))
-					try prepareQkv(b.q, kc, vc, at, info.heads, info.kvHeads, hs, v, d.queryNorm, d.keyNorm, d.valueNorm, eps, start, turns, turnAt, dims, halves, layer.ropeMagnitude, n * blocks * 256)
+				let recurrent = d.recurrent
+				let buffers = b.delta
+				if recurrent is DeviceRecurrent && buffers is DeltaBuffers {
+					try deltaLayer(index, d, recurrent, b.normed, b.projected, buffers, n, b.split)
 				} else {
-					try prepareHeads(b.q, 0, hs, info.heads, d.queryNorm >= 0 ?? (1, 0), v, d.queryNorm, eps, 1, start, turns, turnAt, dims, halves, layer.ropeMagnitude, n * info.heads * 256)
+					let key = d.key
+					let value = d.value
+					// The rounded copy of `normed`, made once for the layer's
+					// query, key and value multiplies.
+					let roundedNormed = false
+					// Gated queries go to `qg` first, then apart.
+					let (both, gates) = (b.qg, b.qgate)
+					let target = layer.gatedQuery && both is gpu.DeviceBuffer<float32> ?? (both, b.q)
+					let queryWidth = layer.gatedQuery ?? (2 * qSize, qSize)
+					if bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && d.query.rounds() {
+						try roundRows(b.normed, 0, e, bytes, scales, e, n, n * e)
+						roundedNormed = true
+						try d.query.multiplyRounded(bytes, scales, target, 0, queryWidth, n, b.split)
+					} else {
+						try d.query.multiplyTokens(b.normed, 0, e, target, 0, queryWidth, n, b.split)
+					}
+					try adapted(slotAdapted(layer, slotQuery), b.normed, 0, e, target, 0, queryWidth, n, queryWidth)
+					try splitGated(both, b.q, gates, hs, n * qSize) when layer.gatedQuery && both is gpu.DeviceBuffer<float32> && gates is gpu.DeviceBuffer<float32>
+					try biasRows(b.q, 0, d.queryBias, qSize, n)
+					if key is DeviceWeights && value is DeviceWeights {
+						let at = start * kvSize
+						let kc = keys[index]
+						let vc = values[index]
+						if bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && roundedNormed && key.rounds() {
+							try key.multiplyRounded(bytes, scales, kc, at, kvSize, n, b.split)
+						} else {
+							try key.multiplyTokens(b.normed, 0, e, kc, at, kvSize, n, b.split)
+						}
+						if bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && roundedNormed && value.rounds() {
+							try value.multiplyRounded(bytes, scales, vc, at, kvSize, n, b.split)
+						} else {
+							try value.multiplyTokens(b.normed, 0, e, vc, at, kvSize, n, b.split)
+						}
+						try adapted(slotAdapted(layer, slotKey), b.normed, 0, e, kc, at, kvSize, n, kvSize)
+						try adapted(slotAdapted(layer, slotValue), b.normed, 0, e, vc, at, kvSize, n, kvSize)
+						try biasRows(kc, at, d.keyBias, kvSize, n)
+						try biasRows(vc, at, d.valueBias, kvSize, n)
+						let blocks = info.heads + info.kvHeads + (d.valueNorm >= 0 ?? (info.kvHeads, 0))
+						try prepareQkv(b.q, kc, vc, at, info.heads, info.kvHeads, hs, v, d.queryNorm, d.keyNorm, d.valueNorm, eps, start, axes, hasAxes ?? (0, -1), parts.ropeSections, turns, turnAt, dims, halves, layer.ropeMagnitude, n * blocks * 256)
+					} else {
+						try prepareHeads(b.q, 0, hs, info.heads, d.queryNorm >= 0 ?? (1, 0), v, d.queryNorm, eps, 1, start, axes, hasAxes ?? (0, -1), parts.ropeSections, turns, turnAt, dims, halves, layer.ropeMagnitude, n * info.heads * 256)
+					}
+					let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
+					try attendTokens(b.q, keys[cache], values[cache], b.attended, info.heads, info.kvHeads, hs, start, layer.window, parts.attentionScale, parts.attentionCap, model.vectors, d.sinks, 1, model.vectors, -1, n * info.heads * 256)
+					try gateValues(b.attended, gates, n * qSize) when layer.gatedQuery && gates is gpu.DeviceBuffer<float32>
+					if bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && d.output.rounds() {
+						try roundRows(b.attended, 0, qSize, bytes, scales, qSize, n, n * qSize)
+						try d.output.multiplyRounded(bytes, scales, b.projected, 0, e, n, b.split)
+					} else {
+						try d.output.multiplyTokens(b.attended, 0, qSize, b.projected, 0, e, n, b.split)
+					}
+					try adapted(slotAdapted(layer, slotOutput), b.attended, 0, qSize, b.projected, 0, e, n, e)
+					try biasRows(b.projected, 0, d.outputBias, e, n)
 				}
-				let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
-				try attendTokens(b.q, keys[cache], values[cache], b.attended, info.heads, info.kvHeads, hs, start, layer.window, parts.attentionScale, parts.attentionCap, n * info.heads * 256)
-				try d.output.multiplyTokens(b.attended, 0, qSize, b.projected, 0, e, n, b.split)
-				try biasRows(b.projected, 0, d.outputBias, e, n)
 				try addNormed(b.x, b.projected, e, v, d.attentionPost, eps, float32(1), b.normed, d.feedForwardNorm, n * 256)
 				let ff = layer.gate.rows
-				try d.gate.multiplyTokens(b.normed, 0, e, b.gated, 0, ff, n, b.split)
-				try d.up.multiplyTokens(b.normed, 0, e, b.upped, 0, ff, n, b.split)
-				try activate(b.gated, 0, 0, b.upped, 0, 0, n * ff, n * ff, parts.gelu ?? (1, 0))
-				try d.down.multiplyTokens(b.gated, 0, ff, b.projected, 0, e, n, b.split)
+				let router = d.router
+				let held = d.experts
+				if router is DeviceWeights && held is DeviceExperts && layer.expertAdapters.len() > 0 {
+					try adaptedMixer().forward(layer, d, held, b.normed, b.projected, n)
+				} else if router is DeviceWeights && held is DeviceExperts {
+					try router.multiplyTokens(b.normed, 0, e, b.routed, 0, router.rows, n, b.split)
+					try mixExperts(d, layer, held, b.routed, b.picks, b.normed, b.gated, b.projected, n, none, lendsFrom(held, n))
+					let out = b.shared
+					try addSharedExpert(layer, d, b.normed, b.projected, b.gated, b.upped, out, n, b.split) when out is gpu.DeviceBuffer<float32>
+				} else if bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && d.gate.rounds() && d.up.rounds() && d.down.rounds() {
+					try roundRows(b.normed, 0, e, bytes, scales, e, n, n * e)
+					try d.gate.multiplyRounded(bytes, scales, b.gated, 0, ff, n, b.split)
+					try d.up.multiplyRounded(bytes, scales, b.upped, 0, ff, n, b.split)
+					try adapted(slotAdapted(layer, slotGate), b.normed, 0, e, b.gated, 0, ff, n, ff)
+					try adapted(slotAdapted(layer, slotUp), b.normed, 0, e, b.upped, 0, ff, n, ff)
+					try activate(b.gated, 0, 0, b.upped, 0, 0, n * ff, n * ff, parts.gelu ?? (1, 0))
+					try roundRows(b.gated, 0, ff, bytes, scales, ff, n, n * ff)
+					try d.down.multiplyRounded(bytes, scales, b.projected, 0, e, n, b.split)
+					try adapted(slotAdapted(layer, slotDown), b.gated, 0, ff, b.projected, 0, e, n, e)
+				} else {
+					try d.gate.multiplyTokens(b.normed, 0, e, b.gated, 0, ff, n, b.split)
+					try d.up.multiplyTokens(b.normed, 0, e, b.upped, 0, ff, n, b.split)
+					try adapted(slotAdapted(layer, slotGate), b.normed, 0, e, b.gated, 0, ff, n, ff)
+					try adapted(slotAdapted(layer, slotUp), b.normed, 0, e, b.upped, 0, ff, n, ff)
+					try activate(b.gated, 0, 0, b.upped, 0, 0, n * ff, n * ff, parts.gelu ?? (1, 0))
+					try d.down.multiplyTokens(b.gated, 0, ff, b.projected, 0, e, n, b.split)
+					try adapted(slotAdapted(layer, slotDown), b.gated, 0, ff, b.projected, 0, e, n, e)
+				}
 				let next = index + 1 < count ?? (model.layers[index + 1].attentionNorm, model.outputNorm)
 				let gate = d.inputGate
 				let inputProjection = d.inputProjection
@@ -423,6 +1088,7 @@ internal partial module std.ai.llm.model {
 				}
 			}
 			try model.output.multiply(b.normed, (n - 1) * e, logits, 0)
+			try adapted(parts.outputAdapters, b.normed, (n - 1) * e, 0, logits, 0, 0, 1, logits.len())
 			try capValues(logits, logits.len(), parts.softCap) when parts.softCap > float32(0)
 			return none
 		}
@@ -431,10 +1097,7 @@ internal partial module std.ai.llm.model {
 		// Fails when the device memory runs out.
 		internal def openBatch(n int) !DeviceBatch {
 			let info = parts.info
-			let widest = 0
-			for let (_, layer) in parts.layers {
-				widest = widest.max(layer.gate.rows)
-			}
+			let widest = widestHalves()
 			let perToken = info.layers * parts.layerWidth
 			let b = DeviceBatch{
 				rows:      n,
@@ -448,7 +1111,19 @@ internal partial module std.ai.llm.model {
 				inputs:    try zeros((n * perToken).max(1)),
 				input:     try zeros((n * parts.layerWidth).max(1)),
 				embedded:  try zeros((n * perToken).max(1)),
+				routed:    try zeros((n * mostExperts()).max(1)),
+				picks:     try zeros((n * 2 * parts.expertsUsed).max(1)),
+				parts:     try zeros(groupsPay(n, parts.expertsUsed, mostExperts()) || (model.arenas.len() == 2 && n >= lendFrom) ?? (n * parts.expertsUsed * info.embedding, 1)),
+				groups:    try zeros(groupsSize(n, mostExperts()).max(1)),
 				split:     try zeros(splitWork),
+			}
+			for let (_, layer) in parts.layers {
+				b.delta = try deltaBuffers(parts, n) when !(layer.recurrent is none) && b.delta is none
+				if layer.gatedQuery && b.qg is none {
+					b.qg = try zeros(2 * n * info.heads * widestHead())
+					b.qgate = try zeros(n * info.heads * widestHead())
+				}
+				b.shared = try zeros(n * info.embedding) when !(layer.sharedGate is none) && b.shared is none
 			}
 			b.hostX.len(n * info.embedding)
 			b.hostLayers.len((n * perToken).max(1))
@@ -462,6 +1137,369 @@ internal partial module std.ai.llm.model {
 				widest = widest.max(layer.headSize)
 			}
 			return widest
+		}
+
+		// The most feed-forward values a token has in any layer: a dense
+		// layer's rows, or those of every expert a routed layer picks.
+		internal def widestHalves() int {
+			let widest = 0
+			for let (_, layer) in parts.layers {
+				widest = widest.max(layer.gate.rows * (layer.router is none ?? (1, parts.expertsUsed)))
+			}
+			return widest
+		}
+
+		// The most experts any layer routes to; 0 without such layers.
+		internal def mostExperts() int {
+			let most = 0
+			for let (_, layer) in parts.layers {
+				most = most.max(layer.expertGate.len())
+			}
+			return most
+		}
+
+		// The feed-forward of a mixture-of-experts layer for `n` tokens:
+		// from each token's router scores in `scores` (the router times
+		// its row of `normed`), its picks into `picks`, the picked
+		// experts' halves into `halves` and their weighted sum into `out`,
+		// as ForwardState.mixExperts. A layer whose experts are all on the
+		// GPU queues its launches and returns. Else the picks are read
+		// back. With `lending`, the experts they name outside the slots
+		// go through the model's two arenas, a few at a time: the copies
+		// into one arena run while the experts in the slots, then those
+		// in the other arena, are computed, and the slots keep what they
+		// hold. Without it
+		// the experts the picks name that the GPU lacks are copied
+		// back, and the experts they name that the GPU lacks are copied
+		// into slots; when the picks name more experts than the slots
+		// hold, the work is done in turns, each with its experts in the
+		// slots. The values are those of a layer held whole.
+		// One token with `back`, the readback of `picks`, does not wait
+		// for its picks before the experts: their launches are queued
+		// behind the pick's and the picks come back while they run, so the
+		// GPU never stands idle. The kernels leave out an expert the table
+		// does not show, so a token whose picks it all shows is done; else
+		// the missing experts are copied and the launches repeated, which
+		// read `normed` and the picks and write `halves` and `out` alone.
+		// Fails when a launch or a copy fails.
+		internal def mixExperts(d DeviceLayer, layer Layer, held DeviceExperts, scores gpu.DeviceBuffer<float32>, picks gpu.DeviceBuffer<float32>, normed gpu.DeviceBuffer<float32>, halves gpu.DeviceBuffer<float32>, out gpu.DeviceBuffer<float32>, n int, back ?gpu.Readback<float32>, lending bool) !none {
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let experts = held.count()
+			let rows = layer.gate.rows
+			let mode = parts.clampedSwiglu ?? (2, 0)
+			try biasRows(scores, 0, d.routerBias, experts, n)
+			try pickExperts(scores, 0, experts, used, parts.pickThenSoftmax ?? (1, 0), parts.expertScale, picks, 0, n * 256)
+			if back is gpu.Readback<float32> && n == 1 && !held.whole() {
+				pickRows.len(picks.len())
+				try back.start()
+				try multiplyExperts(d.gate, d.up, held.table, normed, 0, e, picks, 0, used, model.vectors, d.expertGateBias, d.expertUpBias, halves, 0, rows, 1, 1, mode)
+				try sumExperts(d.down, held.table, halves, 0, picks, 0, used, model.vectors, d.expertDownBias, out, 0, e, e, 1, 1)
+				try back.wait(pickRows)
+				wanted.len(0)
+				for let j = 0; j < used; j++ {
+					wanted.push(int(pickRows[j]))
+				}
+				let done = held.shows(wanted)
+				if done {
+					try held.hold(wanted, false)
+					return none
+				}
+				// The experts neither the slots nor the page-locked cache hold
+				// are computed on the host while the GPU runs the others: a
+				// copy of theirs would go through pageable memory. The first
+				// pass computed those the slots held; it runs again when others
+				// were copied in.
+				let away = try held.uncached(wanted)
+				let copied int[]
+				let entering = false
+				for let (_, ex) in wanted {
+					continue when named(away, ex)
+					copied.push(ex)
+					entering = entering || !held.shows(int[ex])
+				}
+				if away.len() > 0 {
+					hostNormed.len(e)
+					try normed.download(hostNormed)
+				}
+				try held.hold(copied, false) when copied.len() > 0
+				if entering {
+					try multiplyExperts(d.gate, d.up, held.table, normed, 0, e, picks, 0, used, model.vectors, d.expertGateBias, d.expertUpBias, halves, 0, rows, 1, 1, mode)
+					try sumExperts(d.down, held.table, halves, 0, picks, 0, used, model.vectors, d.expertDownBias, out, 0, e, e, 1, 1)
+				}
+				return none when away.len() == 0
+				return addAway(layer, away, out)
+			}
+			let b = batch
+			let grouped = b is DeviceBatch && groupsPay(n, used, experts)
+			let fetched = false
+			if b is DeviceBatch && lending {
+				pickRows.len(picks.len())
+				try picks.download(pickRows)
+				fetched = true
+				// The experts of the last tokens, as many tokens as the
+				// slots hold, stay in the slots for the tokens to come
+				// (`kept` those there already, `entering` the others);
+				// the rest of those outside the slots are lent.
+				let stays bool[]
+				stays.len(experts)
+				let (kept, entering) = (int[], int[])
+				for let t = n - 1; t >= 0; t-- {
+					let fresh = 0
+					for let j = 0; j < used; j++ {
+						fresh++ unless stays[int(pickRows[t * 2 * used + j])]
+					}
+					break when kept.len() + entering.len() + fresh > held.slots()
+					for let j = 0; j < used; j++ {
+						let id = int(pickRows[t * 2 * used + j])
+						continue when stays[id]
+						stays[id] = true
+						if held.holds(id) {
+							kept.push(id)
+						} else {
+							entering.push(id)
+						}
+					}
+				}
+				wanted.len(0)
+				// `others`: experts in the slots the batch names that need not
+				// stay; computed before any expert enters, or kept in the slots.
+				let others int[]
+				let named bool[]
+				named.len(experts)
+				for let t = 0; t < n; t++ {
+					for let j = 0; j < used; j++ {
+						let id = int(pickRows[t * 2 * used + j])
+						if !named[id] && !stays[id] {
+							if held.holds(id) {
+								others.push(id)
+							} else {
+								wanted.push(id)
+							}
+						}
+						named[id] = true
+					}
+				}
+				let places = model.arenas[0].places
+				// A few experts outside the slots all enter them.
+				if wanted.len() < places && kept.len() + entering.len() + wanted.len() <= held.slots() {
+					entering.push(...wanted)
+					wanted.len(0)
+				}
+				// A batch too small for the tiles to pay goes through them
+				// all the same when it would wait for many copies.
+				if grouped || entering.len() + wanted.len() > places {
+					let bytes = b.bytes
+					let scales = b.scales
+					let round = rounded && bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && d.gate.rounds() && d.up.rounds() && d.down.rounds()
+					// The tiles of an expert the table they are given does not
+					// show leave its picks alone. First the slots, while the
+					// two arenas fill; then each arena, and behind it the
+					// copies of the experts it takes next; last the slots
+					// again with the experts that entered, whose copies follow
+					// the last ones into an arena.
+					// Nothing to lend and room for every expert named: they
+					// enter first, and one pass over the slots computes them
+					// all. Without the room, an expert entering could take the
+					// slot of one the batch names before the pass reads it.
+					if wanted.len() == 0 && others.len() + kept.len() + entering.len() <= held.slots() {
+						try held.hold(others, false)
+						try held.hold(kept, false)
+						try held.hold(entering, false)
+						if round && bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> {
+							try mixExpertTilesRounded(d.gate, d.up, d.down, held.table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, bytes, scales, out, e, n, mode)
+						} else {
+							try mixExpertTiles(d.gate, d.up, d.down, held.table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, out, e, n, mode)
+						}
+						return none
+					}
+					let (gate, up, down, table) = (d.gate, d.up, d.down, held.table)
+					for let k = 0; k < 2 && k * places < wanted.len(); k++ {
+						try held.lend(model.arenas[k], wanted[k * places:((k + 1) * places).min(wanted.len())])
+					}
+					let sets = (wanted.len() + places - 1) / places
+					for let turn = -1; turn <= sets; turn++ {
+						let arena = model.arenas[turn.max(0) % 2]
+						if turn == sets {
+							let entered = model.entered
+							break unless entering.len() > 0 && entered is ExpertWindow
+							try held.join()
+							try entered.show(entering, held.slotsOf(entering))
+							(gate, up, down, table) = (d.gate, d.up, d.down, entered.table)
+						} else if turn >= 0 {
+							let views = held.lent(arena)
+							try arena.join()
+							(gate, up, down, table) = (views[0], views[1], views[2], arena.window.table)
+						}
+						if round && bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> {
+							try mixExpertTilesRounded(gate, up, down, table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, bytes, scales, out, e, n, mode)
+						} else {
+							try mixExpertTiles(gate, up, down, table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, out, e, n, mode)
+						}
+						// The arena those launches read is free behind them.
+						let next = turn + 2
+						try held.lend(arena, wanted[next * places:((next + 1) * places).min(wanted.len())]) when turn >= 0 && next < sets
+						// Behind the last copies into an arena and the first
+						// pass over the slots: those that stay are asked for
+						// now, so none of them leaves for one that enters.
+						if next == sets.max(1) {
+							try held.hold(kept, false)
+							try held.hold(entering, false, beside = true) when entering.len() > 0
+						}
+					}
+					return none
+				}
+			}
+			// Held whole: one turn of every token, with nothing to copy.
+			let passes int[][]
+			if held.whole() {
+				passes.push(int[n])
+			} else {
+				pickRows.len(picks.len())
+				try picks.download(pickRows) unless fetched
+				passes = grouped ?? (expertTurns(held, n, used), tokenTurns(held, n, used))
+			}
+			if b is DeviceBatch && grouped {
+				let bytes = b.bytes
+				let scales = b.scales
+				for let (_, turn) in passes {
+					try held.hold(turn, passes.len() > 1) unless held.whole()
+					if rounded && bytes is gpu.DeviceBuffer<byte> && scales is gpu.DeviceBuffer<float32> && d.gate.rounds() && d.up.rounds() && d.down.rounds() {
+						try mixExpertTilesRounded(d.gate, d.up, d.down, held.table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, bytes, scales, out, e, n, mode)
+					} else {
+						try mixExpertTiles(d.gate, d.up, d.down, held.table, experts, normed, e, picks, used, model.vectors, d.expertGateBias, d.expertUpBias, d.expertDownBias, halves, b.upped, b.parts, b.groups, out, e, n, mode)
+					}
+				}
+				return none
+			}
+			let from = 0
+			for let (_, turn) in passes {
+				// A turn of the token path is the experts of some tokens
+				// in a row, and its last value how many they are.
+				let count = turn[turn.len() - 1]
+				try held.hold(turn[0:turn.len() - 1], false) unless held.whole()
+				try multiplyExperts(d.gate, d.up, held.table, normed, from * e, e, picks, from * 2 * used, used, model.vectors, d.expertGateBias, d.expertUpBias, halves, from * used * rows, rows, count, n, mode)
+				try sumExperts(d.down, held.table, halves, from * used * rows, picks, from * 2 * used, used, model.vectors, d.expertDownBias, out, from * e, e, e, count, n)
+				from += count
+			}
+			return none
+		}
+
+		// Whether `list` holds `value`.
+		internal def named(list int[], value int) bool {
+			for let (_, v) in list {
+				return true when v == value
+			}
+			return false
+		}
+
+		// The token's experts `away` computed on the host from `hostNormed`
+		// and the picks' weights in `pickRows`, their weighted sum added to
+		// `out` on the device.
+		// Fails when a copy or launch fails.
+		internal def addAway(layer Layer, away int[], out gpu.DeviceBuffer<float32>) !none {
+			let e = parts.info.embedding
+			let used = parts.expertsUsed
+			let picksAway int[]
+			for let j = 0; j < used; j++ {
+				picksAway.push(j) when named(away, int(pickRows[j]))
+			}
+			// Each expert on a task of its own, its multiplies split further.
+			let outs float32[][]
+			for let k = 0; k < picksAway.len(); k++ {
+				let row float32[]
+				row.len(e)
+				outs.push(row)
+			}
+			forall let k in 0..picksAway.len() {
+				let ex = int(pickRows[picksAway[k]])
+				let gated float32[]
+				let upped float32[]
+				gated.len(layer.expertGate[ex].rows)
+				upped.len(layer.expertUp[ex].rows)
+				expertOutput(parts, layer, ex, hostNormed, gated, upped, outs[k])
+			}
+			hostSum.len(e)
+			clearRange(hostSum, 0, e)
+			for let (k, j) in picksAway {
+				addScaled(hostSum, 0, outs[k], 0, pickRows[used + j], e)
+			}
+			let room = awayRoom
+			let buffer = room is gpu.DeviceBuffer<float32> ?? (room, try zeros(e))
+			awayRoom = buffer
+			try buffer.write(hostSum)
+			return accumulate(out, 0, buffer, 0, e, float32(1), float32(1))
+		}
+
+		// Whether a batch of `n` tokens runs the experts outside the slots
+		// of `held` from the arenas: not for a layer held whole, a batch
+		// too small for the tiles (`groupsPay`), or experts the arenas do
+		// not fit.
+		internal def lendsFrom(held DeviceExperts, n int) bool {
+			return model.arenas.len() == 2 && !held.whole() && n >= lendFrom && held.fits(model.arenas[0])
+		}
+
+		// The experts the picks of `n` tokens in `pickRows` name, in sets
+		// of at most the slots of `held`: those the GPU holds first, so
+		// the first turn copies the fewest.
+		internal def expertTurns(held DeviceExperts, n int, used int) int[][] {
+			let named bool[]
+			named.len(held.count())
+			for let t = 0; t < n; t++ {
+				for let j = 0; j < used; j++ {
+					named[int(pickRows[t * 2 * used + j])] = true
+				}
+			}
+			let order int[]
+			for let (_, there) in bool[true, false] {
+				for let id = 0; id < named.len(); id++ {
+					order.push(id) when named[id] && held.holds(id) == there
+				}
+			}
+			let passes int[][]
+			for let at = 0; at < order.len(); at += held.slots() {
+				passes.push(order[at:(at + held.slots()).min(order.len())])
+			}
+			return passes
+		}
+
+		// The `n` tokens whose picks are in `pickRows` in runs whose
+		// experts fit the slots of `held` together: per run its experts,
+		// then its number of tokens.
+		internal def tokenTurns(held DeviceExperts, n int, used int) int[][] {
+			let passes int[][]
+			let named bool[]
+			named.len(held.count())
+			let turn int[]
+			let count = 0
+			for let t = 0; t < n; t++ {
+				let fresh int[]
+				for let j = 0; j < used; j++ {
+					let id = int(pickRows[t * 2 * used + j])
+					fresh.push(id) unless named[id]
+				}
+				if turn.len() + fresh.len() > held.slots() {
+					for let (_, id) in turn {
+						named[id] = false
+					}
+					turn.push(count)
+					passes.push(turn)
+					turn = int[]
+					count = 0
+					fresh.len(0)
+					for let j = 0; j < used; j++ {
+						fresh.push(int(pickRows[t * 2 * used + j]))
+					}
+				}
+				for let (_, id) in fresh {
+					named[id] = true
+					turn.push(id)
+				}
+				count++
+			}
+			turn.push(count)
+			passes.push(turn)
+			return passes
 		}
 
 		// a[at:at + n] += the vector at `from` in `model.vectors`, if any.
@@ -483,7 +1521,7 @@ internal partial module std.ai.llm.model {
 			let info = parts.info
 			let room = needed.max(capacity * 2).min(context)
 			for let (index, layer) in parts.layers {
-				continue unless layer.sharedCache < 0
+				continue unless layer.sharedCache < 0 && layer.recurrent is none
 				let kvSize = info.kvHeads * layer.headSize
 				keys[index] = try regrow(keys[index], room * kvSize)
 				values[index] = try regrow(values[index], room * kvSize)
@@ -510,8 +1548,24 @@ internal partial module std.ai.llm.model {
 		inputs     gpu.DeviceBuffer<float32>
 		input      gpu.DeviceBuffer<float32>
 		embedded   gpu.DeviceBuffer<float32>
+		routed     gpu.DeviceBuffer<float32>
+		picks      gpu.DeviceBuffer<float32>
+		// Each picked expert's output before the weighted sum, and the
+		// picks by expert (see mixExpertTiles).
+		parts      gpu.DeviceBuffer<float32>
+		groups     gpu.DeviceBuffer<float32>
 		// The column splits of the multiplies (see `multiplyTokens`).
 		split      gpu.DeviceBuffer<float32>
+		// A batch's activations rounded to 8 bits and their scales (see
+		// roundRows), when the state rounds.
+		bytes      ?gpu.DeviceBuffer<byte>
+		scales     ?gpu.DeviceBuffer<float32>
+		// Gated DeltaNet buffers, gated queries and their gates, and a
+		// shared expert's output, for models that have them.
+		delta      ?DeltaBuffers
+		qg         ?gpu.DeviceBuffer<float32>
+		qgate      ?gpu.DeviceBuffer<float32>
+		shared     ?gpu.DeviceBuffer<float32>
 		// Host copies of the token embeddings and per-layer embeddings.
 		hostX      float32[]
 		hostLayers float32[]
@@ -519,9 +1573,16 @@ internal partial module std.ai.llm.model {
 
 	// Frees the device memory of `b`.
 	def freeBatch(b DeviceBatch) {
-		for let (_, buffer) in gpu.DeviceBuffer<float32>[b.x, b.normed, b.q, b.attended, b.projected, b.gated, b.upped, b.inputs, b.input, b.embedded, b.split] {
+		for let (_, buffer) in gpu.DeviceBuffer<float32>[b.x, b.normed, b.q, b.attended, b.projected, b.gated, b.upped, b.inputs, b.input, b.embedded, b.routed, b.picks, b.parts, b.groups, b.split] {
 			buffer.dispose()
 		}
+		let bytes = b.bytes
+		bytes.dispose() when bytes is gpu.DeviceBuffer<byte>
+		for let (_, extra) in [b.scales, b.qg, b.qgate, b.shared] {
+			extra.dispose() when extra is gpu.DeviceBuffer<float32>
+		}
+		let delta = b.delta
+		freeDelta(delta) when delta is DeltaBuffers
 	}
 
 	// A buffer of `n` values holding `old`'s at its start; frees `old`.

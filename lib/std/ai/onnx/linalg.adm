@@ -1,0 +1,824 @@
+partial module std.ai.onnx {
+	use (
+		std.simd
+		std.formats.ai.onnx::(ElementType, elementBits)
+		std.ai.tensor::(Tensor, storageOf, Storage)
+		std.ai.tensor.gemm::*
+	)
+
+	// Runs the matrix products and quantization operators; false for an
+	// operator this family does not have.
+	// Fails when the operator fails on its inputs.
+	internal def applyLinalg(c Call) !bool {
+		match c.step.op {
+			case "MatMul":
+				let a = try c.tensor(0)
+				let b = try c.tensor(1)
+				let packed = a.element == b.element && b.rank() == 2 && a.rank() >= 2 && a.shape[a.rank() - 1] == b.shape[0] ?? (packedWeights(c, 1, false), none)
+				c.out(0, packed is PackedMatrix ?? (matmulPacked(a, packed, c.pool), try matmul(a, b, c.pool)))
+			case "Gemm":
+				try gemmOp(c)
+			case "QuantizeLinear":
+				try quantizeOp(c)
+			case "DequantizeLinear":
+				try dequantizeOp(c)
+			case "DynamicQuantizeLinear":
+				try dynamicQuantize(c)
+			case "MatMulInteger":
+				c.out(0, try integerProduct(try c.tensor(0), try c.tensor(1), c.has(2) ?? (try c.tensor(2), none), c.has(3) ?? (try c.tensor(3), none)))
+			case "QLinearMatMul":
+				try qlinearMatMul(c)
+			case "Einsum":
+				c.out(0, try einsum(c.text("equation", ""), try operands(c)))
+			default:
+				return false
+		}
+		return true
+	}
+
+	// Input `i` packed for gemmPacked as B (stored n × k when `transB`), as
+	// `prepare` left it at load; `none` for a computed input.
+	internal def packedWeights(c Call, i int, transB bool) ?PackedMatrix {
+		return none unless i < c.step.reads.len() && c.step.reads[i] >= 0
+		return c.scope.plan.packed.get(c.step.reads[i] * 2 + (transB ?? (1, 0)))
+	}
+
+	// Packs the initializer `b` at slot `s` for the CPU's products as B
+	// (stored n × k when `transB`; see PackedMatrix).
+	internal def prepareWeights(plan Plan, s int, b Tensor, transB bool) {
+		let key = s * 2 + (transB ?? (1, 0))
+		return when plan.packed.get(key) is PackedMatrix
+		let (rows, cols) = (b.shape[0], b.shape[1])
+		let (k, n) = transB ?? ((cols, rows), (rows, cols))
+		plan.packed.set(key, packB(b.floats, 0, cols, transB, k, n, 1 << 30))
+	}
+
+	// MatMul of `a` (any rank of at least 2, its leading dimensions rows of
+	// one product) by a packed matrix.
+	internal def matmulPacked(a Tensor, b PackedMatrix, pool Pool) Tensor {
+		let shape = a.shape[:a.rank() - 1].clone()
+		shape.push(b.n)
+		let out = pool.tensor(a.element, shape)
+		let rows = a.count() / b.k.max(1)
+		gemmPacked(rows, float32(1), a.floats, 0, b.k, false, b, float32(0), out.floats, 0, b.n)
+		roundTo(out)
+		return out
+	}
+
+	// MatMul with numpy's rules: 1-D operands become a row (a) or a
+	// column (b) and lose that dimension again, the leading dimensions
+	// broadcast as batches.
+	// Fails when the inner dimensions differ or the batches do not
+	// broadcast.
+	internal def matmul(a Tensor, b Tensor, pool ?Pool = none) !Tensor {
+		fail "onnx: MatMul of {a.element.name} and {b.element.name}" unless a.element == b.element
+		let sa = a.shape.len() == 1 ?? (int[1, a.shape[0]], a.shape)
+		let sb = b.shape.len() == 1 ?? (int[b.shape[0], 1], b.shape)
+		let m = sa[sa.len() - 2]
+		let k = sa[sa.len() - 1]
+		let n = sb[sb.len() - 1]
+		fail "onnx: MatMul of {a.shape} and {b.shape}: inner dimensions {k} and {sb[sb.len() - 2]} differ" unless sb[sb.len() - 2] == k
+		let plan = try broadcast(sa[:sa.len() - 2], sb[:sb.len() - 2])
+		let shape = plan.shape.clone()
+		shape.push(m, n)
+		let out = pool is Pool ?? (pool.tensor(a.element, shape), zerosLike(a.element, shape))
+		let batches = plan.outer * plan.inner
+		let ia int[]
+		let ib int[]
+		for let o = 0; o < plan.outer; o++ {
+			for let q = 0; q < plan.inner; q++ {
+				ia.push(plan.aOffsets[o] + q * plan.aStep)
+				ib.push(plan.bOffsets[o] + q * plan.bStep)
+			}
+		}
+		fail "onnx: MatMul of strings" when storageOf(a.element) == Storage.Strings
+		// One B for every batch of an unbroadcast A: the batches are rows
+		// of one product.
+		let shared = true
+		for let t = 0; t < batches; t++ {
+			shared = shared && ib[t] == ib[0] && ia[t] == t
+		}
+		if shared && storageOf(a.element) == Storage.Floats {
+			gemm(batches * m, n, k, float32(1), a.floats, 0, k, false, b.floats, ib[0] * k * n, n, false, float32(0), out.floats, 0, n)
+			roundTo(out)
+		} else {
+			// Batches on tasks when each is too small for gemm to split.
+			let product = def (t int) {
+				match storageOf(a.element) {
+					case Storage.Floats:
+						gemm(m, n, k, float32(1), a.floats, ia[t] * m * k, k, false, b.floats, ib[t] * k * n, n, false, float32(0), out.floats, t * m * n, n)
+					case Storage.Doubles:
+						for let i = 0; i < m; i++ {
+							for let j = 0; j < n; j++ {
+								let acc = 0.0
+								for let p = 0; p < k; p++ {
+									acc += a.doubles[ia[t] * m * k + i * k + p] * b.doubles[ib[t] * k * n + p * n + j]
+								}
+								out.doubles[t * m * n + i * n + j] = acc
+							}
+						}
+					default:
+						for let i = 0; i < m; i++ {
+							for let j = 0; j < n; j++ {
+								let acc = 0
+								for let p = 0; p < k; p++ {
+									acc += a.ints[ia[t] * m * k + i * k + p] * b.ints[ib[t] * k * n + p * n + j]
+								}
+								out.ints[t * m * n + i * n + j] = wrap(acc, elementBits(a.element), signedType(a.element))
+							}
+						}
+				}
+			}
+			if m * n * k >= 1 << 20 {
+				for let t = 0; t < batches; t++ {
+					product(t)
+				}
+			} else {
+				inBands(batches, batches * m * n * k / 16, def (lo int, hi int) {
+					for let t = lo; t < hi; t++ {
+						product(t)
+					}
+				})
+			}
+			roundTo(out)
+		}
+		// 1-D operands lose their dimension again.
+		if a.shape.len() == 1 || b.shape.len() == 1 {
+			let final int[] = plan.shape.clone()
+			final.push(m) unless a.shape.len() == 1
+			final.push(n) unless b.shape.len() == 1
+			out.shape = final
+		}
+		return out
+	}
+
+	// Whether `t` is a signed integer type.
+	internal def signedType(t ElementType) bool {
+		return t := ElementType.Int8 || ElementType.Int16 || ElementType.Int32 || ElementType.Int64 || ElementType.Int4 || ElementType.Int2
+	}
+
+	// Gemm: Y = alpha · op(A) · op(B) + beta · C, C broadcast to m × n.
+	internal def gemmOp(c Call) !none {
+		let a = try c.tensor(0)
+		let b = try c.tensor(1)
+		let transA = c.int("transA", 0) != 0
+		let transB = c.int("transB", 0) != 0
+		let alpha = c.float("alpha", float32(1))
+		let beta = c.float("beta", float32(1))
+		let m = transA ?? (a.shape[1], a.shape[0])
+		let k = transA ?? (a.shape[0], a.shape[1])
+		let n = transB ?? (b.shape[0], b.shape[1])
+		let hasC = c.has(2) && beta != float32(0)
+		// Every value is written: C's broadcast first, else the product.
+		let out = c.pool.tensor(a.element, int[m, n])
+		if hasC {
+			let bias = try c.tensor(2)
+			let plan = try broadcast(int[m, n], bias.shape)
+			for let at = 0; at < m * n; at++ {
+				copyValue(bias, outerIndex(plan, at), out, at)
+			}
+		}
+		match storageOf(a.element) {
+			case Storage.Floats:
+				let packed = packedWeights(c, 1, transB)
+				if packed is PackedMatrix {
+					gemmPacked(m, alpha, a.floats, 0, a.shape[1], transA, packed, hasC ?? (beta, float32(0)), out.floats, 0, n)
+				} else {
+					gemm(m, n, k, alpha, a.floats, 0, a.shape[1], transA, b.floats, 0, b.shape[1], transB, hasC ?? (beta, float32(0)), out.floats, 0, n)
+				}
+				roundTo(out)
+			case Storage.Doubles:
+				for let i = 0; i < m; i++ {
+					for let j = 0; j < n; j++ {
+						let acc = 0.0
+						for let p = 0; p < k; p++ {
+							let x = transA ?? (a.doubles[p * m + i], a.doubles[i * k + p])
+							let y = transB ?? (b.doubles[j * k + p], b.doubles[p * n + j])
+							acc += x * y
+						}
+						out.doubles[i * n + j] = float(alpha) * acc + (hasC ?? (float(beta) * out.doubles[i * n + j], 0.0))
+					}
+				}
+			default:
+				for let i = 0; i < m; i++ {
+					for let j = 0; j < n; j++ {
+						let acc = 0
+						for let p = 0; p < k; p++ {
+							let x = transA ?? (a.ints[p * m + i], a.ints[i * k + p])
+							let y = transB ?? (b.ints[j * k + p], b.ints[p * n + j])
+							acc += x * y
+						}
+						out.ints[i * n + j] = int(alpha) * acc + (hasC ?? (int(beta) * out.ints[i * n + j], 0))
+					}
+				}
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// The index into a scale (or zero point) of value `i` of a tensor of
+	// `shape`: 0 per tensor, the coordinate along `axis` per axis, or the
+	// coordinates with the axis one divided by `block` for blocked
+	// quantization (`scaleShape` the scale's shape).
+	internal def scaleIndex(i int, shape int[], scaleShape int[], axis int, block int) int {
+		let count = 1
+		for let (_, d) in scaleShape {
+			count *= d
+		}
+		return 0 when count == 1
+		let rank = shape.len()
+		if block <= 0 && scaleShape.len() == 1 {
+			let inner = 1
+			for let d = axis + 1; d < rank; d++ {
+				inner *= shape[d]
+			}
+			return (i / inner) % shape[axis]
+		}
+		// Blocked: the coordinates of i, the axis one divided by the block.
+		let at = 0
+		let rest = i
+		let coordinates int[]
+		coordinates.len(rank)
+		for let d = rank - 1; d >= 0; d-- {
+			coordinates[d] = rest % shape[d]
+			rest /= shape[d]
+		}
+		for let d = 0; d < rank; d++ {
+			let k = d == axis ?? (coordinates[d] / block.max(1), coordinates[d])
+			at = at * scaleShape[d] + k
+		}
+		return at
+	}
+
+	// The saturation range of an integer quantization type.
+	internal def quantRange(t ElementType) (int, int) {
+		match t {
+			case ElementType.Uint8:
+				return (0, 255)
+			case ElementType.Int8:
+				return (-128, 127)
+			case ElementType.Uint16:
+				return (0, 65535)
+			case ElementType.Int16:
+				return (-32768, 32767)
+			case ElementType.Uint4:
+				return (0, 15)
+			case ElementType.Int4:
+				return (-8, 7)
+			case ElementType.Uint2:
+				return (0, 3)
+			case ElementType.Int2:
+				return (-2, 1)
+			case ElementType.Int32:
+				return (-2147483648, 2147483647)
+			default:
+				return (0, 0)
+		}
+	}
+
+	// QuantizeLinear: y = saturate(round(x / scale) + zero_point), halves
+	// to even, to the zero point's type (or output_dtype, else Uint8);
+	// float types cast the value as Cast does.
+	internal def quantizeOp(c Call) !none {
+		let x = try c.tensor(0)
+		let scale = try c.tensor(1)
+		let zero = c.has(2) ?? (try c.tensor(2), none)
+		let dtype = c.int("output_dtype", 0)
+		let to = dtype != 0 ?? (ElementType(dtype), zero is Tensor ?? (zero.element, ElementType.Uint8))
+		let axis = normalAxis(c.int("axis", 1), x.rank())
+		let block = c.int("block_size", 0)
+		let saturate = c.int("saturate", 1) != 0
+		let n = x.count()
+		let scales = floatsOf(scale)
+		let zeros = zero is Tensor ?? (floatsOf(zero), float[0])
+		let out = zerosLike(to, x.shape)
+		let values = floatsOf(x)
+		if storageOf(to) == Storage.Floats {
+			let scaled float32[]
+			scaled.len(n)
+			for let i = 0; i < n; i++ {
+				let k = scaleIndex(i, x.shape, scale.shape, axis, block)
+				scaled[i] = float32(values[i] / scales[k] + (zeros.len() > k ?? (zeros[k], 0.0)))
+			}
+			c.out(0, try cast(new Tensor(x.shape.clone(), scaled), to, saturate))
+			return none
+		}
+		let (low, high) = quantRange(to)
+		for let i = 0; i < n; i++ {
+			let k = scaleIndex(i, x.shape, scale.shape, axis, block)
+			// The division in the scale's precision.
+			let q = scale.element == ElementType.Double ?? (values[i] / scales[k], float(float32(values[i]) / float32(scales[k])))
+			let r = roundEven(q) + (zeros.len() > k ?? (zeros[k], 0.0))
+			out.ints[i] = r != r ?? (0, int(r.clamp(float(low), float(high))))
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// The values of `t` as float64s.
+	internal def floatsOf(t Tensor) float[] {
+		let out float[]
+		match storageOf(t.element) {
+			case Storage.Floats:
+				for let (_, v) in t.floats {
+					out.push(float(v))
+				}
+			case Storage.Doubles:
+				out = t.doubles
+			default:
+				for let (_, v) in t.ints {
+					out.push(float(v))
+				}
+		}
+		return out
+	}
+
+	// DequantizeLinear: y = (x − zero_point) · scale, of the scale's type
+	// (or output_dtype).
+	internal def dequantizeOp(c Call) !none {
+		let x = try c.tensor(0)
+		let scale = try c.tensor(1)
+		let zero = c.has(2) ?? (try c.tensor(2), none)
+		let dtype = c.int("output_dtype", 0)
+		let to = dtype != 0 ?? (ElementType(dtype), scale.element)
+		let axis = normalAxis(c.int("axis", 1), x.rank())
+		let block = c.int("block_size", 0)
+		let values = floatsOf(x)
+		let scales = floatsOf(scale)
+		let zeros = zero is Tensor ?? (floatsOf(zero), float[0])
+		let out = zerosLike(to, x.shape)
+		let n = x.count()
+		for let i = 0; i < n; i++ {
+			let k = scaleIndex(i, x.shape, scale.shape, axis, block)
+			let shifted = values[i] - (zeros.len() > k ?? (zeros[k], 0.0))
+			if storageOf(to) == Storage.Doubles {
+				out.doubles[i] = shifted * scales[k]
+			} else {
+				out.floats[i] = float32(shifted) * float32(scales[k])
+			}
+		}
+		roundTo(out)
+		c.out(0, out)
+		return none
+	}
+
+	// DynamicQuantizeLinear: Uint8 values with the scale and zero point
+	// that map min(0, x) .. max(0, x) onto 0 .. 255.
+	internal def dynamicQuantize(c Call) !none {
+		let x = try c.tensor(0)
+		let (lo, hi) = (float32(0), float32(0))
+		for let (_, v) in x.floats {
+			lo = lo.min(v)
+			hi = hi.max(v)
+		}
+		let scale = (hi - lo) / float32(255)
+		let zero = scale == float32(0) ?? (0, int(roundEven(float(float32(0) - lo / scale)).clamp(0.0, 255.0)))
+		let out = zerosLike(ElementType.Uint8, x.shape)
+		for let i = 0; i < x.floats.len(); i++ {
+			let q = scale == float32(0) ?? (0.0, roundEven(float(x.floats[i] / scale)))
+			out.ints[i] = int((q + float(zero)).clamp(0.0, 255.0))
+		}
+		c.out(0, out)
+		c.out(1, new Tensor(int[], float32[scale]))
+		c.out(2, new Tensor(int[], int[zero], ElementType.Uint8))
+		return none
+	}
+
+	// MatMulInteger: (A − a_zero) × (B − b_zero) as Int32, zero points per
+	// tensor, per row of A or per column of B.
+	internal def integerProduct(a Tensor, b Tensor, aZero ?Tensor, bZero ?Tensor) !Tensor {
+		let as2 = a.shape.len() == 1 ?? (int[1, a.shape[0]], a.shape)
+		let bs2 = b.shape.len() == 1 ?? (int[b.shape[0], 1], b.shape)
+		let m = as2[as2.len() - 2]
+		let k = as2[as2.len() - 1]
+		let n = bs2[bs2.len() - 1]
+		fail "onnx: MatMulInteger of {a.shape} and {b.shape}" unless bs2[bs2.len() - 2] == k
+		let plan = try broadcast(as2[:as2.len() - 2], bs2[:bs2.len() - 2])
+		let shape = plan.shape.clone()
+		shape.push(m, n)
+		let out = zerosLike(ElementType.Int32, shape)
+		let za = aZero is Tensor ?? (aZero.ints, int[0])
+		let zb = bZero is Tensor ?? (bZero.ints, int[0])
+		// Shifted operands as float32 make the product a gemm: products of
+		// 8-bit values sum exactly in float32 up to 2^24.
+		let exact = k * 255 * 255 < 1 << 24
+		for let o = 0; o < plan.outer; o++ {
+			for let q = 0; q < plan.inner; q++ {
+				let t = o * plan.inner + q
+				let ia = (plan.aOffsets[o] + q * plan.aStep) * m * k
+				let ib = (plan.bOffsets[o] + q * plan.bStep) * k * n
+				if exact {
+					let fa float32[]
+					fa.len(m * k)
+					for let i = 0; i < m; i++ {
+						let z = za.len() == 0 ?? (0, za.len() == 1 ?? (za[0], za[i]))
+						for let p = 0; p < k; p++ {
+							fa[i * k + p] = float32(a.ints[ia + i * k + p] - z)
+						}
+					}
+					let fb float32[]
+					fb.len(k * n)
+					for let p = 0; p < k; p++ {
+						for let j = 0; j < n; j++ {
+							let z = zb.len() == 0 ?? (0, zb.len() == 1 ?? (zb[0], zb[j]))
+							fb[p * n + j] = float32(b.ints[ib + p * n + j] - z)
+						}
+					}
+					let prod float32[]
+					prod.len(m * n)
+					gemm(m, n, k, float32(1), fa, 0, k, false, fb, 0, n, false, float32(0), prod, 0, n)
+					for let i = 0; i < m * n; i++ {
+						out.ints[t * m * n + i] = int(prod[i])
+					}
+				} else {
+					for let i = 0; i < m; i++ {
+						let z1 = za.len() == 0 ?? (0, za.len() == 1 ?? (za[0], za[i]))
+						for let j = 0; j < n; j++ {
+							let z2 = zb.len() == 0 ?? (0, zb.len() == 1 ?? (zb[0], zb[j]))
+							let acc = 0
+							for let p = 0; p < k; p++ {
+								acc += (a.ints[ia + i * k + p] - z1) * (b.ints[ib + p * n + j] - z2)
+							}
+							out.ints[t * m * n + i * n + j] = wrap(acc, 32, true)
+						}
+					}
+				}
+			}
+		}
+		if a.shape.len() == 1 || b.shape.len() == 1 {
+			let final int[] = plan.shape.clone()
+			final.push(m) unless a.shape.len() == 1
+			final.push(n) unless b.shape.len() == 1
+			out.shape = final
+		}
+		return out
+	}
+
+	// QLinearMatMul: the dequantized product requantized to y's scale and
+	// zero point.
+	internal def qlinearMatMul(c Call) !none {
+		let a = try c.tensor(0)
+		let aScale = floatsOf(try c.tensor(1))
+		let aZero = try c.tensor(2)
+		let b = try c.tensor(3)
+		let bScale = floatsOf(try c.tensor(4))
+		let bZero = try c.tensor(5)
+		let yScale = floatsOf(try c.tensor(6))
+		let yZero = try c.tensor(7)
+		let to = yZero.element
+		if storageOf(a.element) == Storage.Floats {
+			// Float8 operands: dequantize, multiply, quantize.
+			let fa = zerosLike(ElementType.Float, a.shape)
+			for let i = 0; i < a.floats.len(); i++ {
+				fa.floats[i] = float32((float(a.floats[i]) - floatsOf(aZero)[0]) * aScale[0])
+			}
+			let fb = zerosLike(ElementType.Float, b.shape)
+			for let i = 0; i < b.floats.len(); i++ {
+				fb.floats[i] = float32((float(b.floats[i]) - floatsOf(bZero)[0]) * bScale[0])
+			}
+			let prod = try matmul(fa, fb)
+			for let i = 0; i < prod.floats.len(); i++ {
+				prod.floats[i] = float32(float(prod.floats[i]) / yScale[0] + floatsOf(yZero)[0])
+			}
+			c.out(0, try cast(prod, to, true))
+			return none
+		}
+		let product = try integerProduct(a, b, aZero, bZero)
+		let out = zerosLike(to, product.shape)
+		let (low, high) = quantRange(to)
+		let n = product.shape[product.rank() - 1]
+		let m = product.rank() >= 2 ?? (product.shape[product.rank() - 2], 1)
+		for let i = 0; i < product.ints.len(); i++ {
+			let row = (i / n) % m
+			let col = i % n
+			let sa = aScale.len() == 1 ?? (aScale[0], aScale[row])
+			let sb = bScale.len() == 1 ?? (bScale[0], bScale[col])
+			let sy = yScale.len() == 1 ?? (yScale[0], yScale[col])
+			let zy = yZero.ints.len() == 1 ?? (yZero.ints[0], yZero.ints[col])
+			let v = roundEven(float(float32(product.ints[i]) * float32(sa) * float32(sb) / float32(sy))) + float(zy)
+			out.ints[i] = int(v.clamp(float(low), float(high)))
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// The tensors of every input of `c`.
+	internal def operands(c Call) !Tensor[] {
+		let out Tensor[]
+		for let i = 0; i < c.inputs.len(); i++ {
+			out.push(try c.tensor(i))
+		}
+		return out
+	}
+
+	// A tensor whose dimensions carry einsum labels (letters as their
+	// codes, ellipsis dimensions as 1000 + their place from the right).
+	internal struct Labeled {
+		t      Tensor
+		labels int[]
+	}
+
+	// Einsum over `inputs` by `equation`: diagonals and labels only one
+	// operand has go first, then the operands are contracted pairwise
+	// through batched products, and the result is permuted to the output.
+	// Fails on a malformed equation or operand shapes it does not fit.
+	internal def einsum(equation string, inputs Tensor[]) !Tensor {
+		let text = equation.replace(" ", "")
+		let parts = text.split("->")
+		let terms = parts[0].split(",")
+		fail "onnx: Einsum {equation}: {terms.len()} operands named for {inputs.len()}" unless terms.len() == inputs.len()
+		let operands Labeled[]
+		let ellipsis = 0
+		let counts = new map<int, int>()
+		let sizes = new map<int, int>()
+		for let (i, term) in terms {
+			let labels = try labelsOf(term, inputs[i].rank(), equation)
+			for let (d, l) in labels {
+				let had = counts.get(l)
+				counts.set(l, (had is int ?? (had, 0)) + 1)
+				if l >= 1000 {
+					ellipsis = ellipsis.max(l - 999)
+				}
+				let known = sizes.get(l)
+				let size = inputs[i].shape[d]
+				if known is int {
+					fail "onnx: Einsum {equation}: label sizes {known} and {size} differ" unless known == size || known == 1 || size == 1
+					sizes.set(l, known.max(size))
+				} else {
+					sizes.set(l, size)
+				}
+			}
+			operands.push(Labeled{t: inputs[i], labels: labels})
+		}
+		// The output labels: given, or the ellipsis then the labels used
+		// once, in alphabetical order.
+		let output int[]
+		if parts.len() > 1 {
+			output = try labelsOf(parts[1], -1, equation, ellipsis)
+		} else {
+			for let e = ellipsis - 1; e >= 0; e-- {
+				output.push(1000 + e)
+			}
+			let once int[]
+			for let (l, n) in counts {
+				once.push(l) when n == 1 && l < 1000
+			}
+			once.sort((a, b) => a < b)
+			output.push(...once)
+		}
+		// Diagonals within an operand, then labels nothing else uses summed.
+		for let i = 0; i < operands.len(); i++ {
+			operands[i] = diagonal(operands[i])
+			let needed int[] = output.clone()
+			for let (j, o) in operands {
+				needed.push(...o.labels) unless j == i
+			}
+			operands[i] = sumOut(operands[i], needed)
+		}
+		let acc = operands[0]
+		for let i = 1; i < operands.len(); i++ {
+			let needed int[] = output.clone()
+			for let j = i + 1; j < operands.len(); j++ {
+				needed.push(...operands[j].labels)
+			}
+			acc = try contract(acc, operands[i], needed)
+		}
+		acc = sumOut(acc, output)
+		// Labels the output has that the result lacks (sizes 1 broadcast).
+		let perm int[]
+		for let (_, l) in output {
+			let at = acc.labels.indexOf(l)
+			fail "onnx: Einsum {equation}: the output names a label no operand has" when at < 0
+			perm.push(at)
+		}
+		return permuted(acc.t, acc.t.shape, perm)
+	}
+
+	// The labels of one term of an einsum equation, for an operand of
+	// `rank` (-1 for the output, whose ellipsis has `ellipsis` dimensions).
+	internal def labelsOf(term string, rank int, equation string, ellipsis int = 0) !int[] {
+		let out int[]
+		let explicit = 0
+		let bytes = term.bytes()
+		for let (_, b) in bytes {
+			explicit++ when (b >= byte(0x41) && b <= byte(0x5A)) || (b >= byte(0x61) && b <= byte(0x7A))
+		}
+		let dots = rank < 0 ?? (ellipsis, rank - explicit)
+		fail "onnx: Einsum {equation}: {term} does not fit an operand of rank {rank}" when dots < 0 || (dots > 0 && !term.contains("..."))
+		let i = 0
+		for i < bytes.len() {
+			if bytes[i] == byte(0x2E) {
+				for let e = dots - 1; e >= 0; e-- {
+					out.push(1000 + e)
+				}
+				i += 3
+				continue
+			}
+			out.push(int(bytes[i]))
+			i++
+		}
+		return out
+	}
+
+	// `x` with each label that repeats reduced to its diagonal.
+	internal def diagonal(x Labeled) Labeled {
+		let labels int[]
+		for let (_, l) in x.labels {
+			labels.push(l) unless labels.includes(l)
+		}
+		return x when labels.len() == x.labels.len()
+		let shape int[]
+		for let (_, l) in labels {
+			shape.push(x.t.shape[x.labels.indexOf(l)])
+		}
+		let out = zerosLike(x.t.element, shape)
+		let n = out.count()
+		let rank = x.labels.len()
+		let strides int[]
+		strides.len(rank)
+		let s = 1
+		for let d = rank - 1; d >= 0; d-- {
+			strides[d] = s
+			s *= x.t.shape[d]
+		}
+		let coordinates int[]
+		coordinates.len(labels.len())
+		for let o = 0; o < n; o++ {
+			let rest = o
+			for let d = labels.len() - 1; d >= 0; d-- {
+				coordinates[d] = rest % shape[d]
+				rest /= shape[d]
+			}
+			let at = 0
+			for let (d, l) in x.labels {
+				at += coordinates[labels.indexOf(l)] * strides[d]
+			}
+			copyValue(x.t, at, out, o)
+		}
+		return Labeled{t: out, labels: labels}
+	}
+
+	// `x` summed over every label `needed` does not hold.
+	internal def sumOut(x Labeled, needed int[]) Labeled {
+		let keep int[]
+		let drop int[]
+		for let (d, l) in x.labels {
+			if needed.includes(l) {
+				keep.push(d)
+			} else {
+				drop.push(d)
+			}
+		}
+		return x when drop.len() == 0
+		// Kept dimensions first, then a sum over the dropped ones.
+		let moved = permuted(x.t, x.t.shape, keep + drop)
+		let rows = 1
+		for let (_, d) in keep {
+			rows *= x.t.shape[d]
+		}
+		let span = moved.count() / rows.max(1)
+		let shape int[]
+		let labels int[]
+		for let (_, d) in keep {
+			shape.push(x.t.shape[d])
+			labels.push(x.labels[d])
+		}
+		let out = zerosLike(x.t.element, shape)
+		for let r = 0; r < rows; r++ {
+			match storageOf(x.t.element) {
+				case Storage.Floats:
+					let acc = float32(0)
+					for let k = 0; k < span; k++ {
+						acc += moved.floats[r * span + k]
+					}
+					out.floats[r] = acc
+				case Storage.Doubles:
+					let acc = 0.0
+					for let k = 0; k < span; k++ {
+						acc += moved.doubles[r * span + k]
+					}
+					out.doubles[r] = acc
+				default:
+					let acc = 0
+					for let k = 0; k < span; k++ {
+						acc += moved.ints[r * span + k]
+					}
+					out.ints[r] = acc
+			}
+		}
+		return Labeled{t: out, labels: labels}
+	}
+
+	// `x` with dimension `d` repeated to `size` (it has size 1).
+	internal def widen(x Labeled, d int, size int) Labeled {
+		let shape = x.t.shape.clone()
+		shape[d] = size
+		let out = zerosLike(x.t.element, shape)
+		let outer = 1
+		for let k = 0; k < d; k++ {
+			outer *= shape[k]
+		}
+		let inner = out.count() / (outer * size).max(1)
+		for let o = 0; o < outer; o++ {
+			for let r = 0; r < size; r++ {
+				copyRun(x.t, o * inner, out, (o * size + r) * inner, inner)
+			}
+		}
+		return Labeled{t: out, labels: x.labels}
+	}
+
+	// The product of `a` and `b` over their shared labels `needed` does not
+	// hold, kept shared labels as batches: [batch, a's own, b's own].
+	internal def contract(a Labeled, b Labeled, needed int[]) !Labeled {
+		let x = sumOut(a, needed + b.labels)
+		let y = sumOut(b, needed + x.labels)
+		// Size-1 dimensions of a label the other operand has wider.
+		for let (d, l) in x.labels {
+			let other = y.labels.indexOf(l)
+			if other >= 0 && x.t.shape[d] == 1 && y.t.shape[other] > 1 {
+				x = widen(x, d, y.t.shape[other])
+			}
+		}
+		for let (d, l) in y.labels {
+			let other = x.labels.indexOf(l)
+			if other >= 0 && y.t.shape[d] == 1 && x.t.shape[other] > 1 {
+				y = widen(y, d, x.t.shape[other])
+			}
+		}
+		let (batch, own, shared, theirs) = (int[], int[], int[], int[])
+		for let (_, l) in x.labels {
+			if y.labels.includes(l) {
+				if needed.includes(l) {
+					batch.push(l)
+				} else {
+					shared.push(l)
+				}
+			} else {
+				own.push(l)
+			}
+		}
+		for let (_, l) in y.labels {
+			theirs.push(l) unless x.labels.includes(l)
+		}
+		let xOrder = batch + own + shared
+		let yOrder = batch + shared + theirs
+		let px int[]
+		for let (_, l) in xOrder {
+			px.push(x.labels.indexOf(l))
+		}
+		let py int[]
+		for let (_, l) in yOrder {
+			py.push(y.labels.indexOf(l))
+		}
+		let xt = permuted(x.t, x.t.shape, px)
+		let yt = permuted(y.t, y.t.shape, py)
+		let size = def (labels int[], t Labeled) int {
+			let n = 1
+			for let (_, l) in labels {
+				n *= t.t.shape[t.labels.indexOf(l)]
+			}
+			return n
+		}
+		let nb = size(batch, x)
+		let m = size(own, x)
+		let k = size(shared, x)
+		let n = size(theirs, y)
+		let shape int[]
+		let lead = batch + own
+		for let (_, l) in lead {
+			shape.push(x.t.shape[x.labels.indexOf(l)])
+		}
+		for let (_, l) in theirs {
+			shape.push(y.t.shape[y.labels.indexOf(l)])
+		}
+		let out = zerosLike(x.t.element, shape)
+		for let q = 0; q < nb; q++ {
+			match storageOf(x.t.element) {
+				case Storage.Floats:
+					gemm(m, n, k, float32(1), xt.floats, q * m * k, k, false, yt.floats, q * k * n, n, false, float32(0), out.floats, q * m * n, n)
+				case Storage.Doubles:
+					for let i = 0; i < m; i++ {
+						for let j = 0; j < n; j++ {
+							let acc = 0.0
+							for let p = 0; p < k; p++ {
+								acc += xt.doubles[q * m * k + i * k + p] * yt.doubles[q * k * n + p * n + j]
+							}
+							out.doubles[q * m * n + i * n + j] = acc
+						}
+					}
+				default:
+					for let i = 0; i < m; i++ {
+						for let j = 0; j < n; j++ {
+							let acc = 0
+							for let p = 0; p < k; p++ {
+								acc += xt.ints[q * m * k + i * k + p] * yt.ints[q * k * n + p * n + j]
+							}
+							out.ints[q * m * n + i * n + j] = acc
+						}
+					}
+			}
+		}
+		roundTo(out)
+		return Labeled{t: out, labels: batch + own + theirs}
+	}
+}

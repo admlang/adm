@@ -1,0 +1,339 @@
+// The `@migration(db = ...)` steps and stored routines of the databases the
+// Database service holds, run when a connection is added.
+internal partial module std.services.database.migrations {
+	use (
+		std.data.db as data
+		std.os
+		std.reflection
+		std.services::(migration, allowDowngrade)
+		std.services.database::(Database)
+		std.services.versions::*
+	)
+
+	// One `@migration` step of the databases.
+	struct Step {
+		node  reflection.ReflectionNode
+		from  string
+		to    string
+		// The connections as the step names them, "" for the default.
+		names string[]
+	}
+
+	// A connection a step runs on, held for the step: the migration lock
+	// taken on one of its pool's connections, and a transaction on it.
+	struct Held {
+		name string
+		pool data.Pool
+		conn data.Connection
+		tx   data.Transaction
+	}
+
+	// Brings the databases the connection `added` touches up to this
+	// version of the program: the steps on it run in order, each once
+	// every connection it names is added (a step on a connection that is
+	// not added yet waits, with the steps after it on the same
+	// connections), then the routines installed on it are created or
+	// replaced where they changed, and the version recorded.
+	// Fails when a step fails (its transactions rolled back, the version
+	// left at the step before), a routine cannot be installed, the version
+	// cannot be read or written, or the database was migrated by a newer
+	// version of the program and it is not annotated `@allowDowngrade`.
+	def migrate(added string) !none {
+		let current = __app_version__
+		let steps = databaseSteps(current)
+		let routines = try data.routines()
+		return none when steps.len() == 0 && routines.len() == 0
+
+		let registered = Database.names()
+		// The connections whose steps are considered: the one added, and
+		// those of each step that runs, whose later steps may have waited
+		// for it.
+		let active = map<string, bool>{}
+		active[added] = true
+		// Connections with a step waiting for a connection not added yet:
+		// their later steps wait too.
+		let waiting = map<string, bool>{}
+		let owned = map<string, bool>{}
+
+		try refuseDowngrade(added, current)
+		for let (_, step) in steps {
+			let names string[]
+			let missing = false
+			let touches = false
+			let blocked = false
+			for let (_, written) in step.names {
+				let name = resolve(written, registered)
+				if name is none {
+					missing = true
+					continue
+				}
+				names.push(name)
+				owned[name] = true
+				touches = true when active.hasKey(name)
+				blocked = true when waiting.hasKey(name)
+			}
+			continue unless touches
+			if missing || blocked {
+				for let (_, name) in names {
+					waiting[name] = true
+				}
+				continue
+			}
+			continue unless compareVersions(step.from, current) < 0
+			try runStep(step, names)
+			for let (_, name) in names {
+				active[name] = true
+			}
+		}
+		for let (_, r) in routines {
+			let name = resolve(connectionOf(r), registered)
+			owned[name] = true unless name is none
+		}
+		for let (name, _) in active {
+			continue when waiting.hasKey(name) || !owned.hasKey(name)
+			try conclude(name, current, routines, registered)
+		}
+		return none
+	}
+
+	// The steps that name connections, in ascending `from` order. A step
+	// without `to` produces the next step's `from` that shares a connection
+	// with it, else this version.
+	def databaseSteps(current string) Step[] {
+		let found Step[]
+		let froms string[]
+		for let (_, hit) in reflection.attrs(migration) {
+			let db = hit.attr.arguments.valueOf("db")
+			continue when db is none
+			let names string[]
+			match db {
+				case any[]:
+					for let (_, item) in db {
+						names.push(string(item))
+					}
+				default:
+					names.push(string(db))
+			}
+			found.push(Step{node: hit.node, from: attrText(hit, "from"), to: attrText(hit, "to"), names: names})
+			froms.push(attrText(hit, "from"))
+		}
+		let steps Step[]
+		for let (_, i) in orderByVersion(froms) {
+			steps.push(found[i])
+		}
+		for let (k, step) in steps {
+			continue when step.to != ""
+			step.to = current
+			for let j = k + 1; j < steps.len(); j++ {
+				if sharesConnection(step, steps[j]) {
+					step.to = steps[j].from
+					break
+				}
+			}
+		}
+		return steps
+	}
+
+	def sharesConnection(a Step, b Step) bool {
+		for let (_, name) in a.names {
+			return true when b.names.includes(name)
+		}
+		return false
+	}
+
+	// The connection a routine is installed on as its `sql def` names it,
+	// "" for the default.
+	def connectionOf(r data.Routine) string {
+		let name = r.connection
+		return "" when name is none
+		return name
+	}
+
+	// The registered connection a step or routine names: the one by that
+	// name, or for "" the default (the one added without a name, else the
+	// only one); none when it is not added.
+	def resolve(written string, registered string[]) ?string {
+		return written when registered.includes(written)
+		return registered[0] when written == "" && registered.len() == 1
+		return none
+	}
+
+	// Runs one step: the migration lock and a transaction on each of its
+	// connections, the step inside a `transaction` block that the
+	// transactions joined (so its `sql def` calls run on them), and the
+	// version each connection reached recorded in the same transaction
+	// when it is kept in the database. A step every connection is past
+	// already (another instance ran it) is skipped.
+	def runStep(step Step, names string[]) !none {
+		let sorted = names.clone()
+		sorted.sort((a string, b string) => a < b)
+		let held Held[]
+		defer release(held)
+		for let (_, name) in sorted {
+			let pool = try Database.get(name)
+			let conn = try data.lockMigrations(pool, lockKey())
+			let tx = conn.beginTx() onerror (err error) {
+				data.unlockMigrations(pool, conn, lockKey()) onerror recover none
+				fail err
+			}
+			held.push(Held{name: name, pool: pool, conn: conn, tx: tx})
+		}
+		let behind string[]
+		for let (_, h) in held {
+			let version = try readVersion(h.name, h.tx)
+			behind.push(h.name) when version is none || compareVersions(version, step.to) < 0
+		}
+		if behind.len() == 0 {
+			for let (_, h) in held {
+				h.tx.rollbackTx() onerror recover none
+			}
+			return none
+		}
+		let ran = runInBlock(step, held, behind)
+		fail "migration {step.from} -> {step.to} ({step.node.qualifiedName}) on {names.join(", ")} failed: {ran}" when ran is error
+		for let (_, name) in behind {
+			try writeFileVersion(name, step.to)
+		}
+		return none
+	}
+
+	// The step itself, in a `transaction` block the held transactions
+	// join: committed when it returns, rolled back when it fails.
+	def runInBlock(step Step, held Held[], behind string[]) !none {
+		transaction {
+			for let (_, h) in held {
+				__tx_participate(h.pool, h.tx)
+			}
+			let result = reflection.call(step.node, none, [])
+			fail result when result is error
+			for let (_, h) in held {
+				continue unless behind.includes(h.name)
+				try writeTableVersion(h.name, h.tx, step.to)
+			}
+		}
+		return none
+	}
+
+	// Gives back what runStep holds: each connection's migration lock is
+	// released (a transaction still open is rolled back first).
+	def release(held Held[]) {
+		for let (_, h) in held {
+			h.tx.rollbackTx() onerror recover none
+			data.unlockMigrations(h.pool, h.conn, lockKey()) onerror recover none
+		}
+	}
+
+	// Records this version on a connection whose steps are done, and
+	// creates or replaces the routines installed on it whose body changed.
+	def conclude(name string, current string, routines data.Routine[], registered string[]) !none {
+		let pool = try Database.get(name)
+		let conn = try data.lockMigrations(pool, lockKey())
+		let done = concludeLocked(name, pool, conn, current, routines, registered)
+		data.unlockMigrations(pool, conn, lockKey()) onerror (err error) {
+			fail done when done is error
+			fail err
+		}
+		return done
+	}
+
+	def concludeLocked(name string, pool data.Pool, conn data.Connection, current string, routines data.Routine[], registered string[]) !none {
+		let tx = try conn.beginTx()
+		let version = readVersion(name, tx) onerror (err error) {
+			tx.rollbackTx() onerror recover none
+			fail err
+		}
+		if version is none || compareVersions(version, current) < 0 {
+			writeTableVersion(name, tx, current) onerror (err error) {
+				tx.rollbackTx() onerror recover none
+				fail err
+			}
+			try tx.commitTx()
+			try writeFileVersion(name, current)
+		} else {
+			try tx.rollbackTx()
+		}
+		for let (_, r) in routines {
+			let target = resolve(connectionOf(r), registered)
+			continue when target is none || target != name
+			data.installRoutine(pool, conn, r) onerror (err error) {
+				fail "stored routine {r.name} on connection '{name}': {err}"
+			}
+		}
+		return none
+	}
+
+	// Fails when the database the connection reaches was migrated by a
+	// newer version of the program, unless it is annotated
+	// `@allowDowngrade`.
+	def refuseDowngrade(name string, current string) !none {
+		return none when reflection.attrs(allowDowngrade).len() > 0
+		let pool = try Database.get(name)
+		let conn = try data.lockMigrations(pool, lockKey())
+		let version = readVersion(name, conn) onerror (err error) {
+			data.unlockMigrations(pool, conn, lockKey()) onerror recover none
+			fail err
+		}
+		try data.unlockMigrations(pool, conn, lockKey())
+		return none when version is none || compareVersions(version, current) <= 0
+		fail "{__app_name__} {current} cannot use the database of connection '{name}', last migrated by version {version}; annotate the application with @allowDowngrade to permit it"
+	}
+
+	// The name the migration lock is taken under: instances of one program
+	// wait for each other, other programs sharing the database do not.
+	def lockKey() string {
+		return "adm.migrations/" + __app_name__
+	}
+
+	// The version the connection's migrations reached: from its versions
+	// table, or the file in the application's home folder; none before any.
+	def readVersion(name string, q data.Queryable) !?string {
+		let table = Database.versionsTable(name)
+		return data.readVersion(q, table, __app_name__) unless table is none
+		let path = try versionFile(name)
+		return none unless try os.exists(path)
+		let text = string(try os.readFile(path)).trim()
+		return none when text == ""
+		return text
+	}
+
+	// Records a version in the connection's versions table, inside the
+	// transaction that made it; nothing when the version lives in the home
+	// folder.
+	def writeTableVersion(name string, q data.Queryable, version string) !none {
+		let table = Database.versionsTable(name)
+		return none when table is none
+		return data.writeVersion(q, table, __app_name__, version)
+	}
+
+	// Records a version in the home folder, after the transaction that made
+	// it committed; nothing when it lives in a versions table.
+	def writeFileVersion(name string, version string) !none {
+		return none unless Database.versionsTable(name) is none
+		let path = try versionFile(name)
+		try os.mkdir(os.dir(path), parents = true)
+		return os.writeFile(path, version.bytes())
+	}
+
+	// The file a connection's version lives in: `databases/<name>.version`
+	// in the application's home folder, the name with every byte outside
+	// letters, digits, `.`, `_` and `-` written `%XX`; `%default` for the
+	// default connection, which no escaped name can spell.
+	def versionFile(name string) !string {
+		let home = try os.appHome()
+		let file = name == "" ?? ("%default", escapeName(name))
+		return os.join(home, "databases", file + ".version")
+	}
+
+	def escapeName(name string) string {
+		let out string[]
+		for let (_, b) in name.bytes() {
+			let c = int(b)
+			if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 95 || c == 45 {
+				out.push(string([b]))
+			} else {
+				out.push("%{"%02X".format(c)}")
+			}
+		}
+		return out.join("")
+	}
+}

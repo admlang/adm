@@ -1,0 +1,878 @@
+partial module std.ai.onnx {
+	use (
+		std.ai.tensor.gemm::*
+		std.formats.ai.onnx as onnxfile
+		std.formats.ai.onnx::(OnnxModel, Graph, Node, Attribute, TensorData, SparseTensorData, ValueInfo, ValueType, ValueKind, ElementType, Function)
+		std.ai.tensor::(Tensor, tensorOf, storageOf, Storage)
+		std.ai.llm::(Device)
+		std.gpu
+	)
+
+	// What a graph's input, output or intermediate value holds: a tensor
+	// or a sequence of tensors. An optional value that holds neither is
+	// `none` where a `?Value` is expected.
+	type Value = Tensor | Tensor[]
+
+	// A place for a value that may hold none: a slot of a scope, an input
+	// or output of a call.
+	internal struct Held {
+		v ?Value
+		// The value in GPU memory when a GPU operator wrote it; `v` then
+		// holds its host copy once a CPU operator needed one.
+		d ?DeviceTensor
+	}
+
+	// Float arrays a run's steps freed, by length, for later outputs of the
+	// same length: a fresh array costs page faults and zero-filling (about
+	// 0.15 ms per 1.5 MB), a reused one neither. Only arrays no other value
+	// shares come here (see markConsumed), and only operators that write
+	// every value of their output take from it.
+	internal type Pool {
+		arrays map<int, float32[][]>
+
+		def new() {
+			arrays = new map<int, float32[][]>()
+		}
+
+		// A tensor of `element` and `shape` for an output the caller writes
+		// in full: a freed array of its length when there is one and the
+		// type keeps float32 values, else zeros.
+		def tensor(element ElementType, shape int[]) Tensor {
+			if storageOf(element) == Storage.Floats {
+				let n = 1
+				for let (_, d) in shape {
+					n *= d
+				}
+				let list = arrays.get(n)
+				if list is float32[][] && list.len() > 0 {
+					return new Tensor(shape.clone(), list.pop(), element)
+				}
+			}
+			return zerosLike(element, shape)
+		}
+
+		// Keeps `t`'s float32 array for a later output.
+		def give(t Tensor) {
+			return unless storageOf(t.element) == Storage.Floats && t.floats.len() > 0
+			let list = arrays.get(t.floats.len())
+			if list is float32[][] {
+				list.push(t.floats)
+			} else {
+				arrays.set(t.floats.len(), float32[][t.floats])
+			}
+		}
+	}
+
+	// An ONNX model ready to run: `run` takes values for its `inputs` by
+	// name and gives the `outputs`. Operators of the ai.onnx domain run
+	// as their operator set version says; functions the model defines run
+	// their bodies.
+	type Model {
+		// The inputs `run` takes (initializers left out) and the outputs it
+		// gives, as the graph declares them.
+		inputs            ValueInfo[]
+		outputs           ValueInfo[]
+		// The device the heavy operators run on: Gpu or Cpu, never Auto.
+		device            Device
+		internal source   OnnxModel
+		internal plan     Plan
+		// Whether operators with a GPU form run there.
+		internal onDevice bool
+		// The GPU buffers runs leave for the next one (one pool, taken by a
+		// run and given back at its end; an overlapping run starts its own).
+		internal pools    channel<DevicePool>
+
+		internal def new(source OnnxModel, plan Plan, device Device) {
+			self.source = source
+			self.plan = plan
+			self.device = device
+			pools = new channel<DevicePool>(size = 1)
+			pools.offer(new DevicePool())
+		}
+
+		// Runs the graph on `feeds` (a value per input name; an input with an
+		// initializer may be left out to take its default) and returns the
+		// outputs by name; an optional output that holds no value is left
+		// out.
+		// Fails when an input is missing, a value has the wrong type or
+		// shape for its operator, or an operator is not supported.
+		def run(feeds map<string, Value>) !map<string, Value> {
+			let env = new Scope(plan, none)
+			select {
+				case pools:
+					env.devicePool = <-pools
+				default:
+			}
+			for let (_, info) in inputs {
+				let v = feeds.get(info.name)
+				if v is none {
+					fail "onnx: input {info.name} is missing" unless plan.defaults.get(info.name) is int || info.valueType.kind == ValueKind.Optional
+					continue
+				}
+				env.set(info.name, v)
+			}
+			for let (name, _) in feeds {
+				fail "onnx: the model has no input {name}" unless plan.slotOf.get(name) is int
+			}
+			let out = outputsOf(env) onerror (err error) {
+				pools.offer(env.devicePool)
+				return err
+			}
+			pools.offer(env.devicePool)
+			return out
+		}
+
+		// Runs the plan in `env` and gathers the outputs.
+		// Fails as `run` does.
+		internal def outputsOf(env Scope) !map<string, Value> {
+			try execute(self, plan, env)
+			let out = new map<string, Value>()
+			for let (_, info) in outputs {
+				let v = try env.get(info.name)
+				if v is Tensor {
+					out.set(info.name, v)
+				} else if v is Tensor[] {
+					out.set(info.name, v)
+				}
+			}
+			return out
+		}
+	}
+
+	// Loads the ONNX model at `path` and readies it to run on `device`
+	// (the GPU when `Device.Auto` finds one in use).
+	// Fails when the file cannot be read or is not an ONNX model, or the
+	// graph uses an operator or operator set version this library does
+	// not support.
+	def load(path string, device Device = Device.Auto) !Model {
+		return load(try onnxFile(path), device)
+	}
+
+	// Readies a model read with std.formats.ai.onnx to run on `device`.
+	// Fails when the graph uses an operator or operator set version this
+	// library does not support.
+	def load(model OnnxModel, device Device = Device.Auto) !Model {
+		let opsets = new map<string, int>()
+		for let (_, o) in model.opsets {
+			opsets.set(o.domain == "ai.onnx" ?? ("", o.domain), o.version)
+		}
+		let functions = new map<string, Function>()
+		for let (_, f) in model.functions {
+			functions.set(f.domain + "/" + f.name, f)
+		}
+		assert device != Device.Gpu || gpu.available() onerror fail "onnx: no GPU is in use (see ADM_CUDA)"
+		let plan = try compile(model.graph, opsets, functions, string[])
+		let onDevice = device != Device.Cpu && gpu.available()
+		let loaded = new Model(model, plan, onDevice ?? (Device.Gpu, Device.Cpu))
+		loaded.onDevice = onDevice
+		try prepare(plan, loaded.onDevice)
+		for let (_, info) in model.graph.inputs {
+			loaded.inputs.push(info) unless plan.defaults.get(info.name) is int
+		}
+		loaded.outputs = model.graph.outputs
+		return loaded
+	}
+
+	// Readies `plan` and the plans inside it for runs: the initializers
+	// read as tensors (float32 ones also copied to the GPU when
+	// `onDevice`), and the matrices MatMul, Gemm and Conv take as weights
+	// packed for the CPU's products (not needed on the GPU), so a run only
+	// reads the plan and runs may overlap.
+	// Fails when an initializer cannot be read or the GPU memory runs out.
+	internal def prepare(plan Plan, onDevice bool) !none {
+		for let (s, data) in plan.constants {
+			let t = try tensorOf(data)
+			plan.tensors.set(s, t)
+			if onDevice && t.element == ElementType.Float && t.count() > 0 {
+				plan.deviceConstants.set(s, new DeviceTensor(t.shape.clone(), try gpu.upload(t.floats)))
+			}
+		}
+		for let (_, step) in plan.steps {
+			// A Constant node's float32 value goes to the GPU once too.
+			if onDevice && step.domain == "" && step.op == "Constant" && step.writes.len() == 1 && step.writes[0] >= 0 {
+				let a = step.node.attribute("value")
+				let data = a is Attribute ?? (a.t, none)
+				if data is TensorData && data.element == ElementType.Float {
+					let t = try tensorOf(data)
+					plan.deviceConstants.set(step.writes[0], new DeviceTensor(t.shape.clone(), try gpu.upload(t.floats))) when t.count() > 0
+				}
+			}
+			if step.domain == "" && (step.op := "MatMul" || "Gemm") && step.reads.len() > 1 && step.reads[1] >= 0 {
+				let b = plan.tensors.get(step.reads[1])
+				if b is Tensor && b.rank() == 2 && storageOf(b.element) == Storage.Floats {
+					let a = step.node.attribute("transB")
+					let transB = step.op == "Gemm" && a is Attribute && a.i != 0
+					prepareWeights(plan, step.reads[1], b, transB) unless onDevice
+				}
+			}
+			if step.domain == "" && step.op == "Conv" && step.reads.len() > 1 && step.reads[1] >= 0 {
+				let w = plan.tensors.get(step.reads[1])
+				let a = step.node.attribute("group")
+				prepareConv(plan, step.reads[1], w, a is Attribute ?? (a.i, 1)) when w is Tensor && !onDevice
+			}
+			for let (_, sub) in step.graphs {
+				try prepare(sub, onDevice)
+			}
+		}
+		for let (_, fn) in plan.functionPlans {
+			try prepare(fn, onDevice)
+		}
+		return none
+	}
+
+	// The file at `path` read as an ONNX model.
+	internal def onnxFile(path string) !OnnxModel {
+		return onnxfile.load(path)
+	}
+
+	// A graph readied to run: each value a slot, each node a step reading
+	// and writing slots, and per step the slots no later step reads.
+	internal type Plan {
+		slotOf          map<string, int>
+		names           string[]
+		steps           Step[]
+		// The initializers by slot, made tensors when first read.
+		constants       map<int, TensorData>
+		// Graph inputs that have an initializer as their default.
+		defaults        map<string, int>
+		// Values a subgraph reads from the graphs around it.
+		outer           string[]
+		inputs          string[]
+		outputs         string[]
+		opsets          map<string, int>
+		functions       map<string, Function>
+		// Float32 initializers and Constant values on the GPU, by slot, when
+		// the model runs there.
+		deviceConstants map<int, DeviceTensor>
+		// Slots whose values no other value shares arrays with (see
+		// markConsumed).
+		unshared        bool[]
+		// The model's functions this graph calls, readied once each, by
+		// domain/name.
+		functionPlans   map<string, Plan>
+		// Initializers packed for the CPU's matrix products by slot · 2,
+		// plus 1 for a transposed one (see packedWeights).
+		packed          map<int, PackedMatrix>
+		// Conv weights packed for the CPU's products, one matrix a group, by
+		// slot (see convolvePacked).
+		convPacked      map<int, PackedMatrix[]>
+		// The initializers as tensors, by slot, read once at load:
+		// operators never change their inputs, so every run shares them.
+		tensors         map<int, Tensor>
+
+		def new() {
+			tensors = new map<int, Tensor>()
+			packed = new map<int, PackedMatrix>()
+			convPacked = new map<int, PackedMatrix[]>()
+			functionPlans = new map<string, Plan>()
+			deviceConstants = new map<int, DeviceTensor>()
+			slotOf = new map<string, int>()
+			constants = new map<int, TensorData>()
+			defaults = new map<string, int>()
+			opsets = new map<string, int>()
+			functions = new map<string, Function>()
+		}
+
+		// The slot of `name`, made when it has none.
+		def slot(name string) int {
+			let s = slotOf.get(name)
+			return s when s is int
+			slotOf.set(name, names.len())
+			names.push(name)
+			return names.len() - 1
+		}
+	}
+
+	// One node of a plan: its operator, the slots it reads (-1 for an
+	// optional input left out) and writes, and the slots to free after it.
+	internal type Step {
+		node     Node
+		op       string
+		domain   string
+		opset    int
+		reads    int[]
+		writes   int[]
+		frees    int[]
+		// Per input, whether the operator may write its result into the
+		// input's arrays (see Call.consumes).
+		consumes bool[]
+		// The freed slots whose arrays go to the run's Pool.
+		recycles int[]
+		// The key of the plan's readied function (`Plan.functionPlans`) the
+		// model defines for this operator; "" for an operator of its own.
+		function string
+		// The plans of the node's graph attributes, by attribute name.
+		graphs   map<string, Plan>
+
+		def new(node Node) {
+			self.node = node
+			op = node.op
+			domain = node.domain == "ai.onnx" ?? ("", node.domain)
+			graphs = new map<string, Plan>()
+		}
+	}
+
+	// Readies `graph`; `scope` holds the names the graphs around it define,
+	// which it may read.
+	// Fails when a node uses an operator set the model does not import.
+	internal def compile(graph Graph, opsets map<string, int>, functions map<string, Function>, scope string[]) !Plan {
+		let plan = new Plan()
+		plan.opsets = opsets
+		plan.functions = functions
+		let known = new map<string, bool>()
+		for let (_, info) in graph.inputs {
+			plan.slot(info.name)
+			plan.inputs.push(info.name)
+			known.set(info.name, true)
+		}
+		for let (_, t) in graph.initializers {
+			let s = plan.slot(t.name)
+			plan.constants.set(s, t)
+			known.set(t.name, true)
+			plan.defaults.set(t.name, s) when plan.inputs.includes(t.name)
+		}
+		for let (_, sparse) in graph.sparseInitializers {
+			let s = plan.slot(sparse.values.name)
+			plan.constants.set(s, try denseOf(sparse))
+			known.set(sparse.values.name, true)
+		}
+		let inner = scope.clone()
+		for let (name, _) in known {
+			inner.push(name)
+		}
+		for let (_, node) in graph.nodes {
+			let step = new Step(node)
+			let version = opsets.get(step.domain)
+			fail "onnx: node {node.name} ({node.op}) uses domain {step.domain}, which the model does not import" when version is none && functions.get(step.domain + "/" + node.op) is none
+			step.opset = version is int ?? (version, 0)
+			for let (_, input) in node.inputs {
+				if input.len() == 0 {
+					step.reads.push(-1)
+					continue
+				}
+				if known.get(input) is none && !plan.outer.includes(input) {
+					fail "onnx: node {node.name} ({node.op}) reads {input}, which nothing writes" unless scope.includes(input)
+					plan.outer.push(input)
+				}
+				step.reads.push(plan.slot(input))
+			}
+			for let (_, output) in node.outputs {
+				step.writes.push(output.len() == 0 ?? (-1, plan.slot(output)))
+				known.set(output, true) when output.len() > 0
+				inner.push(output) when output.len() > 0
+			}
+			for let (_, a) in node.attributes {
+				let g = a.g
+				if g is Graph {
+					let sub = try compile(g, opsets, functions, inner)
+					step.graphs.set(a.name, sub)
+					// The subgraph's own outer reads are this graph's reads too.
+					for let (_, name) in sub.outer {
+						if known.get(name) is none && !plan.outer.includes(name) && scope.includes(name) {
+							plan.outer.push(name)
+						}
+						plan.slot(name)
+					}
+				}
+			}
+			let key = step.domain + "/" + node.op
+			let fn = functions.get(key)
+			if fn is Function && plan.functionPlans.get(key) is none {
+				let body = new Graph()
+				body.nodes = fn.nodes
+				let fnOpsets = new map<string, int>()
+				for let (domain, v) in opsets {
+					fnOpsets.set(domain, v)
+				}
+				for let (_, o) in fn.opsets {
+					fnOpsets.set(o.domain == "ai.onnx" ?? ("", o.domain), o.version)
+				}
+				for let (_, name) in fn.inputs {
+					let info = ValueInfo{name: name, valueType: new ValueType(), metadata: new map<string, string>()}
+					body.inputs.push(info)
+				}
+				let sub = try compile(body, fnOpsets, functions, string[])
+				sub.outputs = fn.outputs
+				plan.functionPlans.set(key, sub)
+			}
+			step.function = fn is Function ?? (key, "")
+			plan.steps.push(step)
+		}
+		for let (_, info) in graph.outputs {
+			plan.outputs.push(info.name)
+			plan.slot(info.name)
+		}
+		// Free each value after the last step that reads it, unless an
+		// output or an input from outside needs it kept.
+		let last = new map<int, int>()
+		for let (i, step) in plan.steps {
+			for let (_, s) in step.reads {
+				last.set(s, i) when s >= 0
+			}
+			for let (_, sub) in step.graphs {
+				for let (_, name) in sub.outer {
+					last.set(plan.slot(name), i)
+				}
+			}
+		}
+		for let (s, i) in last {
+			let name = plan.names[s]
+			continue when plan.outputs.includes(name) || plan.constants.get(s) is TensorData || plan.outer.includes(name)
+			plan.steps[i].frees.push(s)
+		}
+		markConsumed(plan)
+		return plan
+	}
+
+	// Sets Step.consumes: input j of a step may take the step's result when
+	// the step is its last reader (it is freed after the step) and reads it
+	// once, and the value's arrays belong to it alone: an operator that
+	// allocates its outputs wrote it, and every reader allocates its outputs
+	// too, so no other value (a Reshape's, an Identity's, a function's or a
+	// subgraph's) shares them.
+	internal def markConsumed(plan Plan) {
+		let producer = new map<int, int>()
+		let shared = new map<int, bool>()
+		for let (i, step) in plan.steps {
+			for let (_, s) in step.writes {
+				producer.set(s, i) when s >= 0
+			}
+			for let (_, s) in step.reads {
+				shared.set(s, true) when s >= 0 && !allocates(step)
+			}
+			for let (_, sub) in step.graphs {
+				for let (_, name) in sub.outer {
+					shared.set(plan.slot(name), true)
+				}
+			}
+		}
+		for let (_, step) in plan.steps {
+			step.consumes.len(step.reads.len())
+			continue unless allocates(step)
+			for let (j, s) in step.reads {
+				continue unless s >= 0 && step.frees.includes(s) && shared.get(s) is none
+				let p = producer.get(s)
+				continue unless p is int && allocates(plan.steps[p])
+				let reads = 0
+				for let (_, other) in step.reads {
+					reads++ when other == s
+				}
+				step.consumes[j] = reads == 1
+			}
+		}
+		plan.unshared.len(plan.names.len())
+		for let s = 0; s < plan.names.len(); s++ {
+			plan.unshared[s] = shared.get(s) is none
+		}
+		// A freed value whose arrays are its own and that its last reader
+		// does not take over goes to the pool.
+		for let (_, step) in plan.steps {
+			for let (_, s) in step.frees {
+				continue unless shared.get(s) is none
+				let p = producer.get(s)
+				continue unless p is int && allocates(plan.steps[p])
+				let taken = false
+				for let (j, r) in step.reads {
+					taken = taken || (r == s && step.consumes[j])
+				}
+				step.recycles.push(s) unless taken
+			}
+		}
+	}
+
+	// Whether `step`'s operator always writes its outputs into arrays it
+	// allocates, never into its inputs' (and reads its inputs only).
+	internal def allocates(step Step) bool {
+		return false unless step.domain == "" && step.function.len() == 0
+		return step.op := "Add" || "Sub" || "Mul" || "Div" || "Pow" || "Erf" || "Sqrt" || "Exp" || "Log" || "Tanh" || "Sigmoid" || "Relu" || "Neg" || "Abs" || "Reciprocal" || "Gelu" || "MatMul" || "Gemm" || "Softmax" || "Transpose" || "Slice" || "Concat" || "Conv" || "InstanceNormalization" || "LayerNormalization" || "Resize"
+	}
+
+	// The dense tensor a sparse initializer stands for.
+	internal def denseOf(sparse SparseTensorData) !TensorData {
+		let values = try tensorOf(sparse.values)
+		let indices = try sparse.indices.ints()
+		let count = 1
+		for let (_, d) in sparse.dims {
+			count *= d
+		}
+		let dense = scatterDense(values, indices, sparse.indices.dims, sparse.dims, count)
+		return dense.toData(sparse.values.name)
+	}
+
+	// `values` placed at `indices` (linear, or one row of coordinates per
+	// value) in a tensor of `dims`, zeros elsewhere.
+	internal def scatterDense(values Tensor, indices int[], indexDims int[], dims int[], count int) Tensor {
+		let out = zerosLike(values.element, dims)
+		let n = values.count()
+		let rank = dims.len()
+		let coordinates = indexDims.len() == 2
+		for let i = 0; i < n; i++ {
+			let at = 0
+			if coordinates {
+				for let d = 0; d < rank; d++ {
+					at = at * dims[d] + indices[i * rank + d]
+				}
+			} else {
+				at = indices[i]
+			}
+			copyValue(values, i, out, at)
+		}
+		return out
+	}
+
+	// A scope of values while a plan runs: by slot, with the values its
+	// plan reads from the graphs around it found in `parent`.
+	internal type Scope {
+		plan       Plan
+		values     Held[]
+		parent     ?Scope
+		// GPU buffers freed by the run's steps (see DevicePool); kept by the
+		// outermost scope.
+		devicePool DevicePool
+		// Freed arrays the run reuses; kept by the outermost scope.
+		pool       Pool
+
+		def new(plan Plan, parent ?Scope) {
+			pool = new Pool()
+			self.plan = plan
+			self.parent = parent
+			values.len(plan.names.len())
+			devicePool = new DevicePool()
+		}
+
+		// The outermost scope of the run.
+		def root() Scope {
+			let at = self
+			for {
+				let up = at.parent
+				return at when up is none
+				at = up
+			}
+		}
+
+		// The value called `name`: this scope's (an initializer made a
+		// tensor when first read), else the parent's.
+		// Fails when an initializer cannot be read.
+		def get(name string) !?Value {
+			let s = plan.slotOf.get(name)
+			if s is int {
+				let v = values[s].v
+				return v unless v is none
+				let d = values[s].d
+				if d is DeviceTensor {
+					let host = try downloaded(d)
+					values[s].v = host
+					return host
+				}
+				let t = plan.tensors.get(s)
+				return t when t is Tensor
+				return none unless plan.outer.includes(name)
+			}
+			let p = parent
+			return p is Scope ?? (try p.get(name), none)
+		}
+
+		def set(name string, v ?Value) {
+			let s = plan.slot(name)
+			values.len(plan.names.len()) when s >= values.len()
+			values[s].v = v
+		}
+	}
+
+	// Runs the steps of `plan` in `env`.
+	internal def execute(model Model, plan Plan, env Scope) !none {
+		let p = env.parent
+		if p is Scope {
+			for let (_, name) in plan.outer {
+				env.values[plan.slot(name)].v = try p.get(name)
+			}
+		}
+		for let (_, step) in plan.steps {
+			let call = new Call(model, step, env)
+			call.inputs.len(step.reads.len())
+			for let (i, s) in step.reads {
+				continue when s < 0
+				call.inputs[i].d = env.values[s].d
+				call.inputs[i].v = call.inputs[i].d is none ?? (try valueAt(plan, env, s), env.values[s].v)
+			}
+			call.outputs.len(step.writes.len())
+			if !(try runOnDevice(call)) {
+				// The CPU operator reads host copies of values on the GPU.
+				for let (i, s) in step.reads {
+					let d = call.inputs[i].d
+					if s >= 0 && call.inputs[i].v is none && d is DeviceTensor {
+						let host = try downloaded(d)
+						call.inputs[i].v = host
+						env.values[s].v = host
+					}
+				}
+				let fn = step.function.len() > 0 ?? (plan.functionPlans.get(step.function), none)
+				if fn is Plan {
+					try callFunction(model, call, fn)
+				} else {
+					try apply(call)
+				}
+			}
+			for let (i, s) in step.writes {
+				continue when s < 0
+				env.values[s].v = call.outputs[i].v
+				env.values[s].d = call.outputs[i].d
+			}
+			for let (_, s) in step.frees {
+				let (v, d) = (env.values[s].v, env.values[s].d)
+				if step.recycles.includes(s) {
+					env.root().pool.give(v) when v is Tensor
+					env.root().devicePool.give(d.buffer) when d is DeviceTensor
+				} else if d is DeviceTensor && d.uploaded && plan.unshared[s] {
+					// A copy a GPU operator made of a host value is the slot's own.
+					env.root().devicePool.give(d.buffer)
+				}
+				env.values[s].v = none
+				env.values[s].d = none
+			}
+		}
+		return none
+	}
+
+	// The value of slot `s`: what a step wrote, else the initializer.
+	internal def valueAt(plan Plan, env Scope, s int) !?Value {
+		let v = env.values[s].v
+		return v unless v is none
+		let t = plan.tensors.get(s)
+		return t when t is Tensor
+		return none
+	}
+
+	// Runs a function the model defines on a call's inputs: its body with
+	// the formal inputs bound, attributes referring to the call's.
+	internal def callFunction(model Model, call Call, fn Plan) !none {
+		let env = new Scope(fn, none)
+		for let (i, name) in fn.inputs {
+			env.values[fn.slot(name)].v = i < call.inputs.len() ?? (call.inputs[i].v, none)
+		}
+		// Attributes the body refers to with `ref` take the call's value.
+		for let (_, step) in fn.steps {
+			for let (k, a) in step.node.attributes {
+				continue when a.ref.len() == 0
+				let given = call.step.node.attribute(a.ref)
+				if given is Attribute {
+					let copy = copyAttribute(given)
+					copy.name = a.name
+					step.node.attributes[k] = copy
+				}
+			}
+		}
+		try execute(model, fn, env)
+		for let (i, name) in fn.outputs {
+			call.outputs[i].v = try env.get(name) when i < call.outputs.len()
+		}
+		return none
+	}
+
+	internal def copyAttribute(a Attribute) Attribute {
+		let c = new Attribute()
+		c.name = a.name
+		c.kind = a.kind
+		c.f = a.f
+		c.i = a.i
+		c.s = a.s
+		c.t = a.t
+		c.g = a.g
+		c.sparse = a.sparse
+		c.typeValue = a.typeValue
+		c.floats = a.floats
+		c.ints = a.ints
+		c.strings = a.strings
+		c.tensors = a.tensors
+		c.graphs = a.graphs
+		c.sparseTensors = a.sparseTensors
+		c.types = a.types
+		return c
+	}
+
+	// One node being run: its inputs (`none` for one left out), the
+	// outputs the operator sets, and its attributes.
+	internal type Call {
+		model   Model
+		step    Step
+		scope   Scope
+		inputs  Held[]
+		outputs Held[]
+
+		def new(model Model, step Step, scope Scope) {
+			self.model = model
+			self.step = step
+			self.scope = scope
+		}
+
+		// The operator set version of the node's domain.
+		opset int {
+			def get() int {
+				return step.opset
+			}
+		}
+
+		// Whether the operator may write its result into input `i`'s arrays:
+		// the value is dead after this step and shares its arrays with no
+		// other value (see markConsumed).
+		def consumes(i int) bool {
+			return i < step.consumes.len() && step.consumes[i]
+		}
+
+		// The run's pool of freed arrays (see Pool).
+		pool Pool {
+			def get() Pool {
+				return scope.root().pool
+			}
+		}
+
+		// Whether input `i` was given.
+		def has(i int) bool {
+			return i < inputs.len() && !(inputs[i].v is none)
+		}
+
+		// Input `i`, `none` when it is left out.
+		def input(i int) ?Value {
+			return i < inputs.len() ?? (inputs[i].v, none)
+		}
+
+		// Input `i` as a tensor.
+		// Fails when it is missing or a sequence.
+		def tensor(i int) !Tensor {
+			fail "onnx: {step.op} {step.node.name} needs input {i + 1}" unless has(i)
+			let v = inputs[i].v
+			fail "onnx: {step.op} {step.node.name} takes a tensor as input {i + 1}, not a sequence" unless v is Tensor
+			return v
+		}
+
+		// Input `i` as a sequence.
+		// Fails when it is missing or a tensor.
+		def sequence(i int) !Tensor[] {
+			fail "onnx: {step.op} {step.node.name} needs input {i + 1}" unless has(i)
+			let v = inputs[i].v
+			fail "onnx: {step.op} {step.node.name} takes a sequence as input {i + 1}" unless v is Tensor[]
+			return v
+		}
+
+		// The integer values of input `i` (a shape, axes, sizes...).
+		// Fails like `tensor`.
+		def ints(i int) !int[] {
+			let t = try tensor(i)
+			return intValues(t)
+		}
+
+		// Sets output `i` (ignored when the node leaves it out).
+		def out(i int, v ?Value) {
+			outputs[i].v = v when i < outputs.len()
+		}
+
+		// Whether output `i` is wanted.
+		def wants(i int) bool {
+			return i < step.writes.len() && step.writes[i] >= 0
+		}
+
+		// The attribute called `name`, if the node has one.
+		def attribute(name string) ?Attribute {
+			return step.node.attribute(name)
+		}
+
+		// Integer attribute `name`, `otherwise` when absent.
+		def int(name string, otherwise int) int {
+			let a = attribute(name)
+			return a is Attribute ?? (a.i, otherwise)
+		}
+
+		// Float attribute `name`, `otherwise` when absent.
+		def float(name string, otherwise float32) float32 {
+			let a = attribute(name)
+			return a is Attribute ?? (a.f, otherwise)
+		}
+
+		// String attribute `name`, `otherwise` when absent.
+		def text(name string, otherwise string) string {
+			let a = attribute(name)
+			return a is Attribute ?? (a.text(), otherwise)
+		}
+
+		// Integer-list attribute `name`, `otherwise` when absent.
+		def ints(name string, otherwise int[]) int[] {
+			let a = attribute(name)
+			return a is Attribute ?? (a.ints, otherwise)
+		}
+
+		// Float-list attribute `name`, `otherwise` when absent.
+		def floats(name string, otherwise float32[]) float32[] {
+			let a = attribute(name)
+			return a is Attribute ?? (a.floats, otherwise)
+		}
+
+		// "onnx: <op> <node>: ", the start of an error message about the node.
+		def about() string {
+			return step.node.name.len() > 0 ?? ("onnx: {step.op} {step.node.name}: ", "onnx: {step.op}: ")
+		}
+	}
+
+	// The integer values of `t`, whatever its numeric type.
+	internal def intValues(t Tensor) int[] {
+		match storageOf(t.element) {
+			case Storage.Ints:
+				return t.ints
+			case Storage.Floats:
+				let out int[]
+				for let (_, v) in t.floats {
+					out.push(int(v))
+				}
+				return out
+			case Storage.Doubles:
+				let out int[]
+				for let (_, v) in t.doubles {
+					out.push(int(v))
+				}
+				return out
+			default:
+				return int[]
+		}
+	}
+
+	// A tensor of `element` values of `shape`, all zero (empty strings).
+	internal def zerosLike(element ElementType, shape int[]) Tensor {
+		let n = 1
+		for let (_, d) in shape {
+			n *= d
+		}
+		match storageOf(element) {
+			case Storage.Floats:
+				let v float32[]
+				v.len(n)
+				return new Tensor(shape.clone(), v, element)
+			case Storage.Doubles:
+				let v float[]
+				v.len(n)
+				let t = new Tensor(shape.clone(), v)
+				t.element = element
+				return t
+			case Storage.Ints:
+				let v int[]
+				v.len(n)
+				return new Tensor(shape.clone(), v, element)
+			default:
+				let v string[]
+				v.len(n)
+				return new Tensor(shape.clone(), v)
+		}
+	}
+
+	// Copies value `i` of `from` to place `j` of `to` (same storage).
+	internal def copyValue(from Tensor, i int, to Tensor, j int) {
+		match storageOf(from.element) {
+			case Storage.Floats:
+				to.floats[j] = from.floats[i]
+			case Storage.Doubles:
+				to.doubles[j] = from.doubles[i]
+			case Storage.Ints:
+				to.ints[j] = from.ints[i]
+			default:
+				to.strings[j] = from.strings[i]
+		}
+	}
+}

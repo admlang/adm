@@ -1,0 +1,329 @@
+internal std.ai partial module std.ai.tensor.gemm {
+	use (
+		std.simd
+		std.ai.tensor::(Weights)
+		std.ai.tensor.bands::*
+	)
+
+	// out = X · Wᵀ for a batch of rows of x (their first `w.cols` values;
+	// row i of out gets its first `w.rows`), through float32 tiles of W
+	// multiplied by `gemm`: each tile is expanded once for the whole
+	// batch. The sums add in another order than `Weights.multiply`'s, so
+	// outputs differ from it by rounding; from about 16 rows on this is
+	// several times faster.
+	def multiplyTiled(w Weights, x matrix<float32>, out matrix<float32>) {
+		let n = x.rows
+		return when n == 0
+		forTiles(w, def (tile float32[], r0 int, count int) {
+			gemm(n, count, w.cols, float32(1), x.data(), 0, x.cols, false, tile, 0, w.cols, true, float32(0), out.data(), r0, out.cols)
+		})
+	}
+
+	// out += X · W for a batch: row `i` of `x` (its first `w.rows` values)
+	// weighs W's rows, whose sum is added to row `i` of `out` (its first
+	// `w.cols` values). This is how a gradient goes back through
+	// out = X · Wᵀ. Tiles of W are expanded once for the whole batch.
+	def multiplyTransposed(w Weights, x matrix<float32>, out matrix<float32>) {
+		let n = x.rows
+		return when n == 0
+		forTiles(w, def (tile float32[], r0 int, count int) {
+			gemm(n, w.cols, count, float32(1), x.data(), r0, x.cols, false, tile, 0, w.cols, false, float32(1), out.data(), 0, out.cols)
+		})
+	}
+
+	// Calls `work(tile, r0, count)` for each tile of W's rows from row r0
+	// on, expanded to float32 (count × cols, row-major): tiles of about
+	// `tileValues` values, expanded in bands on tasks.
+	def forTiles(w Weights, work def(float32[], int, int)) {
+		let cols = w.cols
+		let height = (tileValues / cols).max(gemmDepth).min(w.rows)
+		let tile float32[]
+		tile.len(height * cols)
+		for let r0 = 0; r0 < w.rows; r0 += height {
+			let count = height.min(w.rows - r0)
+			forRows(count, cols, def (from int, to int) {
+				w.row(r0 + from, r0 + to, tile[from * cols:to * cols])
+			}, most = maxBatchTasks)
+			work(tile, r0, count)
+		}
+	}
+
+	// Values in one expanded tile of weights: 16 MB.
+	const tileValues = 4194304
+
+	// The float32 matrix product out = alpha · op(A) · op(B) + beta · out
+	// for an m × k op(A) and a k × n op(B). A's rows start lda apart from
+	// a[ao] (its columns when `transA`: A is then stored k × m), B's rows
+	// ldb apart from b[bo] (stored n × k when `transB`), out's rows ldo
+	// apart from out[oo]. With beta 0 out is only written.
+	//
+	// Blocked as BLIS does: for each slice of `gemmDepth` steps of k, B is
+	// packed into panels of 16 columns and A into panels of 6 rows (both
+	// zero-padded, the transposes taken while packing), and a 6 × 16 tile
+	// of out at a time is summed in twelve vector registers over the
+	// slice. Tiles run on tasks for large products, grouped by panels of
+	// B so a group's panels stay in the core's cache while A's panels
+	// stream past.
+	def gemm(m int, n int, k int, alpha float32, a float32[], ao int, lda int, transA bool, b float32[], bo int, ldb int, transB bool, beta float32, out float32[], oo int, ldo int) {
+		return when m == 0 || n == 0
+		gemmPacked(m, alpha, a, ao, lda, transA, packB(b, bo, ldb, transB, k, n, m * n * k), beta, out, oo, ldo)
+	}
+
+	// B (k × n, stored n × k when `transB`) packed for gemmPacked: for each
+	// slice of `gemmDepth` steps from k0, its 16-column panels from
+	// `values[k0 · panels · 16]`, panel jp of a slice of kc steps at
+	// jp · kc · 16 within it.
+	struct PackedMatrix {
+		k      int
+		n      int
+		panels int
+		values float32[]
+	}
+
+	// `b` packed (see PackedMatrix), on tasks when `work` (the product's
+	// multiply-adds) is large.
+	def packB(b float32[], bo int, ldb int, transB bool, k int, n int, work int) PackedMatrix {
+		let panels = (n + 15) / 16
+		let packed = PackedMatrix{k: k, n: n, panels: panels}
+		packed.values.len(panels * 16 * k)
+		let tasks = (work / (1 << 19)).clamp(1, 48).min(panels)
+		for let k0 = 0; k0 < k; k0 += gemmDepth {
+			let kc = gemmDepth.min(k - k0)
+			let at = k0 * panels * 16
+			if tasks == 1 {
+				packColumns(b, bo, ldb, transB, k0, kc, n, packed.values, at, 0, panels)
+				continue
+			}
+			forall let t in 0..tasks {
+				packColumns(b, bo, ldb, transB, k0, kc, n, packed.values, at, panels * t / tasks, panels * (t + 1) / tasks)
+			}
+		}
+		return packed
+	}
+
+	// out = alpha · op(A) · B + beta · out for an m-row op(A) and a packed
+	// B (see gemm), on at most `maxTasks` tasks.
+	def gemmPacked(m int, alpha float32, a float32[], ao int, lda int, transA bool, b PackedMatrix, beta float32, out float32[], oo int, ldo int, maxTasks int = 48) {
+		let (n, k) = (b.n, b.k)
+		return when m == 0 || n == 0
+		if k == 0 || (beta != float32(0) && beta != float32(1)) {
+			for let i = 0; i < m; i++ {
+				for let j = 0; j < n; j++ {
+					let o = oo + i * ldo + j
+					out[o] = beta == float32(0) ?? (float32(0), beta * out[o])
+				}
+			}
+			return when k == 0
+		}
+		let rowPanels = (m + 5) / 6
+		let colPanels = b.panels
+		let groups = (colPanels + gemmGroup - 1) / gemmGroup
+		let tasks = (m * n * k / (1 << 19)).clamp(1, maxTasks.max(1)).min(rowPanels * groups)
+		let pa float32[]
+		for let k0 = 0; k0 < k; k0 += gemmDepth {
+			let kc = gemmDepth.min(k - k0)
+			pa.len(rowPanels * kc * 6)
+			let adds = k0 > 0 || beta != float32(0)
+			let at = k0 * colPanels * 16
+			if tasks == 1 {
+				packRows(a, ao, lda, transA, k0, kc, m, pa, 0, rowPanels)
+				gemmTiles(0, rowPanels * groups, rowPanels, colPanels, m, n, kc, alpha, adds, pa, b.values, at, out, oo, ldo)
+				continue
+			}
+			forall let t in 0..tasks {
+				packRows(a, ao, lda, transA, k0, kc, m, pa, rowPanels * t / tasks, rowPanels * (t + 1) / tasks)
+			}
+			forall let t in 0..tasks {
+				let items = rowPanels * groups
+				gemmTiles(items * t / tasks, items * (t + 1) / tasks, rowPanels, colPanels, m, n, kc, alpha, adds, pa, b.values, at, out, oo, ldo)
+			}
+		}
+	}
+
+	// Steps of k a packed slice holds: 6 rows of A and 16 columns of B of
+	// 256 steps take 6 KB and 16 KB, so a group of B's panels stays in L2.
+	const gemmDepth = 256
+
+	// Panels of B (16 columns each) a task's tile group shares.
+	const gemmGroup = 8
+
+	// Row panels from..to of op(A)'s rows, steps k0..k0 + kc, into pa: panel
+	// ip holds step p's 6 values at (ip · kc + p) · 6, rows past m zero.
+	def packRows(a float32[], ao int, lda int, transA bool, k0 int, kc int, m int, pa float32[], from int, to int) {
+		for let ip = from; ip < to; ip++ {
+			let base = ip * kc * 6
+			for let r = 0; r < 6; r++ {
+				let i = ip * 6 + r
+				if i >= m {
+					for let p = 0; p < kc; p++ {
+						pa[base + p * 6 + r] = float32(0)
+					}
+					continue
+				}
+				if transA {
+					for let p = 0; p < kc; p++ {
+						pa[base + p * 6 + r] = a[ao + (k0 + p) * lda + i]
+					}
+				} else {
+					let row = ao + i * lda + k0
+					for let p = 0; p < kc; p++ {
+						pa[base + p * 6 + r] = a[row + p]
+					}
+				}
+			}
+		}
+	}
+
+	// Column panels from..to of op(B), steps k0..k0 + kc, into pb from `at`:
+	// panel jp holds step p's 16 values at at + (jp · kc + p) · 16, columns
+	// past n zero.
+	def packColumns(b float32[], bo int, ldb int, transB bool, k0 int, kc int, n int, pb float32[], at int, from int, to int) {
+		for let jp = from; jp < to; jp++ {
+			let base = at + jp * kc * 16
+			let j0 = jp * 16
+			let width = 16.min(n - j0)
+			if !transB && width == 16 {
+				for let p = 0; p < kc; p++ {
+					let row = bo + (k0 + p) * ldb + j0
+					simd.store8<float32>(pb, base + p * 16, simd.load8<float32>(b, row))
+					simd.store8<float32>(pb, base + p * 16 + 8, simd.load8<float32>(b, row + 8))
+				}
+				continue
+			}
+			for let p = 0; p < kc; p++ {
+				let o = base + p * 16
+				for let c = 0; c < 16; c++ {
+					if c >= width {
+						pb[o + c] = float32(0)
+					} else if transB {
+						pb[o + c] = b[bo + (j0 + c) * ldb + k0 + p]
+					} else {
+						pb[o + c] = b[bo + (k0 + p) * ldb + j0 + c]
+					}
+				}
+			}
+		}
+	}
+
+	// Tiles from..to of the product of one packed slice: item i is row
+	// panel i % rowPanels of column group i / rowPanels, each 6 × 16 tile
+	// summed in registers and written as alpha · sum, added to out when
+	// `adds`.
+	def gemmTiles(from int, to int, rowPanels int, colPanels int, m int, n int, kc int, alpha float32, adds bool, pa float32[], pb float32[], pbo int, out float32[], oo int, ldo int) {
+		let scale = simd.splat8<float32>(alpha)
+		let tile float32[]
+		tile.len(96)
+		for let item = from; item < to; item++ {
+			let ip = item % rowPanels
+			let group = item / rowPanels
+			let lastPanel = ((group + 1) * gemmGroup).min(colPanels)
+			for let jp = group * gemmGroup; jp < lastPanel; jp++ {
+				let zero = simd.splat8<float32>(float32(0))
+				let (c00, c01, c10, c11, c20, c21) = (zero, zero, zero, zero, zero, zero)
+				let (c30, c31, c40, c41, c50, c51) = (zero, zero, zero, zero, zero, zero)
+				let ai = ip * kc * 6
+				let bi = pbo + jp * kc * 16
+				for let p = 0; p < kc; p++ {
+					let b0 = simd.load8<float32>(pb, bi)
+					let b1 = simd.load8<float32>(pb, bi + 8)
+					let x0 = simd.splat8<float32>(pa[ai])
+					let x1 = simd.splat8<float32>(pa[ai + 1])
+					c00 = simd.fma(x0, b0, c00)
+					c01 = simd.fma(x0, b1, c01)
+					c10 = simd.fma(x1, b0, c10)
+					c11 = simd.fma(x1, b1, c11)
+					let x2 = simd.splat8<float32>(pa[ai + 2])
+					let x3 = simd.splat8<float32>(pa[ai + 3])
+					c20 = simd.fma(x2, b0, c20)
+					c21 = simd.fma(x2, b1, c21)
+					c30 = simd.fma(x3, b0, c30)
+					c31 = simd.fma(x3, b1, c31)
+					let x4 = simd.splat8<float32>(pa[ai + 4])
+					let x5 = simd.splat8<float32>(pa[ai + 5])
+					c40 = simd.fma(x4, b0, c40)
+					c41 = simd.fma(x4, b1, c41)
+					c50 = simd.fma(x5, b0, c50)
+					c51 = simd.fma(x5, b1, c51)
+					ai += 6
+					bi += 16
+				}
+				let i0 = ip * 6
+				let j0 = jp * 16
+				let rows = 6.min(m - i0)
+				let cols = 16.min(n - j0)
+				if rows == 6 && cols == 16 {
+					let o = oo + i0 * ldo + j0
+					if adds {
+						simd.store8<float32>(out, o, simd.fma(c00, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c01, scale, simd.load8<float32>(out, o + 8)))
+						o += ldo
+						simd.store8<float32>(out, o, simd.fma(c10, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c11, scale, simd.load8<float32>(out, o + 8)))
+						o += ldo
+						simd.store8<float32>(out, o, simd.fma(c20, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c21, scale, simd.load8<float32>(out, o + 8)))
+						o += ldo
+						simd.store8<float32>(out, o, simd.fma(c30, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c31, scale, simd.load8<float32>(out, o + 8)))
+						o += ldo
+						simd.store8<float32>(out, o, simd.fma(c40, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c41, scale, simd.load8<float32>(out, o + 8)))
+						o += ldo
+						simd.store8<float32>(out, o, simd.fma(c50, scale, simd.load8<float32>(out, o)))
+						simd.store8<float32>(out, o + 8, simd.fma(c51, scale, simd.load8<float32>(out, o + 8)))
+					} else {
+						simd.store8<float32>(out, o, c00 * scale)
+						simd.store8<float32>(out, o + 8, c01 * scale)
+						o += ldo
+						simd.store8<float32>(out, o, c10 * scale)
+						simd.store8<float32>(out, o + 8, c11 * scale)
+						o += ldo
+						simd.store8<float32>(out, o, c20 * scale)
+						simd.store8<float32>(out, o + 8, c21 * scale)
+						o += ldo
+						simd.store8<float32>(out, o, c30 * scale)
+						simd.store8<float32>(out, o + 8, c31 * scale)
+						o += ldo
+						simd.store8<float32>(out, o, c40 * scale)
+						simd.store8<float32>(out, o + 8, c41 * scale)
+						o += ldo
+						simd.store8<float32>(out, o, c50 * scale)
+						simd.store8<float32>(out, o + 8, c51 * scale)
+					}
+					continue
+				}
+				// An edge tile: through a buffer, its part inside out.
+				simd.store8<float32>(tile, 0, c00 * scale)
+				simd.store8<float32>(tile, 8, c01 * scale)
+				simd.store8<float32>(tile, 16, c10 * scale)
+				simd.store8<float32>(tile, 24, c11 * scale)
+				simd.store8<float32>(tile, 32, c20 * scale)
+				simd.store8<float32>(tile, 40, c21 * scale)
+				simd.store8<float32>(tile, 48, c30 * scale)
+				simd.store8<float32>(tile, 56, c31 * scale)
+				simd.store8<float32>(tile, 64, c40 * scale)
+				simd.store8<float32>(tile, 72, c41 * scale)
+				simd.store8<float32>(tile, 80, c50 * scale)
+				simd.store8<float32>(tile, 88, c51 * scale)
+				for let r = 0; r < rows; r++ {
+					let o = oo + (i0 + r) * ldo + j0
+					for let c = 0; c < cols; c++ {
+						out[o + c] = adds ?? (out[o + c] + tile[r * 16 + c], tile[r * 16 + c])
+					}
+				}
+			}
+		}
+	}
+
+	// The rows×cols matrix at m[mo] (rows ld apart) transposed, packed.
+	def transposed(m float32[], mo int, ld int, rows int, cols int) float32[] {
+		let out float32[]
+		out.len(rows * cols)
+		for let r = 0; r < rows; r++ {
+			for let c = 0; c < cols; c++ {
+				out[c * rows + r] = m[mo + r * ld + c]
+			}
+		}
+		return out
+	}
+}

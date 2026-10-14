@@ -1,0 +1,2540 @@
+partial module std.ai.onnx {
+	use (
+		std.ai.tensor.gemm::*
+		std.simd
+		std.math
+		std.formats.ai.onnx::(ElementType, Attribute, AttributeKind, isFloat, elementBits)
+		std.ai.tensor::(Tensor, storageOf, Storage)
+	)
+
+	// Runs the convolution, pooling, resizing and spatial sampling operators; false for an operator this family does not have.
+	// Fails when the operator fails on its inputs.
+	internal def applyConvolutions(c Call) !bool {
+		match c.step.op {
+			case "Conv":
+				try convOp(c)
+			case "ConvInteger":
+				try convIntegerOp(c)
+			case "QLinearConv":
+				try qlinearConvOp(c)
+			case "ConvTranspose":
+				try convTransposeOp(c)
+			case "DeformConv":
+				try deformConvOp(c)
+			case "Col2Im":
+				try col2imOp(c)
+			case "CausalConvWithState":
+				try causalConvOp(c)
+			case "MaxPool":
+				try poolOp(c, PoolKind.Max, false)
+			case "AveragePool":
+				try poolOp(c, PoolKind.Average, false)
+			case "LpPool":
+				try poolOp(c, PoolKind.Lp, false)
+			case "GlobalMaxPool":
+				try poolOp(c, PoolKind.Max, true)
+			case "GlobalAveragePool":
+				try poolOp(c, PoolKind.Average, true)
+			case "GlobalLpPool":
+				try poolOp(c, PoolKind.Lp, true)
+			case "MaxUnpool":
+				try maxUnpoolOp(c)
+			case "MaxRoiPool":
+				try maxRoiPoolOp(c)
+			case "RoiAlign":
+				try roiAlignOp(c)
+			case "NonMaxSuppression":
+				try nonMaxSuppressionOp(c)
+			case "AffineGrid":
+				try affineGridOp(c)
+			case "GridSample":
+				try gridSampleOp(c)
+			case "Resize", "Upsample":
+				try resizeOp(c)
+			default:
+				return false
+		}
+		return true
+	}
+
+	// ---- Sliding windows ----
+
+	// Where a sliding window reads, per spatial axis: the `input` sizes,
+	// the `output` positions, the kernel, strides and dilations, and the
+	// padding before (`begin`) and after (`end`) the input.
+	internal struct Window {
+		input     int[]
+		output    int[]
+		kernel    int[]
+		strides   int[]
+		dilations int[]
+		before    int[]
+		after     int[]
+	}
+
+	// The product of `dims` (1 for none).
+	internal def volume(dims int[]) int {
+		let n = 1
+		for let (_, d) in dims {
+			n *= d
+		}
+		return n
+	}
+
+	// Integer division rounded up (toward plus infinity).
+	internal def ceilDiv(x int, y int) int {
+		return -floorDiv(-x, y)
+	}
+
+	// `n` copies of `v`.
+	internal def repeated(v int, n int) int[] {
+		let out int[]
+		for let i = 0; i < n; i++ {
+			out.push(v)
+		}
+		return out
+	}
+
+	// The window of a convolution or pooling of `c` over the spatial sizes
+	// `input` with `kernel`: its strides, dilations, pads and auto_pad,
+	// the output sizes rounded down, or up with `ceil` (a pooling's
+	// ceil_mode, where a window that would start in the end padding is
+	// left out).
+	// Fails when an attribute has the wrong length or a non-positive
+	// stride or dilation.
+	internal def windowOf(c Call, input int[], kernel int[], ceil bool) !Window {
+		let rank = input.len()
+		let w = Window{input: input.clone(), kernel: kernel.clone(), strides: c.ints("strides", repeated(1, rank)), dilations: c.ints("dilations", repeated(1, rank))}
+		let pads = c.ints("pads", repeated(0, 2 * rank))
+		fail c.about() + "kernel_shape {kernel}, strides {w.strides}, dilations {w.dilations} and pads {pads} do not fit {rank} spatial axes" unless kernel.len() == rank && w.strides.len() == rank && w.dilations.len() == rank && pads.len() == 2 * rank
+		let auto = c.text("auto_pad", "NOTSET")
+		w.before.len(rank)
+		w.after.len(rank)
+		w.output.len(rank)
+		for let d = 0; d < rank; d++ {
+			let s = w.strides[d]
+			fail c.about() + "strides, dilations and the kernel must be positive" unless s > 0 && w.dilations[d] > 0 && kernel[d] > 0
+			let span = (kernel[d] - 1) * w.dilations[d] + 1
+			match auto {
+				case "SAME_UPPER", "SAME_LOWER":
+					let out = ceilDiv(input[d], s)
+					let pad = ((out - 1) * s + span - input[d]).max(0)
+					w.before[d] = auto == "SAME_UPPER" ?? (pad / 2, pad - pad / 2)
+					w.after[d] = pad - w.before[d]
+					w.output[d] = out
+				case "VALID":
+					w.output[d] = floorDiv(input[d] - span, s) + 1
+				default:
+					fail c.about() + "auto_pad {auto} is not NOTSET, SAME_UPPER, SAME_LOWER or VALID" unless auto == "NOTSET" || auto.len() == 0
+					w.before[d] = pads[d]
+					w.after[d] = pads[rank + d]
+					let total = input[d] + pads[d] + pads[rank + d] - span
+					let out = (ceil ?? (ceilDiv(total, s), floorDiv(total, s))) + 1
+					out -= 1 when ceil && out > 0 && (out - 1) * s >= input[d] + pads[d]
+					w.output[d] = out
+			}
+			w.output[d] = w.output[d].max(0)
+		}
+		return w
+	}
+
+	// The shape (batch, channels, spatial...).
+	internal def planeShape(batch int, channels int, spatial int[]) int[] {
+		let shape = int[batch, channels]
+		for let (_, d) in spatial {
+			shape.push(d)
+		}
+		return shape
+	}
+
+	// How a window's kernel taps read an image: for every tap and every
+	// row of output positions (all axes but the last), the stretch of the
+	// row that falls inside the image. A run starts at `col` in the
+	// column matrix of one channel (tap-major: tap · outputs + position)
+	// and at `image` in the channel's image, and covers `count` values,
+	// `step` apart in the image (the last axis' stride).
+	internal struct Runs {
+		tap   int[]
+		col   int[]
+		image int[]
+		count int[]
+		step  int
+	}
+
+	// The runs of `w` (see Runs); taps and positions reading padding have
+	// none.
+	internal def runsOf(w Window) Runs {
+		let rank = w.input.len()
+		let last = rank - 1
+		let runs = Runs{step: w.strides[last]}
+		let taps = volume(w.kernel)
+		let outSize = volume(w.output)
+		let outLast = w.output[last]
+		return runs when outSize == 0
+		let rows = outSize / outLast
+		let inStride int[]
+		inStride.len(rank)
+		let stride = 1
+		for let d = last; d >= 0; d-- {
+			inStride[d] = stride
+			stride *= w.input[d]
+		}
+		let kc int[]
+		kc.len(rank)
+		let s = w.strides[last]
+		let inLast = w.input[last]
+		for let tap = 0; tap < taps; tap++ {
+			let rem = tap
+			for let d = last; d >= 0; d-- {
+				kc[d] = rem % w.kernel[d]
+				rem /= w.kernel[d]
+			}
+			let base = kc[last] * w.dilations[last] - w.before[last]
+			let x0 = base >= 0 ?? (0, ceilDiv(-base, s))
+			let x1 = inLast - 1 - base < 0 ?? (0, (floorDiv(inLast - 1 - base, s) + 1).min(outLast))
+			continue when x1 <= x0
+			for let row = 0; row < rows; row++ {
+				let r = row
+				let at = 0
+				let inside = true
+				for let d = last - 1; d >= 0; d-- {
+					let o = r % w.output[d]
+					r /= w.output[d]
+					let i = o * w.strides[d] - w.before[d] + kc[d] * w.dilations[d]
+					if i < 0 || i >= w.input[d] {
+						inside = false
+						break
+					}
+					at += i * inStride[d]
+				}
+				continue unless inside
+				runs.tap.push(tap)
+				runs.col.push(tap * outSize + row * outLast + x0)
+				runs.image.push(at + x0 * s + base)
+				runs.count.push(x1 - x0)
+			}
+		}
+		return runs
+	}
+
+	// Whether the columns of `w` are its input (a 1 × … × 1 kernel, unit
+	// strides, no padding).
+	internal def pointwise(w Window) bool {
+		return false when volume(w.kernel) != 1
+		for let d = 0; d < w.input.len(); d++ {
+			return false unless w.strides[d] == 1 && w.before[d] == 0 && w.after[d] == 0
+		}
+		return true
+	}
+
+	// Tasks to split `work` values of work over `items` independent items.
+	internal def tasksFor(work int, items int) int {
+		return (work / parallelFrom).clamp(1, 32).min(items.max(1))
+	}
+
+	// The column matrix of `channels` images at x[xo] (inSize values
+	// each): per channel and tap a row of `outSize` values, zero where the
+	// tap reads padding. Positions that read padding are never written,
+	// so a buffer reused for the same runs stays right.
+	internal def im2col<T: SimdNumeric>(x T[], xo int, channels int, inSize int, taps int, outSize int, runs Runs, col T[]) {
+		let tasks = tasksFor(channels * taps * outSize, channels)
+		if tasks == 1 {
+			im2colChannels(x, xo, 0, channels, inSize, taps, outSize, runs, col)
+			return
+		}
+		forall let t in 0..tasks {
+			im2colChannels(x, xo, channels * t / tasks, channels * (t + 1) / tasks, inSize, taps, outSize, runs, col)
+		}
+	}
+
+	internal def im2colChannels<T: SimdNumeric>(x T[], xo int, first int, last int, inSize int, taps int, outSize int, runs Runs, col T[]) {
+		let step = runs.step
+		for let ch = first; ch < last; ch++ {
+			let cb = ch * taps * outSize
+			let ib = xo + ch * inSize
+			for let r = 0; r < runs.count.len(); r++ {
+				let dst = cb + runs.col[r]
+				let src = ib + runs.image[r]
+				let n = runs.count[r]
+				if step == 1 {
+					x[src:src + n].copy(col[dst:dst + n])
+				} else {
+					for let j = 0; j < n; j++ {
+						col[dst + j] = x[src + j * step]
+					}
+				}
+			}
+		}
+	}
+
+	// Adds the column matrix of `channels` images (per channel `taps`
+	// rows of `colSize`) at col[co] into the images at img[io] (`imgSize`
+	// values each), the inverse of im2col.
+	internal def col2imInto<T: SimdNumeric>(col T[], co int, channels int, taps int, colSize int, runs Runs, img T[], io int, imgSize int) {
+		let tasks = tasksFor(channels * taps * colSize, channels)
+		if tasks == 1 {
+			col2imChannels(col, co, 0, channels, taps, colSize, runs, img, io, imgSize)
+			return
+		}
+		forall let t in 0..tasks {
+			col2imChannels(col, co, channels * t / tasks, channels * (t + 1) / tasks, taps, colSize, runs, img, io, imgSize)
+		}
+	}
+
+	internal def col2imChannels<T: SimdNumeric>(col T[], co int, first int, last int, taps int, colSize int, runs Runs, img T[], io int, imgSize int) {
+		let step = runs.step
+		for let ch = first; ch < last; ch++ {
+			let cb = co + ch * taps * colSize
+			let ib = io + ch * imgSize
+			for let r = 0; r < runs.count.len(); r++ {
+				let src = cb + runs.col[r]
+				let dst = ib + runs.image[r]
+				let n = runs.count[r]
+				let j = 0
+				if step == 1 {
+					for; j + 8 <= n; j += 8 {
+						simd.store8<T>(img, dst + j, simd.load8<T>(img, dst + j) + simd.load8<T>(col, src + j))
+					}
+				}
+				for; j < n; j++ {
+					img[dst + j * step] += col[src + j]
+				}
+			}
+		}
+	}
+
+	// ---- Matrix products ----
+
+	// The float32 matrix product out = a · b for an m × k `a` (rows lda
+	// apart from a[ao]) and a k × n `b` (rows ldb apart from b[bo]) into
+	// out (rows ldo apart from out[oo]), out overwritten; the products
+	// the convolutions take as `mul` have this form.
+	internal def floatProduct(m int, n int, k int, a float32[], ao int, lda int, b float32[], bo int, ldb int, out float32[], oo int, ldo int) {
+		gemm(m, n, k, float32(1), a, ao, lda, false, b, bo, ldb, false, float32(0), out, oo, ldo)
+	}
+
+	internal def doubleProduct(m int, n int, k int, a float[], ao int, lda int, b float[], bo int, ldb int, out float[], oo int, ldo int) {
+		multiply(m, n, k, a, ao, lda, b, bo, ldb, out, oo, ldo)
+	}
+
+	internal def intProduct(m int, n int, k int, a int[], ao int, lda int, b int[], bo int, ldb int, out int[], oo int, ldo int) {
+		multiply(m, n, k, a, ao, lda, b, bo, ldb, out, oo, ldo)
+	}
+
+	// The product (see floatProduct) of any numeric lanes: eight columns of a
+	// row at a time, rows split over tasks for large products.
+	internal def multiply<T: SimdNumeric>(m int, n int, k int, a T[], ao int, lda int, b T[], bo int, ldb int, out T[], oo int, ldo int) {
+		return when m == 0 || n == 0
+		let tasks = tasksFor(m * n * k / 8, m)
+		if tasks == 1 {
+			multiplyRows(0, m, n, k, a, ao, lda, b, bo, ldb, out, oo, ldo)
+			return
+		}
+		forall let t in 0..tasks {
+			multiplyRows(m * t / tasks, m * (t + 1) / tasks, n, k, a, ao, lda, b, bo, ldb, out, oo, ldo)
+		}
+	}
+
+	internal def multiplyRows<T: SimdNumeric>(first int, last int, n int, k int, a T[], ao int, lda int, b T[], bo int, ldb int, out T[], oo int, ldo int) {
+		for let i = first; i < last; i++ {
+			let r = ao + i * lda
+			let o = oo + i * ldo
+			let j = 0
+			for; j + 8 <= n; j += 8 {
+				let acc = simd.splat8<T>(T(0))
+				for let p = 0; p < k; p++ {
+					acc = acc + simd.splat8<T>(a[r + p]) * simd.load8<T>(b, bo + p * ldb + j)
+				}
+				simd.store8<T>(out, o + j, acc)
+			}
+			for; j < n; j++ {
+				let acc = T(0)
+				for let p = 0; p < k; p++ {
+					acc += a[r + p] * b[bo + p * ldb + j]
+				}
+				out[o + j] = acc
+			}
+		}
+	}
+
+	// The product of an m × k `a` and a k × n `b` (row-major, a[ao] and
+	// b[bo] on) into out[oo] with every leading dimension packed, split
+	// into bands of columns on tasks when there are too few rows for the
+	// product to split itself.
+	internal def columnBands<T: SimdNumeric>(m int, n int, k int, a T[], ao int, b T[], bo int, out T[], oo int, mul def(int, int, int, T[], int, int, T[], int, int, T[], int, int)) {
+		let bands = (m * n * k / (1 << 21)).clamp(1, 32).min((n + 63) / 64)
+		if bands <= 1 || m >= 64 {
+			mul(m, n, k, a, ao, k, b, bo, n, out, oo, n)
+			return
+		}
+		forall let t in 0..bands {
+			let from = t == 0 ?? (0, n * t / bands / 16 * 16)
+			let to = t == bands - 1 ?? (n, n * (t + 1) / bands / 16 * 16)
+			mul(m, to - from, k, a, ao, k, b, bo + from, n, out, oo + from, n)
+		}
+	}
+
+	// ---- Convolutions ----
+
+	// Convolves `batch` images of `channels` at x into y (maps output
+	// channels, which start zero): W (maps × channels/group × kernel)
+	// applied by groups, as a depthwise loop when every group has one
+	// input and one output channel, else as the product of each group's
+	// weights with its column matrix.
+	internal def convolveInto<T: SimdNumeric>(x T[], w T[], y T[], batch int, channels int, maps int, group int, win Window, mul def(int, int, int, T[], int, int, T[], int, int, T[], int, int)) {
+		let cg = channels / group
+		let mg = maps / group
+		let taps = volume(win.kernel)
+		let inSize = volume(win.input)
+		let outSize = volume(win.output)
+		return when outSize == 0 || batch == 0 || maps == 0
+		if cg == 1 && mg == 1 {
+			depthwise(x, w, y, batch * channels, channels, inSize, taps, outSize, runsOf(win))
+			return
+		}
+		let depth = cg * taps
+		if pointwise(win) {
+			for let b = 0; b < batch; b++ {
+				for let g = 0; g < group; g++ {
+					columnBands(mg, outSize, depth, w, g * mg * depth, x, (b * channels + g * cg) * inSize, y, (b * maps + g * mg) * outSize, mul)
+				}
+			}
+			return
+		}
+		let runs = runsOf(win)
+		let col T[]
+		col.len(depth * outSize)
+		for let b = 0; b < batch; b++ {
+			for let g = 0; g < group; g++ {
+				im2col(x, (b * channels + g * cg) * inSize, cg, inSize, taps, outSize, runs, col)
+				columnBands(mg, outSize, depth, w, g * mg * depth, col, 0, y, (b * maps + g * mg) * outSize, mul)
+			}
+		}
+	}
+
+	// A depthwise convolution: plane p of x (channel p % channels) with
+	// that channel's kernel into plane p of y, which starts zero.
+	internal def depthwise<T: SimdNumeric>(x T[], w T[], y T[], planes int, channels int, inSize int, taps int, outSize int, runs Runs) {
+		let tasks = tasksFor(planes * taps * outSize, planes)
+		if tasks == 1 {
+			depthwisePlanes(x, w, y, 0, planes, channels, inSize, taps, outSize, runs)
+			return
+		}
+		forall let t in 0..tasks {
+			depthwisePlanes(x, w, y, planes * t / tasks, planes * (t + 1) / tasks, channels, inSize, taps, outSize, runs)
+		}
+	}
+
+	internal def depthwisePlanes<T: SimdNumeric>(x T[], w T[], y T[], first int, last int, channels int, inSize int, taps int, outSize int, runs Runs) {
+		let step = runs.step
+		for let p = first; p < last; p++ {
+			let xo = p * inSize
+			let yo = p * outSize
+			let wo = (p % channels) * taps
+			for let r = 0; r < runs.count.len(); r++ {
+				let tap = runs.tap[r]
+				let wv = w[wo + tap]
+				let dst = yo + runs.col[r] - tap * outSize
+				let src = xo + runs.image[r]
+				let n = runs.count[r]
+				let j = 0
+				if step == 1 {
+					let wv8 = simd.splat8<T>(wv)
+					for; j + 8 <= n; j += 8 {
+						simd.store8<T>(y, dst + j, simd.load8<T>(y, dst + j) + wv8 * simd.load8<T>(x, src + j))
+					}
+				}
+				for; j < n; j++ {
+					y[dst + j] += wv * x[src + j * step]
+				}
+			}
+		}
+	}
+
+	// Adds bias[ch] to every value of each output plane.
+	internal def addBias<T: SimdNumeric>(y T[], bias T[], batch int, maps int, size int) {
+		for let b = 0; b < batch; b++ {
+			for let m = 0; m < maps; m++ {
+				let o = (b * maps + m) * size
+				let v = bias[m]
+				let v8 = simd.splat8<T>(v)
+				let j = 0
+				for; j + 8 <= size; j += 8 {
+					simd.store8<T>(y, o + j, simd.load8<T>(y, o + j) + v8)
+				}
+				for; j < size; j++ {
+					y[o + j] += v
+				}
+			}
+		}
+	}
+
+	// Checks the shapes of a convolution's X (N × C × ...) and W (M ×
+	// C/group × kernel) for `group`.
+	internal def checkConv(c Call, x Tensor, w Tensor, group int) !none {
+		fail c.about() + "X must have a batch, a channel and at least one spatial axis" unless x.rank() >= 3
+		fail c.about() + "W has shape {w.shape}, X {x.shape}" unless w.rank() == x.rank()
+		fail c.about() + "group {group} does not divide the {x.shape[1]} input and {w.shape[0]} output channels" unless group > 0 && x.shape[1] % group == 0 && w.shape[0] % group == 0
+		fail c.about() + "W has {w.shape[1]} channels per group, X {x.shape[1] / group}" unless w.shape[1] == x.shape[1] / group
+		return none
+	}
+
+	// The kernel shape of a convolution: the attribute, else W's.
+	// Fails when the attribute disagrees with W.
+	internal def kernelOf(c Call, w Tensor) !int[] {
+		let kernel = c.ints("kernel_shape", w.shape[2:].clone())
+		fail c.about() + "kernel_shape {kernel} does not match W {w.shape}" unless kernel.equals(w.shape[2:].clone())
+		return kernel
+	}
+
+	// Whether `t` is a real floating-point type kept as float32.
+	internal def realFloats(t ElementType) bool {
+		return isFloat(t) && storageOf(t) == Storage.Floats && t != ElementType.Complex64
+	}
+
+	// Packs a constant float32 Conv weight W (maps × channels/group ×
+	// kernel) for convolvePacked: per group, the maps' rows of
+	// channels/group · taps values as B of a product (stored n × k).
+	// Depthwise weights (one channel and one map a group) are left to
+	// the direct loop.
+	internal def prepareConv(plan Plan, s int, w Tensor, group int) {
+		return when plan.convPacked.get(s) is PackedMatrix[] || w.rank() < 3 || !realFloats(w.element) || group < 1 || w.shape[0] % group != 0
+		let maps = w.shape[0]
+		let mg = maps / group
+		return when w.shape[1] == 1 && mg == 1
+		let depth = w.count() / maps.max(1)
+		let packs PackedMatrix[]
+		for let g = 0; g < group; g++ {
+			packs.push(packB(w.floats, g * mg * depth, depth, true, depth, mg, 1 << 30))
+		}
+		plan.convPacked.set(s, packs)
+	}
+
+	// Rows of output positions a convolvePacked task builds and multiplies
+	// at a time: 64 row panels, so a block's rows stay near the core.
+	const convBlock = 384
+
+	// The float32 convolution of `batch` images of `channels` at x into y
+	// (maps output channels) with W packed per group (`packs`), plus
+	// `bias` when given: for each group, blocks of output positions become
+	// rows of their window's values (im2row), multiplied by the packed
+	// weights on one task each, the products written into y's planes.
+	internal def convolvePacked(x float32[], packs PackedMatrix[], bias float32[], y float32[], batch int, channels int, maps int, win Window) {
+		let group = packs.len()
+		let cg = channels / group
+		let mg = maps / group
+		let inSize = volume(win.input)
+		let outSize = volume(win.output)
+		let depth = packs[0].k
+		return when outSize == 0 || batch == 0
+		let blocks = (outSize + convBlock - 1) / convBlock
+		let items = batch * group * blocks
+		let tasks = (items * convBlock * depth * mg / (1 << 21)).clamp(1, 48).min(items)
+		forall let t in 0..tasks {
+			let rows float32[]
+			rows.len(convBlock * depth)
+			let product float32[]
+			product.len(convBlock * mg)
+			for let item = items * t / tasks; item < items * (t + 1) / tasks; item++ {
+				let block = item % blocks
+				let g = (item / blocks) % group
+				let b = item / (blocks * group)
+				let p0 = block * convBlock
+				let n = convBlock.min(outSize - p0)
+				im2row(x, (b * channels + g * cg) * inSize, cg, win, p0, n, depth, rows)
+				gemmPacked(n, float32(1), rows, 0, depth, false, packs[g], float32(0), product, 0, mg, 1)
+				for let m = 0; m < mg; m++ {
+					let plane = (b * maps + g * mg + m) * outSize + p0
+					let add = bias.len() > 0 ?? (bias[g * mg + m], float32(0))
+					for let r = 0; r < n; r++ {
+						y[plane + r] = product[r * mg + m] + add
+					}
+				}
+			}
+		}
+	}
+
+	// Rows `p0` to p0 + n of the window matrix of `cg` channels from
+	// x[xo:]: row r holds, for each channel and kernel tap (the last axis
+	// innermost), the input value the tap reads for output position p0 + r,
+	// 0 in the padding.
+	internal def im2row(x float32[], xo int, cg int, win Window, p0 int, n int, depth int, rows float32[]) {
+		let rank = win.output.len()
+		let last = rank - 1
+		let taps = depth / cg.max(1)
+		let inSize = volume(win.input)
+		let lastKernel = win.kernel[last]
+		let outer = taps / lastKernel
+		let position int[]
+		position.len(rank)
+		let tap int[]
+		tap.len(rank)
+		for let r = 0; r < n; r++ {
+			// The output coordinates of position p0 + r.
+			let rest = p0 + r
+			for let d = last; d >= 0; d-- {
+				position[d] = rest % win.output[d]
+				rest /= win.output[d]
+			}
+			let row = r * depth
+			let start = position[last] * win.strides[last] - win.before[last]
+			let width = win.input[last]
+			let step = win.dilations[last]
+			for let q = 0; q < outer; q++ {
+				// The kernel coordinates of the axes before the last, and the
+				// input row they read; off the input when any falls outside.
+				let k = q
+				for let d = last - 1; d >= 0; d-- {
+					tap[d] = k % win.kernel[d]
+					k /= win.kernel[d]
+				}
+				let at = 0
+				let inside = true
+				for let d = 0; d < last; d++ {
+					let i = position[d] * win.strides[d] - win.before[d] + tap[d] * win.dilations[d]
+					inside = inside && i >= 0 && i < win.input[d]
+					at = at * win.input[d] + i
+				}
+				for let c = 0; c < cg; c++ {
+					let o = row + (c * outer + q) * lastKernel
+					if !inside {
+						for let j = 0; j < lastKernel; j++ {
+							rows[o + j] = float32(0)
+						}
+						continue
+					}
+					let base = xo + c * inSize + at * width
+					for let j = 0; j < lastKernel; j++ {
+						let i = start + j * step
+						rows[o + j] = i >= 0 && i < width ?? (x[base + i], float32(0))
+					}
+				}
+			}
+		}
+	}
+
+	// Conv: floating-point convolution with groups, strides, dilations,
+	// pads or auto_pad, and an optional bias.
+	internal def convOp(c Call) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(1)
+		let group = c.int("group", 1)
+		try checkConv(c, x, w, group)
+		fail c.about() + "X is {x.element.name}, W {w.element.name}" unless x.element == w.element
+		let win = try windowOf(c, x.shape[2:].clone(), try kernelOf(c, w), false)
+		let y = zerosLike(x.element, planeShape(x.shape[0], w.shape[0], win.output))
+		let size = volume(win.output)
+		let packs = c.step.reads.len() > 1 && c.step.reads[1] >= 0 ?? (c.scope.plan.convPacked.get(c.step.reads[1]), none)
+		if realFloats(x.element) && packs is PackedMatrix[] && packs.len() == group {
+			convolvePacked(x.floats, packs, c.has(2) ?? ((try c.tensor(2)).floats, float32[]), y.floats, x.shape[0], x.shape[1], w.shape[0], win)
+			roundTo(y)
+		} else if realFloats(x.element) {
+			convolveInto(x.floats, w.floats, y.floats, x.shape[0], x.shape[1], w.shape[0], group, win, floatProduct)
+			addBias(y.floats, (try c.tensor(2)).floats, x.shape[0], w.shape[0], size) when c.has(2)
+			roundTo(y)
+		} else if x.element == ElementType.Double {
+			convolveInto(x.doubles, w.doubles, y.doubles, x.shape[0], x.shape[1], w.shape[0], group, win, doubleProduct)
+			addBias(y.doubles, (try c.tensor(2)).doubles, x.shape[0], w.shape[0], size) when c.has(2)
+		} else {
+			fail c.about() + "Conv of {x.element.name}"
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// The integer zero point of input `i` (0 when absent): a scalar, or
+	// one value per output channel (`perChannel` values).
+	// Fails when it has another length.
+	internal def zeroPoints(c Call, i int, perChannel int) !int[] {
+		return int[0] unless c.has(i)
+		let values = try c.ints(i)
+		fail c.about() + "zero point {i + 1} has {values.len()} values, not 1 or {perChannel}" unless values.len() == 1 || values.len() == perChannel
+		return values
+	}
+
+	// `t`'s values minus the zero point: one for all, or one per block of
+	// `block` values.
+	internal def shifted(t Tensor, zero int[], block int) int[] {
+		let out = t.ints.clone()
+		if zero.len() == 1 {
+			let z = zero[0]
+			return out when z == 0
+			for let i = 0; i < out.len(); i++ {
+				out[i] -= z
+			}
+			return out
+		}
+		for let i = 0; i < out.len(); i++ {
+			out[i] -= zero[i / block]
+		}
+		return out
+	}
+
+	// The integer convolution of ConvInteger and QLinearConv: x and w
+	// (8-bit integers) less their zero points (inputs xz and wz), as
+	// 64-bit sums.
+	internal def integerConvolution(c Call, x Tensor, xz int, w Tensor, wz int) !Tensor {
+		let group = c.int("group", 1)
+		try checkConv(c, x, w, group)
+		fail c.about() + "takes integer inputs, not {x.element.name} and {w.element.name}" unless storageOf(x.element) == Storage.Ints && storageOf(w.element) == Storage.Ints
+		let win = try windowOf(c, x.shape[2:].clone(), try kernelOf(c, w), false)
+		let maps = w.shape[0]
+		let xs = shifted(x, try zeroPoints(c, xz, 1), 1)
+		let ws = shifted(w, try zeroPoints(c, wz, maps), w.count() / maps.max(1))
+		let y = zerosLike(ElementType.Int32, planeShape(x.shape[0], maps, win.output))
+		convolveInto(xs, ws, y.ints, x.shape[0], x.shape[1], maps, group, win, intProduct)
+		return y
+	}
+
+	// ConvInteger: the convolution of zero-point-shifted 8-bit integers
+	// into Int32.
+	internal def convIntegerOp(c Call) !none {
+		let y = try integerConvolution(c, try c.tensor(0), 2, try c.tensor(1), 3)
+		for let i = 0; i < y.ints.len(); i++ {
+			y.ints[i] = wrap(y.ints[i], 32, true)
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// QLinearConv: the integer convolution plus the Int32 bias, scaled by
+	// x_scale · w_scale / y_scale (w_scale per output channel or one),
+	// rounded half to even, moved by y_zero_point and saturated to the
+	// output type (y_zero_point's, else x's).
+	internal def qlinearConvOp(c Call) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(3)
+		let acc = try integerConvolution(c, x, 2, w, 5)
+		let maps = w.shape[0]
+		let xScale = float32(scalarFloat(try c.tensor(1)))
+		let yScale = float32(scalarFloat(try c.tensor(6)))
+		let wScale = asDoubles(try c.tensor(4))
+		fail c.about() + "w_scale has {wScale.len()} values, not 1 or {maps}" unless wScale.len() == 1 || wScale.len() == maps
+		let element = c.has(7) ?? ((try c.tensor(7)).element, x.element)
+		let yZero = c.has(7) ?? (scalarInt(try c.tensor(7)), 0)
+		let (low, high) = element == ElementType.Int8 ?? ((-128, 127), (0, 255))
+		let bias = c.has(8) ?? (try c.ints(8), int[])
+		let size = acc.count() / (acc.shape[0] * maps).max(1)
+		let y = zerosLike(element, acc.shape)
+		let scales float[]
+		for let m = 0; m < maps; m++ {
+			let ws = float32(wScale[wScale.len() == 1 ?? (0, m)])
+			scales.push(float(xScale * ws / yScale))
+		}
+		for let i = 0; i < acc.ints.len(); i++ {
+			let m = (i / size) % maps
+			let v = acc.ints[i] + (bias.len() > 0 ?? (bias[m], 0))
+			let q = roundEven(float(v) * scales[m]) + float(yZero)
+			y.ints[i] = int(q.clamp(float(low), float(high)))
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// The window of a ConvTranspose over its input sizes: the output
+	// sizes from output_shape (its padding then split as auto_pad says),
+	// from auto_pad SAME (input · stride), or from the pads and
+	// output_padding. As a Window it reads the other way: `input` is the
+	// output image, `output` the input positions the kernel scatters from.
+	// Fails when an attribute has the wrong length.
+	internal def transposeWindow(c Call, input int[], kernel int[]) !Window {
+		let rank = input.len()
+		let strides = c.ints("strides", repeated(1, rank))
+		let dilations = c.ints("dilations", repeated(1, rank))
+		let pads = c.ints("pads", repeated(0, 2 * rank))
+		let extra = c.ints("output_padding", repeated(0, rank))
+		let given = c.ints("output_shape", int[])
+		// Some models give output_shape with the batch and channel axes.
+		let shape = given.len() == rank + 2 ?? (given[2:].clone(), given)
+		fail c.about() + "kernel_shape, strides, dilations, pads, output_padding or output_shape do not fit {rank} spatial axes" unless kernel.len() == rank && strides.len() == rank && dilations.len() == rank && pads.len() == 2 * rank && extra.len() == rank && (shape.len() == 0 || shape.len() == rank)
+		let auto = c.text("auto_pad", "NOTSET")
+		let w = Window{output: input.clone(), kernel: kernel.clone(), strides: strides, dilations: dilations}
+		w.input.len(rank)
+		w.before.len(rank)
+		w.after.len(rank)
+		for let d = 0; d < rank; d++ {
+			fail c.about() + "strides and dilations must be positive" unless strides[d] > 0 && dilations[d] > 0
+			let span = (kernel[d] - 1) * dilations[d] + 1
+			let full = strides[d] * (input[d] - 1) + extra[d] + span
+			if shape.len() > 0 || auto == "SAME_UPPER" || auto == "SAME_LOWER" {
+				let out = shape.len() > 0 ?? (shape[d], input[d] * strides[d])
+				let total = full - out
+				if auto == "SAME_UPPER" {
+					w.before[d] = floorDiv(total, 2)
+					w.after[d] = total - w.before[d]
+				} else {
+					w.after[d] = floorDiv(total, 2)
+					w.before[d] = total - w.after[d]
+				}
+				w.input[d] = out
+			} else {
+				w.before[d] = pads[d]
+				w.after[d] = pads[rank + d]
+				w.input[d] = (full - pads[d] - pads[rank + d]).max(0)
+			}
+		}
+		return w
+	}
+
+	// ConvTranspose: each input value scatters the kernel times itself
+	// into the output: per group the product of the transposed weights
+	// with the input, folded back by col2im, plus the bias.
+	internal def convTransposeOp(c Call) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(1)
+		let group = c.int("group", 1)
+		fail c.about() + "X must have a batch, a channel and at least one spatial axis, W as many" unless x.rank() >= 3 && w.rank() == x.rank()
+		fail c.about() + "group {group} does not divide the {x.shape[1]} input channels, or W {w.shape} does not have them" unless group > 0 && x.shape[1] % group == 0 && w.shape[0] == x.shape[1]
+		fail c.about() + "X is {x.element.name}, W {w.element.name}" unless x.element == w.element
+		let win = try transposeWindow(c, x.shape[2:].clone(), try kernelOf(c, w))
+		let maps = w.shape[1] * group
+		let y = zerosLike(x.element, planeShape(x.shape[0], maps, win.input))
+		let size = volume(win.input)
+		if realFloats(x.element) {
+			transposeInto(x.floats, w.floats, y.floats, x.shape[0], x.shape[1], maps, group, win, floatProduct)
+			addBias(y.floats, (try c.tensor(2)).floats, x.shape[0], maps, size) when c.has(2)
+			roundTo(y)
+		} else if x.element == ElementType.Double {
+			transposeInto(x.doubles, w.doubles, y.doubles, x.shape[0], x.shape[1], maps, group, win, doubleProduct)
+			addBias(y.doubles, (try c.tensor(2)).doubles, x.shape[0], maps, size) when c.has(2)
+		} else {
+			fail c.about() + "ConvTranspose of {x.element.name}"
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// The transposed convolution of `batch` images of `channels` at x
+	// into y (`maps` channels, which start zero) for a transposed window
+	// (see transposeWindow).
+	internal def transposeInto<T: SimdNumeric>(x T[], w T[], y T[], batch int, channels int, maps int, group int, win Window, mul def(int, int, int, T[], int, int, T[], int, int, T[], int, int)) {
+		let cg = channels / group
+		let mg = maps / group
+		let taps = volume(win.kernel)
+		let inSize = volume(win.output)
+		let outSize = volume(win.input)
+		return when outSize == 0 || inSize == 0 || batch == 0 || mg == 0
+		let rows = mg * taps
+		// Each group's weights (cg × rows) transposed to rows × cg.
+		let wt T[]
+		wt.len(group * rows * cg)
+		for let g = 0; g < group; g++ {
+			let base = g * rows * cg
+			for let ci = 0; ci < cg; ci++ {
+				for let r = 0; r < rows; r++ {
+					wt[base + r * cg + ci] = w[base + ci * rows + r]
+				}
+			}
+		}
+		let runs = runsOf(win)
+		let col T[]
+		col.len(rows * inSize)
+		for let b = 0; b < batch; b++ {
+			for let g = 0; g < group; g++ {
+				columnBands(rows, inSize, cg, wt, g * rows * cg, x, (b * channels + g * cg) * inSize, col, 0, mul)
+				col2imInto(col, 0, mg, taps, inSize, runs, y, (b * maps + g * mg) * outSize, outSize)
+			}
+		}
+	}
+
+	// Col2Im: blocks (N × C·block × L) summed back into images of
+	// image_shape (input 2 the block shape), as the inverse of im2col with
+	// the strides, dilations and pads.
+	internal def col2imOp(c Call) !none {
+		let data = try c.tensor(0)
+		let image = try c.ints(1)
+		let block = try c.ints(2)
+		let rank = image.len()
+		fail c.about() + "input must be N × C·block × L" unless data.rank() == 3
+		fail c.about() + "block_shape {block} does not fit image_shape {image}" unless block.len() == rank && rank > 0
+		let win = try windowOf(c, image, block, false)
+		let taps = volume(block)
+		fail c.about() + "{data.shape[1]} values per block is not a multiple of the block {block}" unless taps > 0 && data.shape[1] % taps == 0
+		let blocks = volume(win.output)
+		fail c.about() + "{data.shape[2]} blocks, the image and window make {blocks}" unless data.shape[2] == blocks
+		let batch = data.shape[0]
+		let channels = data.shape[1] / taps
+		let out = zerosLike(data.element, planeShape(batch, channels, image))
+		let size = volume(image)
+		let runs = runsOf(win)
+		let per = channels * taps * blocks
+		match storageOf(data.element) {
+			case Storage.Floats:
+				let parts = data.element == ElementType.Complex64 ?? (2, 1)
+				for let part = 0; part < parts; part++ {
+					let col = parts == 1 ?? (data.floats, everyOther(data.floats, part))
+					let img float32[]
+					img.len(batch * channels * size)
+					for let b = 0; b < batch; b++ {
+						col2imInto(col, b * per, channels, taps, blocks, runs, img, b * channels * size, size)
+					}
+					for let i = 0; i < img.len(); i++ {
+						out.floats[parts * i + part] = img[i]
+					}
+				}
+				roundTo(out)
+			case Storage.Doubles:
+				let parts = data.element == ElementType.Complex128 ?? (2, 1)
+				for let part = 0; part < parts; part++ {
+					let col float[]
+					for let i = part; i < data.doubles.len(); i += parts {
+						col.push(data.doubles[i])
+					}
+					let img float[]
+					img.len(batch * channels * size)
+					for let b = 0; b < batch; b++ {
+						col2imInto(col, b * per, channels, taps, blocks, runs, img, b * channels * size, size)
+					}
+					for let i = 0; i < img.len(); i++ {
+						out.doubles[parts * i + part] = img[i]
+					}
+				}
+			case Storage.Ints:
+				for let b = 0; b < batch; b++ {
+					col2imInto(data.ints, b * per, channels, taps, blocks, runs, out.ints, b * channels * size, size)
+				}
+				let bits = elementBits(data.element)
+				let signed = signedType(data.element)
+				let logical = data.element == ElementType.Bool
+				for let i = 0; i < out.ints.len(); i++ {
+					out.ints[i] = logical ?? (out.ints[i] != 0 ?? (1, 0), wrap(out.ints[i], bits, signed))
+				}
+			default:
+				fail c.about() + "Col2Im sums overlapping blocks, which strings cannot be"
+		}
+		c.out(0, out)
+		return none
+	}
+
+	// Every other value of `v` from `first`.
+	internal def everyOther(v float32[], first int) float32[] {
+		let out float32[]
+		out.len(v.len() / 2)
+		for let i = 0; i < out.len(); i++ {
+			out[i] = v[2 * i + first]
+		}
+		return out
+	}
+
+	// CausalConvWithState: a depthwise causal 1-D convolution over the
+	// past state (or zeros) followed by the input, with an optional bias
+	// and fused SiLU; the last k − 1 positions of that sequence are the
+	// present state.
+	internal def causalConvOp(c Call) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(1)
+		fail c.about() + "input must be batch × channels × length and weight channels × 1 × k" unless x.rank() == 3 && w.rank() == 3 && w.shape[0] == x.shape[1] && w.shape[1] == 1 && w.shape[2] > 0
+		fail c.about() + "CausalConvWithState of {x.element.name}" unless realFloats(x.element) && x.element == w.element
+		let activation = c.text("activation", "none")
+		fail c.about() + "activation {activation} is not none, silu or swish" unless activation := "none" || "silu" || "swish"
+		let (batch, channels, length) = (x.shape[0], x.shape[1], x.shape[2])
+		let k = w.shape[2]
+		let keep = k - 1
+		let span = length + keep
+		let planes = batch * channels
+		let padded float32[]
+		padded.len(planes * span)
+		if c.has(3) {
+			let past = try c.tensor(3)
+			fail c.about() + "past_state has shape {past.shape}, not [{batch}, {channels}, {keep}]" unless past.shape.equals(int[batch, channels, keep])
+			for let p = 0; p < planes; p++ {
+				past.floats[p * keep:(p + 1) * keep].copy(padded[p * span:p * span + keep])
+			}
+		}
+		for let p = 0; p < planes; p++ {
+			x.floats[p * length:(p + 1) * length].copy(padded[p * span + keep:(p + 1) * span])
+		}
+		let win = Window{input: int[span], output: int[length], kernel: int[k], strides: int[1], dilations: int[1], before: int[0], after: int[0]}
+		let y = zerosLike(x.element, x.shape)
+		convolveInto(padded, w.floats, y.floats, batch, channels, channels, channels, win, floatProduct)
+		addBias(y.floats, (try c.tensor(2)).floats, batch, channels, length) when c.has(2)
+		roundTo(y)
+		if activation != "none" {
+			for let i = 0; i < y.floats.len(); i++ {
+				let v = float(y.floats[i])
+				y.floats[i] = float32(v / (1.0 + math.E ** -v))
+			}
+			roundTo(y)
+		}
+		let present = zerosLike(x.element, int[batch, channels, keep])
+		for let p = 0; p < planes; p++ {
+			padded[(p + 1) * span - keep:(p + 1) * span].copy(present.floats[p * keep:(p + 1) * keep])
+		}
+		c.out(0, y)
+		c.out(1, present)
+		return none
+	}
+
+	// DeformConv: a convolution whose kernel taps read X at positions
+	// moved by `offset` (per offset group, tap and output position, one
+	// shift per spatial axis), sampled multilinearly with zeros outside
+	// and weighted by `mask`, then multiplied by the weights per group,
+	// plus the bias.
+	internal def deformConvOp(c Call) !none {
+		let x = try c.tensor(0)
+		let w = try c.tensor(1)
+		let offset = try c.tensor(2)
+		let group = c.int("group", 1)
+		try checkConv(c, x, w, group)
+		fail c.about() + "DeformConv of {x.element.name} and {w.element.name}" unless (x.element == ElementType.Double || realFloats(x.element)) && w.element == x.element
+		let kernel = try kernelOf(c, w)
+		let win = try windowOf(c, x.shape[2:].clone(), kernel, false)
+		let rank = kernel.len()
+		let groups = c.int("offset_group", 1)
+		let (batch, channels, maps) = (x.shape[0], x.shape[1], w.shape[0])
+		let taps = volume(kernel)
+		fail c.about() + "offset_group {groups} does not divide the {channels} channels" unless groups > 0 && channels % groups == 0
+		fail c.about() + "offset has shape {offset.shape}, the window needs [{batch}, {groups * taps * rank}, {win.output}]" unless offset.rank() == rank + 2 && offset.shape[0] == batch && offset.shape[1] == groups * taps * rank && offset.shape[2:].clone().equals(win.output)
+		let outSize = volume(win.output)
+		let inSize = volume(win.input)
+		let shifts = asDoubles(offset)
+		let mask = c.has(4) ?? (asDoubles(try c.tensor(4)), float[])
+		fail c.about() + "mask has {mask.len()} values, not {batch * groups * taps * outSize}" unless mask.len() == 0 || mask.len() == batch * groups * taps * outSize
+		let y = zerosLike(x.element, planeShape(batch, maps, win.output))
+		let corners = 1 << rank
+		let cg = channels / group
+		let mg = maps / group
+		let depth = cg * taps
+		let perGroup = channels / groups
+		let places int[]
+		let weights float[]
+		places.len(groups * taps * outSize * corners)
+		weights.len(places.len())
+		let floats = realFloats(x.element)
+		let colFloats float32[]
+		let colDoubles float[]
+		if floats {
+			colFloats.len(channels * taps * outSize)
+		} else {
+			colDoubles.len(channels * taps * outSize)
+		}
+		for let b = 0; b < batch; b++ {
+			deformSamples(win, shifts, b * groups * taps * rank * outSize, mask, b * groups * taps * outSize, groups, places, weights)
+			if floats {
+				let wf float32[]
+				wf.len(weights.len())
+				for let i = 0; i < wf.len(); i++ {
+					wf[i] = float32(weights[i])
+				}
+				deformColumns(x.floats, b * channels * inSize, channels, inSize, perGroup, taps * outSize, corners, places, wf, colFloats)
+				for let g = 0; g < group; g++ {
+					columnBands(mg, outSize, depth, w.floats, g * mg * depth, colFloats, g * depth * outSize, y.floats, (b * maps + g * mg) * outSize, floatProduct)
+				}
+			} else {
+				deformColumns(x.doubles, b * channels * inSize, channels, inSize, perGroup, taps * outSize, corners, places, weights, colDoubles)
+				for let g = 0; g < group; g++ {
+					columnBands(mg, outSize, depth, w.doubles, g * mg * depth, colDoubles, g * depth * outSize, y.doubles, (b * maps + g * mg) * outSize, doubleProduct)
+				}
+			}
+		}
+		if c.has(3) {
+			if floats {
+				addBias(y.floats, (try c.tensor(3)).floats, batch, maps, outSize)
+			} else {
+				addBias(y.doubles, (try c.tensor(3)).doubles, batch, maps, outSize)
+			}
+		}
+		roundTo(y)
+		c.out(0, y)
+		return none
+	}
+
+	// The values of a numeric tensor as float64.
+	internal def asDoubles(t Tensor) float[] {
+		match storageOf(t.element) {
+			case Storage.Floats:
+				let out float[]
+				out.len(t.floats.len())
+				for let i = 0; i < out.len(); i++ {
+					out[i] = float(t.floats[i])
+				}
+				return out
+			case Storage.Doubles:
+				return t.doubles
+			default:
+				let out float[]
+				out.len(t.ints.len())
+				for let i = 0; i < out.len(); i++ {
+					out[i] = float(t.ints[i])
+				}
+				return out
+		}
+	}
+
+	// The sampling corners of a deformable convolution for one image: for
+	// each offset group, tap and output position the 2^rank corners
+	// around the moved tap, their places in a channel (-1 outside the
+	// image) and multilinear weights times the mask.
+	internal def deformSamples(win Window, shifts float[], so int, mask float[], mo int, groups int, places int[], weights float[]) {
+		let rank = win.input.len()
+		let taps = volume(win.kernel)
+		let outSize = volume(win.output)
+		let corners = 1 << rank
+		let kc int[]
+		kc.len(rank)
+		let oc int[]
+		oc.len(rank)
+		let low int[]
+		low.len(rank)
+		let frac float[]
+		frac.len(rank)
+		for let g = 0; g < groups; g++ {
+			for let tap = 0; tap < taps; tap++ {
+				let rem = tap
+				for let d = rank - 1; d >= 0; d-- {
+					kc[d] = rem % win.kernel[d]
+					rem /= win.kernel[d]
+				}
+				for let p = 0; p < outSize; p++ {
+					let r = p
+					for let d = rank - 1; d >= 0; d-- {
+						oc[d] = r % win.output[d]
+						r /= win.output[d]
+					}
+					let m = mask.len() > 0 ?? (mask[mo + (g * taps + tap) * outSize + p], 1.0)
+					for let d = 0; d < rank; d++ {
+						let at = float(oc[d] * win.strides[d] - win.before[d] + kc[d] * win.dilations[d]) + shifts[so + ((g * taps + tap) * rank + d) * outSize + p]
+						let f = at.floor()
+						low[d] = int(f)
+						frac[d] = at - f
+					}
+					let o = ((g * taps + tap) * outSize + p) * corners
+					for let k = 0; k < corners; k++ {
+						let place = 0
+						let weight = m
+						for let d = 0; d < rank; d++ {
+							let up = (k >> (rank - 1 - d)) & 1
+							let i = low[d] + up
+							weight *= up == 1 ?? (frac[d], 1.0 - frac[d])
+							if i < 0 || i >= win.input[d] || place < 0 {
+								place = -1
+							} else {
+								place = place * win.input[d] + i
+							}
+						}
+						places[o + k] = place
+						weights[o + k] = place < 0 ?? (0.0, weight)
+					}
+				}
+			}
+		}
+	}
+
+	// The deformable column matrix of one image at x[xo]: per channel, tap
+	// and position the weighted sum of its corners (see deformSamples;
+	// `perGroup` channels share an offset group, `count` is taps ·
+	// positions).
+	internal def deformColumns<T: SimdFloat>(x T[], xo int, channels int, inSize int, perGroup int, count int, corners int, places int[], weights T[], col T[]) {
+		let tasks = tasksFor(channels * count * corners, channels)
+		forall let t in 0..tasks {
+			for let ch = channels * t / tasks; ch < channels * (t + 1) / tasks; ch++ {
+				let base = xo + ch * inSize
+				let so = (ch / perGroup) * count * corners
+				let co = ch * count
+				for let i = 0; i < count; i++ {
+					let acc = T(0)
+					let s = so + i * corners
+					for let k = 0; k < corners; k++ {
+						let place = places[s + k]
+						acc += place < 0 ?? (T(0), weights[s + k] * x[base + place])
+					}
+					col[co + i] = acc
+				}
+			}
+		}
+	}
+
+	// ---- Pooling ----
+
+	// What a pooling operator takes of each window.
+	internal enum PoolKind {
+		Max,
+		Average,
+		Lp,
+	}
+
+	// MaxPool, AveragePool and LpPool over their windows, and the Global
+	// forms over each whole image: the maximum (with the flat index of
+	// each, row- or column-major by storage_order, as output 2), the mean
+	// (counting the padding with count_include_pad) or the p-norm.
+	// Fails for an element type the operator does not take.
+	internal def poolOp(c Call, kind PoolKind, global bool) !none {
+		let x = try c.tensor(0)
+		fail c.about() + "X must have a batch, a channel and at least one spatial axis" unless x.rank() >= 3
+		let spatial = x.shape[2:].clone()
+		let rank = spatial.len()
+		let win = Window{input: spatial, output: repeated(1, rank), kernel: spatial.clone(), strides: repeated(1, rank), dilations: repeated(1, rank), before: repeated(0, rank), after: repeated(0, rank)}
+		if !global {
+			let kernel = c.ints("kernel_shape", int[])
+			fail c.about() + "kernel_shape {kernel} does not fit X {x.shape}" unless kernel.len() == rank
+			win = try windowOf(c, spatial, kernel, c.int("ceil_mode", 0) != 0)
+		}
+		let planes = x.shape[0] * x.shape[1]
+		let y = zerosLike(x.element, planeShape(x.shape[0], x.shape[1], win.output))
+		let inf = 1.0 / 0.0
+		if kind == PoolKind.Max {
+			let indices = !global && c.wants(1)
+			let order = c.int("storage_order", 0)
+			let at = indices ?? (flatIndices(planes, spatial, order == 1), int[])
+			let found int[]
+			found.len(indices ?? (y.count(), 0))
+			if realFloats(x.element) {
+				if indices {
+					poolIndexPlanes(x.floats, at, y.floats, found, planes, win, float32(-inf))
+				} else {
+					poolPlanes(x.floats, y.floats, planes, win, true, float32(-inf))
+				}
+				roundTo(y)
+			} else if x.element == ElementType.Double {
+				if indices {
+					poolIndexPlanes(x.doubles, at, y.doubles, found, planes, win, -inf)
+				} else {
+					poolPlanes(x.doubles, y.doubles, planes, win, true, -inf)
+				}
+			} else if storageOf(x.element) == Storage.Ints && x.element != ElementType.Bool {
+				let lowest = signedType(x.element) ?? (-(1 << (elementBits(x.element) - 1)), 0)
+				if indices {
+					poolIndexPlanes(x.ints, at, y.ints, found, planes, win, lowest)
+				} else {
+					poolPlanes(x.ints, y.ints, planes, win, true, lowest)
+				}
+			} else {
+				fail c.about() + "{c.step.op} of {x.element.name}"
+			}
+			c.out(0, y)
+			c.out(1, new Tensor(y.shape.clone(), found)) when indices
+			return none
+		}
+		let p = kind == PoolKind.Lp ?? (lpPower(c), 1.0)
+		let counts = kind == PoolKind.Average ?? (windowCounts(win, c.int("count_include_pad", 0) != 0), float[])
+		if realFloats(x.element) {
+			let src = kind == PoolKind.Lp ?? (powerFloats(x.floats, p), x.floats)
+			poolPlanes(src, y.floats, planes, win, false, float32(0))
+			finishFloats(y.floats, counts, p)
+			roundTo(y)
+		} else if x.element == ElementType.Double {
+			let src = kind == PoolKind.Lp ?? (powerDoubles(x.doubles, p), x.doubles)
+			poolPlanes(src, y.doubles, planes, win, false, 0.0)
+			finishDoubles(y.doubles, counts, p)
+		} else {
+			fail c.about() + "{c.step.op} of {x.element.name}"
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// LpPool's p (an integer attribute, a float in version 1), 2 when
+	// absent.
+	internal def lpPower(c Call) float {
+		let a = c.attribute("p")
+		return 2.0 unless a is Attribute
+		return a.kind == AttributeKind.Float ?? (float(a.f), float(a.i))
+	}
+
+	// |v|^p of every value.
+	internal def powerFloats(v float32[], p float) float32[] {
+		let out float32[]
+		out.len(v.len())
+		if p == 2.0 {
+			let i = 0
+			for; i + 8 <= v.len(); i += 8 {
+				let x = simd.load8<float32>(v, i)
+				simd.store8<float32>(out, i, x * x)
+			}
+			for; i < v.len(); i++ {
+				out[i] = v[i] * v[i]
+			}
+			return out
+		}
+		for let i = 0; i < v.len(); i++ {
+			out[i] = float32(float(v[i]).abs() ** p)
+		}
+		return out
+	}
+
+	internal def powerDoubles(v float[], p float) float[] {
+		let out float[]
+		out.len(v.len())
+		for let i = 0; i < v.len(); i++ {
+			out[i] = p == 2.0 ?? (v[i] * v[i], v[i].abs() ** p)
+		}
+		return out
+	}
+
+	// The window sums made means (divided by `counts`, one per output
+	// position of a plane, when given) or p-norms (the p-th root, p ≠ 1).
+	internal def finishFloats(y float32[], counts float[], p float) {
+		if counts.len() > 0 {
+			let size = counts.len()
+			for let i = 0; i < y.len(); i++ {
+				y[i] = float32(float(y[i]) / counts[i % size])
+			}
+		} else if p == 2.0 {
+			let i = 0
+			for; i + 8 <= y.len(); i += 8 {
+				simd.store8<float32>(y, i, simd.sqrt(simd.load8<float32>(y, i)))
+			}
+			for; i < y.len(); i++ {
+				y[i] = float32(math.sqrt(float(y[i])))
+			}
+		} else if p != 1.0 {
+			for let i = 0; i < y.len(); i++ {
+				y[i] = float32(float(y[i]) ** (1.0 / p))
+			}
+		}
+	}
+
+	internal def finishDoubles(y float[], counts float[], p float) {
+		if counts.len() > 0 {
+			let size = counts.len()
+			for let i = 0; i < y.len(); i++ {
+				y[i] /= counts[i % size]
+			}
+		} else if p != 1.0 {
+			for let i = 0; i < y.len(); i++ {
+				y[i] = p == 2.0 ?? (math.sqrt(y[i]), y[i] ** (1.0 / p))
+			}
+		}
+	}
+
+	// How many values each output position of a plane averages: per axis
+	// the taps inside the input (or inside the padded input with
+	// `includePad`), multiplied over the axes.
+	internal def windowCounts(win Window, includePad bool) float[] {
+		let rank = win.input.len()
+		let counts = float[1.0]
+		for let a = 0; a < rank; a++ {
+			let low = includePad ?? (-win.before[a], 0)
+			let high = includePad ?? (win.input[a] + win.after[a], win.input[a])
+			let axis float[]
+			for let q = 0; q < win.output[a]; q++ {
+				let n = 0
+				for let t = 0; t < win.kernel[a]; t++ {
+					let at = q * win.strides[a] - win.before[a] + t * win.dilations[a]
+					n += at >= low && at < high ?? (1, 0)
+				}
+				axis.push(float(n))
+			}
+			let next float[]
+			for let (_, v) in counts {
+				for let (_, n) in axis {
+					next.push(v * n)
+				}
+			}
+			counts = next
+		}
+		return counts
+	}
+
+	// The flat index of every value of `planes` images of `spatial` sizes:
+	// plane · size + the place in the plane, row-major or `columnMajor`.
+	internal def flatIndices(planes int, spatial int[], columnMajor bool) int[] {
+		let size = volume(spatial)
+		let rank = spatial.len()
+		let local int[]
+		local.len(size)
+		let stride int[]
+		stride.len(rank)
+		let s = 1
+		for let d = 0; d < rank; d++ {
+			let at = columnMajor ?? (d, rank - 1 - d)
+			stride[at] = s
+			s *= spatial[at]
+		}
+		for let i = 0; i < size; i++ {
+			let r = i
+			let place = 0
+			for let d = rank - 1; d >= 0; d-- {
+				place += (r % spatial[d]) * stride[d]
+				r /= spatial[d]
+			}
+			local[i] = place
+		}
+		let out int[]
+		out.len(planes * size)
+		for let p = 0; p < planes; p++ {
+			for let i = 0; i < size; i++ {
+				out[p * size + i] = p * size + local[i]
+			}
+		}
+		return out
+	}
+
+	// Pools `planes` images at x into y one axis at a time, the last
+	// first (a box's maximum or sum is the maximum or sum along each of
+	// its axes in turn): the maximum of each window (`lowest` for one with
+	// no value), else its sum.
+	internal def poolPlanes<T: SimdNumeric>(x T[], y T[], planes int, win Window, max bool, lowest T) {
+		let rank = win.input.len()
+		let dims = win.input.clone()
+		let src = x
+		for let a = rank - 1; a >= 0; a-- {
+			let outer = planes * volume(dims[0:a].clone())
+			let inner = volume(dims[a + 1:].clone())
+			let same = win.kernel[a] == 1 && win.strides[a] == 1 && win.before[a] == 0 && win.output[a] == dims[a]
+			if same {
+				src[0:y.len()].copy(y) when a == 0
+				continue
+			}
+			let dst T[]
+			if a == 0 {
+				dst = y
+			} else {
+				dst.len(outer * win.output[a] * inner)
+			}
+			let len = dims[a]
+			let out = win.output[a]
+			let units = inner == 1 ?? (outer, outer * out)
+			let tasks = tasksFor(outer * out * inner * win.kernel[a], units)
+			if tasks == 1 {
+				poolAxis(src, dst, 0, units, len, inner, out, win.strides[a], win.before[a], win.dilations[a], win.kernel[a], max, lowest)
+			} else {
+				forall let t in 0..tasks {
+					poolAxis(src, dst, units * t / tasks, units * (t + 1) / tasks, len, inner, out, win.strides[a], win.before[a], win.dilations[a], win.kernel[a], max, lowest)
+				}
+			}
+			dims[a] = out
+			src = dst
+		}
+	}
+
+	// One axis of poolPlanes for units first..last: with `inner` 1 a unit
+	// is a whole line (the windows of the line's positions run eight at
+	// a time where every tap is inside), else one output position of a
+	// line, its `inner` values eight at a time.
+	internal def poolAxis<T: SimdNumeric>(src T[], dst T[], first int, last int, len int, inner int, out int, stride int, before int, dilation int, kernel int, max bool, lowest T) {
+		let vacant = max ?? (lowest, T(0))
+		if inner == 1 {
+			// The positions whose taps are all inside the line.
+			let qa = stride == 1 ?? (before.max(0), out)
+			let qb = stride == 1 ?? ((len - 1 - (kernel - 1) * dilation + before).min(out - 1), -1)
+			for let o = first; o < last; o++ {
+				let s = o * len
+				let d = o * out
+				let q = 0
+				for; q < out; q++ {
+					if q >= qa && q + 8 <= qb + 1 {
+						let at = s + q - before
+						let acc = simd.load8<T>(src, at)
+						for let t = 1; t < kernel; t++ {
+							let v = simd.load8<T>(src, at + t * dilation)
+							acc = max ?? (simd.max(acc, v), acc + v)
+						}
+						simd.store8<T>(dst, d + q, acc)
+						q += 7
+						continue
+					}
+					let t0 = ceilDiv(before - q * stride, dilation).max(0)
+					let t1 = floorDiv(len - 1 - q * stride + before, dilation).min(kernel - 1)
+					if t0 > t1 {
+						dst[d + q] = vacant
+						continue
+					}
+					let base = s + q * stride - before
+					let acc = src[base + t0 * dilation]
+					for let t = t0 + 1; t <= t1; t++ {
+						let v = src[base + t * dilation]
+						acc = max ?? (v > acc ?? (v, acc), acc + v)
+					}
+					dst[d + q] = acc
+				}
+			}
+			return
+		}
+		for let u = first; u < last; u++ {
+			let o = u / out
+			let q = u % out
+			let d = u * inner
+			let t0 = ceilDiv(before - q * stride, dilation).max(0)
+			let t1 = floorDiv(len - 1 - q * stride + before, dilation).min(kernel - 1)
+			if t0 > t1 {
+				for let j = 0; j < inner; j++ {
+					dst[d + j] = vacant
+				}
+				continue
+			}
+			let base = o * len * inner + (q * stride - before) * inner
+			let s0 = base + t0 * dilation * inner
+			src[s0:s0 + inner].copy(dst[d:d + inner])
+			for let t = t0 + 1; t <= t1; t++ {
+				let s = base + t * dilation * inner
+				let j = 0
+				for; j + 8 <= inner; j += 8 {
+					let a = simd.load8<T>(dst, d + j)
+					let b = simd.load8<T>(src, s + j)
+					simd.store8<T>(dst, d + j, max ?? (simd.max(a, b), a + b))
+				}
+				for; j < inner; j++ {
+					let b = src[s + j]
+					dst[d + j] = max ?? (b > dst[d + j] ?? (b, dst[d + j]), dst[d + j] + b)
+				}
+			}
+		}
+	}
+
+	// Max pooling that keeps where each maximum came from: like
+	// poolPlanes, with `at` the flat index of every value of x and `found`
+	// receiving those of the maxima (-1 for a window with no value). Ties
+	// keep the first in row-major order of the window.
+	internal def poolIndexPlanes<T: SimdNumeric>(x T[], at int[], y T[], found int[], planes int, win Window, lowest T) {
+		let rank = win.input.len()
+		let dims = win.input.clone()
+		let src = x
+		let srcAt = at
+		for let a = rank - 1; a >= 0; a-- {
+			let outer = planes * volume(dims[0:a].clone())
+			let inner = volume(dims[a + 1:].clone())
+			let len = dims[a]
+			let out = win.output[a]
+			let dst T[]
+			let dstAt int[]
+			if a == 0 {
+				dst = y
+				dstAt = found
+			} else {
+				dst.len(outer * out * inner)
+				dstAt.len(outer * out * inner)
+			}
+			let (stride, before, dilation, kernel) = (win.strides[a], win.before[a], win.dilations[a], win.kernel[a])
+			let tasks = tasksFor(outer * out * inner * kernel, outer)
+			forall let t in 0..tasks {
+				for let o = outer * t / tasks; o < outer * (t + 1) / tasks; o++ {
+					for let q = 0; q < out; q++ {
+						let t0 = ceilDiv(before - q * stride, dilation).max(0)
+						let t1 = floorDiv(len - 1 - q * stride + before, dilation).min(kernel - 1)
+						for let j = 0; j < inner; j++ {
+							let d = (o * out + q) * inner + j
+							let best = lowest
+							let source = -1
+							for let k = t0; k <= t1; k++ {
+								let s = (o * len + q * stride - before + k * dilation) * inner + j
+								if source < 0 || src[s] > best {
+									best = src[s]
+									source = srcAt[s]
+								}
+							}
+							dst[d] = best
+							dstAt[d] = source
+						}
+					}
+				}
+			}
+			dims[a] = out
+			src = dst
+			srcAt = dstAt
+		}
+	}
+
+	// ---- Unpooling and regions ----
+
+	// MaxUnpool: each value of X placed at its index (from MaxPool) in a
+	// zero tensor of the shape a max pooling inverts, (in − 1) · stride −
+	// pads + kernel per axis; with output_shape (input 3) that tensor
+	// sits at the start of one of that shape.
+	// Fails when an index is outside the unpooled tensor.
+	internal def maxUnpoolOp(c Call) !none {
+		let x = try c.tensor(0)
+		let at = try c.ints(1)
+		fail c.about() + "X must have a batch, a channel and at least one spatial axis" unless x.rank() >= 3
+		fail c.about() + "I has {at.len()} indices for {x.count()} values" unless at.len() == x.count()
+		let rank = x.rank() - 2
+		let kernel = c.ints("kernel_shape", int[])
+		let strides = c.ints("strides", repeated(1, rank))
+		let pads = c.ints("pads", repeated(0, 2 * rank))
+		fail c.about() + "kernel_shape, strides or pads do not fit {rank} spatial axes" unless kernel.len() == rank && strides.len() == rank && pads.len() == 2 * rank
+		let inferred = int[x.shape[0], x.shape[1]]
+		for let d = 0; d < rank; d++ {
+			inferred.push((x.shape[d + 2] - 1) * strides[d] - pads[d] - pads[rank + d] + kernel[d])
+		}
+		let shape = c.has(2) ?? (try c.ints(2), inferred)
+		fail c.about() + "output_shape {shape} has another rank than X" unless shape.len() == x.rank()
+		let y = zerosLike(x.element, shape)
+		let total = volume(inferred)
+		let same = shape.equals(inferred)
+		for let i = 0; i < at.len(); i++ {
+			let place = at[i]
+			fail c.about() + "index {place} is outside the unpooled tensor of shape {inferred}" unless place >= 0 && place < total
+			if same {
+				copyValue(x, i, y, place)
+				continue
+			}
+			let r = place
+			let target = 0
+			let stride = 1
+			let inside = true
+			for let d = shape.len() - 1; d >= 0; d-- {
+				let k = r % inferred[d]
+				r /= inferred[d]
+				inside = inside && k < shape[d]
+				target += k * stride
+				stride *= shape[d]
+			}
+			copyValue(x, i, y, target) when inside
+		}
+		c.out(0, y)
+		return none
+	}
+
+	// v rounded to the nearest integer, halves away from zero.
+	internal def roundAway(v float) float {
+		return v < 0.0 ?? (-((-v + 0.5).floor()), (v + 0.5).floor())
+	}
+
+	// MaxRoiPool: for each region (batch, x1, y1, x2, y2), scaled by
+	// spatial_scale and rounded, the maximum of each of pooled_shape bins
+	// (0 for an empty bin).
+	internal def maxRoiPoolOp(c Call) !none {
+		let x = try c.tensor(0)
+		let rois = asDoubles(try c.tensor(1))
+		fail c.about() + "X must be N × C × H × W" unless x.rank() == 4
+		let pooled = c.ints("pooled_shape", int[])
+		fail c.about() + "pooled_shape must have two positive sizes" unless pooled.len() == 2 && pooled[0] > 0 && pooled[1] > 0
+		let scale = float(c.float("spatial_scale", float32(1)))
+		let (channels, height, width) = (x.shape[1], x.shape[2], x.shape[3])
+		let (ph, pw) = (pooled[0], pooled[1])
+		let count = rois.len() / 5
+		let y = zerosLike(x.element, int[count, channels, ph, pw])
+		let values = asDoubles(x)
+		let out float[]
+		out.len(y.count())
+		let bad = -1
+		forall let r in 0..count {
+			let roi = rois[r * 5:r * 5 + 5].clone()
+			let batch = int(roi[0])
+			if batch < 0 || batch >= x.shape[0] {
+				bad = r
+				continue
+			}
+			let startW = int(roundAway(roi[1] * scale))
+			let startH = int(roundAway(roi[2] * scale))
+			let endW = int(roundAway(roi[3] * scale))
+			let endH = int(roundAway(roi[4] * scale))
+			let binH = float((endH - startH + 1).max(1)) / float(ph)
+			let binW = float((endW - startW + 1).max(1)) / float(pw)
+			for let ch = 0; ch < channels; ch++ {
+				let plane = (batch * channels + ch) * height * width
+				for let i = 0; i < ph; i++ {
+					let h0 = (int((float(i) * binH).floor()) + startH).clamp(0, height)
+					let h1 = (int((float(i + 1) * binH).ceil()) + startH).clamp(0, height)
+					for let j = 0; j < pw; j++ {
+						let w0 = (int((float(j) * binW).floor()) + startW).clamp(0, width)
+						let w1 = (int((float(j + 1) * binW).ceil()) + startW).clamp(0, width)
+						let best = 0.0
+						let seen = false
+						for let h = h0; h < h1; h++ {
+							for let w = w0; w < w1; w++ {
+								let v = values[plane + h * width + w]
+								if !seen || v > best {
+									best = v
+									seen = true
+								}
+							}
+						}
+						out[((r * channels + ch) * ph + i) * pw + j] = best
+					}
+				}
+			}
+		}
+		fail c.about() + "region {bad} names batch {rois[bad * 5]}, which X does not have" when bad >= 0
+		try storeDoubles(c, y, out)
+		c.out(0, y)
+		return none
+	}
+
+	// Stores float64 results into a floating-point tensor `y`.
+	// Fails for a type that is not floating-point.
+	internal def storeDoubles(c Call, y Tensor, values float[]) !none {
+		if y.element == ElementType.Double {
+			y.doubles = values
+			return none
+		}
+		fail c.about() + "{c.step.op} of {y.element.name}" unless realFloats(y.element)
+		for let i = 0; i < values.len(); i++ {
+			y.floats[i] = float32(values[i])
+		}
+		roundTo(y)
+		return none
+	}
+
+	// RoiAlign: for each region (x1, y1, x2, y2 of image batch_indices[r],
+	// scaled by spatial_scale, shifted by half a pixel in the half_pixel
+	// mode), output_height × output_width bins, each the average or
+	// maximum of sampling_ratio² bilinear samples (adaptive when 0).
+	internal def roiAlignOp(c Call) !none {
+		let x = try c.tensor(0)
+		let rois = asDoubles(try c.tensor(1))
+		let batches = try c.ints(2)
+		fail c.about() + "X must be N × C × H × W" unless x.rank() == 4
+		let count = batches.len()
+		fail c.about() + "rois has {rois.len()} values, not 4 per region of batch_indices" unless rois.len() == count * 4
+		let mode = c.text("mode", "avg")
+		fail c.about() + "mode {mode} is not avg or max" unless mode := "avg" || "max"
+		let halfPixel = c.text("coordinate_transformation_mode", c.opset >= 16 ?? ("half_pixel", "output_half_pixel")) == "half_pixel"
+		let (ph, pw) = (c.int("output_height", 1), c.int("output_width", 1))
+		let ratio = c.int("sampling_ratio", 0)
+		let scale = float(c.float("spatial_scale", float32(1)))
+		let (channels, height, width) = (x.shape[1], x.shape[2], x.shape[3])
+		let values = asDoubles(x)
+		let y = zerosLike(x.element, int[count, channels, ph, pw])
+		let out float[]
+		out.len(y.count())
+		let bad = -1
+		let average = mode == "avg"
+		forall let r in 0..count {
+			let batch = batches[r]
+			if batch < 0 || batch >= x.shape[0] {
+				bad = r
+				continue
+			}
+			let shift = halfPixel ?? (0.5, 0.0)
+			let x0 = rois[r * 4] * scale - shift
+			let y0 = rois[r * 4 + 1] * scale - shift
+			let roiW = rois[r * 4 + 2] * scale - shift - x0
+			let roiH = rois[r * 4 + 3] * scale - shift - y0
+			if !halfPixel {
+				roiW = roiW.max(1.0)
+				roiH = roiH.max(1.0)
+			}
+			let binH = roiH / float(ph)
+			let binW = roiW / float(pw)
+			let gridH = ratio > 0 ?? (ratio, int((roiH / float(ph)).ceil()))
+			let gridW = ratio > 0 ?? (ratio, int((roiW / float(pw)).ceil()))
+			let samples = (gridH * gridW).max(1)
+			// Per bin and sample: four places and weights, shared by the channels.
+			let places int[]
+			let weights float[]
+			for let i = 0; i < ph; i++ {
+				for let j = 0; j < pw; j++ {
+					for let iy = 0; iy < gridH; iy++ {
+						let yy = y0 + float(i) * binH + (float(iy) + 0.5) * binH / float(gridH)
+						for let ix = 0; ix < gridW; ix++ {
+							let xx = x0 + float(j) * binW + (float(ix) + 0.5) * binW / float(gridW)
+							bilinearCorners(yy, xx, height, width, places, weights)
+						}
+					}
+				}
+			}
+			let per = gridH * gridW
+			for let ch = 0; ch < channels; ch++ {
+				let plane = (batch * channels + ch) * height * width
+				for let b = 0; b < ph * pw; b++ {
+					let acc = 0.0
+					for let s = 0; s < per; s++ {
+						let k = (b * per + s) * 4
+						if average {
+							acc += weights[k] * values[plane + places[k]] + weights[k + 1] * values[plane + places[k + 1]] + weights[k + 2] * values[plane + places[k + 2]] + weights[k + 3] * values[plane + places[k + 3]]
+						} else {
+							let v = (weights[k] * values[plane + places[k]]).max(weights[k + 1] * values[plane + places[k + 1]]).max(weights[k + 2] * values[plane + places[k + 2]]).max(weights[k + 3] * values[plane + places[k + 3]])
+							acc = s == 0 ?? (v, acc.max(v))
+						}
+					}
+					out[(r * channels + ch) * ph * pw + b] = average ?? (acc / float(samples), acc)
+				}
+			}
+		}
+		fail c.about() + "region {bad} names batch {batches[bad]}, which X does not have" when bad >= 0
+		try storeDoubles(c, y, out)
+		c.out(0, y)
+		return none
+	}
+
+	// The four corners and weights of a bilinear sample at (yy, xx) of an
+	// image of height × width, as RoiAlign takes them: a sample more than
+	// one pixel outside reads nothing (weights 0), one near the edge is
+	// clamped to it.
+	internal def bilinearCorners(yy float, xx float, height int, width int, places int[], weights float[]) {
+		if yy < -1.0 || yy > float(height) || xx < -1.0 || xx > float(width) {
+			places.push(0, 0, 0, 0)
+			weights.push(0.0, 0.0, 0.0, 0.0)
+			return
+		}
+		let fy = yy.max(0.0)
+		let fx = xx.max(0.0)
+		let yLow = int(fy)
+		let xLow = int(fx)
+		let yHigh = yLow + 1
+		let xHigh = xLow + 1
+		if yLow >= height - 1 {
+			yLow = height - 1
+			yHigh = yLow
+			fy = float(yLow)
+		}
+		if xLow >= width - 1 {
+			xLow = width - 1
+			xHigh = xLow
+			fx = float(xLow)
+		}
+		let ly = fy - float(yLow)
+		let lx = fx - float(xLow)
+		let (hy, hx) = (1.0 - ly, 1.0 - lx)
+		places.push(yLow * width + xLow, yLow * width + xHigh, yHigh * width + xLow, yHigh * width + xHigh)
+		weights.push(hy * hx, hy * lx, ly * hx, ly * lx)
+	}
+
+	// NonMaxSuppression: per batch and class, the boxes scoring above
+	// score_threshold from the highest score down, each kept unless its
+	// IoU with a box already kept exceeds iou_threshold, at most
+	// max_output_boxes_per_class; rows (batch, class, box) as Int64.
+	internal def nonMaxSuppressionOp(c Call) !none {
+		let boxesT = try c.tensor(0)
+		let scoresT = try c.tensor(1)
+		fail c.about() + "boxes must be batches × boxes × 4 and scores batches × classes × boxes" unless boxesT.rank() == 3 && boxesT.shape[2] == 4 && scoresT.rank() == 3 && scoresT.shape[0] == boxesT.shape[0] && scoresT.shape[2] == boxesT.shape[1]
+		let limit = c.has(2) && (try c.tensor(2)).count() > 0 ?? (scalarInt(try c.tensor(2)).max(0), 0)
+		let iou = c.has(3) && (try c.tensor(3)).count() > 0 ?? (scalarFloat(try c.tensor(3)), 0.0)
+		let thresholded = c.has(4) && (try c.tensor(4)).count() > 0
+		let threshold = thresholded ?? (scalarFloat(try c.tensor(4)), 0.0)
+		let center = c.int("center_point_box", 0) == 1
+		let boxes = asDoubles(boxesT)
+		let scores = asDoubles(scoresT)
+		let (batches, classes, count) = (scoresT.shape[0], scoresT.shape[1], scoresT.shape[2])
+		// Each box as y1, x1, y2, x2 with the smaller coordinates first.
+		let corners float[]
+		corners.len(boxes.len())
+		for let i = 0; i < batches * count; i++ {
+			let b = boxes[i * 4:i * 4 + 4].clone()
+			if center {
+				corners[i * 4] = b[1] - b[3] / 2.0
+				corners[i * 4 + 1] = b[0] - b[2] / 2.0
+				corners[i * 4 + 2] = b[1] + b[3] / 2.0
+				corners[i * 4 + 3] = b[0] + b[2] / 2.0
+			} else {
+				corners[i * 4] = b[0].min(b[2])
+				corners[i * 4 + 1] = b[1].min(b[3])
+				corners[i * 4 + 2] = b[0].max(b[2])
+				corners[i * 4 + 3] = b[1].max(b[3])
+			}
+		}
+		let rows int[]
+		for let b = 0; b < batches; b++ {
+			for let k = 0; k < classes; k++ {
+				let so = (b * classes + k) * count
+				let order int[]
+				for let i = 0; i < count; i++ {
+					order.push(i) unless thresholded && !(scores[so + i] > threshold)
+				}
+				order.sort((p, q) => scores[so + p] > scores[so + q] || (scores[so + p] == scores[so + q] && p < q))
+				let kept int[]
+				for let (_, i) in order {
+					break when kept.len() >= limit
+					let keep = true
+					for let (_, j) in kept {
+						if overlaps(corners, (b * count + i) * 4, (b * count + j) * 4, iou) {
+							keep = false
+							break
+						}
+					}
+					continue unless keep
+					kept.push(i)
+					rows.push(b, k, i)
+				}
+			}
+		}
+		c.out(0, new Tensor(int[rows.len() / 3, 3], rows))
+		return none
+	}
+
+	// Whether the boxes at corners[a] and corners[b] (y1, x1, y2, x2)
+	// overlap by an IoU above `threshold`.
+	internal def overlaps(corners float[], a int, b int, threshold float) bool {
+		let x0 = corners[a + 1].max(corners[b + 1])
+		let x1 = corners[a + 3].min(corners[b + 3])
+		return false when x1 <= x0
+		let y0 = corners[a].max(corners[b])
+		let y1 = corners[a + 2].min(corners[b + 2])
+		return false when y1 <= y0
+		let inter = (x1 - x0) * (y1 - y0)
+		let areaA = (corners[a + 3] - corners[a + 1]) * (corners[a + 2] - corners[a])
+		let areaB = (corners[b + 3] - corners[b + 1]) * (corners[b + 2] - corners[b])
+		let joined = areaA + areaB - inter
+		return false when inter <= 0.0 || areaA <= 0.0 || areaB <= 0.0 || joined <= 0.0
+		return inter / joined > threshold
+	}
+
+	// ---- Grids ----
+
+	// The normalized coordinate (−1 to 1) of position i of n: pixel
+	// centres, or the corner pixels at ±1 with align_corners.
+	internal def gridCoordinate(i int, n int, alignCorners bool) float {
+		return n > 1 ?? (-1.0 + 2.0 * float(i) / float(n - 1), -1.0) when alignCorners
+		return -1.0 + (2.0 * float(i) + 1.0) / float(n)
+	}
+
+	// AffineGrid: for each batch the normalized coordinates (x, y[, z]) of
+	// an output of `size` (N, C, H, W or N, C, D, H, W) mapped through the
+	// affine matrix theta (2 × 3 or 3 × 4).
+	internal def affineGridOp(c Call) !none {
+		let theta = try c.tensor(0)
+		let size = try c.ints(1)
+		let align = c.int("align_corners", 0) != 0
+		fail c.about() + "size must be N, C, H, W or N, C, D, H, W" unless size.len() == 4 || size.len() == 5
+		let rank = size.len() - 2
+		fail c.about() + "theta has shape {theta.shape}, size {size} needs [{size[0]}, {rank}, {rank + 1}]" unless theta.shape.equals(int[size[0], rank, rank + 1])
+		let t = asDoubles(theta)
+		let spatial = size[2:].clone()
+		let points = volume(spatial)
+		let shape = int[size[0]]
+		for let (_, d) in spatial {
+			shape.push(d)
+		}
+		shape.push(rank)
+		let y = zerosLike(theta.element, shape)
+		let out float[]
+		out.len(y.count())
+		// Coordinates by axis, x first: the last spatial axis.
+		let base float[]
+		base.len(points * rank)
+		for let p = 0; p < points; p++ {
+			let r = p
+			for let d = rank - 1; d >= 0; d-- {
+				base[p * rank + (rank - 1 - d)] = gridCoordinate(r % spatial[d], spatial[d], align)
+				r /= spatial[d]
+			}
+		}
+		for let n = 0; n < size[0]; n++ {
+			let m = n * rank * (rank + 1)
+			for let p = 0; p < points; p++ {
+				for let k = 0; k < rank; k++ {
+					let row = m + k * (rank + 1)
+					let v = t[row + rank]
+					for let j = 0; j < rank; j++ {
+						v += t[row + j] * base[p * rank + j]
+					}
+					out[(n * points + p) * rank + k] = v
+				}
+			}
+		}
+		try storeDoubles(c, y, out)
+		c.out(0, y)
+		return none
+	}
+
+	// A coordinate reflected back into [low, high] off the border it
+	// crossed, as many times as needed.
+	internal def reflect(x float, low float, high float) float {
+		let range = high - low
+		if x < low {
+			let dx = low - x
+			let n = int(dx / range)
+			let r = dx - float(n) * range
+			return n % 2 == 0 ?? (low + r, high - r)
+		}
+		if x > high {
+			let dx = x - high
+			let n = int(dx / range)
+			let r = dx - float(n) * range
+			return n % 2 == 0 ?? (high - r, low + r)
+		}
+		return x
+	}
+
+	// The cubic convolution weights (Keys, a = −0.75) of the four taps
+	// around a sample `f` past the second.
+	internal def keysWeights(f float, a float) float[] {
+		let x = f.abs()
+		return float[((a * (x + 1.0) - 5.0 * a) * (x + 1.0) + 8.0 * a) * (x + 1.0) - 4.0 * a, ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0, ((a + 2.0) * (1.0 - x) - (a + 3.0)) * (1.0 - x) * (1.0 - x) + 1.0, ((a * (2.0 - x) - 5.0 * a) * (2.0 - x) + 8.0 * a) * (2.0 - x) - 4.0 * a]
+	}
+
+	// GridSample: X (N, C, D1…Dr) read at the normalized coordinates of
+	// `grid` (N, out…, r; x first) by nearest, (multi)linear or cubic
+	// interpolation, with zeros, border or reflection padding.
+	internal def gridSampleOp(c Call) !none {
+		let x = try c.tensor(0)
+		let grid = try c.tensor(1)
+		let rank = x.rank() - 2
+		fail c.about() + "X must have a batch, a channel and spatial axes, grid (N, out…, {rank})" unless rank >= 1 && grid.rank() == x.rank() && grid.shape[0] == x.shape[0] && grid.shape[grid.rank() - 1] == rank
+		let given = c.text("mode", c.opset >= 20 ?? ("linear", "bilinear"))
+		let mode = given == "bilinear" ?? ("linear", given == "bicubic" ?? ("cubic", given))
+		fail c.about() + "mode {given} is not nearest, linear or cubic" unless mode := "nearest" || "linear" || "cubic"
+		let padding = c.text("padding_mode", "zeros")
+		fail c.about() + "padding_mode {padding} is not zeros, border or reflection" unless padding := "zeros" || "border" || "reflection"
+		let align = c.int("align_corners", 0) != 0
+		let (batch, channels) = (x.shape[0], x.shape[1])
+		let spatial = x.shape[2:].clone()
+		let inSize = volume(spatial)
+		let outDims = grid.shape[1:grid.rank() - 1].clone()
+		let points = volume(outDims)
+		let y = zerosLike(x.element, planeShape(batch, channels, outDims))
+		let coords = asDoubles(grid)
+		let per = mode == "nearest" ?? (1, mode == "linear" ?? (2, 4))
+		let taps = 1
+		for let d = 0; d < rank; d++ {
+			taps *= per
+		}
+		let places int[]
+		let weights float[]
+		places.len(taps * points)
+		weights.len(taps * points)
+		let numeric = storageOf(x.element) != Storage.Strings && x.element != ElementType.Complex64 && x.element != ElementType.Complex128
+		fail c.about() + "{mode} sampling of {x.element.name}" unless mode == "nearest" || numeric
+		for let n = 0; n < batch; n++ {
+			gridTaps(coords, n * points * rank, points, spatial, mode, padding, align, places, weights)
+			if mode == "nearest" {
+				let width = x.element == ElementType.Complex64 || x.element == ElementType.Complex128 ?? (2, 1)
+				for let ch = 0; ch < channels; ch++ {
+					let xo = (n * channels + ch) * inSize
+					let yo = (n * channels + ch) * points
+					for let p = 0; p < points; p++ {
+						let place = places[p]
+						continue when place < 0
+						for let k = 0; k < width; k++ {
+							copyValue(x, (xo + place) * width + k, y, (yo + p) * width + k)
+						}
+					}
+				}
+				continue
+			}
+			if realFloats(x.element) {
+				let wf float32[]
+				wf.len(weights.len())
+				for let i = 0; i < wf.len(); i++ {
+					wf[i] = float32(weights[i])
+				}
+				sampleChannels(x.floats, n * channels * inSize, inSize, channels, points, taps, places, wf, y.floats, n * channels * points)
+			} else if x.element == ElementType.Double {
+				sampleChannels(x.doubles, n * channels * inSize, inSize, channels, points, taps, places, weights, y.doubles, n * channels * points)
+			} else {
+				let values = asDoubles(x)
+				let out float[]
+				out.len(channels * points)
+				sampleChannels(values, n * channels * inSize, inSize, channels, points, taps, places, weights, out, 0)
+				let bits = elementBits(x.element)
+				let signed = signedType(x.element)
+				for let i = 0; i < out.len(); i++ {
+					let v = out[i]
+					y.ints[n * channels * points + i] = x.element == ElementType.Bool ?? (v != 0.0 ?? (1, 0), wrap(truncated(v), bits, signed))
+				}
+			}
+		}
+		roundTo(y)
+		c.out(0, y)
+		return none
+	}
+
+	// The taps of GridSample for one batch: per point (coordinates at
+	// coords[co], x first) and tap, the place in a channel (-1 for a zero
+	// padding tap) and the weight, tap-major.
+	internal def gridTaps(coords float[], co int, points int, spatial int[], mode string, padding string, align bool, places int[], weights float[]) {
+		let rank = spatial.len()
+		let per = mode == "nearest" ?? (1, mode == "linear" ?? (2, 4))
+		let axisPlace int[]
+		axisPlace.len(rank * per)
+		let axisWeight float[]
+		axisWeight.len(rank * per)
+		let taps = places.len() / points.max(1)
+		let strides int[]
+		strides.len(rank)
+		let stride = 1
+		for let d = rank - 1; d >= 0; d-- {
+			strides[d] = stride
+			stride *= spatial[d]
+		}
+		for let p = 0; p < points; p++ {
+			for let d = 0; d < rank; d++ {
+				let size = spatial[d]
+				let normalized = coords[co + p * rank + (rank - 1 - d)]
+				let low = align ?? (0.0, -0.5)
+				let high = align ?? (float(size - 1), float(size) - 0.5)
+				// Denormalized in float32, as the coordinates are.
+				let v = float(float32(align ?? ((normalized + 1.0) / 2.0 * float(size - 1), ((normalized + 1.0) * float(size) - 1.0) / 2.0)))
+				v = mode == "nearest" ?? (roundEven(v), v)
+				if v < low || v > high {
+					if padding == "border" {
+						v = v.clamp(0.0, float(size - 1))
+					} else if padding == "reflection" {
+						v = reflect(v, low, high)
+					}
+				}
+				if mode == "nearest" {
+					axisPlace[d] = gridIndex(int(v), size, padding, low, high)
+					axisWeight[d] = 1.0
+					continue
+				}
+				let f = v.floor()
+				let i0 = int(f)
+				if mode == "linear" {
+					axisPlace[d * 2] = gridIndex(i0, size, padding, low, high)
+					axisPlace[d * 2 + 1] = gridIndex(i0 + 1, size, padding, low, high)
+					axisWeight[d * 2] = 1.0 - (v - f)
+					axisWeight[d * 2 + 1] = v - f
+				} else {
+					let w = keysWeights(v - f, -0.75)
+					for let k = 0; k < 4; k++ {
+						axisPlace[d * 4 + k] = gridIndex(i0 - 1 + k, size, padding, low, high)
+						axisWeight[d * 4 + k] = w[k]
+					}
+				}
+			}
+			for let t = 0; t < taps; t++ {
+				let place = 0
+				let weight = 1.0
+				let r = t
+				for let d = rank - 1; d >= 0; d-- {
+					let k = r % per
+					r /= per
+					let i = axisPlace[d * per + k]
+					weight *= axisWeight[d * per + k]
+					place = i < 0 || place < 0 ?? (-1, place + i * strides[d])
+				}
+				places[t * points + p] = place
+				weights[t * points + p] = place < 0 ?? (0.0, weight)
+			}
+		}
+	}
+
+	// Index `i` of an axis of `size` under a padding mode: -1 outside for
+	// zeros, clamped for border, reflected for reflection.
+	internal def gridIndex(i int, size int, padding string, low float, high float) int {
+		return i when i >= 0 && i < size
+		match padding {
+			case "zeros":
+				return -1
+			case "border":
+				return i.clamp(0, size - 1)
+			default:
+				return int(reflect(float(i), low, high)).clamp(0, size - 1)
+		}
+	}
+
+	// Weighted sums of taps for every channel: out[oo + ch · points + p]
+	// = Σ weights[t · points + p] · x[xo + ch · inSize + places[…]] over
+	// the taps with a place, eight points at a time.
+	internal def sampleChannels<T: SimdFloat>(x T[], xo int, inSize int, channels int, points int, taps int, places int[], weights T[], out T[], oo int) {
+		let gathers int[]
+		gathers.len(places.len())
+		let valid T[]
+		valid.len(places.len())
+		for let i = 0; i < places.len(); i++ {
+			gathers[i] = places[i].max(0)
+			valid[i] = places[i] >= 0 ?? (T(1), T(0))
+		}
+		let tasks = tasksFor(channels * points * taps, channels)
+		forall let t in 0..tasks {
+			for let ch = channels * t / tasks; ch < channels * (t + 1) / tasks; ch++ {
+				let base = xo + ch * inSize
+				let o = oo + ch * points
+				let p = 0
+				let zero = simd.splat8<T>(T(0))
+				for; p + 8 <= points; p += 8 {
+					let acc = zero
+					for let k = 0; k < taps; k++ {
+						let at = k * points + p
+						let inside = simd.gt(simd.load8<T>(valid, at), zero)
+						let v = simd.maskedGather8<T>(x, base, simd.load8<int>(gathers, at), inside, zero)
+						acc = simd.fma(simd.load8<T>(weights, at), v, acc)
+					}
+					simd.store8<T>(out, o + p, acc)
+				}
+				for; p < points; p++ {
+					let acc = T(0)
+					for let k = 0; k < taps; k++ {
+						let place = places[k * points + p]
+						acc += place < 0 ?? (T(0), weights[k * points + p] * x[base + place])
+					}
+					out[o + p] = acc
+				}
+			}
+		}
+	}
+
+	// ---- Resizing ----
+
+	// How one axis of a Resize reads its input: per output position the
+	// `taps` input places and weights (tap-major: tap · out + position;
+	// one place and no weights for nearest), and the positions outside a
+	// tf_crop_and_resize region, which take the extrapolation value.
+	internal struct Resampling {
+		taps    int
+		places  int[]
+		weights float[]
+		outside int[]
+	}
+
+	// The settings of a Resize that shape every axis' resampling.
+	internal struct ResizeMode {
+		mode        string
+		coordinate  string
+		nearestMode string
+		cubicA      float
+		exclude     bool
+		antialias   bool
+	}
+
+	// Resize (and the older Upsample): X resampled to sizes or by scales
+	// on its axes (all, or `axes`), one axis after another, by nearest,
+	// linear or cubic interpolation (antialiased when downscaling with
+	// antialias), with the coordinate transformation, nearest rounding,
+	// cubic coefficient, exclude_outside, tf_crop_and_resize region and
+	// extrapolation value, and keep_aspect_ratio_policy for sizes.
+	// Upsample and Resize 10 resample asymmetrically, nearest rounding
+	// down.
+	// Fails when neither scales nor sizes is given or they do not fit.
+	internal def resizeOp(c Call) !none {
+		let x = try c.tensor(0)
+		let rank = x.rank()
+		let legacy = c.step.op == "Upsample" || c.opset < 11
+		let given = c.text("mode", "nearest")
+		let mode = given == "bilinear" ?? ("linear", given)
+		fail c.about() + "mode {given} is not nearest, linear or cubic" unless mode := "nearest" || "linear" || "cubic"
+		let listed = legacy ?? (int[], c.ints("axes", int[]))
+		let axes int[]
+		for let i = 0; i < (listed.len() == 0 ?? (rank, listed.len())); i++ {
+			let a = listed.len() == 0 ?? (i, listed[i] < 0 ?? (listed[i] + rank, listed[i]))
+			fail c.about() + "axis {a} is outside rank {rank} or repeated" unless a >= 0 && a < rank && !axes.includes(a)
+			axes.push(a)
+		}
+		let scales float[]
+		let sizes int[]
+		if legacy {
+			if c.step.op == "Upsample" && c.opset < 9 {
+				for let (_, f) in c.floats("scales", float32[]) {
+					scales.push(float(f))
+				}
+			} else {
+				scales = asDoubles(try c.tensor(1))
+			}
+		} else if c.has(2) && (try c.tensor(2)).count() > 0 {
+			scales = asDoubles(try c.tensor(2))
+		} else if c.has(3) && (try c.tensor(3)).count() > 0 {
+			sizes = try c.ints(3)
+		} else {
+			fail c.about() + "needs scales or sizes"
+		}
+		fail c.about() + "has {scales.len() + sizes.len()} scales or sizes for {axes.len()} axes" unless scales.len() + sizes.len() == axes.len()
+		let coordinate = legacy ?? ("asymmetric", c.text("coordinate_transformation_mode", "half_pixel"))
+		let crop = coordinate == "tf_crop_and_resize"
+		let roiStart float[]
+		let roiEnd float[]
+		for let a = 0; a < rank; a++ {
+			roiStart.push(0.0)
+			roiEnd.push(1.0)
+		}
+		if !legacy && c.has(1) {
+			let roi = asDoubles(try c.tensor(1))
+			if roi.len() > 0 {
+				fail c.about() + "roi has {roi.len()} values for {axes.len()} axes" unless roi.len() == 2 * axes.len()
+				for let (i, a) in axes {
+					roiStart[a] = roi[i]
+					roiEnd[a] = roi[axes.len() + i]
+				}
+			}
+		}
+		let scale float[]
+		for let a = 0; a < rank; a++ {
+			scale.push(1.0)
+		}
+		let out = x.shape.clone()
+		if sizes.len() > 0 {
+			for let (i, a) in axes {
+				fail c.about() + "size {sizes[i]} of axis {a} is negative" unless sizes[i] >= 0
+				scale[a] = float(sizes[i]) / float(x.shape[a])
+				out[a] = sizes[i]
+			}
+			let policy = c.text("keep_aspect_ratio_policy", "stretch")
+			if policy != "stretch" {
+				fail c.about() + "keep_aspect_ratio_policy {policy} is not stretch, not_larger or not_smaller" unless policy := "not_larger" || "not_smaller"
+				let s = scale[axes[0]]
+				for let (_, a) in axes {
+					s = policy == "not_larger" ?? (s.min(scale[a]), s.max(scale[a]))
+				}
+				for let (_, a) in axes {
+					scale[a] = s
+					out[a] = int(s * float(x.shape[a]) + 0.5)
+				}
+			}
+		} else {
+			for let (i, a) in axes {
+				fail c.about() + "scale {scales[i]} of axis {a} is not positive" unless scales[i] > 0.0
+				scale[a] = scales[i]
+				out[a] = int((float(x.shape[a]) * (crop ?? (roiEnd[a] - roiStart[a], 1.0)) * scales[i]).floor())
+			}
+		}
+		let settings = ResizeMode{mode: mode, coordinate: coordinate, nearestMode: legacy ?? ("floor", c.text("nearest_mode", "round_prefer_floor")), cubicA: float(c.float("cubic_coeff_a", float32(-0.75))), exclude: c.int("exclude_outside", 0) != 0, antialias: !legacy && mode != "nearest" && c.int("antialias", 0) != 0}
+		let extrapolation = float(c.float("extrapolation_value", float32(0)))
+		let nearest = mode == "nearest"
+		let integers = !nearest && storageOf(x.element) == Storage.Ints
+		fail c.about() + "{mode} resizing of {x.element.name}" unless nearest || integers || x.element == ElementType.Double || realFloats(x.element)
+		// Integers interpolate in float64, rounded and saturated once at the end.
+		let current = integers ?? (new Tensor(x.shape.clone(), asDoubles(x)), x)
+		for let a = 0; a < rank; a++ {
+			let trivial = (scale[a] - 1.0).abs() <= 0.000000001 && out[a] == current.shape[a] && (!crop || (roiStart[a] == 0.0 && roiEnd[a] == 1.0))
+			continue when trivial
+			let plan = resampling(current.shape[a], out[a], scale[a], roiStart[a], roiEnd[a], settings)
+			current = try resizeAxis(c, current, a, out[a], plan, nearest, extrapolation)
+		}
+		if integers {
+			let y = zerosLike(x.element, current.shape)
+			let bits = elementBits(x.element)
+			let signed = signedType(x.element)
+			let low = signed ?? (-float(1 << (bits - 1)), 0.0)
+			let high = x.element == ElementType.Bool ?? (1.0, bits >= 63 ?? (9223372036854775807.0, signed ?? (float((1 << (bits - 1)) - 1), float((1 << bits) - 1))))
+			for let i = 0; i < y.ints.len(); i++ {
+				y.ints[i] = int(roundEven(current.doubles[i]).clamp(low, high))
+			}
+			current = y
+		} else if current != x {
+			roundTo(current)
+		}
+		c.out(0, current)
+		return none
+	}
+
+	// The source coordinate of output position `q` of an axis resized from
+	// `len` to `out` (`wide` = scale · len, the output length as a real).
+	internal def sourceCoordinate(q int, len int, out int, scale float, roiStart float, roiEnd float, coordinate string) float {
+		let wide = scale * float(len)
+		let y = float(q)
+		match coordinate {
+			case "align_corners":
+				return wide == 1.0 ?? (0.0, y * float(len - 1) / (wide - 1.0))
+			case "asymmetric":
+				return y / scale
+			case "tf_crop_and_resize":
+				let span = roiEnd - roiStart
+				let at = wide == 1.0 ?? (span * float(len - 1) / 2.0, y * span * float(len - 1) / (wide - 1.0))
+				return at + roiStart * float(len - 1)
+			case "pytorch_half_pixel":
+				return wide == 1.0 ?? (-0.5, (y + 0.5) / scale - 0.5)
+			case "half_pixel_symmetric":
+				let adjustment = float(out) / wide
+				let offset = float(len) / 2.0 * (1.0 - adjustment)
+				return offset + (y + 0.5) / scale - 0.5
+			default:
+				return (y + 0.5) / scale - 0.5
+		}
+	}
+
+	// The weights of the taps around a source coordinate `ratio` past the
+	// first (1 for a whole coordinate): nearest (as 0/1), linear or cubic,
+	// widened by 1/scale when antialiasing a downscale.
+	internal def resizeWeights(ratio float, scale float, m ResizeMode) float[] {
+		match m.mode {
+			case "nearest":
+				return float[0.0, 1.0] when ratio == 1.0
+				let up = false
+				match m.nearestMode {
+					case "round_prefer_ceil":
+						up = ratio >= 0.5
+					case "floor":
+						up = false
+					case "ceil":
+						up = true
+					default:
+						up = ratio > 0.5
+				}
+				return up ?? (float[0.0, 1.0], float[1.0, 0.0])
+			case "linear":
+				return float[1.0 - ratio, ratio] unless m.antialias
+				let s = scale.min(1.0)
+				let start = int((-1.0 / s).floor()) + 1
+				let footprint = 2 - 2 * start
+				let out float[]
+				let sum = 0.0
+				for let j = 0; j < footprint; j++ {
+					let v = (1.0 - ((float(start + j) - ratio) * s).abs()).clamp(0.0, 1.0)
+					out.push(v)
+					sum += v
+				}
+				for let j = 0; j < footprint; j++ {
+					out[j] /= sum
+				}
+				return out
+			default:
+				let a = m.cubicA
+				return keysWeights(ratio, a) unless m.antialias
+				let s = scale.min(1.0)
+				let first = int((-2.0 / s).floor()) + 1
+				let out float[]
+				let sum = 0.0
+				for let i = first; i < 2 - first; i++ {
+					let x = (s * (float(i) - ratio)).abs()
+					let v = x <= 1.0 ?? ((a + 2.0) * x * x * x - (a + 3.0) * x * x + 1.0, x < 2.0 ?? (a * x * x * x - 5.0 * a * x * x + 8.0 * a * x - 4.0 * a, 0.0))
+					out.push(v)
+					sum += v
+				}
+				for let j = 0; j < out.len(); j++ {
+					out[j] /= sum
+				}
+				return out
+		}
+	}
+
+	// The resampling of an axis from `len` to `out` positions (see
+	// Resampling): per position its source coordinate, the taps nearest
+	// it (the edge repeated outside the input) and their weights.
+	internal def resampling(len int, out int, scale float, roiStart float, roiEnd float, m ResizeMode) Resampling {
+		let nearest = m.mode == "nearest"
+		let plan = Resampling{}
+		for let q = 0; q < out; q++ {
+			let x = sourceCoordinate(q, len, out, scale, roiStart, roiEnd, m.coordinate)
+			plan.outside.push(q) when m.coordinate == "tf_crop_and_resize" && (x < 0.0 || x > float(len - 1))
+			let whole = x.floor()
+			let ratio = x == whole ?? (1.0, x - whole)
+			let w = resizeWeights(ratio, scale, m)
+			let n = w.len()
+			let pad = (n + 1) / 2
+			let shifted = x + float(pad)
+			let p = shifted.floor()
+			let frac = shifted - p
+			let start = int(p) - pad
+			if n % 2 == 0 {
+				start += frac == 0.0 ?? (-(n / 2), -(n / 2) + 1)
+			} else {
+				start += frac <= 0.5 ?? (-((n - 1) / 2), -((n - 1) / 2) + 1)
+			}
+			if m.exclude && !nearest {
+				let sum = 0.0
+				for let j = 0; j < n; j++ {
+					w[j] = start + j < 0 || start + j >= len ?? (0.0, w[j])
+					sum += w[j]
+				}
+				sum = sum == 0.0 ?? (1.0, sum)
+				for let j = 0; j < n; j++ {
+					w[j] /= sum
+				}
+			}
+			if nearest {
+				plan.taps = 1
+				plan.places.push((start + (w[0] != 0.0 ?? (0, 1))).clamp(0, len - 1))
+				continue
+			}
+			if q == 0 {
+				plan.taps = n
+				plan.places.len(n * out)
+				plan.weights.len(n * out)
+			}
+			for let j = 0; j < n; j++ {
+				plan.places[j * out + q] = (start + j).clamp(0, len - 1)
+				plan.weights[j * out + q] = w[j]
+			}
+		}
+		return plan
+	}
+
+	// `t` resampled along `axis` to `out` positions by `plan`: gathered
+	// for nearest (any type), weighted sums otherwise (float types);
+	// positions outside the crop region take `extrapolation`.
+	internal def resizeAxis(c Call, t Tensor, axis int, out int, plan Resampling, nearest bool, extrapolation float) !Tensor {
+		let shape = t.shape.clone()
+		let len = shape[axis]
+		shape[axis] = out
+		let outer = volume(shape[0:axis].clone())
+		let inner = volume(shape[axis + 1:].clone())
+		let y = zerosLike(t.element, shape)
+		let width = t.element == ElementType.Complex64 || t.element == ElementType.Complex128 ?? (2, 1)
+		if nearest {
+			match storageOf(t.element) {
+				case Storage.Floats:
+					gatherAxis(t.floats, y.floats, outer, len, inner * width, out, plan.places)
+				case Storage.Doubles:
+					gatherAxis(t.doubles, y.doubles, outer, len, inner * width, out, plan.places)
+				case Storage.Ints:
+					gatherAxis(t.ints, y.ints, outer, len, inner, out, plan.places)
+				default:
+					gatherAxis(t.strings, y.strings, outer, len, inner, out, plan.places)
+			}
+		} else if t.element == ElementType.Double {
+			weighAxis(t.doubles, y.doubles, outer, len, inner, out, plan.taps, plan.places, plan.weights)
+		} else {
+			let w float32[]
+			w.len(plan.weights.len())
+			for let i = 0; i < w.len(); i++ {
+				w[i] = float32(plan.weights[i])
+			}
+			weighAxis(t.floats, y.floats, outer, len, inner, out, plan.taps, plan.places, w)
+		}
+		if plan.outside.len() > 0 {
+			fail c.about() + "extrapolation into {t.element.name}" unless storageOf(t.element) != Storage.Strings
+			let fill = zerosLike(t.element, int[1])
+			match storageOf(t.element) {
+				case Storage.Floats:
+					fill.floats[0] = float32(extrapolation)
+				case Storage.Doubles:
+					fill.doubles[0] = extrapolation
+				default:
+					fill.ints[0] = int(extrapolation)
+			}
+			for let o = 0; o < outer; o++ {
+				for let (_, q) in plan.outside {
+					for let j = 0; j < inner * width; j++ {
+						copyValue(fill, 0, y, (o * out + q) * inner * width + j)
+					}
+				}
+			}
+		}
+		return y
+	}
+
+	// dst[o, q, :] = src[o, places[q], :] for blocks of `inner` values.
+	internal def gatherAxis<T>(src T[], dst T[], outer int, len int, inner int, out int, places int[]) {
+		let tasks = tasksFor(outer * out * inner, outer)
+		forall let t in 0..tasks {
+			for let o = outer * t / tasks; o < outer * (t + 1) / tasks; o++ {
+				for let q = 0; q < out; q++ {
+					let s = (o * len + places[q]) * inner
+					let d = (o * out + q) * inner
+					if inner == 1 {
+						dst[d] = src[s]
+					} else {
+						src[s:s + inner].copy(dst[d:d + inner])
+					}
+				}
+			}
+		}
+	}
+
+	// dst[o, q, :] = Σ_k weights[k · out + q] · src[o, places[k · out + q], :]:
+	// eight output positions at a time by gathers on the last axis,
+	// eight inner values at a time on the others.
+	internal def weighAxis<T: SimdFloat>(src T[], dst T[], outer int, len int, inner int, out int, taps int, places int[], weights T[]) {
+		let tasks = tasksFor(outer * out * inner * taps, outer)
+		forall let t in 0..tasks {
+			for let o = outer * t / tasks; o < outer * (t + 1) / tasks; o++ {
+				if inner == 1 {
+					let base = o * len
+					let d = o * out
+					let q = 0
+					for; q + 8 <= out; q += 8 {
+						let acc = simd.splat8<T>(T(0))
+						for let k = 0; k < taps; k++ {
+							let at = k * out + q
+							acc = simd.fma(simd.load8<T>(weights, at), simd.gather8<T>(src, base, simd.load8<int>(places, at)), acc)
+						}
+						simd.store8<T>(dst, d + q, acc)
+					}
+					for; q < out; q++ {
+						let acc = T(0)
+						for let k = 0; k < taps; k++ {
+							acc += weights[k * out + q] * src[base + places[k * out + q]]
+						}
+						dst[d + q] = acc
+					}
+					continue
+				}
+				for let q = 0; q < out; q++ {
+					let d = (o * out + q) * inner
+					for let k = 0; k < taps; k++ {
+						let w = weights[k * out + q]
+						let s = (o * len + places[k * out + q]) * inner
+						let w8 = simd.splat8<T>(w)
+						let j = 0
+						if k == 0 {
+							for; j + 8 <= inner; j += 8 {
+								simd.store8<T>(dst, d + j, w8 * simd.load8<T>(src, s + j))
+							}
+							for; j < inner; j++ {
+								dst[d + j] = w * src[s + j]
+							}
+						} else {
+							for; j + 8 <= inner; j += 8 {
+								simd.store8<T>(dst, d + j, simd.fma(w8, simd.load8<T>(src, s + j), simd.load8<T>(dst, d + j)))
+							}
+							for; j < inner; j++ {
+								dst[d + j] += w * src[s + j]
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}

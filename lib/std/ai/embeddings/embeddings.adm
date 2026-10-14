@@ -1,0 +1,610 @@
+// Text as vectors: an embedding model turns a text into a list of numbers
+// whose direction carries its meaning, so texts about the same thing lie
+// close together. Store the vectors anywhere (a database column of bytes
+// holds one), and find the texts nearest a question by comparing vectors.
+//
+// ```
+// let model = try embeddings.load("all-minilm.gguf")
+// let stored = try model.embed(string["The cat sat on the mat.", "Stocks fell sharply."])
+// let question = try model.embed("Where did the cat sit?")
+// let best = embeddings.nearest(question, stored, 1)   // [0]
+// ```
+partial module std.ai.embeddings {
+	use (
+		std.os
+		std.math
+		std.simd
+		std.data.encoding::(JSON)
+		std.formats.ai
+		std.formats.ai::(ModelFile)
+		std.formats.ai.onnx::(ElementType)
+		std.ai.onnx
+		std.ai.tensor
+		std.ai.tensor::(Tensor, Weights, loadWeights, layerNorm, gelu, GeluForm, silu, rope, RopeStyle, softmax)
+		std.ai.llm::(Tokenizer, loadTokenizer, Device)
+	)
+
+	// How a model's token vectors become one vector for the text.
+	enum Pooling {
+		// The mean of every token's vector.
+		Mean,
+		// The first token's ([CLS]).
+		First,
+		// The last token's.
+		Last,
+	}
+
+	// A loaded embedding model.
+	type EmbeddingModel {
+		// Numbers in each vector.
+		dimensions         int
+		pooling            Pooling
+		// Whether vectors are scaled to length 1, so that their dot product
+		// is their cosine similarity.
+		normalized         bool
+		// Tokens of a text the model reads; the rest is cut off.
+		maxTokens          int
+		// Where the model runs.
+		device             Device
+		internal tokenizer Tokenizer
+		internal graph     ?onnx.Model
+		internal encoder   ?Encoder
+		// The ONNX inputs the graph takes besides input_ids.
+		internal masks     bool
+		internal types     bool
+		internal padding   int
+
+		def new(tokenizer Tokenizer) {
+			self.tokenizer = tokenizer
+		}
+
+		// The vector of `text`.
+		// Fails when the model does.
+		def embed(text string) !float32[] {
+			return (try embed(string[text]))[0]
+		}
+
+		// The vector of each text, in order.
+		// Fails when the model does.
+		def embed(texts string[]) !float32[][] {
+			let tokens int[][]
+			for let (_, text) in texts {
+				let ids = tokenizer.encode(text)
+				if ids.len() > maxTokens {
+					// Keep the closing token the post-processor added.
+					let last = ids[ids.len() - 1]
+					ids = ids[0:maxTokens]
+					ids[maxTokens - 1] = last
+				}
+				tokens.push(ids)
+			}
+			let out float32[][]
+			out.len(texts.len())
+			let model = encoder
+			if model is Encoder {
+				for let (i, ids) in tokens {
+					out[i] = finished(model.pool(model.forward(ids), pooling))
+				}
+				return out
+			}
+			let g = graph
+			fail "embeddings: the model holds no graph" unless g is onnx.Model
+			// Batches of texts of similar length, padded to the longest.
+			let order int[]
+			for let i = 0; i < tokens.len(); i++ {
+				order.push(i)
+			}
+			order = order.sort((a, b) => tokens[a].len() - tokens[b].len())
+			let batch = 16
+			for let from = 0; from < order.len(); from += batch {
+				let picked = order[from:(from + batch).min(order.len())]
+				let vectors = try runBatch(g, tokens, picked)
+				for let (k, i) in picked {
+					out[i] = finished(vectors[k])
+				}
+			}
+			return out
+		}
+
+		// One batch through the ONNX graph: the pooled vector of each text.
+		internal def runBatch(g onnx.Model, tokens int[][], picked int[]) !float32[][] {
+			let width = 0
+			for let (_, i) in picked {
+				width = width.max(tokens[i].len())
+			}
+			let rows = picked.len()
+			let ids int[]
+			let mask int[]
+			ids.len(rows * width)
+			mask.len(rows * width)
+			for let (r, i) in picked {
+				for let t = 0; t < width; t++ {
+					let real = t < tokens[i].len()
+					ids[r * width + t] = real ?? (tokens[i][t], padding)
+					mask[r * width + t] = real ?? (1, 0)
+				}
+			}
+			let feeds = new map<string, onnx.Value>()
+			let shape = int[rows, width]
+			feeds.set("input_ids", new Tensor(shape, ids, ElementType.Int64))
+			feeds.set("attention_mask", new Tensor(shape, mask, ElementType.Int64)) when masks
+			if types {
+				let zeros int[]
+				zeros.len(rows * width)
+				feeds.set("token_type_ids", new Tensor(shape, zeros, ElementType.Int64))
+			}
+			let out = try g.run(feeds)
+			let pooled = out.get("sentence_embedding")
+			let vectors float32[][]
+			if pooled is Tensor {
+				for let r = 0; r < rows; r++ {
+					vectors.push(pooled.floats[r * dimensions:(r + 1) * dimensions].clone())
+				}
+				return vectors
+			}
+			let hidden = out.get("last_hidden_state")
+			if !(hidden is Tensor) {
+				hidden = out.get("token_embeddings")
+			}
+			fail "embeddings: the model gives neither sentence_embedding nor last_hidden_state" unless hidden is Tensor
+			let d = hidden.shape[2]
+			for let (r, i) in picked {
+				let n = tokens[i].len()
+				let v float32[]
+				v.len(d)
+				let base = r * width * d
+				match pooling {
+					case Pooling.First:
+						hidden.floats[base:base + d].copy(v)
+					case Pooling.Last:
+						hidden.floats[base + (n - 1) * d:base + n * d].copy(v)
+					default:
+						for let t = 0; t < n; t++ {
+							addInto(v, hidden.floats, base + t * d, d)
+						}
+						scaleBy(v, float32(1) / float32(n))
+				}
+				vectors.push(v)
+			}
+			return vectors
+		}
+
+		// The vector as the model gives it: scaled to length 1 when the
+		// model's vectors are.
+		internal def finished(v float32[]) float32[] {
+			return v unless normalized
+			let length = math.sqrt(float(dot(v, v)))
+			scaleBy(v, length > 0.0 ?? (float32(1.0 / length), float32(0)))
+			return v
+		}
+	}
+
+	// Loads an embedding model: a GGUF file of a BERT or Nomic BERT
+	// model (as Ollama keeps all-minilm, nomic-embed-text, mxbai-embed-large,
+	// bge and snowflake-arctic-embed), or a folder of a sentence-transformers
+	// ONNX export (onnx/model.onnx with tokenizer.json; its pooling and
+	// normalisation read from 1_Pooling/config.json and modules.json), on
+	// `device` (ONNX models; GGUF models run on the processor).
+	// Fails when the files cannot be read or describe another kind of model.
+	def load(path string, device Device = Device.Auto) !EmbeddingModel {
+		let info = try os.stat(path, true)
+		return try loadOnnx(path, device) when info.isDir
+		let file = try ai.load(path)
+		let tokenizer = try loadTokenizer(file)
+		let encoder = try readEncoder(file)
+		let model = new EmbeddingModel(tokenizer)
+		model.encoder = encoder
+		model.dimensions = encoder.width
+		model.maxTokens = encoder.context
+		model.pooling = encoder.poolingKind
+		model.normalized = true
+		model.device = Device.Cpu
+		return model
+	}
+
+	internal def loadOnnx(folder string, device Device) !EmbeddingModel {
+		let tokenizer = try loadTokenizer(folder)
+		let file = os.join(folder, "onnx", "model.onnx")
+		let g = try onnx.load((try os.exists(file)) ?? (file, os.join(folder, "model.onnx")), device)
+		let model = new EmbeddingModel(tokenizer)
+		model.graph = g
+		model.device = g.device
+		for let (_, input) in g.inputs {
+			model.masks = model.masks || input.name == "attention_mask"
+			model.types = model.types || input.name == "token_type_ids"
+		}
+		let config = try jsonAt(folder, "config.json")
+		let pooling = try jsonAt(os.join(folder, "1_Pooling"), "config.json")
+		let sentence = try jsonAt(folder, "sentence_bert_config.json")
+		model.dimensions = intAt(pooling, "word_embedding_dimension", intAt(config, "hidden_size", 0))
+		model.pooling = boolAt(pooling, "pooling_mode_cls_token", false) ?? (Pooling.First, boolAt(pooling, "pooling_mode_lasttoken", false) ?? (Pooling.Last, Pooling.Mean))
+		model.maxTokens = intAt(sentence, "max_seq_length", intAt(config, "max_position_embeddings", 512))
+		model.padding = intAt(config, "pad_token_id", 0)
+		let modules = os.join(folder, "modules.json")
+		if try os.exists(modules) {
+			model.normalized = string(try os.readFile(modules)).contains("Normalize")
+		}
+		fail "embeddings: {folder} does not say how wide its vectors are (1_Pooling/config.json or config.json)" when model.dimensions == 0
+		return model
+	}
+
+	// The cosine of the angle between two vectors: 1 for the same
+	// direction, 0 for unrelated, -1 for opposite.
+	def similarity(a float32[], b float32[]) float {
+		let ab = float(dot(a, b))
+		let aa = float(dot(a, a))
+		let bb = float(dot(b, b))
+		return 0.0 when aa == 0.0 || bb == 0.0
+		return ab / math.sqrt(aa * bb)
+	}
+
+	// The positions in `vectors` of the `count` vectors most similar to
+	// `query` (cosine similarity), most similar first. Large lists are
+	// compared on tasks.
+	def nearest(query float32[], vectors float32[][], count int = 1) int[] {
+		let scores float[]
+		scores.len(vectors.len())
+		let q = float(dot(query, query))
+		let tasks = (vectors.len() * query.len() / (1 << 18)).clamp(1, 32)
+		forall let b in 0..tasks {
+			for let i = vectors.len() * b / tasks; i < vectors.len() * (b + 1) / tasks; i++ {
+				let v = vectors[i]
+				let vv = float(dot(v, v))
+				scores[i] = q == 0.0 || vv == 0.0 ?? (-2.0, float(dot(query, v)) / math.sqrt(q * vv))
+			}
+		}
+		let order int[]
+		for let i = 0; i < vectors.len(); i++ {
+			order.push(i)
+		}
+		order = order.sort((a, b) => scores[b] > scores[a] ?? (1, scores[b] < scores[a] ?? (-1, a - b)))
+		return order[0:count.clamp(0, order.len())]
+	}
+
+	// ---- GGUF encoders ------------------------------------------------------
+
+	// One layer of a BERT encoder.
+	internal type EncoderLayer {
+		// Separate projections with biases (BERT), or one fused (Nomic).
+		query      ?Weights
+		key        ?Weights
+		value      ?Weights
+		fused      ?Weights
+		queryBias  float32[] = []
+		keyBias    float32[] = []
+		valueBias  float32[] = []
+		output     Weights
+		outputBias float32[] = []
+		attnNorm   float32[]
+		attnBias   float32[]
+		up         Weights
+		upBias     float32[] = []
+		gate       ?Weights
+		down       Weights
+		downBias   float32[] = []
+		outNorm    float32[]
+		outBias    float32[]
+
+		def new(output Weights, up Weights, down Weights, attnNorm float32[], attnBias float32[], outNorm float32[], outBias float32[]) {
+			self.output = output
+			self.up = up
+			self.down = down
+			self.attnNorm = attnNorm
+			self.attnBias = attnBias
+			self.outNorm = outNorm
+			self.outBias = outBias
+		}
+	}
+
+	// A BERT (learned positions, GELU) or Nomic BERT (rotary positions,
+	// SwiGLU) encoder read from GGUF.
+	internal type Encoder {
+		width       int
+		heads       int
+		context     int
+		epsilon     float32
+		rotary      bool
+		ropeBase    float32
+		poolingKind Pooling
+		tokens      Weights
+		positions   ?Weights
+		typeRow     float32[]
+		embedNorm   float32[]
+		embedBias   float32[]
+		layers      EncoderLayer[] = []
+
+		def new(tokens Weights, typeRow float32[], embedNorm float32[], embedBias float32[]) {
+			self.tokens = tokens
+			self.typeRow = typeRow
+			self.embedNorm = embedNorm
+			self.embedBias = embedBias
+		}
+
+		// The last layer's vector of every token of `ids` (a row each).
+		def forward(ids int[]) matrix<float32> {
+			let n = ids.len()
+			let d = width
+			let x = matrix<float32>[].size(n, d)
+			let place float32[]
+			place.len(d)
+			for let t = 0; t < n; t++ {
+				let row = x.row(t)
+				tokens.row(ids[t], row)
+				let pos = positions
+				if pos is Weights {
+					pos.row(t, place)
+					addInto(row, place, 0, d)
+				}
+				addInto(row, typeRow, 0, d)
+				layerNorm(row, embedNorm, embedBias, epsilon)
+			}
+			let hd = d / heads
+			let q = matrix<float32>[].size(n, d)
+			let k = matrix<float32>[].size(n, d)
+			let v = matrix<float32>[].size(n, d)
+			let attended = matrix<float32>[].size(n, d)
+			let projected = matrix<float32>[].size(n, d)
+			for let (_, layer) in layers {
+				let fused = layer.fused
+				if fused is Weights {
+					let qkv = matrix<float32>[].size(n, 3 * d)
+					fused.multiply(x, qkv)
+					for let t = 0; t < n; t++ {
+						let row = qkv.row(t)
+						row[0:d].copy(q.row(t))
+						row[d:2 * d].copy(k.row(t))
+						row[2 * d:3 * d].copy(v.row(t))
+					}
+				} else {
+					project(layer.query, x, q, layer.queryBias)
+					project(layer.key, x, k, layer.keyBias)
+					project(layer.value, x, v, layer.valueBias)
+				}
+				if rotary {
+					for let t = 0; t < n; t++ {
+						rope(q.row(t), t, heads, hd, ropeBase, RopeStyle.Halves)
+						rope(k.row(t), t, heads, hd, ropeBase, RopeStyle.Halves)
+					}
+				}
+				attend(q, k, v, attended, n, heads, hd)
+				layer.output.multiply(attended, projected)
+				for let t = 0; t < n; t++ {
+					let row = x.row(t)
+					let p = projected.row(t)
+					addInto(p, layer.outputBias, 0, d) when layer.outputBias.len() > 0
+					addInto(row, p, 0, d)
+					layerNorm(row, layer.attnNorm, layer.attnBias, epsilon)
+				}
+				let wide = layer.up.rows
+				let hidden = matrix<float32>[].size(n, wide)
+				layer.up.multiply(x, hidden)
+				let gate = layer.gate
+				if gate is Weights {
+					let gates = matrix<float32>[].size(n, wide)
+					gate.multiply(x, gates)
+					for let t = 0; t < n; t++ {
+						let g = gates.row(t)
+						silu(g)
+						let h = hidden.row(t)
+						for let j = 0; j < wide; j++ {
+							h[j] *= g[j]
+						}
+					}
+				} else {
+					for let t = 0; t < n; t++ {
+						let h = hidden.row(t)
+						addInto(h, layer.upBias, 0, wide) when layer.upBias.len() > 0
+						gelu(h, GeluForm.Erf)
+					}
+				}
+				layer.down.multiply(hidden, projected)
+				for let t = 0; t < n; t++ {
+					let row = x.row(t)
+					let p = projected.row(t)
+					addInto(p, layer.downBias, 0, d) when layer.downBias.len() > 0
+					addInto(row, p, 0, d)
+					layerNorm(row, layer.outNorm, layer.outBias, epsilon)
+				}
+			}
+			return x
+		}
+
+		// The text's vector from its tokens' vectors.
+		def pool(x matrix<float32>, kind Pooling) float32[] {
+			let v float32[]
+			v.len(width)
+			match kind {
+				case Pooling.First:
+					x.row(0).copy(v)
+				case Pooling.Last:
+					x.row(x.rows - 1).copy(v)
+				default:
+					for let t = 0; t < x.rows; t++ {
+						addInto(v, x.row(t), 0, width)
+					}
+					scaleBy(v, float32(1) / float32(x.rows))
+			}
+			return v
+		}
+	}
+
+	// out = x · Wᵀ + bias.
+	internal def project(w ?Weights, x matrix<float32>, out matrix<float32>, bias float32[]) {
+		if w is Weights {
+			w.multiply(x, out)
+		}
+		return when bias.len() == 0
+		for let t = 0; t < out.rows; t++ {
+			addInto(out.row(t), bias, 0, bias.len())
+		}
+	}
+
+	// Every token attending to every token, a task per head:
+	// softmax(q·kᵀ/√hd)·v into `out`.
+	internal def attend(q matrix<float32>, k matrix<float32>, v matrix<float32>, out matrix<float32>, n int, heads int, hd int) {
+		let scale = float32(1) / float32(math.sqrt(float(hd)))
+		forall let h in 0..heads {
+			let o = h * hd
+			let scores float32[]
+			scores.len(n)
+			let kh float32[]
+			kh.len(n * hd)
+			let vh float32[]
+			vh.len(n * hd)
+			for let t = 0; t < n; t++ {
+				k.row(t)[o:o + hd].copy(kh[t * hd:(t + 1) * hd])
+				v.row(t)[o:o + hd].copy(vh[t * hd:(t + 1) * hd])
+			}
+			for let i = 0; i < n; i++ {
+				let qi = q.row(i)[o:o + hd].clone()
+				for let j = 0; j < n; j++ {
+					scores[j] = headDot(qi, kh, j * hd, hd) * scale
+				}
+				softmax(scores)
+				let row = out.row(i)
+				for let e = 0; e < hd; e++ {
+					row[o + e] = float32(0)
+				}
+				for let j = 0; j < n; j++ {
+					weighted(row, o, vh, j * hd, hd, scores[j])
+				}
+			}
+		}
+	}
+
+	// a · b[at..at + n].
+	internal def headDot(a float32[], b float32[], at int, n int) float32 {
+		let acc = simd.splat8<float32>(float32(0))
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			acc = simd.fma(simd.load8<float32>(a, i), simd.load8<float32>(b, at + i), acc)
+		}
+		let sum = simd.sum(acc)
+		for; i < n; i++ {
+			sum += a[i] * b[at + i]
+		}
+		return sum
+	}
+
+	// row[o..o + n] += w · v[at..at + n].
+	internal def weighted(row float32[], o int, v float32[], at int, n int, w float32) {
+		let s = simd.splat8<float32>(w)
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(row, o + i, simd.fma(simd.load8<float32>(v, at + i), s, simd.load8<float32>(row, o + i)))
+		}
+		for; i < n; i++ {
+			row[o + i] += w * v[at + i]
+		}
+	}
+
+	// v[0..n] += from[at..at + n].
+	internal def addInto(v float32[], from float32[], at int, n int) {
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			simd.store8<float32>(v, i, simd.load8<float32>(v, i) + simd.load8<float32>(from, at + i))
+		}
+		for; i < n; i++ {
+			v[i] += from[at + i]
+		}
+	}
+
+	internal def scaleBy(v float32[], s float32) {
+		let f = simd.splat8<float32>(s)
+		let i = 0
+		for; i + 8 <= v.len(); i += 8 {
+			simd.store8<float32>(v, i, simd.load8<float32>(v, i) * f)
+		}
+		for; i < v.len(); i++ {
+			v[i] *= s
+		}
+	}
+
+	internal def dot(a float32[], b float32[]) float32 {
+		let n = a.len().min(b.len())
+		let acc = simd.splat8<float32>(float32(0))
+		let i = 0
+		for; i + 8 <= n; i += 8 {
+			acc = simd.fma(simd.load8<float32>(a, i), simd.load8<float32>(b, i), acc)
+		}
+		let sum = simd.sum(acc)
+		for; i < n; i++ {
+			sum += a[i] * b[i]
+		}
+		return sum
+	}
+
+	// The encoder in a GGUF file of architecture bert or nomic-bert.
+	// Fails when the file holds another architecture or misses a tensor.
+	internal def readEncoder(file ModelFile) !Encoder {
+		let arch = file.getString("general.architecture")
+		fail "embeddings: the file names no architecture" when arch is none
+		fail "embeddings: {arch} models are not embedding models this reads (bert, nomic-bert)" unless arch := "bert" || "nomic-bert"
+		let width = file.getInt("{arch}.embedding_length")
+		let heads = file.getInt("{arch}.attention.head_count")
+		let count = file.getInt("{arch}.block_count")
+		fail "embeddings: the file lacks {arch}.embedding_length, head_count or block_count" when width is none || heads is none || count is none
+		let types = try file.readFloats("token_types.weight")
+		let encoder = new Encoder(try loadWeights(file, "token_embd.weight"), types[0:width], try file.readFloats("token_embd_norm.weight"), try file.readFloats("token_embd_norm.bias"))
+		encoder.width = width
+		encoder.heads = heads
+		let context = file.getInt("{arch}.context_length")
+		encoder.context = context is int ?? (context, 512)
+		let eps = file.getFloat("{arch}.attention.layer_norm_epsilon")
+		encoder.epsilon = float32(eps is float ?? (eps, 1e-12))
+		encoder.rotary = arch == "nomic-bert"
+		let base = file.getFloat("{arch}.rope.freq_base")
+		encoder.ropeBase = float32(base is float ?? (base, 10000.0))
+		let pooling = file.getInt("{arch}.pooling_type")
+		encoder.poolingKind = pooling is int && pooling == 2 ?? (Pooling.First, pooling is int && pooling == 3 ?? (Pooling.Last, Pooling.Mean))
+		if file.tensor("position_embd.weight") is ai.TensorInfo {
+			encoder.positions = try loadWeights(file, "position_embd.weight")
+		}
+		for let l = 0; l < count; l++ {
+			let p = "blk.{l}."
+			let layer = new EncoderLayer(try loadWeights(file, p + "attn_output.weight"), try loadWeights(file, p + "ffn_up.weight"), try loadWeights(file, p + "ffn_down.weight"), try file.readFloats(p + "attn_output_norm.weight"), try file.readFloats(p + "attn_output_norm.bias"), try file.readFloats(p + "layer_output_norm.weight"), try file.readFloats(p + "layer_output_norm.bias"))
+			if file.tensor(p + "attn_qkv.weight") is ai.TensorInfo {
+				layer.fused = try loadWeights(file, p + "attn_qkv.weight")
+			} else {
+				layer.query = try loadWeights(file, p + "attn_q.weight")
+				layer.key = try loadWeights(file, p + "attn_k.weight")
+				layer.value = try loadWeights(file, p + "attn_v.weight")
+				layer.queryBias = try optionalFloats(file, p + "attn_q.bias")
+				layer.keyBias = try optionalFloats(file, p + "attn_k.bias")
+				layer.valueBias = try optionalFloats(file, p + "attn_v.bias")
+			}
+			layer.outputBias = try optionalFloats(file, p + "attn_output.bias")
+			layer.upBias = try optionalFloats(file, p + "ffn_up.bias")
+			layer.downBias = try optionalFloats(file, p + "ffn_down.bias")
+			if file.tensor(p + "ffn_gate.weight") is ai.TensorInfo {
+				layer.gate = try loadWeights(file, p + "ffn_gate.weight")
+			}
+			encoder.layers.push(layer)
+		}
+		return encoder
+	}
+
+	// A 1D tensor's values, none when the file lacks it.
+	internal def optionalFloats(file ModelFile, name string) !float32[] {
+		return float32[] unless file.tensor(name) is ai.TensorInfo
+		return try file.readFloats(name)
+	}
+
+	internal def jsonAt(folder string, name string) !map<string, any> {
+		let path = os.join(folder, name)
+		return new map<string, any>() unless try os.exists(path)
+		let doc = try new JSON().parse(try os.readFile(path))
+		fail "embeddings: {path} is not a JSON object" unless doc is map<string, any>
+		return doc
+	}
+
+	internal def intAt(m map<string, any>, key string, fallback int) int {
+		let v = m.get(key)
+		return v is int ?? (v, fallback)
+	}
+
+	internal def boolAt(m map<string, any>, key string, fallback bool) bool {
+		let v = m.get(key)
+		return v is bool ?? (v, fallback)
+	}
+}

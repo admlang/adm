@@ -1,0 +1,432 @@
+internal partial module std.ai.llm.model {
+	use (
+		std.math
+		std.math.geom
+		std.formats.ai
+		std.formats.ai::(ModelFile, TensorType, MetaArray)
+		std.formats.image::(Image)
+		std.gfx.processing.transform
+		std.ai.tensor::(Weights, loadWeights, layerNorm, gelu)
+		std.ai.llm::*
+	)
+
+	// An image encoder the language model reads the rows of in place of
+	// token embeddings.
+	interface PictureEncoder {
+		// The rows `img` becomes, as wide as the language model's embedding.
+		// Fails when the encoder runs on the GPU and a launch, copy or
+		// allocation there fails.
+		def encode(img Image) !matrix<float32>
+		// Columns of the grid the rows of `img` lie on, which the model's
+		// positions follow (Qwen's multi-axis RoPE); 0 when they are read
+		// as a sequence.
+		def columns(img Image) int
+	}
+
+	// One block of the Qwen3-VL vision transformer: LayerNorms with
+	// biases, attention with biases, a GELU feed-forward.
+	struct QwenVisionLayer {
+		norm1      float32[]
+		norm1Bias  float32[]
+		query      Weights
+		key        Weights
+		value      Weights
+		output     Weights
+		queryBias  float32[]
+		keyBias    float32[]
+		valueBias  float32[]
+		outputBias float32[]
+		norm2      float32[]
+		norm2Bias  float32[]
+		up         Weights
+		upBias     float32[]
+		down       Weights
+		downBias   float32[]
+	}
+
+	// Qwen 3.5's image encoder (Qwen3-VL's): 16×16 patches of the image
+	// shown as two equal frames, learned positions interpolated to the
+	// patch grid, a ViT with 2D RoPE over patches taken 2×2 at a time,
+	// then each 2×2 group normed, joined and projected to the language
+	// model's width by a GELU MLP.
+	type QwenVisionEncoder {
+		// Output channels × (3 · patch²): the two frames' kernels summed,
+		// channel, then row, then column.
+		patches       Weights
+		patchBias     float32[]
+		// `grid` × `grid` rows of `width` positions.
+		positions     float32[]
+		grid          int
+		layers        QwenVisionLayer[]
+		postNorm      float32[]
+		postNormBias  float32[]
+		mergeUp       Weights
+		mergeUpBias   float32[]
+		mergeDown     Weights
+		mergeDownBias float32[]
+		// The encoder's weights on the GPU, which runs it when the model
+		// is there; none on the CPU.
+		device        ?DeviceVision
+		width         int
+		heads         int
+		patch         int
+		merge         int
+		epsilon       float32
+		// The fewest and most pixels an image is resized to.
+		minPixels     int
+		maxPixels     int
+
+		def new(patches Weights, mergeUp Weights, mergeDown Weights) {
+			self.patches = patches
+			self.mergeUp = mergeUp
+			self.mergeDown = mergeDown
+		}
+
+		// The size `img` is resized to, a multiple of patch · merge each way.
+		def sizeOf(img Image) (int, int) {
+			let align = patch * merge
+			return targetSize(int(img.size().width), int(img.size().height), align, minPixels, maxPixels)
+		}
+
+		// Columns of the grid the rows of `img` lie on.
+		def columns(img Image) int {
+			let (w, _) = sizeOf(img)
+			return w / (patch * merge)
+		}
+
+		// The rows `img` becomes, one per merge × merge patches, row by
+		// row of that grid.
+		// Fails like `encodeValues`.
+		def encode(img Image) !matrix<float32> {
+			let (w, h) = sizeOf(img)
+			let pixels = img.raw()
+			let stride = img.stride()
+			if w != int(img.size().width) || h != int(img.size().height) {
+				let resized = transform.resize(img, new geom.Size<uint>(uint(w), uint(h)), transform.ResizeMode.Bicubic)
+				pixels = resized.raw()
+				stride = resized.stride()
+			}
+			// Each channel scaled to [-1, 1] (the mean and deviation are 0.5).
+			let values float32[]
+			values.len(w * h * 3)
+			for let y = 0; y < h; y++ {
+				for let x = 0; x < w; x++ {
+					for let c = 0; c < 3; c++ {
+						values[(y * w + x) * 3 + c] = float32(pixels[y * stride + x * 4 + c]) / float32(127.5) - float32(1)
+					}
+				}
+			}
+			return try encodeValues(values, w, h)
+		}
+
+		// The rows of an image given as its normalized values, w × h pixels
+		// of 3 channels row by row; w and h are multiples of patch · merge.
+		// Fails when the encoder runs on the GPU and a launch, copy or
+		// allocation there fails.
+		def encodeValues(values float32[], w int, h int) !matrix<float32> {
+			let nx = w / patch
+			let ny = h / patch
+			let n = nx * ny
+			let area = patch * patch
+			// Patches in merge order: each merge × merge group's patches
+			// row by row, the groups row by row. `py`/`px` hold each
+			// patch's place for the positions and RoPE.
+			let py int[]
+			let px int[]
+			for let by = 0; by < ny / merge; by++ {
+				for let bx = 0; bx < nx / merge; bx++ {
+					for let dy = 0; dy < merge; dy++ {
+						for let dx = 0; dx < merge; dx++ {
+							py.push(by * merge + dy)
+							px.push(bx * merge + dx)
+						}
+					}
+				}
+			}
+			// Each patch's values, channel-major.
+			let raw = matrix<float32>[].size(n, 3 * area)
+			for let k = 0; k < n; k++ {
+				let row = raw.row(k)
+				for let ky = 0; ky < patch; ky++ {
+					for let kx = 0; kx < patch; kx++ {
+						let at = ((py[k] * patch + ky) * w + px[k] * patch + kx) * 3
+						for let c = 0; c < 3; c++ {
+							row[c * area + ky * patch + kx] = values[at + c]
+						}
+					}
+				}
+			}
+			let added = interpolatePositions(ny, nx)
+			let gpuVision = device
+			if gpuVision is DeviceVision {
+				// The learned position of each patch, in merge order.
+				let ordered = matrix<float32>[].size(n, width)
+				let places float32[]
+				for let k = 0; k < n; k++ {
+					copyInto(added.row(py[k] * nx + px[k]), ordered.row(k))
+					places.push(float32(py[k]), float32(px[k]))
+				}
+				return gpuVision.encode(self, raw, ordered, places)
+			}
+			let x = matrix<float32>[].size(n, width)
+			multiplyRows(patches, raw, x)
+			for let k = 0; k < n; k++ {
+				let row = x.row(k)
+				addInto(row, patchBias)
+				addInto(row, added.row(py[k] * nx + px[k]))
+			}
+			for let (_, layer) in layers {
+				runLayer(layer, x, py, px)
+			}
+			for let k = 0; k < n; k++ {
+				layerNorm(x.row(k), postNorm, postNormBias, epsilon)
+			}
+			// Each group's merge² rows side by side are one row of the MLP.
+			let joined = merge * merge * width
+			let groups = n / (merge * merge)
+			let grouped = matrix<float32>[].size(groups, joined)
+			x.data().copy(grouped.data())
+			let hidden = matrix<float32>[].size(groups, mergeUp.rows)
+			multiplyRows(mergeUp, grouped, hidden)
+			for let g = 0; g < groups; g++ {
+				let row = hidden.row(g)
+				addInto(row, mergeUpBias)
+				gelu(row)
+			}
+			let out = matrix<float32>[].size(groups, mergeDown.rows)
+			multiplyRows(mergeDown, hidden, out)
+			for let g = 0; g < groups; g++ {
+				addInto(out.row(g), mergeDownBias)
+			}
+			return out
+		}
+
+		// The learned positions bilinearly interpolated, corners aligned,
+		// from their `grid` × `grid` to ny × nx, row by row.
+		internal def interpolatePositions(ny int, nx int) matrix<float32> {
+			let out = matrix<float32>[].size(ny * nx, width)
+			let last = float(grid - 1)
+			for let y = 0; y < ny; y++ {
+				let fy = ny > 1 ?? (float(y) * last / float(ny - 1), 0.0)
+				let y0 = int(fy.floor())
+				let y1 = (y0 + 1).min(grid - 1)
+				let dy = float32(fy - float(y0))
+				for let xi = 0; xi < nx; xi++ {
+					let fx = nx > 1 ?? (float(xi) * last / float(nx - 1), 0.0)
+					let x0 = int(fx.floor())
+					let x1 = (x0 + 1).min(grid - 1)
+					let dx = float32(fx - float(x0))
+					let row = out.row(y * nx + xi)
+					let (a, b, c, d) = ((y0 * grid + x0) * width, (y0 * grid + x1) * width, (y1 * grid + x0) * width, (y1 * grid + x1) * width)
+					let one = float32(1)
+					for let e = 0; e < width; e++ {
+						row[e] = (one - dy) * (one - dx) * positions[a + e] + (one - dy) * dx * positions[b + e] + dy * (one - dx) * positions[c + e] + dy * dx * positions[d + e]
+					}
+				}
+			}
+			return out
+		}
+
+		// One transformer block over every patch of `x` (patch k at row
+		// py[k], column px[k]), in place.
+		internal def runLayer(layer QwenVisionLayer, x matrix<float32>, py int[], px int[]) {
+			let n = x.rows
+			let hs = width / heads
+			let normed = x.clone()
+			for let i = 0; i < n; i++ {
+				layerNorm(normed.row(i), layer.norm1, layer.norm1Bias, epsilon)
+			}
+			let q = matrix<float32>[].size(n, width)
+			let k = matrix<float32>[].size(n, width)
+			let v = matrix<float32>[].size(n, width)
+			multiplyRows(layer.query, normed, q)
+			multiplyRows(layer.key, normed, k)
+			multiplyRows(layer.value, normed, v)
+			// RoPE: a head's first half of pairs turns by the patch's row,
+			// the second by its column; value i pairs with i + hs/2.
+			let half = hs / 2
+			let quarter = half / 2
+			let tasks = (n / 16).clamp(1, 32)
+			forall let t in 0..tasks {
+				let cs float32[]
+				let sn float32[]
+				cs.len(half)
+				sn.len(half)
+				for let i = n * t / tasks; i < n * (t + 1) / tasks; i++ {
+					for let j = 0; j < half; j++ {
+						let p = j < quarter ?? (py[i], px[i])
+						let theta = float(p) * 10000.0 ** (-2.0 * float(j % quarter) / float(half))
+						cs[j] = float32(math.cos(theta))
+						sn[j] = float32(math.sin(theta))
+					}
+					let qr = q.row(i)
+					let kr = k.row(i)
+					addInto(qr, layer.queryBias)
+					addInto(kr, layer.keyBias)
+					addInto(v.row(i), layer.valueBias)
+					for let h = 0; h < heads; h++ {
+						let o = h * hs
+						for let j = 0; j < half; j++ {
+							let (qa, qb, ka, kb) = (qr[o + j], qr[o + j + half], kr[o + j], kr[o + j + half])
+							qr[o + j] = qa * cs[j] - qb * sn[j]
+							qr[o + j + half] = qa * sn[j] + qb * cs[j]
+							kr[o + j] = ka * cs[j] - kb * sn[j]
+							kr[o + j + half] = ka * sn[j] + kb * cs[j]
+						}
+					}
+				}
+			}
+			// The scale goes on the queries; attendHead sums plain products.
+			let scale = float32(1.0 / math.sqrt(float(hs)))
+			let qd = q.data()
+			for let i = 0; i < qd.len(); i++ {
+				qd[i] *= scale
+			}
+			let attended = matrix<float32>[].size(n, width)
+			let kd = k.data()
+			let vd = v.data()
+			let ad = attended.data()
+			forall let t in 0..tasks {
+				let scores float32[]
+				scores.len(n)
+				for let i = n * t / tasks; i < n * (t + 1) / tasks; i++ {
+					for let h = 0; h < heads; h++ {
+						attendHead(qd, kd, vd, ad, scores, i, h * hs, hs, width, n)
+					}
+				}
+			}
+			let projected = matrix<float32>[].size(n, width)
+			multiplyRows(layer.output, attended, projected)
+			for let i = 0; i < n; i++ {
+				let p = projected.row(i)
+				addInto(p, layer.outputBias)
+				addInto(x.row(i), p)
+				let r = normed.row(i)
+				copyInto(x.row(i), r)
+				layerNorm(r, layer.norm2, layer.norm2Bias, epsilon)
+			}
+			let up = matrix<float32>[].size(n, layer.up.rows)
+			multiplyRows(layer.up, normed, up)
+			for let i = 0; i < n; i++ {
+				let row = up.row(i)
+				addInto(row, layer.upBias)
+				gelu(row)
+			}
+			multiplyRows(layer.down, up, projected)
+			for let i = 0; i < n; i++ {
+				let p = projected.row(i)
+				addInto(p, layer.downBias)
+				addInto(x.row(i), p)
+			}
+		}
+	}
+
+	// Qwen 3.5's image encoder from its model file (Ollama keeps it there,
+	// under `v.`, beside the language model) or from a llama.cpp projector
+	// (`clip.vision.projector_type` qwen3vl_merger), for a language model
+	// `width` wide. `arch` is the model file's architecture, empty for a
+	// projector.
+	// Fails when a tensor is missing or cannot be read, the encoder has
+	// deepstack layers, or it projects to another width.
+	def readQwenVision(file ModelFile, arch string, width int) !QwenVisionEncoder {
+		let projector = arch.len() == 0
+		let key = def (name string) string {
+			return projector ?? ("clip.vision." + name, arch + ".vision." + name)
+		}
+		let name = def (ollama string, clip string) string {
+			return projector ?? (clip, ollama)
+		}
+		let deep = file.metadata.get(key("deepstack_visual_indexes"))
+		fail "llm: Qwen vision encoders with deepstack layers are not supported" when deep is MetaArray && deep.getInts().len() > 0
+		for let (_, layer) in flags(file, key("is_deepstack_layers")) {
+			fail "llm: Qwen vision encoders with deepstack layers are not supported" when layer
+		}
+		let size = try required(file, key("embedding_length"))
+		let patch = try required(file, key("patch_size"))
+		let merge = file.getInt(key("spatial_merge_size"))
+		let area = patch * patch
+		// One kernel per output channel over 3 channels of `patch`² pixels,
+		// the two frames summed.
+		let summed float32[]
+		summed.len(size * 3 * area)
+		if projector {
+			for let (_, slice) in string["v.patch_embd.weight", "v.patch_embd.weight.1"] {
+				let values = try file.readFloats(slice)
+				for let i = 0; i < summed.len(); i++ {
+					summed[i] += values[i]
+				}
+			}
+		} else {
+			// [out channel, channel, frame, row, column], row-major.
+			let values = try file.readFloats("v.patch_embed.weight")
+			for let o = 0; o < size; o++ {
+				for let c = 0; c < 3; c++ {
+					for let f = 0; f < 2; f++ {
+						let from = ((o * 3 + c) * 2 + f) * area
+						let to = (o * 3 + c) * area
+						for let j = 0; j < area; j++ {
+							summed[to + j] += values[from + j]
+						}
+					}
+				}
+			}
+		}
+		let bytes byte[]
+		for let (_, value) in summed {
+			let bits = int(__bitcast_u32_from_f32(value))
+			bytes.push(byte(bits & 255), byte((bits >> 8) & 255), byte((bits >> 16) & 255), byte((bits >> 24) & 255))
+		}
+		let encoder = new QwenVisionEncoder(new Weights(TensorType.F32, size, 3 * area, bytes), try loadWeights(file, name("v.merger.linear_fc1.weight", "mm.0.weight")), try loadWeights(file, name("v.merger.linear_fc2.weight", "mm.2.weight")))
+		fail "llm: the image encoder projects to {encoder.mergeDown.rows} values, the model reads {width}" unless encoder.mergeDown.rows == width
+		encoder.patchBias = try file.readFloats(name("v.patch_embed.bias", "v.patch_embd.bias"))
+		let positionName = name("v.pos_embed.weight", "v.position_embd.weight")
+		let positionTensor = file.tensor(positionName)
+		fail "llm: the image encoder has no {positionName}" when positionTensor is none
+		encoder.positions = try file.readFloats(positionName)
+		encoder.grid = int(math.sqrt(float(positionTensor.shape[1])))
+		fail "llm: {positionTensor.shape[1]} learned image positions are not a square grid" unless encoder.grid * encoder.grid == positionTensor.shape[1]
+		encoder.postNorm = try file.readFloats(name("v.merger.norm.weight", "v.post_ln.weight"))
+		encoder.postNormBias = try file.readFloats(name("v.merger.norm.bias", "v.post_ln.bias"))
+		encoder.mergeUpBias = try file.readFloats(name("v.merger.linear_fc1.bias", "mm.0.bias"))
+		encoder.mergeDownBias = try file.readFloats(name("v.merger.linear_fc2.bias", "mm.2.bias"))
+		encoder.width = size
+		encoder.heads = try required(file, key("attention.head_count"))
+		encoder.patch = patch
+		encoder.merge = merge is none ?? (2, merge)
+		let eps = file.getFloat(key("attention.layer_norm_epsilon"))
+		encoder.epsilon = float32(eps is none ?? (0.000001, eps))
+		// Ollama's files carry the processor's pixel bounds; llama.cpp's
+		// projectors leave them to its default of 8 to 4096 rows.
+		let align = encoder.patch * encoder.merge
+		let least = file.getInt(key("shortest_edge"))
+		let most = file.getInt(key("longest_edge"))
+		encoder.minPixels = least is none ?? (8 * align * align, least)
+		encoder.maxPixels = most is none ?? (4096 * align * align, most)
+		let count = try required(file, key("block_count"))
+		for let n = 0; n < count; n++ {
+			let p = "v.blk.{n}."
+			let fused = !(file.tensor(p + "attn_qkv.weight") is none)
+			let qkv = fused ?? (try splitRows(file, p + "attn_qkv.weight", int[size, size, size]), Weights[])
+			let qkvBias = fused ?? (try file.readFloats(p + "attn_qkv.bias"), float32[])
+			encoder.layers.push(QwenVisionLayer{
+				norm1:      try file.readFloats(p + name("norm1.weight", "ln1.weight")),
+				norm1Bias:  try file.readFloats(p + name("norm1.bias", "ln1.bias")),
+				query:      fused ?? (qkv[0], try loadWeights(file, p + "attn_q.weight")),
+				key:        fused ?? (qkv[1], try loadWeights(file, p + "attn_k.weight")),
+				value:      fused ?? (qkv[2], try loadWeights(file, p + "attn_v.weight")),
+				output:     try loadWeights(file, p + "attn_out.weight"),
+				queryBias:  fused ?? (qkvBias[0:size], try file.readFloats(p + "attn_q.bias")),
+				keyBias:    fused ?? (qkvBias[size:2 * size], try file.readFloats(p + "attn_k.bias")),
+				valueBias:  fused ?? (qkvBias[2 * size:3 * size], try file.readFloats(p + "attn_v.bias")),
+				outputBias: try file.readFloats(p + "attn_out.bias"),
+				norm2:      try file.readFloats(p + name("norm2.weight", "ln2.weight")),
+				norm2Bias:  try file.readFloats(p + name("norm2.bias", "ln2.bias")),
+				up:         try loadWeights(file, p + name("mlp.linear_fc1.weight", "ffn_up.weight")),
+				upBias:     try file.readFloats(p + name("mlp.linear_fc1.bias", "ffn_up.bias")),
+				down:       try loadWeights(file, p + name("mlp.linear_fc2.weight", "ffn_down.weight")),
+				downBias:   try file.readFloats(p + name("mlp.linear_fc2.bias", "ffn_down.bias")),
+			})
+		}
+		return encoder
+	}
+}

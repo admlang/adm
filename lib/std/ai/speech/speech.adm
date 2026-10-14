@@ -1,0 +1,429 @@
+// Speech to text with Whisper models in ONNX form: whole recordings,
+// or what a microphone hears as it is said.
+//
+// ```
+// let model = try speech.load("whisper-base")
+// println(try model.transcribe(try audio.load("talk.wav")))
+//
+// for let heard in model.listen(try devices.openMicrophone()) {
+//     print("\r{heard.text}")
+//     println("") when heard.final
+// }
+// ```
+partial module std.ai.speech {
+	use (
+		std.os
+		std.math
+		std.data.encoding::(JSON)
+		std.formats.audio
+		std.formats.audio::(Audio, AudioStream)
+		std.formats.ai.onnx::(ElementType)
+		std.media.dsp::(MelSpectrogram)
+		std.ai.onnx
+		std.ai.tensor::(Tensor)
+		std.ai.llm::(Tokenizer, loadTokenizer, Device)
+	)
+
+	// What a model does with the speech it hears.
+	enum SpeechTask {
+		// Writes it down in the language spoken.
+		Transcribe,
+		// Writes it down in English.
+		Translate,
+	}
+
+	// A stretch of speech `listen` heard.
+	struct Heard {
+		// The words so far.
+		text  string
+		// Whether the speaker paused: the text will not change any more, and
+		// the next one starts a new sentence.
+		final bool
+		// What stopped listening, on the last one, when something failed.
+		error ?error = none
+	}
+
+	// A Whisper model.
+	type SpeechModel {
+		// The language spoken, as a code like `en`; empty finds it anew
+		// for each stretch of sound. Ignored by English-only models.
+		language               string
+		task                   SpeechTask
+		internal encoder       onnx.Model
+		internal decoder       onnx.Model
+		// Split exports: a second decoder that reads the cache.
+		internal cached        ?onnx.Model
+		internal tokenizer     Tokenizer
+		internal spectrogram   MelSpectrogram
+		internal layers        int
+		internal heads         int
+		internal headSize      int
+		internal frames        int
+		internal rate          int
+		internal start         int
+		internal end           int
+		internal noTimes       int
+		internal multilingual  bool
+		internal languages     map<string, int>
+		internal tasks         map<string, int>
+		internal suppress      int[]
+		internal suppressFirst int[]
+
+		def new(encoder onnx.Model, decoder onnx.Model, tokenizer Tokenizer, spectrogram MelSpectrogram) {
+			self.encoder = encoder
+			self.decoder = decoder
+			self.tokenizer = tokenizer
+			self.spectrogram = spectrogram
+			languages = new map<string, int>()
+			tasks = new map<string, int>()
+		}
+
+		// Where the model runs.
+		def device() Device {
+			return encoder.device
+		}
+
+		// The words spoken in `sound`, any sample rate and channels, in
+		// 30-second stretches.
+		// Fails when a model run does.
+		def transcribe(sound Audio) !string {
+			let converter = new audio.Converter(int(sound.info.sampleRate), int(sound.info.channels), rate, 1)
+			let samples = converter.convert(sound.samples)
+			samples.push(...converter.flush())
+			return try transcribe(samples)
+		}
+
+		// The words spoken in `samples`, mono at the model's rate (16 kHz),
+		// in 30-second stretches.
+		// Fails when a model run does.
+		def transcribe(samples float32[]) !string {
+			let window = frames * spectrogram.hop
+			let texts string[]
+			for let from = 0; from < samples.len(); from += window {
+				let text = try stretch(samples[from:(from + window).min(samples.len())])
+				texts.push(text) when text.len() > 0
+			}
+			return texts.join(" ")
+		}
+
+		// What `source` (a microphone, or any audio stream) hears, as it is
+		// said: each pause in the speech ends a sentence (`final`), and while
+		// one goes on its text is given again and again as the words come,
+		// from its first second on.
+		// Quiet is never transcribed (Whisper makes up words for silence),
+		// and a sentence is cut at 28 seconds. A task reads the stream until
+		// it ends or fails; close the stream to stop listening.
+		def listen(source AudioStream) Iterator<Heard> {
+			let info = source.info()
+			let converter = new audio.Converter(int(info.sampleRate), int(info.channels), rate, 1)
+			let pieces = new channel<float32[]>(size = 600)
+			async record(source, int(info.channels), int(info.sampleRate), pieces)
+			let longest = 28 * rate
+			let sentence float32[]
+			// Loudness of the room when nobody speaks, learnt as it goes.
+			let floor float32 = 0.002
+			let heard = false
+			let quiet = 0
+			for {
+				// Everything recorded since the last pass; wait for a piece
+				// when there is none yet.
+				let got = <-pieces
+				let ended = got.len() == 0 && pieces.closed
+				for !ended {
+					let mono = converter.convert(got)
+					let level = loudness(mono)
+					floor = level < floor ?? (level, floor + (level - floor) * float32(0.01))
+					let voiced = level > (floor * float32(4)).max(float32(0.004))
+					heard = heard || voiced
+					quiet = voiced ?? (0, quiet + mono.len())
+					sentence.push(...mono) when heard
+					break when pieces.len() == 0
+					got = <-pieces
+					ended = got.len() == 0 && pieces.closed
+				}
+				// Under a second of sound Whisper guesses ("Thank you."), so a
+				// sentence shows once it has one, or when it ends.
+				if heard && (sentence.len() >= rate || ended || quiet >= rate * 8 / 10) {
+					let final = ended || quiet >= rate * 8 / 10 || sentence.len() >= longest
+					let text = stretch(sentence) onerror (err error) {
+						yield Heard{text: "", final: true, error: err}
+						return
+					}
+					yield Heard{text: text, final: final} when text.len() > 0 || final
+					if final {
+						sentence = float32[]
+						heard = false
+						quiet = 0
+					}
+				}
+				return when ended
+			}
+		}
+
+		// The words of one stretch of at most 30 seconds.
+		internal def stretch(samples float32[]) !string {
+			let feeds = new map<string, onnx.Value>()
+			feeds.set("input_features", features(samples))
+			let encoded = (try encoder.run(feeds)).get("last_hidden_state")
+			fail "speech: the encoder gave no last_hidden_state" unless encoded is Tensor
+			let prompt = int[start]
+			if multilingual {
+				let code = language.len() > 0 ?? (language, try detect(encoded))
+				let lang = languages.get("<|{code}|>")
+				fail "speech: the model does not know the language {code}" unless lang is int
+				prompt.push(lang)
+				let job = tasks.get(task == SpeechTask.Translate ?? ("translate", "transcribe"))
+				prompt.push(job) when job is int
+			}
+			prompt.push(noTimes) when noTimes >= 0
+			let tokens = try decode(encoded, prompt, frames * 224 / 3000)
+			return tokenizer.decode(tokens).trim(" ")
+		}
+
+		// The language spoken: the language token most likely right after
+		// the start of the transcript.
+		internal def detect(encoded Tensor) !string {
+			let logits = try firstLogits(encoded, int[start])
+			let best = ""
+			let bestValue float32 = 0
+			for let (name, id) in languages {
+				let v = logits.floats[id]
+				if best.len() == 0 || v > bestValue {
+					best = name
+					bestValue = v
+				}
+			}
+			return best.slice(2, best.len() - 2)
+		}
+
+		// The decoder's logits for the last of `prompt`, with no cache.
+		internal def firstLogits(encoded Tensor, prompt int[]) !Tensor {
+			let step = new map<string, onnx.Value>()
+			step.set("input_ids", new Tensor(int[1, prompt.len()], prompt))
+			step.set("encoder_hidden_states", encoded)
+			if cached is none {
+				step.set("use_cache_branch", new Tensor(int[1], int[0], ElementType.Bool))
+				for let (name, value) in emptyCache(encoded.shape[1]) {
+					step.set(name, value)
+				}
+			}
+			let logits = (try decoder.run(step)).get("logits")
+			fail "speech: the decoder gave no logits" unless logits is Tensor
+			let vocab = logits.shape[2]
+			let at = (logits.shape[1] - 1) * vocab
+			return new Tensor(int[vocab], logits.floats[at:at + vocab])
+		}
+
+		// Greedy decoding after `prompt`, the keys and values kept between
+		// tokens: the generated tokens, at most `limit`.
+		internal def decode(encoded Tensor, prompt int[], limit int) !int[] {
+			let tokens = prompt.clone()
+			let past = emptyCache(encoded.shape[1])
+			let merged = cached is none
+			for tokens.len() < prompt.len() + limit {
+				let first = tokens.len() == prompt.len()
+				let step = new map<string, onnx.Value>()
+				let ids = first ?? (tokens.clone(), int[tokens[tokens.len() - 1]])
+				step.set("input_ids", new Tensor(int[1, ids.len()], ids))
+				step.set("encoder_hidden_states", encoded) when merged || first
+				if merged {
+					step.set("use_cache_branch", new Tensor(int[1], int[first ?? (0, 1)], ElementType.Bool))
+				}
+				if merged || !first {
+					for let (name, value) in past {
+						step.set(name, value)
+					}
+				}
+				let model = decoder
+				let withPast = cached
+				model = withPast when !first && withPast is onnx.Model
+				let out = try model.run(step)
+				let logits = out.get("logits")
+				fail "speech: the decoder gave no logits" unless logits is Tensor
+				let next = pick(logits, first)
+				break when next == end
+				tokens.push(next)
+				// The decoder's keys and values grow; the encoder's are made once.
+				for let l = 0; l < layers; l++ {
+					for let (_, kind) in string["decoder", "encoder"] {
+						continue unless kind == "decoder" || first
+						for let (_, part) in string["key", "value"] {
+							let present = out.get("present.{l}.{kind}.{part}")
+							fail "speech: the decoder gave no present.{l}.{kind}.{part}" unless present is Tensor
+							past.set("past_key_values.{l}.{kind}.{part}", present)
+						}
+					}
+				}
+			}
+			return tokens[prompt.len():]
+		}
+
+		// Keys and values of no tokens, and of the encoder's positions.
+		internal def emptyCache(positions int) map<string, onnx.Value> {
+			let past = new map<string, onnx.Value>()
+			for let l = 0; l < layers; l++ {
+				for let (_, kind) in string["decoder", "encoder"] {
+					for let (_, part) in string["key", "value"] {
+						let shape = int[1, heads, kind == "decoder" ?? (0, positions), headSize]
+						let values float32[]
+						values.len(shape[2] * heads * headSize)
+						past.set("past_key_values.{l}.{kind}.{part}", new Tensor(shape, values))
+					}
+				}
+			}
+			return past
+		}
+
+		// The most likely next token of the last position, with the tokens
+		// the model's generation settings suppress left out.
+		internal def pick(logits Tensor, first bool) int {
+			let vocab = logits.shape[2]
+			let at = (logits.shape[1] - 1) * vocab
+			let row = logits.floats[at:at + vocab].clone()
+			for let (_, t) in suppress {
+				row[t] = float32(-1e30) when t < vocab
+			}
+			if first {
+				for let (_, t) in suppressFirst {
+					row[t] = float32(-1e30) when t < vocab
+				}
+			}
+			let best = 0
+			for let k = 1; k < vocab; k++ {
+				best = k when row[k] > row[best]
+			}
+			return best
+		}
+
+		// The log-mel spectrogram the encoder takes: [1, mels, frames], the
+		// sound cut or padded with silence to `frames` hops; log10, floored
+		// 8 below the loudest value, scaled to (x + 4) / 4.
+		internal def features(samples float32[]) Tensor {
+			let padded float32[]
+			padded.len(frames * spectrogram.hop)
+			let n = samples.len().min(padded.len())
+			samples[0:n].copy(padded[0:n])
+			let energies = spectrogram.compute(padded)
+			let mels = spectrogram.mels
+			let out float32[]
+			out.len(mels * frames)
+			let top = float32(-1e30)
+			for let f = 0; f < frames; f++ {
+				let row = energies.row(f)
+				for let m = 0; m < mels; m++ {
+					let v = float32(math.log10(float(row[m]).max(1e-10)))
+					out[m * frames + f] = v
+					top = v.max(top)
+				}
+			}
+			for let i = 0; i < out.len(); i++ {
+				out[i] = (out[i].max(top - float32(8)) + float32(4)) / float32(4)
+			}
+			return new Tensor(int[1, mels, frames], out)
+		}
+	}
+
+	// Loads the Whisper export in `folder` (as onnx-community/whisper-* lay
+	// it out: onnx/encoder_model.onnx with decoder_model_merged.onnx, or
+	// decoder_model.onnx and decoder_with_past_model.onnx; config.json,
+	// generation_config.json, preprocessor_config.json and the tokenizer
+	// files), on `device`.
+	// Fails when a file is missing or cannot be read.
+	def load(folder string, language string = "", task SpeechTask = SpeechTask.Transcribe, device Device = Device.Auto) !SpeechModel {
+		let config = try jsonAt(folder, "config.json")
+		let generation = try jsonAt(folder, "generation_config.json")
+		let pre = try jsonAt(folder, "preprocessor_config.json")
+		let onnxDir = os.join(folder, "onnx")
+		let encoder = try onnx.load(os.join(onnxDir, "encoder_model.onnx"), device)
+		let merged = os.join(onnxDir, "decoder_model_merged.onnx")
+		let isMerged = try os.exists(merged)
+		let decoder = try onnx.load(isMerged ?? (merged, os.join(onnxDir, "decoder_model.onnx")), device)
+		let tokenizer = try loadTokenizer(folder)
+		let rate = intAt(pre, "sampling_rate", 16000)
+		let hop = intAt(pre, "hop_length", 160)
+		let spectrogram = new MelSpectrogram(rate, window = intAt(pre, "n_fft", 400), hop = hop, mels = intAt(pre, "feature_size", intAt(config, "num_mel_bins", 80)))
+		let model = new SpeechModel(encoder, decoder, tokenizer, spectrogram)
+		model.cached = isMerged ?? (none, try onnx.load(os.join(onnxDir, "decoder_with_past_model.onnx"), device))
+		model.language = language
+		model.task = task
+		model.rate = rate
+		model.frames = intAt(pre, "nb_max_frames", intAt(pre, "chunk_length", 30) * rate / hop)
+		model.layers = intAt(config, "decoder_layers", 6)
+		model.heads = intAt(config, "decoder_attention_heads", 8)
+		model.headSize = intAt(config, "d_model", 512) / model.heads
+		model.start = intAt(generation, "decoder_start_token_id", intAt(config, "decoder_start_token_id", 50258))
+		model.end = intAt(generation, "eos_token_id", intAt(config, "eos_token_id", 50257))
+		model.noTimes = intAt(generation, "no_timestamps_token_id", -1)
+		model.multilingual = boolAt(generation, "is_multilingual", false)
+		let langs = generation.get("lang_to_id")
+		if langs is map<string, any> {
+			for let (name, id) in langs {
+				model.languages.set(name, id) when id is int
+			}
+		}
+		let jobs = generation.get("task_to_id")
+		if jobs is map<string, any> {
+			for let (name, id) in jobs {
+				model.tasks.set(name, id) when id is int
+			}
+		}
+		model.suppress = intsAt(generation, "suppress_tokens")
+		model.suppressFirst = intsAt(generation, "begin_suppress_tokens")
+		return model
+	}
+
+	// Hands `source`'s sound over in pieces of 100 ms until it ends or
+	// fails, then closes `pieces`. A piece the reader has no room for is
+	// dropped rather than waited on, so a reader that stopped never holds
+	// the task.
+	internal async def record(source AudioStream, channels int, rate int, pieces channel<float32[]>) {
+		let frames = (rate / 10).max(1)
+		for {
+			let buf float32[]
+			buf.len(frames * channels)
+			let n = source.read(buf) onerror recover 0
+			break when n == 0
+			let _ = pieces.offer(buf[0:n * channels])
+		}
+		pieces.close()
+	}
+
+	// The root mean square of `samples`.
+	internal def loudness(samples float32[]) float32 {
+		return float32(0) when samples.len() == 0
+		let sum = 0.0
+		for let (_, s) in samples {
+			sum += float(s) * float(s)
+		}
+		return float32(math.sqrt(sum / float(samples.len())))
+	}
+
+	internal def jsonAt(folder string, name string) !map<string, any> {
+		let path = os.join(folder, name)
+		return new map<string, any>() unless try os.exists(path)
+		let doc = try new JSON().parse(try os.readFile(path))
+		fail "speech: {path} is not a JSON object" unless doc is map<string, any>
+		return doc
+	}
+
+	internal def intAt(m map<string, any>, key string, fallback int) int {
+		let v = m.get(key)
+		return v is int ?? (v, fallback)
+	}
+
+	internal def boolAt(m map<string, any>, key string, fallback bool) bool {
+		let v = m.get(key)
+		return v is bool ?? (v, fallback)
+	}
+
+	internal def intsAt(m map<string, any>, key string) int[] {
+		let out int[]
+		let v = m.get(key)
+		if v is any[] {
+			for let (_, x) in v {
+				out.push(x) when x is int
+			}
+		}
+		return out
+	}
+}

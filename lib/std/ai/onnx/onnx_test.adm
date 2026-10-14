@@ -1,0 +1,333 @@
+partial module std.ai.onnx {
+	use (
+		std.os
+		std.gpu
+		std.testing
+		std.data.encoding::(ProtoReader)
+		std.formats.ai.onnx as onnxfile
+		std.formats.ai.onnx::(OnnxModel, Node, Attribute, AttributeKind, ValueInfo, ValueType, ValueKind, ElementType, Dimension, OpsetId)
+		std.ai.tensor::(Tensor, tensorOf, storageOf, Storage)
+		std.ai.llm::(Device)
+		std.services.runtime::(Runtime)
+	)
+
+	check "ONNX execution" {
+		// A float tensor value of a graph, of `shape`.
+		internal def floatInfo(name string, shape int[]) ValueInfo {
+			let t = new ValueType()
+			t.kind = ValueKind.Tensor
+			t.element = ElementType.Float
+			t.ranked = true
+			for let (_, d) in shape {
+				t.shape.push(Dimension{value: d})
+			}
+			return ValueInfo{name: name, valueType: t, metadata: new map<string, string>()}
+		}
+
+		internal def node(op string, inputs string[], outputs string[]) Node {
+			let n = new Node()
+			n.op = op
+			n.inputs = inputs
+			n.outputs = outputs
+			return n
+		}
+
+		internal def attribute(name string, kind AttributeKind, i int, f float32) Attribute {
+			let a = new Attribute()
+			a.name = name
+			a.kind = kind
+			a.i = i
+			a.f = f
+			return a
+		}
+
+		// Values from a fixed linear congruential sequence in [-1, 1).
+		internal def noise(count int, seed int) float32[] {
+			let out float32[]
+			let s = seed
+			for let i = 0; i < count; i++ {
+				s = (s * 1103515245 + 12345) & 0x7FFFFFFF
+				out.push(float32(s % 2000 - 1000) / float32(1000))
+			}
+			return out
+		}
+
+		// Y = X · W, then Z = 0.5 · Y · Vᵀ + 2 · C, with W and V initializers
+		// large enough for the GPU path.
+		internal def productModel(m int, k int, n int, p int) OnnxModel {
+			let model = new OnnxModel()
+			model.irVersion = 10
+			model.opsets.push(OpsetId{domain: "", version: 21})
+			let g = model.graph
+			g.inputs.push(floatInfo("X", int[m, k]))
+			g.outputs.push(floatInfo("Y", int[m, n]), floatInfo("Z", int[m, p]))
+			g.initializers.push(new Tensor(int[k, n], noise(k * n, 7)).toData("W"))
+			g.initializers.push(new Tensor(int[p, n], noise(p * n, 11)).toData("V"))
+			g.initializers.push(new Tensor(int[p], noise(p, 13)).toData("C"))
+			g.nodes.push(node("MatMul", string["X", "W"], string["Y"]))
+			let gemm = node("Gemm", string["Y", "V", "C"], string["Z"])
+			gemm.attributes.push(attribute("transB", AttributeKind.Int, 1, float32(0)))
+			gemm.attributes.push(attribute("alpha", AttributeKind.Float, 0, float32(0.5)))
+			gemm.attributes.push(attribute("beta", AttributeKind.Float, 0, float32(2)))
+			g.nodes.push(gemm)
+			return model
+		}
+
+		internal def output(out map<string, Value>, name string) !Tensor {
+			let v = out.get(name)
+			fail "no output {name}" unless v is Tensor
+			return v
+		}
+
+		// The largest difference between `a` and `b` relative to the
+		// largest magnitude of `a`.
+		internal def spread(a float32[], b float32[]) float {
+			let (top, worst) = (0.0, 0.0)
+			for let i = 0; i < a.len(); i++ {
+				top = top.max(float(a[i]).abs())
+				worst = worst.max(float(a[i] - b[i]).abs())
+			}
+			return worst / top.max(1e-30)
+		}
+
+		@test()
+		def TestProductsMatchReference() !none {
+			let (m, k, n, p) = (256, 256, 128, 256)
+			let model = try load(productModel(m, k, n, p), Device.Cpu)
+			let x = noise(m * k, 3)
+			let feeds = new map<string, Value>()
+			feeds.set("X", new Tensor(int[m, k], x))
+			let out = try model.run(feeds)
+			let y = try output(out, "Y")
+			let z = try output(out, "Z")
+			assert y.shape.equals(int[m, n]) && z.shape.equals(int[m, p])
+			let w = noise(k * n, 7)
+			let v = noise(p * n, 11)
+			let c = noise(p, 13)
+			let wantY float32[]
+			for let i = 0; i < m; i++ {
+				for let j = 0; j < n; j++ {
+					let acc = 0.0
+					for let q = 0; q < k; q++ {
+						acc += float(x[i * k + q]) * float(w[q * n + j])
+					}
+					wantY.push(float32(acc))
+				}
+			}
+			let wantZ float32[]
+			for let i = 0; i < m; i++ {
+				for let j = 0; j < p; j++ {
+					let acc = 0.0
+					for let q = 0; q < n; q++ {
+						acc += float(wantY[i * n + q]) * float(v[j * n + q])
+					}
+					wantZ.push(float32(0.5 * acc + 2.0 * float(c[j])))
+				}
+			}
+			assert spread(wantY, y.floats) < 1e-5 && spread(wantZ, z.floats) < 1e-5
+			return none
+		}
+
+		internal def intsAttribute(name string, values int[]) Attribute {
+			let a = attribute(name, AttributeKind.Ints, 0, float32(0))
+			a.ints = values
+			return a
+		}
+
+		// Two 1-D convolutions as Kokoro's decoder has them: Y with groups,
+		// dilation and padding on both sides, Z of Y with a stride and
+		// uneven padding, no bias.
+		internal def convModel(batch int, channels int, length int) OnnxModel {
+			let model = new OnnxModel()
+			model.irVersion = 10
+			model.opsets.push(OpsetId{domain: "", version: 21})
+			let g = model.graph
+			g.inputs.push(floatInfo("X", int[batch, channels, length]))
+			g.outputs.push(floatInfo("Y", int[batch, 12, length]), floatInfo("Z", int[batch, 6, (length + 4 - 5) / 2 + 1]))
+			g.initializers.push(new Tensor(int[12, channels / 2, 3], noise(12 * channels / 2 * 3, 17)).toData("W"))
+			g.initializers.push(new Tensor(int[12], noise(12, 19)).toData("B"))
+			g.initializers.push(new Tensor(int[6, 12, 5], noise(6 * 12 * 5, 23)).toData("V"))
+			let first = node("Conv", string["X", "W", "B"], string["Y"])
+			first.attributes.push(intsAttribute("kernel_shape", int[3]), intsAttribute("dilations", int[2]), intsAttribute("pads", int[2, 2]))
+			first.attributes.push(attribute("group", AttributeKind.Int, 2, float32(0)))
+			let second = node("Conv", string["Y", "V"], string["Z"])
+			second.attributes.push(intsAttribute("kernel_shape", int[5]), intsAttribute("strides", int[2]), intsAttribute("pads", int[1, 3]))
+			g.nodes.push(first, second)
+			return model
+		}
+
+		// 1-D convolutions run on the GPU as 2-D ones of height 1 and give
+		// the CPU's values up to the order of the sums.
+		@test()
+		def TestConv1dOnGpu() !none {
+			return none unless gpu.available()
+			let (batch, channels, length) = (2, 8, 301)
+			let feeds = new map<string, Value>()
+			feeds.set("X", new Tensor(int[batch, channels, length], noise(batch * channels * length, 29)))
+			let cpu = try (try load(convModel(batch, channels, length), Device.Cpu)).run(feeds)
+			let out = try (try load(convModel(batch, channels, length), Device.Gpu)).run(feeds)
+			for let (_, name) in string["Y", "Z"] {
+				let want = try output(cpu, name)
+				let got = try output(out, name)
+				assert want.shape.equals(got.shape)
+				assert spread(want.floats, got.floats) < 1e-5
+			}
+			return none
+		}
+
+		// On a GPU the products run there, the weights copied at load, and
+		// give the CPU's values up to the order of the sums.
+		@test()
+		def TestProductsOnGpu() !none {
+			if !gpu.available() {
+				try testing.expectError(load(productModel(8, 8, 8, 8), Device.Gpu))
+				return none
+			}
+			let (m, k, n, p) = (256, 256, 128, 256)
+			let x = noise(m * k, 5)
+			let feeds = new map<string, Value>()
+			feeds.set("X", new Tensor(int[m, k], x))
+			let cpu = try (try load(productModel(m, k, n, p), Device.Cpu)).run(feeds)
+			let model = try load(productModel(m, k, n, p), Device.Gpu)
+			// Twice: the second run reads the weights the first uploaded.
+			for let round = 0; round < 2; round++ {
+				let out = try model.run(feeds)
+				assert spread((try output(cpu, "Y")).floats, (try output(out, "Y")).floats) < 1e-5
+				assert spread((try output(cpu, "Z")).floats, (try output(out, "Z")).floats) < 1e-5
+			}
+			assert model.plan.deviceConstants.len() == 3
+			return none
+		}
+
+		// With ADM_TEST_ONNX_CONFORMANCE naming the node cases of the ONNX
+		// backend tests (`<case>/model.onnx` and
+		// `test_data_set_N/{input,output}_K.pb`, as the onnx package's
+		// backend/test/data/node holds them), every case gives its outputs
+		// (relative 1e-3, absolute 1e-7, NaN matching NaN).
+		@test()
+		def TestConformance() !none {
+			let dir = Runtime.getEnv("ADM_TEST_ONNX_CONFORMANCE")
+			return none when dir is none || dir.len() == 0
+			let entries = try os.readDir(dir)
+			let failures string[]
+			for let (_, e) in entries {
+				continue when unreproducible(os.base(e.path))
+				let reason = conformanceCase(e.path) onerror (err error) {
+					recover err.message
+				}
+				failures.push("{os.base(e.path)}: {reason}") when reason.len() > 0
+			}
+			fail "{failures.len()} of {entries.len()} cases fail, first {failures[0]}" when failures.len() > 0
+			return none
+		}
+
+		// Cases whose expected values cannot be reproduced: Bernoulli's are
+		// unseeded numpy draws; the inverse DFTs expect float32 rounding
+		// noise (2e-7) where the exact value, which the float64 transform
+		// gives, is 0.
+		internal def unreproducible(name string) bool {
+			return name.startsWith("test_bernoulli") || name.startsWith("test_dft_inverse")
+		}
+
+		// "" when every data set of the case at `path` matches, else why not.
+		internal def conformanceCase(path string) !string {
+			let model = try load(try onnxfile.load(os.join(path, "model.onnx")), Device.Cpu)
+			for let (_, entry) in try os.readDir(path) {
+				continue unless os.base(entry.path).startsWith("test_data_set_")
+				let feeds = new map<string, Value>()
+				for let (i, info) in model.inputs {
+					let v = try storedValue(try os.readFile(os.join(entry.path, "input_{i}.pb")), info.valueType)
+					if v is Tensor {
+						feeds.set(info.name, v)
+					} else if v is Tensor[] {
+						feeds.set(info.name, v)
+					}
+				}
+				let got = try model.run(feeds)
+				for let (i, info) in model.outputs {
+					let want = try storedValue(try os.readFile(os.join(entry.path, "output_{i}.pb")), info.valueType)
+					let problem = valueDiffers(want, got.get(info.name))
+					return "output {info.name}: {problem}" when problem.len() > 0
+				}
+			}
+			return ""
+		}
+
+		// A value as the test data stores it, by the type the graph declares:
+		// a TensorProto, a SequenceProto (tensors in field 3) or an
+		// OptionalProto (a tensor in field 3, a sequence in field 5).
+		internal def storedValue(data byte[], kind ValueType) !?Value {
+			match kind.kind {
+				case ValueKind.Sequence:
+					return try storedSequence(data)
+				case ValueKind.Optional:
+					let r = new ProtoReader(data)
+					for r.more() {
+						let f = try r.next()
+						return try tensorOf(try onnxfile.decodeTensor(try f.payload())) when f.number == 3
+						return try storedSequence(try f.payload()) when f.number == 5
+					}
+					return none
+				default:
+					return try tensorOf(try onnxfile.decodeTensor(data))
+			}
+		}
+
+		internal def storedSequence(data byte[]) !Tensor[] {
+			let items Tensor[]
+			let r = new ProtoReader(data)
+			for r.more() {
+				let f = try r.next()
+				items.push(try tensorOf(try onnxfile.decodeTensor(try f.payload()))) when f.number == 3
+			}
+			return items
+		}
+
+		internal def valueDiffers(want ?Value, have ?Value) string {
+			return have is none ?? ("", "expected no value") when want is none
+			return "no value" when have is none
+			if want is Tensor[] {
+				return "expected a sequence" unless have is Tensor[]
+				return "sequence of {have.len()}, expected {want.len()}" unless have.len() == want.len()
+				for let i = 0; i < want.len(); i++ {
+					let p = tensorDiffers(want[i], have[i])
+					return "item {i}: {p}" when p.len() > 0
+				}
+				return ""
+			}
+			return "expected a tensor" unless have is Tensor
+			return tensorDiffers(want, have) when want is Tensor
+			return "?"
+		}
+
+		internal def tensorDiffers(want Tensor, have Tensor) string {
+			return "element {have.element.name}, expected {want.element.name}" unless want.element == have.element
+			return "shape {have.shape}, expected {want.shape}" unless want.shape.equals(have.shape)
+			match storageOf(want.element) {
+				case Storage.Floats:
+					for let i = 0; i < want.floats.len(); i++ {
+						return "value {i}: {have.floats[i]}, expected {want.floats[i]}" unless near(float(want.floats[i]), float(have.floats[i]))
+					}
+				case Storage.Doubles:
+					for let i = 0; i < want.doubles.len(); i++ {
+						return "value {i}: {have.doubles[i]}, expected {want.doubles[i]}" unless near(want.doubles[i], have.doubles[i])
+					}
+				case Storage.Ints:
+					for let i = 0; i < want.ints.len(); i++ {
+						return "value {i}: {have.ints[i]}, expected {want.ints[i]}" unless want.ints[i] == have.ints[i]
+					}
+				default:
+					for let i = 0; i < want.strings.len(); i++ {
+						return "value {i}: {have.strings[i]}, expected {want.strings[i]}" unless want.strings[i] == have.strings[i]
+					}
+			}
+			return ""
+		}
+
+		internal def near(w float, h float) bool {
+			return h != h when w != w
+			return w == h when w.abs() == 1.0 / 0.0
+			return (w - h).abs() <= 0.0000001 + 0.001 * w.abs()
+		}
+	}
+}
