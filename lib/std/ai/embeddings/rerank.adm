@@ -1,0 +1,188 @@
+partial module std.ai.embeddings {
+	use (
+		std.gpu
+		std.os
+		std.math
+		std.formats.ai
+		std.formats.ai.onnx::(ElementType)
+		std.ai.onnx
+		std.ai.tensor::(Tensor)
+		std.ai.llm::(Tokenizer, loadTokenizer, Device)
+	)
+
+	// What orders passages by how well they answer a question: a loaded
+	// cross-encoder (`loadReranker`), or a hosted reranking model. Search
+	// by vectors first, then rerank the few best passages it found.
+	interface Reranker {
+		// How well each of `passages` answers `question`, from 0 (not at
+		// all) to 1, in order.
+		def rank(question string, passages string[]) !float[]
+	}
+
+	// A cross-encoder: it reads the question and a passage together and
+	// scores how well the passage answers it, which judges relevance
+	// better than comparing two vectors and costs a pass of the model per
+	// passage. It is a `Reranker`.
+	//
+	// ```
+	// let reranker = try embeddings.loadReranker("bge-reranker-v2-m3.gguf")
+	// let scores = try reranker.rank("Where did the cat sit?", string["The cat sat on the mat.", "Stocks fell."])
+	// ```
+	type RerankModel {
+		// Tokens of a question and passage the model reads together; the
+		// longer of the two is cut to fit.
+		maxTokens          int
+		// Where the model runs.
+		device             Device
+		internal tokenizer Tokenizer
+		internal graph     ?onnx.Model
+		internal encoder   ?Encoder
+		// The ONNX inputs the graph takes besides input_ids.
+		internal masks     bool
+		internal types     bool
+		internal padding   int
+
+		def new(tokenizer Tokenizer) {
+			self.tokenizer = tokenizer
+		}
+
+		// How well each of `passages` answers `question`, from 0 to 1 (the
+		// model's score through the logistic function), in order.
+		// Fails when the model does.
+		def rank(question string, passages string[]) !float[] {
+			let ids int[][]
+			let kinds int[][]
+			for let (_, passage) in passages {
+				let (pair, segments) = try tokenizer.encode(question, passage, maxTokens)
+				ids.push(pair)
+				kinds.push(segments)
+			}
+			let out float[]
+			out.len(passages.len())
+			let model = encoder
+			if model is Encoder {
+				let starts int[]
+				for let (_, group) in batchesOf(ids, encoderBatch) {
+					let batchIds int[][]
+					let batchKinds int[][]
+					for let (_, i) in group {
+						batchIds.push(ids[i])
+						batchKinds.push(kinds[i])
+					}
+					let scores = try model.score(model.forward(batchIds, batchKinds, starts), starts)
+					for let (k, i) in group {
+						out[i] = logistic(scores[k])
+					}
+				}
+				return out
+			}
+			let g = graph
+			fail "embeddings: the reranker holds no model" unless g is onnx.Model
+			for let (_, group) in batchesOf(ids, onnxBatchTokens) {
+				let scores = try runPairs(g, ids, kinds, group)
+				for let (k, i) in group {
+					out[i] = logistic(scores[k])
+				}
+			}
+			return out
+		}
+
+		// One batch of pairs through the ONNX graph, padded to the longest:
+		// each pair's score.
+		internal def runPairs(g onnx.Model, ids int[][], kinds int[][], picked int[]) !float[] {
+			let width = 0
+			for let (_, i) in picked {
+				width = width.max(ids[i].len())
+			}
+			let rows = picked.len()
+			let flat int[]
+			let mask int[]
+			let segments int[]
+			flat.len(rows * width)
+			mask.len(rows * width)
+			segments.len(rows * width)
+			for let (r, i) in picked {
+				for let t = 0; t < width; t++ {
+					let real = t < ids[i].len()
+					flat[r * width + t] = real ?? (ids[i][t], padding)
+					mask[r * width + t] = real ?? (1, 0)
+					segments[r * width + t] = real ?? (kinds[i][t], 0)
+				}
+			}
+			let shape = int[rows, width]
+			let feeds = new map<string, onnx.Value>()
+			feeds.set("input_ids", new Tensor(shape, flat, ElementType.Int64))
+			feeds.set("attention_mask", new Tensor(shape, mask, ElementType.Int64)) when masks
+			feeds.set("token_type_ids", new Tensor(shape, segments, ElementType.Int64)) when types
+			let out = try g.run(feeds)
+			let logits = out.get("logits")
+			fail "embeddings: the reranker gives no logits" unless logits is Tensor
+			let labels = logits.floats.len() / rows
+			fail "embeddings: the reranker gives {labels} scores a pair; a reranker gives one" unless labels == 1
+			let scores float[]
+			for let r = 0; r < rows; r++ {
+				scores.push(float(logits.floats[r]))
+			}
+			return scores
+		}
+	}
+
+	// Tokens one ONNX batch of pairs holds at most, padding included.
+	internal const onnxBatchTokens = 8192
+
+	internal def logistic(x float) float {
+		return 1.0 / (1.0 + math.E ** (-x))
+	}
+
+	// Loads a cross-encoder: a GGUF file of a BERT or XLM-RoBERTa model
+	// with a classification head (as llama.cpp converts bge-reranker-v2-m3,
+	// bge-reranker-base and the ms-marco MiniLM cross-encoders), or a
+	// folder of an ONNX export (onnx/model.onnx with tokenizer.json, its
+	// output named logits), on `device`, its products on the GPU at
+	// `precision` (ONNX models; GGUF models run on the processor).
+	// Fails when the files cannot be read, hold no classification head, or
+	// their tokenizer has no template for a pair of texts.
+	def loadReranker(path string, device Device = Device.Auto, precision gpu.Precision = gpu.Precision.Exact) !RerankModel {
+		let info = try os.stat(path, true)
+		let model = info.isDir ?? (try onnxReranker(path, device, precision), try ggufReranker(path))
+		// A tokenizer without a template for pairs is refused now, not at
+		// the first search.
+		try model.tokenizer.encode("", "", 0)
+		return model
+	}
+
+	internal def onnxReranker(folder string, device Device, precision gpu.Precision) !RerankModel {
+		let file = os.join(folder, "onnx", "model.onnx")
+		let g = try onnx.load((try os.exists(file)) ?? (file, os.join(folder, "model.onnx")), device, precision)
+		let model = new RerankModel(try loadTokenizer(folder))
+		model.graph = g
+		model.device = g.device
+		for let (_, input) in g.inputs {
+			model.masks = model.masks || input.name == "attention_mask"
+			model.types = model.types || input.name == "token_type_ids"
+		}
+		let config = try jsonAt(folder, "config.json")
+		let kind = config.get("model_type")
+		// RoBERTa models number positions from 2: two fewer than the table.
+		let offset = kind is string && (kind := "xlm-roberta" || "roberta") ?? (2, 0)
+		let positions = intAt(config, "max_position_embeddings", 514) - offset
+		let stated = intAt(try jsonAt(folder, "tokenizer_config.json"), "model_max_length", 0)
+		model.maxTokens = stated > 0 && stated < positions ?? (stated, positions)
+		model.padding = intAt(config, "pad_token_id", 0)
+		return model
+	}
+
+	internal def ggufReranker(path string) !RerankModel {
+		let file = try ai.load(path)
+		let encoder = try readEncoder(file)
+		fail "embeddings: {path} has no classification head (cls.output): it is an embedding model, which load reads" when encoder.scorer.len() == 0
+		// BERT's head reads the first token through its pooler; files whose
+		// converter left it out give scores unrelated to the model's.
+		fail "embeddings: {path} has the scores of a classification head but not the dense layer before them (cls.weight); convert the model again with the pooler kept" when encoder.pooler is none
+		let model = new RerankModel(try loadTokenizer(file))
+		model.encoder = encoder
+		model.maxTokens = encoder.context
+		model.device = Device.Cpu
+		return model
+	}
+}

@@ -1,59 +1,106 @@
 // Retrieval: texts and documents cut into passages, embedded, and found
-// again by meaning, so a model answers from them. Any embedder works: a
-// model loaded with std.ai.embeddings, or a hosted one of the adm.ai
-// libraries; any chat answers: a local session or a hosted one.
+// again by meaning and by their words, so a model answers from them. Any
+// embedder works: a model loaded with std.ai.embeddings, or a hosted one of
+// the adm.ai libraries; any chat answers: a local session or a hosted one.
 //
 //     let index = new retrieval.Index(try embeddings.load("all-minilm.gguf"))
 //     try index.add(try docs.load("handbook.md"), source = "handbook")
 //     let answer = try index.ask(model.session(), "How many days of leave do I get?")
 //
-// Passages are searched by the cosine similarity of their vectors to the
-// question's.
+// A search ranks passages by the cosine similarity of their vectors to the
+// question's and by BM25 over their words, and fuses the two rankings; a
+// reranker (a cross-encoder, `embeddings.loadReranker`) then orders the
+// best of them by reading each with the question. Indexes of more than
+// 10 000 passages are searched by meaning through a graph (HNSW) instead
+// of passage by passage.
 partial module std.ai.retrieval {
 	use (
 		std.os
-		std.bytes
+		std.math
+		std.simd
 		std.formats.docs
 		std.formats.docs::(Document)
 		std.ai.embeddings
-		std.ai.embeddings::(Embedder)
+		std.ai.embeddings::(Embedder, EmbeddingModel, Reranker)
 		std.ai.llm::(Chat)
 	)
 
-	// What starts an index file.
-	internal const indexMagic = "ADMRIDX1"
+	// What starts an index file, and what started the first version's.
+	internal const indexMagic = "ADMRIDX2"
+	internal const firstMagic = "ADMRIDX1"
 
 	// Texts embedded per request to the embedder.
 	internal const embedBatch = 32
+
+	// Passages compared one by one up to this many; beyond, the search by
+	// meaning goes through the graph.
+	internal const exactLimit = 10000
+
+	// How wide a graph search looks on its bottom level, at least.
+	internal const searchBreadth = 128
+
+	// Reciprocal rank fusion's constant (Cormack, Clarke and Büttcher, 2009):
+	// a passage gains 1 / (60 + rank) from each ranking it is in.
+	internal const fusionK = 60
+
+	// What a search matches the question by.
+	enum Matching {
+		// Meaning and words, the two rankings fused: finds passages that
+		// say the same in other words, and names, codes and numbers
+		// a vector blurs.
+		Both,
+		// Meaning: the cosine similarity of the passages' vectors to the
+		// question's.
+		Meaning,
+		// Words: BM25 over the passages' words (case folded); the
+		// embedder is not asked.
+		Words,
+	}
 
 	// A passage found for a question.
 	struct Passage {
 		text   string
 		// Where the passage came from, as `Index.add` was told.
 		source string
-		// Cosine similarity to the question: 1 the same meaning, 0
-		// unrelated.
+		// How well it matches: the reranker's relevance (0 to 1) when the
+		// index has a reranker; else the cosine similarity of its vector to
+		// the question's (1 the same meaning, 0 unrelated), or its BM25
+		// score when the search matched words only.
 		score  float
 	}
 
-	// Passages of texts and documents with their vectors, searched by
-	// meaning. Add to it, search it, ask a chat from it; `save` keeps it
-	// in a file `load` reads back.
+	// Passages of texts and documents with their vectors and words,
+	// searched by meaning and by words. Add to it, search it, ask a chat
+	// from it; `save` keeps it in a file `load` reads back.
 	type Index {
 		embedder         Embedder
-		// Characters a passage holds at most; consecutive passages of one
-		// text share `overlap` characters, so a sentence cut at a passage's
-		// end is whole in the next.
-		size             int         = 1200
-		overlap          int         = 200
-		internal texts   string[]
-		internal sources string[]
-		internal vectors float32[][]
+		// Orders the passages a search found by reading each with the
+		// question; none to keep the order of the matching.
+		reranker         ?Reranker = none
+		// Characters a passage holds at most (and never more tokens than an
+		// `EmbeddingModel` reads); consecutive passages of one text share
+		// `overlap` characters, so a sentence cut at a passage's end is
+		// whole in the next.
+		size             int       = 1200
+		overlap          int       = 200
+		// Passages each ranking hands on, for the fusion and the reranker
+		// to choose the best `count` from.
+		candidates       int       = 50
+		internal texts   string[]  = []
+		internal sources string[]  = []
+		// The passages' vectors scaled to length 1, one after another.
+		internal dims    int       = 0
+		internal vectors float32[] = []
+		internal words   Keywords
+		internal graph   Graph
 
-		def new(embedder Embedder, size int = 1200, overlap int = 200) {
+		def new(embedder Embedder, size int = 1200, overlap int = 200, reranker ?Reranker = none) {
 			self.embedder = embedder
 			self.size = size
 			self.overlap = overlap
+			self.reranker = reranker
+			words = new Keywords()
+			graph = new Graph()
 		}
 
 		// Passages held.
@@ -63,16 +110,15 @@ partial module std.ai.retrieval {
 
 		// Cuts `text` into passages and adds them with their vectors;
 		// returns how many.
-		// Fails when the embedder does.
+		// Fails when the embedder does, or gives vectors of another length
+		// than the index holds.
 		def add(text string, source string = "") !int {
-			let pieces = passagesOf(text, size, overlap)
+			let pieces = fitted(passagesOf(text, size, overlap))
 			for let from = 0; from < pieces.len(); from += embedBatch {
 				let batch = pieces[from:(from + embedBatch).min(pieces.len())].clone()
 				let made = try embedder.embed(batch)
 				for let (k, v) in made {
-					texts.push(batch[k])
-					sources.push(source)
-					vectors.push(v)
+					try place(self, batch[k], source, v)
 				}
 			}
 			return pieces.len()
@@ -84,20 +130,111 @@ partial module std.ai.retrieval {
 			return try add(new docs.Markdown().encode(document), source.len() > 0 ?? (source, document.title))
 		}
 
-		// The `count` passages nearest in meaning to `question`, nearest
-		// first.
-		// Fails when the embedder does.
-		def search(question string, count int = 4) !Passage[] {
-			let out Passage[]
-			return out when texts.len() == 0
-			let query = try embedder.embed(question)
-			for let (_, at) in embeddings.nearest(query, vectors, count) {
-				out.push(Passage{text: texts[at], source: sources[at], score: embeddings.similarity(query, vectors[at])})
+		// `pieces` with those longer than an `EmbeddingModel` reads cut
+		// further, so no passage is cut short by the model.
+		internal def fitted(pieces string[]) string[] {
+			let model = embedder
+			return pieces unless model is EmbeddingModel
+			let out string[]
+			for let (_, piece) in pieces {
+				let n = model.length(piece)
+				if n <= model.maxTokens || piece.len() < 2 {
+					out.push(piece)
+					continue
+				}
+				// Cut at the share of characters that fits, with a margin for
+				// tokens spread unevenly.
+				let part = (piece.len() * model.maxTokens * 9 / (n * 10)).max(1)
+				out.push(...fitted(splitLong(piece, part)))
 			}
 			return out
 		}
 
-		// Asks `chat` `question` with the `count` nearest passages before it,
+		// The `count` passages that best match `question`, best first.
+		// Fails when the embedder or the reranker does.
+		def search(question string, count int = 4, matching Matching = Matching.Both) !Passage[] {
+			let out Passage[]
+			return out when texts.len() == 0 || count <= 0
+			let ranker = reranker
+			let pool = ranker is none && matching != Matching.Both ?? (count, candidates.max(count))
+			let query float32[] = []
+			let byMeaning int[]
+			if matching != Matching.Words {
+				query = unit(try embedder.embed(question))
+				fail "retrieval: the embedder gave a vector of {query.len()} numbers; the index holds vectors of {dims}" unless query.len() == dims
+				byMeaning = nearest(query, pool)
+			}
+			let byWords int[]
+			let wordScores float[]
+			if matching != Matching.Meaning {
+				let (ids, scores) = words.search(question, pool)
+				byWords = ids
+				wordScores = scores
+			}
+			let order = matching == Matching.Both ?? (fuse(byMeaning, byWords, pool), matching == Matching.Meaning ?? (byMeaning, byWords))
+			let scores float[]
+			if ranker is Reranker && order.len() > 0 {
+				let read string[]
+				for let (_, at) in order {
+					read.push(texts[at])
+				}
+				let relevance = try ranker.rank(question, read)
+				let ranked int[]
+				for let i = 0; i < order.len(); i++ {
+					ranked.push(i)
+				}
+				ranked = ranked.sort((a, b) => relevance[b] > relevance[a] ?? (1, relevance[b] < relevance[a] ?? (-1, a - b)))
+				let reordered int[]
+				for let (_, i) in ranked {
+					reordered.push(order[i])
+					scores.push(relevance[i])
+				}
+				order = reordered
+			} else {
+				for let (k, at) in order {
+					scores.push(matching == Matching.Words ?? (wordScores[k], float(dotAt(query, 0, vectors, at * dims, dims))))
+				}
+			}
+			for let k = 0; k < order.len().min(count); k++ {
+				out.push(Passage{text: texts[order[k]], source: sources[order[k]], score: scores[k]})
+			}
+			return out
+		}
+
+		// The `count` passages whose vectors are nearest the unit vector
+		// `query`, nearest first: every passage compared on tasks, or the
+		// graph searched once the index is large.
+		internal def nearest(query float32[], count int) int[] {
+			let n = texts.len()
+			if n > exactLimit {
+				graph.grow(vectors, dims, n)
+				let (ids, _) = graph.search(vectors, dims, query, 0, count, searchBreadth.max(count))
+				return ids
+			}
+			let tasks = (n * dims / (1 << 18)).clamp(1, 32)
+			let bests Ranked[]
+			bests.len(tasks)
+			forall let b in 0..tasks {
+				let best = new Ranked(true)
+				for let i = n * b / tasks; i < n * (b + 1) / tasks; i++ {
+					best.keep(dotAt(query, 0, vectors, i * dims, dims), i, count)
+				}
+				bests[b] = best
+			}
+			let all = new Ranked(true)
+			for let (_, best) in bests {
+				for let i = 0; i < best.len(); i++ {
+					all.keep(best.scores[i], int(best.ids[i]), count)
+				}
+			}
+			let out int[]
+			for let (_, id) in all.bestFirst() {
+				out.push(int(id))
+			}
+			return out
+		}
+
+		// Asks `chat` `question` with the `count` best passages before it,
 		// to answer from them and name the sources it used; returns the
 		// answer.
 		// Fails like `search` and `Chat.say`.
@@ -117,68 +254,296 @@ partial module std.ai.retrieval {
 				continue when sources[i] == source
 				texts[kept] = texts[i]
 				sources[kept] = sources[i]
-				vectors[kept] = vectors[i]
+				vectors[i * dims:(i + 1) * dims].copy(vectors[kept * dims:(kept + 1) * dims]) when kept != i
 				kept++
 			}
 			let removed = texts.len() - kept
+			return 0 when removed == 0
 			texts.len(kept)
 			sources.len(kept)
-			vectors.len(kept)
+			vectors.len(kept * dims)
+			words.clear()
+			for let (_, text) in texts {
+				words.add(text)
+			}
+			// Node numbers moved: the graph is built again when next needed.
+			graph.clear()
 			return removed
 		}
 
-		// Writes the passages and vectors to `path`.
+		// Writes the passages, their vectors and words, and the graph when
+		// one was built, to `path`.
 		// Fails when the file cannot be written.
 		def save(path string) !none {
-			let out = new bytes.Buffer()
-			try out.writeString(indexMagic)
-			try out.write(uint32(texts.len()), bytes.Endian.Little)
+			let out byte[]
+			out.push(...indexMagic.bytes())
+			putU32(out, texts.len())
+			putU32(out, dims)
 			for let (i, text) in texts {
-				try writeText(out, sources[i])
-				try writeText(out, text)
-				let v = vectors[i]
-				try out.write(uint32(v.len()), bytes.Endian.Little)
-				for let (_, x) in v {
-					try out.write(x, bytes.Endian.Little)
+				putText(out, sources[i])
+				putText(out, text)
+			}
+			putFloats(out, vectors)
+			let lengths int32[]
+			for let (_, n) in words.lengths {
+				lengths.push(int32(n))
+			}
+			putInts(out, lengths)
+			putU32(out, words.postings.len())
+			for let (word, list) in words.postings {
+				putText(out, word)
+				putU32(out, list.len())
+				let pairs int32[]
+				for let (_, v) in list {
+					pairs.push(int32(v))
+				}
+				putInts(out, pairs)
+			}
+			putU32(out, graph.len())
+			if graph.len() > 0 {
+				putU32(out, graph.entry)
+				putU32(out, graph.top)
+				let levels int32[]
+				for let (_, l) in graph.levels {
+					levels.push(int32(l))
+				}
+				putInts(out, levels)
+				for let (_, own) in graph.links {
+					putInts(out, own)
 				}
 			}
-			return os.writeFile(path, out.bytes())
+			return os.writeFile(path, out)
 		}
 	}
 
 	// An index `save` wrote, its questions embedded by `embedder` (the one
-	// that made it, or the vectors do not compare).
+	// that made it, or the vectors do not compare) and its passages
+	// reordered by `reranker` when given. Files of the first version (no
+	// words, no graph) are read too.
 	// Fails when the file cannot be read or is not an index.
-	def load(path string, embedder Embedder) !Index {
+	def load(path string, embedder Embedder, reranker ?Reranker = none) !Index {
 		let data = try os.readFile(path)
-		let reader = new bytes.BinaryReader(new bytes.Reader(data), bytes.Endian.Little, none)
-		fail "retrieval: {path} is not an index" unless (try reader.readString(indexMagic.len())) == indexMagic
-		let index = new Index(embedder)
-		let count = int(try reader.read<uint32>())
-		for let i = 0; i < count; i++ {
-			index.sources.push(try readText(reader))
-			index.texts.push(try readText(reader))
-			let n = int(try reader.read<uint32>())
-			let v float32[]
-			v.len(n)
-			for let k = 0; k < n; k++ {
-				v[k] = try reader.read<float32>()
+		let index = new Index(embedder, reranker = reranker)
+		let r = new Cursor(data, indexMagic.len())
+		let magic = data.len() >= indexMagic.len() ?? (string(data[0:indexMagic.len()]), "")
+		if magic == firstMagic {
+			let count = try r.u32()
+			for let i = 0; i < count; i++ {
+				let source = try r.text()
+				let text = try r.text()
+				let v float32[]
+				v.len(try r.u32())
+				try r.floats(v)
+				try place(index, text, source, v)
 			}
-			index.vectors.push(v)
+			return index
+		}
+		fail "retrieval: {path} is not an index" unless magic == indexMagic
+		let count = try r.u32()
+		index.dims = try r.u32()
+		for let i = 0; i < count; i++ {
+			index.sources.push(try r.text())
+			index.texts.push(try r.text())
+		}
+		index.vectors.len(count * index.dims)
+		try r.floats(index.vectors)
+		let lengths int32[]
+		lengths.len(count)
+		try r.ints(lengths)
+		for let (_, n) in lengths {
+			index.words.lengths.push(int(n))
+			index.words.total += int(n)
+		}
+		let wordCount = try r.u32()
+		for let w = 0; w < wordCount; w++ {
+			let word = try r.text()
+			let pairs int32[]
+			pairs.len(try r.u32())
+			try r.ints(pairs)
+			let list int[]
+			for let (_, v) in pairs {
+				list.push(int(v))
+			}
+			index.words.postings.set(word, list)
+		}
+		let nodes = try r.u32()
+		if nodes > 0 {
+			fail "retrieval: {path} holds a graph of {nodes} nodes for {count} passages" when nodes > count
+			index.graph.entry = try r.u32()
+			index.graph.top = try r.u32()
+			let levels int32[]
+			levels.len(nodes)
+			try r.ints(levels)
+			for let (_, l) in levels {
+				fail "retrieval: {path} holds a graph node on level {l}" unless l >= 0 && l <= 30
+				index.graph.levels.push(int(l))
+				let own int32[]
+				own.len(slotOf(int(l) + 1))
+				try r.ints(own)
+				index.graph.links.push(own)
+			}
 		}
 		return index
 	}
 
-	internal def writeText(out bytes.Buffer, text string) !none {
-		let data = text.bytes()
-		try out.write(uint32(data.len()), bytes.Endian.Little)
-		try out.write(data)
+	// Adds a passage with its vector (scaled to length 1 on the way in).
+	// Fails when the vector's length differs from the index's.
+	internal def place(index Index, text string, source string, v float32[]) !none {
+		index.dims = v.len() when index.dims == 0
+		fail "retrieval: the embedder gave a vector of {v.len()} numbers; the index holds vectors of {index.dims}" unless v.len() == index.dims
+		index.texts.push(text)
+		index.sources.push(source)
+		index.vectors.push(...unit(v))
+		index.words.add(text)
 		return none
 	}
 
-	internal def readText(reader bytes.BinaryReader) !string {
-		let n = int(try reader.read<uint32>())
-		return string(try reader.read(n))
+	// The passages of two rankings in the order of their reciprocal rank
+	// fusion, the best `count`.
+	internal def fuse(a int[], b int[], count int) int[] {
+		let slot = new map<int, int>()
+		let ids int[]
+		let scores float[]
+		for let (_, ranking) in [a, b] {
+			for let (rank, id) in ranking {
+				let at = slot.get(id)
+				let gain = 1.0 / float(fusionK + rank + 1)
+				if at is int {
+					scores[at] += gain
+				} else {
+					slot.set(id, ids.len())
+					ids.push(id)
+					scores.push(gain)
+				}
+			}
+		}
+		let order int[]
+		for let i = 0; i < ids.len(); i++ {
+			order.push(i)
+		}
+		order = order.sort((x, y) => scores[y] > scores[x] ?? (1, scores[y] < scores[x] ?? (-1, ids[x] - ids[y])))
+		let out int[]
+		for let k = 0; k < order.len().min(count); k++ {
+			out.push(ids[order[k]])
+		}
+		return out
+	}
+
+	// `v` scaled to length 1; all zeros stay zeros.
+	internal def unit(v float32[]) float32[] {
+		let length = math.sqrt(float(dotAt(v, 0, v, 0, v.len())))
+		return v.clone() when length == 0.0
+		let scale = float32(1.0 / length)
+		let out float32[]
+		out.len(v.len())
+		for let i = 0; i < v.len(); i++ {
+			out[i] = v[i] * scale
+		}
+		return out
+	}
+
+	internal def putU32(out byte[], v int) {
+		out.push(byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 24) & 0xFF))
+	}
+
+	internal def putText(out byte[], text string) {
+		let data = text.bytes()
+		putU32(out, data.len())
+		out.push(...data)
+	}
+
+	// The values as little-endian bytes, four at a time.
+	internal def putFloats(out byte[], v float32[]) {
+		let at = out.len()
+		out.len(at + v.len() * 4)
+		let i = 0
+		for; i + 4 <= v.len(); i += 4 {
+			simd.store16<byte>(out, at + i * 4, simd.load4<float32>(v, i).bitcast16<byte>())
+		}
+		for; i < v.len(); i++ {
+			let bits = int(__bitcast_u32_from_f32(v[i]))
+			for let k = 0; k < 4; k++ {
+				out[at + i * 4 + k] = byte((bits >> (8 * k)) & 0xFF)
+			}
+		}
+	}
+
+	internal def putInts(out byte[], v int32[]) {
+		let at = out.len()
+		out.len(at + v.len() * 4)
+		let i = 0
+		for; i + 4 <= v.len(); i += 4 {
+			simd.store16<byte>(out, at + i * 4, simd.load4<int32>(v, i).bitcast16<byte>())
+		}
+		for; i < v.len(); i++ {
+			let x = int(v[i])
+			for let k = 0; k < 4; k++ {
+				out[at + i * 4 + k] = byte((x >> (8 * k)) & 0xFF)
+			}
+		}
+	}
+
+	// Reads an index file's numbers and texts in order.
+	internal type Cursor {
+		data byte[]
+		at   int
+
+		def new(data byte[], at int) {
+			self.data = data
+			self.at = at
+		}
+
+		// Fails when fewer than `n` bytes are left.
+		def need(n int) !none {
+			expects {
+				assert n >= 0 && at + n <= data.len() onerror fail "retrieval: the index file is cut short"
+			}
+			return none
+		}
+
+		def u32() !int {
+			try need(4)
+			let v = int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16) | (int(data[at + 3]) << 24)
+			at += 4
+			return v
+		}
+
+		def text() !string {
+			let n = try u32()
+			try need(n)
+			let s = string(data[at:at + n])
+			at += n
+			return s
+		}
+
+		// Fills `out` from the next 4 × out.len() bytes.
+		def floats(out float32[]) !none {
+			try need(out.len() * 4)
+			let i = 0
+			for; i + 4 <= out.len(); i += 4 {
+				simd.store4<float32>(out, i, simd.load16<byte>(data, at + i * 4).bitcast4<float32>())
+			}
+			for; i < out.len(); i++ {
+				let b = at + i * 4
+				out[i] = __bitcast_f32_from_u32(uint32(int(data[b]) | (int(data[b + 1]) << 8) | (int(data[b + 2]) << 16) | (int(data[b + 3]) << 24)))
+			}
+			at += out.len() * 4
+			return none
+		}
+
+		def ints(out int32[]) !none {
+			try need(out.len() * 4)
+			let i = 0
+			for; i + 4 <= out.len(); i += 4 {
+				simd.store4<int32>(out, i, simd.load16<byte>(data, at + i * 4).bitcast4<int32>())
+			}
+			for; i < out.len(); i++ {
+				let b = at + i * 4
+				out[i] = int32(int(data[b]) | (int(data[b + 1]) << 8) | (int(data[b + 2]) << 16) | (int(data[b + 3]) << 24))
+			}
+			at += out.len() * 4
+			return none
+		}
 	}
 
 	// `text` cut into passages of at most `size` characters at paragraph

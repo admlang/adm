@@ -69,6 +69,12 @@ partial module std.ai.embeddings {
 			self.tokenizer = tokenizer
 		}
 
+		// Tokens `text` takes, those the model puts around a text included;
+		// the model reads at most `maxTokens` of them.
+		def length(text string) int {
+			return tokenizer.encode(text).len()
+		}
+
 		// The vector of `text`.
 		// Fails when the model does.
 		def embed(text string) !float32[] {
@@ -93,8 +99,16 @@ partial module std.ai.embeddings {
 			out.len(texts.len())
 			let model = encoder
 			if model is Encoder {
-				for let (i, ids) in tokens {
-					out[i] = finished(model.pool(model.forward(ids), pooling))
+				let starts int[]
+				for let (_, group) in batchesOf(tokens, encoderBatch) {
+					let ids int[][]
+					for let (_, i) in group {
+						ids.push(tokens[i])
+					}
+					let x = model.forward(ids, int[][], starts)
+					for let (k, i) in group {
+						out[i] = finished(model.pool(x, starts[k], starts[k + 1], pooling))
+					}
 				}
 				return out
 			}
@@ -275,6 +289,34 @@ partial module std.ai.embeddings {
 
 	// ---- GGUF encoders ------------------------------------------------------
 
+	// Tokens one forward pass of a GGUF encoder takes at most: the texts
+	// share its products, and its activations stay within a few hundred MB.
+	internal const encoderBatch = 8192
+
+	// The positions of `tokens` in groups of at most `budget` tokens (a
+	// longer text alone), texts of similar length together.
+	internal def batchesOf(tokens int[][], budget int) int[][] {
+		let order int[]
+		for let i = 0; i < tokens.len(); i++ {
+			order.push(i)
+		}
+		order = order.sort((a, b) => tokens[a].len() - tokens[b].len())
+		let out int[][]
+		let group int[]
+		let used = 0
+		for let (_, i) in order {
+			if group.len() > 0 && used + tokens[i].len() > budget {
+				out.push(group)
+				group = int[]
+				used = 0
+			}
+			group.push(i)
+			used += tokens[i].len()
+		}
+		out.push(group) when group.len() > 0
+		return out
+	}
+
 	// One layer of a BERT encoder.
 	internal type EncoderLayer {
 		// Separate projections with biases (BERT), or one fused (Nomic).
@@ -309,7 +351,8 @@ partial module std.ai.embeddings {
 	}
 
 	// A BERT (learned positions, GELU) or Nomic BERT (rotary positions,
-	// SwiGLU) encoder read from GGUF.
+	// SwiGLU) encoder read from GGUF, with the classification head of a
+	// cross-encoder when the file has one.
 	internal type Encoder {
 		width       int
 		heads       int
@@ -320,35 +363,57 @@ partial module std.ai.embeddings {
 		poolingKind Pooling
 		tokens      Weights
 		positions   ?Weights
-		typeRow     float32[]
+		// The token type embeddings, one row of `width` per type.
+		typeRows    float32[]
 		embedNorm   float32[]
 		embedBias   float32[]
 		layers      EncoderLayer[] = []
+		// The head of a cross-encoder: a dense layer with tanh over the
+		// first token (BERT's pooler, RoBERTa's dense), then the first
+		// label's row of the scores (empty without a head).
+		pooler      ?Weights
+		poolerBias  float32[]      = []
+		scorer      float32[]      = []
+		scorerBias  float32        = float32(0)
 
-		def new(tokens Weights, typeRow float32[], embedNorm float32[], embedBias float32[]) {
+		def new(tokens Weights, typeRows float32[], embedNorm float32[], embedBias float32[]) {
 			self.tokens = tokens
-			self.typeRow = typeRow
+			self.typeRows = typeRows
 			self.embedNorm = embedNorm
 			self.embedBias = embedBias
 		}
 
-		// The last layer's vector of every token of `ids` (a row each).
-		def forward(ids int[]) matrix<float32> {
-			let n = ids.len()
+		// The last layer's vector of every token of each text, the texts'
+		// rows one after another (text `s` from `starts[s]` to
+		// `starts[s + 1]`). `types` holds each text's token types; an empty
+		// list is type 0 throughout. The texts share every product, so a
+		// weight tile is decoded once for all of them.
+		def forward(ids int[][], types int[][], starts int[]) matrix<float32> {
+			starts.len(0)
+			starts.push(0)
+			for let (_, seq) in ids {
+				starts.push(starts[starts.len() - 1] + seq.len())
+			}
+			let n = starts[ids.len()]
 			let d = width
 			let x = matrix<float32>[].size(n, d)
-			let place float32[]
-			place.len(d)
-			for let t = 0; t < n; t++ {
-				let row = x.row(t)
-				tokens.row(ids[t], row)
-				let pos = positions
-				if pos is Weights {
-					pos.row(t, place)
-					addInto(row, place, 0, d)
+			let typeCount = typeRows.len() / d
+			forall let s in 0..ids.len() {
+				let place float32[]
+				place.len(d)
+				let seq = ids[s]
+				for let t = 0; t < seq.len(); t++ {
+					let row = x.row(starts[s] + t)
+					tokens.row(seq[t], row)
+					let pos = positions
+					if pos is Weights {
+						pos.row(t, place)
+						addInto(row, place, 0, d)
+					}
+					let kind = s < types.len() && t < types[s].len() ?? (types[s][t].clamp(0, typeCount - 1), 0)
+					addInto(row, typeRows, kind * d, d)
+					layerNorm(row, embedNorm, embedBias, epsilon)
 				}
-				addInto(row, typeRow, 0, d)
-				layerNorm(row, embedNorm, embedBias, epsilon)
 			}
 			let hd = d / heads
 			let q = matrix<float32>[].size(n, d)
@@ -373,12 +438,14 @@ partial module std.ai.embeddings {
 					project(layer.value, x, v, layer.valueBias)
 				}
 				if rotary {
-					for let t = 0; t < n; t++ {
-						rope(q.row(t), t, heads, hd, ropeBase, RopeStyle.Halves)
-						rope(k.row(t), t, heads, hd, ropeBase, RopeStyle.Halves)
+					for let s = 0; s < ids.len(); s++ {
+						for let t = starts[s]; t < starts[s + 1]; t++ {
+							rope(q.row(t), t - starts[s], heads, hd, ropeBase, RopeStyle.Halves)
+							rope(k.row(t), t - starts[s], heads, hd, ropeBase, RopeStyle.Halves)
+						}
 					}
 				}
-				attend(q, k, v, attended, n, heads, hd)
+				attend(q, k, v, attended, starts, heads, hd)
 				layer.output.multiply(attended, projected)
 				for let t = 0; t < n; t++ {
 					let row = x.row(t)
@@ -421,22 +488,45 @@ partial module std.ai.embeddings {
 			return x
 		}
 
-		// The text's vector from its tokens' vectors.
-		def pool(x matrix<float32>, kind Pooling) float32[] {
+		// The vector of the text whose rows run from `from` to `to`.
+		def pool(x matrix<float32>, from int, to int, kind Pooling) float32[] {
 			let v float32[]
 			v.len(width)
 			match kind {
 				case Pooling.First:
-					x.row(0).copy(v)
+					x.row(from).copy(v)
 				case Pooling.Last:
-					x.row(x.rows - 1).copy(v)
+					x.row(to - 1).copy(v)
 				default:
-					for let t = 0; t < x.rows; t++ {
+					for let t = from; t < to; t++ {
 						addInto(v, x.row(t), 0, width)
 					}
-					scaleBy(v, float32(1) / float32(x.rows))
+					scaleBy(v, float32(1) / float32(to - from))
 			}
 			return v
+		}
+
+		// The head's score for each text, from its first row.
+		// Fails when the encoder has no head.
+		def score(x matrix<float32>, starts int[]) !float[] {
+			let dense = pooler
+			fail "embeddings: the model has no classification head (cls.weight and cls.output)" unless dense is Weights && scorer.len() == width
+			let texts = starts.len() - 1
+			let firsts = matrix<float32>[].size(texts, width)
+			for let s = 0; s < texts; s++ {
+				x.row(starts[s]).copy(firsts.row(s))
+			}
+			let pooled = matrix<float32>[].size(texts, width)
+			project(dense, firsts, pooled, poolerBias)
+			let scores float[]
+			for let s = 0; s < texts; s++ {
+				let row = pooled.row(s)
+				for let j = 0; j < width; j++ {
+					row[j] = float32(math.tanh(float(row[j])))
+				}
+				scores.push(float(dot(scorer, row) + scorerBias))
+			}
+			return scores
 		}
 	}
 
@@ -451,12 +541,15 @@ partial module std.ai.embeddings {
 		}
 	}
 
-	// Every token attending to every token, a task per head:
-	// softmax(q·kᵀ/√hd)·v into `out`.
-	internal def attend(q matrix<float32>, k matrix<float32>, v matrix<float32>, out matrix<float32>, n int, heads int, hd int) {
+	// Every token attending to every token of its own text, a task per
+	// text and head: softmax(q·kᵀ/√hd)·v into `out`.
+	internal def attend(q matrix<float32>, k matrix<float32>, v matrix<float32>, out matrix<float32>, starts int[], heads int, hd int) {
 		let scale = float32(1) / float32(math.sqrt(float(hd)))
-		forall let h in 0..heads {
-			let o = h * hd
+		let texts = starts.len() - 1
+		forall let job in 0..texts * heads {
+			let base = starts[job / heads]
+			let n = starts[job / heads + 1] - base
+			let o = (job % heads) * hd
 			let scores float32[]
 			scores.len(n)
 			let kh float32[]
@@ -464,16 +557,16 @@ partial module std.ai.embeddings {
 			let vh float32[]
 			vh.len(n * hd)
 			for let t = 0; t < n; t++ {
-				k.row(t)[o:o + hd].copy(kh[t * hd:(t + 1) * hd])
-				v.row(t)[o:o + hd].copy(vh[t * hd:(t + 1) * hd])
+				k.row(base + t)[o:o + hd].copy(kh[t * hd:(t + 1) * hd])
+				v.row(base + t)[o:o + hd].copy(vh[t * hd:(t + 1) * hd])
 			}
 			for let i = 0; i < n; i++ {
-				let qi = q.row(i)[o:o + hd].clone()
+				let qi = q.row(base + i)[o:o + hd].clone()
 				for let j = 0; j < n; j++ {
 					scores[j] = headDot(qi, kh, j * hd, hd) * scale
 				}
 				softmax(scores)
-				let row = out.row(i)
+				let row = out.row(base + i)
 				for let e = 0; e < hd; e++ {
 					row[o + e] = float32(0)
 				}
@@ -557,7 +650,7 @@ partial module std.ai.embeddings {
 		let count = file.getInt("{arch}.block_count")
 		fail "embeddings: the file lacks {arch}.embedding_length, head_count or block_count" when width is none || heads is none || count is none
 		let types = try file.readFloats("token_types.weight")
-		let encoder = new Encoder(try loadWeights(file, "token_embd.weight"), types[0:width], try file.readFloats("token_embd_norm.weight"), try file.readFloats("token_embd_norm.bias"))
+		let encoder = new Encoder(try loadWeights(file, "token_embd.weight"), types, try file.readFloats("token_embd_norm.weight"), try file.readFloats("token_embd_norm.bias"))
 		encoder.width = width
 		encoder.heads = heads
 		let context = file.getInt("{arch}.context_length")
@@ -592,6 +685,18 @@ partial module std.ai.embeddings {
 				layer.gate = try loadWeights(file, p + "ffn_gate.weight")
 			}
 			encoder.layers.push(layer)
+		}
+		if file.tensor("cls.output.weight") is ai.TensorInfo {
+			// One label's row (llama.cpp keeps a single label as a vector).
+			let scores = try file.readFloats("cls.output.weight")
+			fail "embeddings: the classification head gives {scores.len() / width} scores; a reranker gives one" unless scores.len() == width
+			encoder.scorer = scores
+			let bias = try optionalFloats(file, "cls.output.bias")
+			encoder.scorerBias = bias.len() > 0 ?? (bias[0], float32(0))
+			if file.tensor("cls.weight") is ai.TensorInfo {
+				encoder.pooler = try loadWeights(file, "cls.weight")
+				encoder.poolerBias = try optionalFloats(file, "cls.bias")
+			}
 		}
 		return encoder
 	}
