@@ -1,0 +1,401 @@
+partial module std.crypto.openpgp {
+	use (
+		std.crypto
+		std.crypto.cipher
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+	)
+
+	// A Public Key Encrypted Session Key packet (RFC 9580 §5.1).
+	internal struct PKESK {
+		version    int
+		// Version 3: the recipient's Key ID; version 6: its fingerprint.
+		// Empty (or zeros) for an anonymous recipient.
+		recipient  byte[]
+		keyVersion int    = 0
+		algorithm  int
+		// The algorithm-specific fields.
+		fields     byte[]
+	}
+
+	internal def parsePKESK(body byte[]) !PKESK {
+		let r = new BodyReader(body)
+		let version = try r.byte1()
+		if version == 3 {
+			let id = try r.take(8)
+			let algorithm = try r.byte1()
+			return PKESK{version: 3, recipient: id, algorithm: algorithm, fields: r.rest()}
+		}
+		fail pgpError("PKESK version {version} is not known") unless version == 6
+		let size = try r.byte1()
+		let keyVersion = 0
+		let fp byte[] = []
+		if size > 0 {
+			keyVersion = try r.byte1()
+			fp = try r.take(size - 1)
+		}
+		let algorithm = try r.byte1()
+		return PKESK{version: 6, recipient: fp, keyVersion: keyVersion, algorithm: algorithm, fields: r.rest()}
+	}
+
+	// Whether a PKESK names this key packet, or no one.
+	internal def pkeskFor(p PKESK, k KeyPacket) bool {
+		return false unless p.algorithm == k.algorithm
+		return true when p.recipient.len() == 0 || p.recipient.hex() == "0000000000000000"
+		return p.recipient.hex() == (p.version == 3 ?? (k.keyID(), k.fingerprint())).hex()
+	}
+
+	// The 2-octet sum of the session key octets.
+	internal def keyChecksum(key byte[]) byte[] {
+		let sum = 0
+		for let b in key {
+			sum = (sum + int(b)) & 0xFFFF
+		}
+		return [byte(sum >> 8), byte(sum & 0xFF)]
+	}
+
+	// A PKESK packet body encrypting a session key to k: version 3 (the
+	// cipher travels with the key) or 6.
+	internal def pkeskBody(k KeyPacket, version int, cipherID int, sessionKey byte[]) !byte[] {
+		let out byte[] = [byte(version)]
+		if version == 3 {
+			out += k.keyID()
+		} else {
+			let fp = k.fingerprint()
+			out += [byte(fp.len() + 1), byte(k.version)]
+			out += fp
+		}
+		out.push(byte(k.algorithm))
+		let prefix byte[] = version == 3 ?? ([byte(cipherID)], [])
+		switch k.algorithm {
+			case 1, 2:
+				let pub = new crypto.RSAPublicKey(parseBigInt(k.mpis[0]), int(parseBigInt(k.mpis[1])))
+				let m = prefix + sessionKey + keyChecksum(sessionKey)
+				out += mpiBytes(try pub.encrypt(m, crypto.RSAPadding.PKCS1v15))
+			case 16:
+				fail pgpError("Elgamal does not encrypt to version 6 PKESK packets") when version == 6
+				let (c1, c2) = try elgamalEncrypt(k, prefix + sessionKey + keyChecksum(sessionKey))
+				out += mpiBytes(c1)
+				out += mpiBytes(c2)
+			case 18:
+				out += try ecdhEncrypt(k, prefix + sessionKey + keyChecksum(sessionKey))
+			case 25, 26:
+				fail pgpError("X25519 and X448 carry only AES session keys") when version == 3 && !(cipherID := 7 || 8 || 9)
+				let x25519 = k.algorithm == 25
+				let ephemeral byte[] = []
+				let shared byte[] = []
+				if x25519 {
+					let eph = try crypto.generateX25519Key()
+					ephemeral = eph.public.bytes
+					shared = try eph.sharedSecret(try crypto.newX25519PublicKey(k.native))
+				} else {
+					let eph = try crypto.generateX448Key()
+					ephemeral = eph.public.bytes
+					shared = try eph.sharedSecret(try crypto.newX448PublicKey(k.native))
+				}
+				let kek = try nativeKEK(x25519, ephemeral, k.native, shared)
+				let wrapped = try cipher.wrapKey(try cipher.newAES(kek), sessionKey)
+				out += ephemeral
+				out.push(byte(wrapped.len() + prefix.len()))
+				out += prefix
+				out += wrapped
+			default:
+				fail pgpError("public key algorithm {k.algorithm} does not encrypt")
+		}
+		return out
+	}
+
+	// The cipher (0 when a version 6 PKESK leaves it to the SEIPD packet)
+	// and session key a PKESK holds for an unlocked key.
+	internal def pkeskOpen(p PKESK, k KeyPacket) !(int, byte[]) {
+		fail pgpError("the key is locked: unlock it with its passphrase") unless k.unlocked
+		let r = new BodyReader(p.fields)
+		let m byte[] = []
+		switch p.algorithm {
+			case 1, 2:
+				let priv = try rsaPrivate(k)
+				let c = leftPad(try r.mpi(), priv.size())
+				m = priv.decrypt(c, crypto.RSAPadding.PKCS1v15) onerror (err error) {
+					fail pgpError("the session key does not decrypt")
+				}
+			case 16:
+				m = try elgamalDecrypt(k, try r.mpi(), try r.mpi())
+			case 18:
+				m = try ecdhDecrypt(k, r)
+			case 25, 26:
+				let x25519 = p.algorithm == 25
+				let ephemeral = try r.take(x25519 ?? (32, 56))
+				let size = try r.byte1()
+				let cipherID = 0
+				if p.version == 3 {
+					cipherID = try r.byte1()
+					size--
+				}
+				let wrapped = try r.take(size)
+				let shared byte[] = []
+				if x25519 {
+					let priv = try crypto.newX25519PrivateKey(k.secretNative)
+					shared = try priv.sharedSecret(try crypto.newX25519PublicKey(ephemeral))
+				} else {
+					let priv = try crypto.newX448PrivateKey(k.secretNative)
+					shared = try priv.sharedSecret(try crypto.newX448PublicKey(ephemeral))
+				}
+				let kek = try nativeKEK(x25519, ephemeral, k.native, shared)
+				let key = cipher.unwrapKey(try cipher.newAES(kek), wrapped) onerror (err error) {
+					fail pgpError("the session key does not decrypt")
+				}
+				fail pgpError("X25519 and X448 carry only AES session keys") when p.version == 3 && !(cipherID := 7 || 8 || 9)
+				fail pgpError("the session key is {key.len()} octets, not one of algorithm {cipherID}") when p.version == 3 && key.len() != (try keySize(cipherID))
+				return (cipherID, key)
+			default:
+				fail pgpError("public key algorithm {p.algorithm} does not decrypt")
+		}
+		return try splitSessionKey(m, p.version == 3)
+	}
+
+	// The cipher and key of a decrypted session key field: the cipher octet
+	// (when it is there), the key and its checksum.
+	internal def splitSessionKey(m byte[], withCipher bool) !(int, byte[]) {
+		let start = withCipher ?? (1, 0)
+		fail pgpError("the session key does not decrypt") when m.len() < start + 3
+		let key = m[start:m.len() - 2]
+		fail pgpError("the session key does not decrypt") unless keyChecksum(key).hex() == m[m.len() - 2:].hex()
+		let cipherID = withCipher ?? (int(m[0]), 0)
+		fail pgpError("the session key does not fit algorithm {cipherID}") when withCipher && key.len() != (try keySize(cipherID))
+		return (cipherID, key)
+	}
+
+	// The AES key wrapping key of X25519 (HKDF-SHA256, 16 octets) and X448
+	// (HKDF-SHA512, 32 octets): §5.1.6, §5.1.7.
+	internal def nativeKEK(x25519 bool, ephemeral byte[], recipient byte[], shared byte[]) !byte[] {
+		let ikm = ephemeral + recipient + shared
+		return try hash.hkdf(Hash.SHA256, ikm, [], "OpenPGP X25519".bytes(), 16) when x25519
+		return try hash.hkdf(Hash.SHA512, ikm, [], "OpenPGP X448".bytes(), 32)
+	}
+
+	internal def rsaPrivate(k KeyPacket) !crypto.RSAPrivateKey {
+		fail pgpError("an RSA secret key has four MPIs") unless k.secretMPIs.len() == 4
+		let n = parseBigInt(k.mpis[0])
+		let e = parseBigInt(k.mpis[1])
+		let d = parseBigInt(k.secretMPIs[0])
+		let p = parseBigInt(k.secretMPIs[1])
+		let q = parseBigInt(k.secretMPIs[2])
+		let qinv = q.modInverse(p)
+		fail pgpError("the RSA primes have no inverse") when qinv is none
+		let one = bigint(1)
+		return new crypto.RSAPrivateKey(n, int(e), d, p, q, d.mod(p - one), d.mod(q - one), qinv)
+	}
+
+	// Elgamal (§5.1.4): m in EME-PKCS1-v1_5 the size of p, then g^k and
+	// m·y^k mod p.
+	internal def elgamalEncrypt(k KeyPacket, message byte[]) !(byte[], byte[]) {
+		let p = parseBigInt(k.mpis[0])
+		let g = parseBigInt(k.mpis[1])
+		let y = parseBigInt(k.mpis[2])
+		let size = (p.bitLen() + 7) / 8
+		fail pgpError("the session key is too long for the Elgamal key") when message.len() > size - 11
+		let padding byte[] = []
+		for padding.len() < size - message.len() - 3 {
+			for let b in try crypto.rand(size - message.len() - 3 - padding.len()) {
+				padding.push(b) when b != byte(0)
+			}
+		}
+		let m = parseBigInt(byte[0, 2] + padding + byte[0] + message)
+		let two = bigint(2)
+		let secret = parseBigInt(try crypto.rand(size + 8)).mod(p - two) + bigint(1)
+		let c1 = g.modPow(secret, p)
+		let c2 = (m * y.modPow(secret, p)).mod(p)
+		return (c1.bytes(), c2.bytes())
+	}
+
+	internal def elgamalDecrypt(k KeyPacket, c1Bytes byte[], c2Bytes byte[]) !byte[] {
+		let p = parseBigInt(k.mpis[0])
+		let x = parseBigInt(k.secretMPIs[0])
+		let c1 = parseBigInt(c1Bytes)
+		let c2 = parseBigInt(c2Bytes)
+		let inverse = c1.modPow(x, p).modInverse(p)
+		fail pgpError("the session key does not decrypt") when inverse is none
+		let size = (p.bitLen() + 7) / 8
+		let em = leftPad((c2 * inverse).mod(p).bytes(), size)
+		fail pgpError("the session key does not decrypt") unless em.len() == size && em[0] == byte(0) && em[1] == byte(2)
+		let i = 2
+		for i < em.len() && em[i] != byte(0) {
+			i++
+		}
+		fail pgpError("the session key does not decrypt") when i >= em.len() || i < 10
+		return em[i + 1:]
+	}
+
+	// The "Anonymous Sender" of the ECDH KDF parameters (§11.5).
+	internal const anonymousSender = byte[0x41, 0x6E, 0x6F, 0x6E, 0x79, 0x6D, 0x6F, 0x75, 0x73, 0x20, 0x53, 0x65, 0x6E, 0x64, 0x65, 0x72, 0x20, 0x20, 0x20, 0x20]
+
+	// The key encryption key of ECDH (§11.4, §11.5): the KDF of the shared
+	// x coordinate over the curve, algorithm, KDF parameters and recipient.
+	internal def ecdhKEK(k KeyPacket, shared byte[]) !byte[] {
+		fail pgpError("ECDH does not take hash algorithm {k.kdfHash} for its KDF") when k.kdfHash := 1 || 2 || 3
+		fail pgpError("ECDH wraps keys only with AES, not algorithm {k.kdfCipher}") unless k.kdfCipher := 7 || 8 || 9
+		let params byte[] = [byte(k.oid.len())]
+		params += k.oid
+		params += [byte(18), byte(3), byte(1), byte(k.kdfHash), byte(k.kdfCipher)]
+		params += anonymousSender
+		params += k.fingerprint()
+		let input byte[] = [byte(0), byte(0), byte(0), byte(1)]
+		input += shared
+		input += params
+		let digest = try digestOf(k.kdfHash, input)
+		let size = try keySize(k.kdfCipher)
+		fail pgpError("the KDF hash is shorter than the wrapping key") when digest.len() < size
+		return digest[0:size]
+	}
+
+	// ECDH (§11.5): an ephemeral key, the KEK it agrees on, and the session
+	// key field padded (PKCS #5) and wrapped.
+	internal def ecdhEncrypt(k KeyPacket, m byte[]) !byte[] {
+		let info = try curveInfo(k.oid)
+		let ephemeral byte[] = []
+		let shared byte[] = []
+		if info.form == CurveForm.Curve25519Legacy {
+			fail pgpError("a Curve25519Legacy point starts with 0x40") unless k.mpis[0].len() == 33 && k.mpis[0][0] == byte(0x40)
+			let eph = try crypto.generateX25519Key()
+			ephemeral = byte[0x40] + eph.public.bytes
+			shared = try eph.sharedSecret(try crypto.newX25519PublicKey(k.mpis[0][1:]))
+		} else {
+			fail pgpError("ECDH needs a Weierstrass curve or Curve25519Legacy") unless info.form == CurveForm.Weierstrass
+			let c = try weierstrass(info)
+			let peer = try crypto.unmarshalPoint(c, k.mpis[0])
+			let eph = try crypto.ecdhKeyPair(c)
+			ephemeral = crypto.marshalPoint(c, eph.public)
+			shared = try crypto.ecdh(c, eph.scalar, peer)
+		}
+		let kek = try ecdhKEK(k, shared)
+		let pad = 8 - m.len() % 8
+		let padded = m.clone()
+		for let i = 0; i < pad; i++ {
+			padded.push(byte(pad))
+		}
+		let wrapped = try cipher.wrapKey(try cipher.newAES(kek), padded)
+		let out = mpiBytes(ephemeral)
+		out.push(byte(wrapped.len()))
+		out += wrapped
+		return out
+	}
+
+	internal def ecdhDecrypt(k KeyPacket, r BodyReader) !byte[] {
+		let ephemeral = try r.mpi()
+		let size = try r.byte1()
+		fail pgpError("an ECDH wrapped key length of 255 is reserved") when size == 255
+		let wrapped = try r.take(size)
+		let info = try curveInfo(k.oid)
+		let shared byte[] = []
+		if info.form == CurveForm.Curve25519Legacy {
+			fail pgpError("a Curve25519Legacy point starts with 0x40") unless ephemeral.len() == 33 && ephemeral[0] == byte(0x40)
+			// The secret MPI is the native scalar reversed (§5.5.5.6.1.1).
+			let scalar = leftPad(k.secretMPIs[0], 32).clone().reverse()
+			let priv = try crypto.newX25519PrivateKey(scalar)
+			shared = try priv.sharedSecret(try crypto.newX25519PublicKey(ephemeral[1:]))
+		} else {
+			let c = try weierstrass(info)
+			let point = try crypto.unmarshalPoint(c, ephemeral)
+			shared = try crypto.ecdh(c, parseBigInt(k.secretMPIs[0]), point)
+		}
+		let kek = try ecdhKEK(k, shared)
+		let padded = cipher.unwrapKey(try cipher.newAES(kek), wrapped) onerror (err error) {
+			fail pgpError("the session key does not decrypt")
+		}
+		fail pgpError("the session key does not decrypt") when padded.len() == 0
+		let pad = int(padded[padded.len() - 1])
+		fail pgpError("the session key does not decrypt") when pad < 1 || pad > 8 || pad > padded.len()
+		for let i = padded.len() - pad; i < padded.len(); i++ {
+			fail pgpError("the session key does not decrypt") unless int(padded[i]) == pad
+		}
+		return padded[0:padded.len() - pad]
+	}
+
+	// A Symmetric Key Encrypted Session Key packet (§5.3).
+	internal struct SKESK {
+		version  int
+		cipherID int
+		aead     int    = 0
+		s2k      S2K
+		iv       byte[] = []
+		// The encrypted session key (and tag); empty when the S2K output is
+		// the session key itself (version 4).
+		key      byte[] = []
+	}
+
+	internal def parseSKESK(body byte[]) !SKESK {
+		let r = new BodyReader(body)
+		let version = try r.byte1()
+		if version == 4 {
+			let cipherID = try r.byte1()
+			let s2k = try readS2K(r)
+			return SKESK{version: 4, cipherID: cipherID, s2k: s2k, key: r.rest()}
+		}
+		fail pgpError("SKESK version {version} is not known") unless version == 6
+		try r.byte1()
+		let cipherID = try r.byte1()
+		let mode = try r.byte1()
+		let s2kSize = try r.byte1()
+		let s2kReader = new BodyReader(try r.take(s2kSize))
+		let s2k = try readS2K(s2kReader)
+		fail pgpError("the S2K field has octets after its specifier") unless s2kReader.done()
+		let iv = try r.take(try aeadNonceSize(mode))
+		return SKESK{version: 6, cipherID: cipherID, aead: mode, s2k: s2k, iv: iv, key: r.rest()}
+	}
+
+	// The cipher (0 for version 6) and session key a passphrase opens.
+	internal def skeskOpen(p SKESK, passphrase byte[]) !(int, byte[]) {
+		fail pgpError("an SKESK needs a salted S2K") when p.s2k.kind == 0 && (p.version == 6 || p.key.len() > 0)
+		fail pgpError("a version 6 SKESK does not use hash algorithm {p.s2k.hash}") when p.version == 6 && p.s2k.kind != 4 && (p.s2k.hash := 1 || 2 || 3)
+		let size = try keySize(p.cipherID)
+		let derived = try deriveKey(p.s2k, passphrase, size)
+		if p.version == 4 {
+			return (p.cipherID, derived) when p.key.len() == 0
+			let plain = try cfbDecrypt(p.cipherID, derived, zeroBytes(try blockSizeOf(p.cipherID)), p.key)
+			fail pgpError("the passphrase does not decrypt the message") when plain.len() < 2
+			let cipherID = int(plain[0])
+			let key = plain[1:]
+			fail pgpError("the passphrase does not decrypt the message") unless knownSymmetric(cipherID) && key.len() == (try keySize(cipherID))
+			return (cipherID, key)
+		}
+		let ad byte[] = [byte(0xC0 | tagSKESK), byte(6), byte(p.cipherID), byte(p.aead)]
+		let kek = try hash.hkdf(Hash.SHA256, derived, [], ad, size)
+		let aead = try aeadOf(p.aead, p.cipherID, kek)
+		let key = aead.open(p.iv, p.key, ad) onerror (err error) {
+			fail pgpError("the passphrase does not decrypt the message")
+		}
+		return (0, key)
+	}
+
+	// An SKESK packet body: version 4 (iterated and salted SHA2-256, the
+	// session key in CFB) or 6 (Argon2 and AEAD).
+	internal def skeskBody(version int, cipherID int, mode int, sessionKey byte[], passphrase byte[]) !byte[] {
+		let size = try keySize(cipherID)
+		if version == 4 {
+			let s2k = try newS2K(false)
+			let derived = try deriveKey(s2k, passphrase, size)
+			let out byte[] = [byte(4), byte(cipherID)]
+			out += s2kBytes(s2k)
+			out += try cfbEncrypt(cipherID, derived, zeroBytes(try blockSizeOf(cipherID)), [byte(cipherID)] + sessionKey)
+			return out
+		}
+		let s2k = try newS2K(true)
+		let derived = try deriveKey(s2k, passphrase, size)
+		let ad byte[] = [byte(0xC0 | tagSKESK), byte(6), byte(cipherID), byte(mode)]
+		let kek = try hash.hkdf(Hash.SHA256, derived, [], ad, size)
+		let iv = try crypto.rand(try aeadNonceSize(mode))
+		let aead = try aeadOf(mode, cipherID, kek)
+		let field = s2kBytes(s2k)
+		let out byte[] = [byte(6), byte(3 + field.len() + iv.len()), byte(cipherID), byte(mode), byte(field.len())]
+		out += field
+		out += iv
+		out += aead.seal(iv, sessionKey, ad)
+		return out
+	}
+
+	internal def zeroBytes(count int) byte[] {
+		let out byte[] = []
+		out.len(count)
+		return out
+	}
+}

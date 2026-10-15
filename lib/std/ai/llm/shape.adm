@@ -1,0 +1,590 @@
+internal partial module std.ai.llm.calls {
+	use (
+		std.reflection
+		std.data.encoding::(JSON)
+		std.data.encoding.jsonschema
+	)
+
+	// Structured output: a recognizer of the JSON texts a JSON Schema
+	// allows, fed a reply byte by byte, so sampling keeps only the tokens
+	// whose bytes it accepts. It reads what replies need: objects
+	// (`properties`, `required`; only the declared properties when there
+	// are any), arrays (`items`, `minItems`, `maxItems`), strings, numbers,
+	// integers, booleans, null, `enum` and `const`, `type` lists, `anyOf`
+	// and `oneOf` (as anyOf: one of them), and `{}` for any JSON. Other
+	// keywords (patterns, formats, bounds of numbers) do not narrow it.
+
+	// What a schema node allows.
+	enum ShapeKind {
+		Any,
+		Object,
+		Array,
+		Text,
+		Number,
+		Integer,
+		Boolean,
+		Null,
+		// One of `constants` (JSON texts).
+		Constant,
+		// One of `options`.
+		Either,
+	}
+
+	// A schema compiled for recognizing.
+	type ShapeNode {
+		kind      ShapeKind
+		// Object: the declared properties, in order, and the required ones.
+		names     string[]
+		values    ShapeNode[]
+		required  string[]
+		// Array: the items' node and the count bounds (-1 for none).
+		items     ?ShapeNode
+		least     int         = 0
+		most      int         = -1
+		constants string[]
+		options   ShapeNode[]
+
+		def new(kind ShapeKind) {
+			self.kind = kind
+		}
+
+		// The node of property `name`; none when the object has no such
+		// property.
+		def property(name string) ?ShapeNode {
+			for let (k, n) in names {
+				return values[k] when n == name
+			}
+			return none
+		}
+	}
+
+	// The node a JSON Schema (as JSON.parse builds it) describes.
+	def compileShape(schema ?any) ShapeNode {
+		return new ShapeNode(ShapeKind.Any) unless schema is map<string, any>
+		if schema.hasKey("const") {
+			let constant = schema.get("const")
+			let node = new ShapeNode(ShapeKind.Constant)
+			node.constants.push(constant is none ?? ("null", string((new JSON()).encode(constant))))
+			return node
+		}
+		let choices = schema.get("enum")
+		if choices is any[] {
+			let node = new ShapeNode(ShapeKind.Constant)
+			for let (_, c) in choices {
+				node.constants.push(c is none ?? ("null", string((new JSON()).encode(c))))
+			}
+			return node
+		}
+		for let (_, key) in string["anyOf", "oneOf"] {
+			let list = schema.get(key)
+			if list is any[] && list.len() > 0 {
+				let node = new ShapeNode(ShapeKind.Either)
+				for let (_, option) in list {
+					node.options.push(compileShape(option))
+				}
+				return node
+			}
+		}
+		let declared = schema.get("type")
+		if declared is any[] {
+			let node = new ShapeNode(ShapeKind.Either)
+			for let (_, one) in declared {
+				let alone = new map<string, any>()
+				for let (_, k) in schema.keys() {
+					let v = schema.get(k)
+					alone.set(k, v) unless v is none
+				}
+				alone.set("type", one) unless one is none
+				node.options.push(compileShape(alone))
+			}
+			return node
+		}
+		let kind = declared is string ?? (declared, "")
+		match kind {
+			case "object":
+				return objectShape(schema)
+			case "array":
+				let node = new ShapeNode(ShapeKind.Array)
+				node.items = compileShape(schema.get("items"))
+				node.least = countAt(schema, "minItems", 0)
+				node.most = countAt(schema, "maxItems", -1)
+				return node
+			case "string":
+				return new ShapeNode(ShapeKind.Text)
+			case "number":
+				return new ShapeNode(ShapeKind.Number)
+			case "integer":
+				return new ShapeNode(ShapeKind.Integer)
+			case "boolean":
+				return new ShapeNode(ShapeKind.Boolean)
+			case "null":
+				return new ShapeNode(ShapeKind.Null)
+			default:
+				return schema.hasKey("properties") ?? (objectShape(schema), new ShapeNode(ShapeKind.Any))
+		}
+	}
+
+	internal def objectShape(schema map<string, any>) ShapeNode {
+		let node = new ShapeNode(ShapeKind.Object)
+		let properties = schema.get("properties")
+		if properties is map<string, any> {
+			for let (_, name) in properties.keys() {
+				node.names.push(name)
+				node.values.push(compileShape(properties.get(name)))
+			}
+		}
+		let required = schema.get("required")
+		if required is any[] {
+			for let (_, r) in required {
+				node.required.push(r) when r is string
+			}
+		}
+		return node
+	}
+
+	internal def countAt(schema map<string, any>, key string, otherwise int) int {
+		let v = schema.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return otherwise
+	}
+
+	// Where one alternative of the recognizer is: a stack of frames, the
+	// innermost last.
+	enum FrameKind {
+		// A value of `node` comes next.
+		Value,
+		// Inside an object: `phase` 0 key or end, 1 key (after a comma),
+		// 2 colon, 3 comma or end.
+		Object,
+		// Inside an array: `phase` 0 value or end, 1 value (after a
+		// comma), 2 comma or end.
+		Array,
+		// Inside a string; `known` holds the texts it may still be (enum
+		// members, keys), each without its quotes; empty for any.
+		Text,
+		// Inside a number; `phase` as `numberStep`.
+		Number,
+		// The rest of a literal (`true`, a constant) in `literal`.
+		Literal,
+	}
+
+	type Frame {
+		kind    FrameKind
+		node    ?ShapeNode
+		phase   int
+		count   int
+		// Object: the keys written; the key being written.
+		seen    string[]
+		key     string
+		// Text: the bytes so far, the texts allowed, whether an escape
+		// opened, whether this string is an object's key.
+		text    byte[]
+		known   string[]
+		escaped bool
+		isKey   bool
+		integer bool
+		literal byte[]
+
+		def new(kind FrameKind, node ?ShapeNode) {
+			self.kind = kind
+			self.node = node
+		}
+
+		def copy() Frame {
+			let out = new Frame(kind, node)
+			out.phase = phase
+			out.count = count
+			out.seen = seen.clone()
+			out.key = key
+			out.text = text.clone()
+			out.known = known.clone()
+			out.escaped = escaped
+			out.isKey = isKey
+			out.integer = integer
+			out.literal = literal.clone()
+			return out
+		}
+	}
+
+	// The recognizer: the alternatives still alive, each a stack of
+	// frames, and the whitespace run (bounded, so a reply cannot loop on
+	// spaces).
+	type ShapeMatcher {
+		internal stacks Frame[][]
+		internal spaces int
+		internal fed    int
+
+		def new(root ShapeNode) {
+			stacks.push([new Frame(FrameKind.Value, root)])
+		}
+
+		// A copy to try bytes on.
+		def copy() ShapeMatcher {
+			let out = new ShapeMatcher(new ShapeNode(ShapeKind.Any))
+			out.stacks.len(0)
+			for let (_, s) in stacks {
+				let frames Frame[]
+				for let (_, f) in s {
+					frames.push(f.copy())
+				}
+				out.stacks.push(frames)
+			}
+			out.spaces = spaces
+			out.fed = fed
+			return out
+		}
+
+		// Whether nothing has been fed yet.
+		def untouched() bool {
+			return fed == 0
+		}
+
+		// Feeds `bytes`; false when no alternative accepts them (the
+		// matcher is then dead).
+		def feed(bytes byte[]) bool {
+			for let (_, b) in bytes {
+				return false unless step(b)
+			}
+			return true
+		}
+
+		// Whether a whole value has been read (only whitespace may follow).
+		def complete() bool {
+			for let (_, s) in stacks {
+				return true when s.len() == 0
+				return true when s.len() == 1 && s[0].kind == FrameKind.Number && numberEnds(s[0])
+			}
+			return false
+		}
+
+		internal def step(b byte) bool {
+			let white = b == byte(32) || b == byte(10) || b == byte(9) || b == byte(13)
+			if white && !inString() {
+				spaces++
+				return false when spaces > 2
+			} else {
+				spaces = 0
+			}
+			fed++
+			let next Frame[][]
+			for let (_, s) in stacks {
+				for let (_, out) in advance(s, b) {
+					next.push(out)
+				}
+			}
+			stacks = next
+			return stacks.len() > 0
+		}
+
+		// Whether every alternative is inside a string (where whitespace is
+		// text).
+		internal def inString() bool {
+			for let (_, s) in stacks {
+				return false when s.len() == 0 || s[s.len() - 1].kind != FrameKind.Text
+			}
+			return stacks.len() > 0
+		}
+	}
+
+	// The stacks byte `b` leads `stack` to: none when it rejects it,
+	// several when a value may be one of several shapes.
+	internal def advance(stack Frame[], b byte) Frame[][] {
+		let out Frame[][]
+		let white = b == byte(32) || b == byte(10) || b == byte(9) || b == byte(13)
+		if stack.len() == 0 {
+			out.push(stack) when white
+			return out
+		}
+		let top = stack[stack.len() - 1]
+		match top.kind {
+			case FrameKind.Value:
+				if white {
+					out.push(stack)
+					return out
+				}
+				let node = top.node
+				for let (_, opened) in opening(node is none ?? (new ShapeNode(ShapeKind.Any), node), b) {
+					let next = stack[:stack.len() - 1].clone()
+					next.push(...opened)
+					out.push(next)
+				}
+			case FrameKind.Text:
+				let next = textStep(stack, top, b)
+				out.push(next) unless next is none
+			case FrameKind.Number:
+				let digit = numberStep(top, b)
+				if digit {
+					out.push(stack)
+				} else if numberEnds(top) {
+					// The number ended: the byte belongs to what holds it.
+					let rest = stack[:stack.len() - 1].clone()
+					for let (_, after) in advance(close(rest), b) {
+						out.push(after)
+					}
+				}
+			case FrameKind.Literal:
+				if top.literal.len() > 0 && top.literal[0] == b {
+					top.literal = top.literal[1:].clone()
+					out.push(top.literal.len() == 0 ?? (close(stack[:stack.len() - 1].clone()), stack))
+				}
+			case FrameKind.Object:
+				let node = top.node
+				if white {
+					out.push(stack)
+					return out
+				}
+				if (top.phase == 0 || top.phase == 3) && b == byte(125) {
+					// `}` once every required key is there.
+					for let (_, r) in requiredOf(node) {
+						return out unless top.seen.indexOf(r) >= 0
+					}
+					out.push(close(stack[:stack.len() - 1].clone()))
+				} else if (top.phase == 0 || top.phase == 1) && b == byte(34) {
+					let key = new Frame(FrameKind.Text, none)
+					key.isKey = true
+					key.known = keysLeft(node, top.seen)
+					return out when key.known.len() == 0 && hasNames(node)
+					let next = stack.clone()
+					next.push(key)
+					out.push(next)
+				} else if top.phase == 2 && b == byte(58) {
+					top.phase = 4
+					let next = stack.clone()
+					let field = node is none ?? (none, node.property(top.key))
+					next.push(new Frame(FrameKind.Value, field is none ?? (new ShapeNode(ShapeKind.Any), field)))
+					out.push(next)
+				} else if top.phase == 3 && b == byte(44) {
+					// A comma only when a key may follow it.
+					if !hasNames(node) || keysLeft(node, top.seen).len() > 0 {
+						top.phase = 1
+						out.push(stack)
+					}
+				}
+			case FrameKind.Array:
+				if white {
+					out.push(stack)
+					return out
+				}
+				let node = top.node
+				let most = node is none ?? (-1, node.most)
+				let least = node is none ?? (0, node.least)
+				if (top.phase == 0 || top.phase == 2) && b == byte(93) {
+					out.push(close(stack[:stack.len() - 1].clone())) when top.count >= least
+				} else if top.phase == 2 && b == byte(44) {
+					if most < 0 || top.count < most {
+						top.phase = 1
+						out.push(stack)
+					}
+				} else if top.phase == 0 || top.phase == 1 {
+					return out when top.phase == 0 && most == 0
+					let item = node is none ?? (none, node.items)
+					top.phase = 4
+					let inner = stack.clone()
+					inner.push(new Frame(FrameKind.Value, item is none ?? (new ShapeNode(ShapeKind.Any), item)))
+					for let (_, after) in advance(inner, b) {
+						out.push(after)
+					}
+				}
+			default:
+		}
+		return out
+	}
+
+	// The frames a value of `node` opens with byte `b` (the value's first).
+	internal def opening(node ShapeNode, b byte) Frame[][] {
+		let out Frame[][]
+		match node.kind {
+			case ShapeKind.Either:
+				for let (_, option) in node.options {
+					out.push(...opening(option, b))
+				}
+			case ShapeKind.Any:
+				for let (_, kind) in [ShapeKind.Object, ShapeKind.Array, ShapeKind.Text, ShapeKind.Number, ShapeKind.Boolean, ShapeKind.Null] {
+					out.push(...opening(new ShapeNode(kind), b))
+				}
+			case ShapeKind.Object:
+				out.push([new Frame(FrameKind.Object, node)]) when b == byte(123)
+			case ShapeKind.Array:
+				out.push([new Frame(FrameKind.Array, node)]) when b == byte(91)
+			case ShapeKind.Text:
+				out.push([new Frame(FrameKind.Text, node)]) when b == byte(34)
+			case ShapeKind.Number, ShapeKind.Integer:
+				let number = new Frame(FrameKind.Number, node)
+				number.integer = node.kind == ShapeKind.Integer
+				out.push([number]) when numberStep(number, b)
+			case ShapeKind.Boolean:
+				for let (_, word) in string["true", "false"] {
+					if word.bytes()[0] == b {
+						let literal = new Frame(FrameKind.Literal, node)
+						literal.literal = word.bytes()[1:].clone()
+						out.push(literal.literal.len() == 0 ?? (Frame[], [literal]))
+					}
+				}
+			case ShapeKind.Null:
+				if b == byte(110) {
+					let literal = new Frame(FrameKind.Literal, node)
+					literal.literal = "ull".bytes()
+					out.push([literal])
+				}
+			case ShapeKind.Constant:
+				for let (_, c) in node.constants {
+					let bytes = c.bytes()
+					continue unless bytes.len() > 0 && bytes[0] == b
+					if b == byte(34) {
+						let text = new Frame(FrameKind.Text, node)
+						text.known.push(string(bytes[1:bytes.len() - 1]))
+						out.push([text])
+					} else if bytes.len() == 1 {
+						out.push(Frame[])
+					} else {
+						let literal = new Frame(FrameKind.Literal, node)
+						literal.literal = bytes[1:].clone()
+						out.push([literal])
+					}
+				}
+		}
+		return out
+	}
+
+	// `stack` after the value on its top finished: what holds it moves on.
+	internal def close(stack Frame[]) Frame[] {
+		return stack when stack.len() == 0
+		let top = stack[stack.len() - 1]
+		if top.kind == FrameKind.Object && top.phase == 4 {
+			top.phase = 3
+		} else if top.kind == FrameKind.Array && top.phase == 4 {
+			top.phase = 2
+			top.count++
+		}
+		return stack
+	}
+
+	// One byte of a string: none when it rejects it.
+	internal def textStep(stack Frame[], top Frame, b byte) ?Frame[] {
+		if top.escaped {
+			top.escaped = false
+			top.text.push(b)
+			return none unless b := byte(34) || byte(92) || byte(47) || byte(98) || byte(102) || byte(110) || byte(114) || byte(116) || byte(117)
+			return fits(top) ?? (stack, none)
+		}
+		if b == byte(92) {
+			top.escaped = true
+			top.text.push(b)
+			return fits(top) ?? (stack, none)
+		}
+		if b == byte(34) {
+			// The string ends: it must be one of the allowed texts, if any.
+			let written = string(top.text)
+			return none when top.known.len() > 0 && top.known.indexOf(written) < 0
+			let rest = stack[:stack.len() - 1].clone()
+			if top.isKey {
+				let owner = rest[rest.len() - 1]
+				owner.key = written
+				owner.seen.push(written)
+				owner.phase = 2
+				return rest
+			}
+			return close(rest)
+		}
+		return none when b < byte(32)
+		top.text.push(b)
+		return fits(top) ?? (stack, none)
+	}
+
+	// Whether a string's bytes so far start one of its allowed texts.
+	internal def fits(frame Frame) bool {
+		return true when frame.known.len() == 0
+		let written = string(frame.text)
+		for let (_, k) in frame.known {
+			return true when k.startsWith(written)
+		}
+		return false
+	}
+
+	// One byte of a number; false when it cannot continue the number.
+	// Phases: 0 start, 1 after '-', 2 after a leading 0, 3 in the whole
+	// digits, 4 after '.', 5 in the fraction, 6 after e/E, 7 after its
+	// sign, 8 in the exponent.
+	internal def numberStep(frame Frame, b byte) bool {
+		let digit = b >= byte(48) && b <= byte(57)
+		return false when frame.count >= 24
+		frame.count++
+		match frame.phase {
+			case 0:
+				if b == byte(45) {
+					frame.phase = 1
+					return true
+				}
+				frame.phase = b == byte(48) ?? (2, 3)
+				return digit
+			case 1:
+				frame.phase = b == byte(48) ?? (2, 3)
+				return digit
+			case 2, 3:
+				return true when digit && frame.phase == 3
+				if !frame.integer && b == byte(46) {
+					frame.phase = 4
+					return true
+				}
+				if !frame.integer && (b == byte(101) || b == byte(69)) {
+					frame.phase = 6
+					return true
+				}
+			case 4, 5:
+				if digit {
+					frame.phase = 5
+					return true
+				}
+				if frame.phase == 5 && (b == byte(101) || b == byte(69)) {
+					frame.phase = 6
+					return true
+				}
+			case 6:
+				if b == byte(43) || b == byte(45) {
+					frame.phase = 7
+					return true
+				}
+				frame.phase = 8
+				return digit
+			case 7, 8:
+				frame.phase = 8
+				return digit
+			default:
+		}
+		frame.count--
+		return false
+	}
+
+	// Whether a number may end where it is.
+	internal def numberEnds(frame Frame) bool {
+		return frame.phase := 2 || 3 || 5 || 8
+	}
+
+	internal def requiredOf(node ?ShapeNode) string[] {
+		return node is none ?? (string[], node.required)
+	}
+
+	internal def hasNames(node ?ShapeNode) bool {
+		return !(node is none) && node.names.len() > 0
+	}
+
+	// The declared keys an object has not written yet; empty for an
+	// object that declares none (any key then).
+	internal def keysLeft(node ?ShapeNode, seen string[]) string[] {
+		let out string[]
+		return out when node is none
+		for let (_, n) in node.names {
+			out.push(n) unless seen.indexOf(n) >= 0
+		}
+		return out
+	}
+
+	// The JSON Schema of the type `target` has, for `fill`.
+	// Fails when `target` is none.
+	def schemaFor(target any) !map<string, any> {
+		let described = reflection.descriptorOf(target)
+		fail "llm: fill takes a struct or type to fill" when described is none
+		return jsonschema.schemaOf(described)
+	}
+}

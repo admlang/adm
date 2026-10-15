@@ -1,7 +1,7 @@
 partial module std.ai.onnx {
 	use (
 		std.gpu
-		std.ai.tensor.gpu::(blockSum, blockMax)
+		std.ai.tensor.gpu::(blockSum, blockMax, tileAsync, copyAsync, copyCommit, copyWait, warpTileTf32)
 	)
 
 	// The CUDA kernels of the operators that run on the GPU (see
@@ -149,6 +149,156 @@ partial module std.ai.onnx {
 				float v = alpha * acc[i][j];
 				if (beta != 0.0f) v += beta * C[gm * ldc + gn];
 				C[gm * ldc + gn] = v;
+			}
+		}
+	}
+
+	// deviceGemm on the tensor cores: A and B rounded to TF32, products
+	// added in float32. Blocks of 256 threads compute 128 × 128 tiles of
+	// C, each warp 64 × 32 of them, over slices of 16 steps of k copied to
+	// shared memory asynchronously, the next slice while the tensor cores
+	// work on this one. `threads` as deviceGemm's.
+	@launch(block = 256, x = "threads", cpu = false, arch = 80)
+	internal cuda def deviceGemmTf32(a gpu.DeviceBuffer<float32>, ao, lda, ta, sa int, b gpu.DeviceBuffer<float32>, bo, ldb, tb, sb int, c gpu.DeviceBuffer<float32>, co, ldc, sc, m, n, k, batches int, alpha, beta float32, threads int) !none {
+		__shared__ __align__(16) float As[2][2720];
+		__shared__ __align__(16) float Bs[2][2720];
+		int64_t tilesM = (m + 127) / 128, tilesN = (n + 127) / 128;
+		int64_t blk = blockIdx.x, tiles = tilesM * tilesN;
+		int64_t bt = blk / tiles, rem = blk % tiles;
+		if (bt >= batches) return;
+		int64_t tm = (rem % tilesM) * 128, tn = (rem / tilesM) * 128;
+		float * A = a + ao + bt * sa;
+		float * B = b + bo + bt * sb;
+		float * C = c + co + bt * sc;
+		int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+		// Row-major A and transposed B have k along memory.
+		int alongA = !ta, alongB = tb != 0;
+		int wideA = lda % 4 == 0 && (ao + bt * sa) % 4 == 0, wideB = ldb % 4 == 0 && (bo + bt * sb) % 4 == 0;
+		int aO = alongA ? 20: 1, aK = alongA ? 1: 136, bO = alongB ? 20: 1, bK = alongB ? 1: 136;
+		float acc[64];
+		#pragma unroll
+		for (int i = 0; i < 64; i++) acc[i] = 0.0f;
+		int64_t slices = (k + 15) / 16;
+		tileAsync(As[0], 2720, A, 0, lda, alongA, tm, m, 0, k, wideA);
+		tileAsync(Bs[0], 2720, B, 0, ldb, alongB, tn, n, 0, k, wideB);
+		copyCommit();
+		for (int64_t q = 0; q < slices; q++) {
+			int cur = q & 1;
+			if (q + 1 < slices) {
+				tileAsync(As[cur ^ 1], 2720, A, 0, lda, alongA, tm, m, (q + 1) * 16, k, wideA);
+				tileAsync(Bs[cur ^ 1], 2720, B, 0, ldb, alongB, tn, n, (q + 1) * 16, k, wideB);
+				copyCommit();
+				copyWait(1);
+			} else {
+				copyWait(0);
+			}
+			__syncthreads();
+			warpTileTf32(As[cur], 2720, aO, aK, Bs[cur], 2720, bO, bK, acc, 64, (warp >> 2) * 64, (warp & 3) * 32, 4, 4);
+			__syncthreads();
+		}
+		int g = lane >> 2, t = lane & 3;
+		#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			#pragma unroll
+			for (int j = 0; j < 4; j++) {
+				#pragma unroll
+				for (int r = 0; r < 4; r++) {
+					int64_t gm = tm + (warp >> 2) * 64 + i * 16 + g + (r >> 1) * 8;
+					int64_t gn = tn + (warp & 3) * 32 + j * 8 + t * 2 + (r & 1);
+					if (gm >= m || gn >= n) continue;
+					float v = alpha * acc[(i * 4 + j) * 4 + r];
+					if (beta != 0.0f) v += beta * C[gm * ldc + gn];
+					C[gm * ldc + gn] = v;
+				}
+			}
+		}
+	}
+
+	// deviceConv on the tensor cores, rounded and tiled as deviceGemmTf32:
+	// the weights' rows keep k along shared memory, the window columns
+	// keep the positions. Each thread copies the window values of one
+	// position, walking its taps without divisions. `threads` as
+	// deviceConv's.
+	@launch(block = 256, x = "threads", cpu = false, arch = 80)
+	internal cuda def deviceConvTf32(x gpu.DeviceBuffer<float32>, xo int, w gpu.DeviceBuffer<float32>, wo int, bias gpu.DeviceBuffer<float32>, bo int, out gpu.DeviceBuffer<float32>, oo, batch, channels, height, width, maps, groups, kh, kw, sh, sw, ph, pw, dh, dw, oh, ow, threads int) !none {
+		__shared__ __align__(16) float As[2][2720];
+		__shared__ __align__(16) float Bs[2][2720];
+		int cg = channels / groups, mg = maps / groups;
+		int m = mg, k = cg * kh * kw;
+		int64_t n = (int64_t) batch * oh * ow;
+		int64_t tilesM = (m + 127) / 128, tilesN = (n + 127) / 128;
+		int64_t blk = blockIdx.x, tiles = tilesM * tilesN;
+		int64_t g = blk / tiles, rem = blk % tiles;
+		if (g >= groups) return;
+		int64_t tm = (rem % tilesM) * 128, tn = (rem / tilesM) * 128;
+		float * W = w + wo + g * mg * k;
+		int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+		int wide = k % 4 == 0 && wo % 4 == 0;
+		int64_t plane = (int64_t) height * width;
+		// This thread's position (column o of the tile) and where its
+		// window starts.
+		int o = tid & 127, first = tid >> 7;
+		int64_t gn = tn + o;
+		int inRange = gn < n;
+		int64_t positions = (int64_t) oh * ow, nb = gn / positions, p = gn % positions;
+		int iy0 = (int) (p / ow) * sh - ph, ix0 = (int) (p % ow) * sw - pw;
+		const float * X = x + xo + (nb * channels + g * cg) * plane;
+		// The tap of step `first` of the next slice: channel, row, column.
+		int taps = kh * kw;
+		int ci = first / taps, tr = (first % taps) / kw, ts = first % kw;
+		float acc[64];
+		#pragma unroll
+		for (int i = 0; i < 64; i++) acc[i] = 0.0f;
+		#define WINDOW_ASYNC(buf, k0) \
+		for (int l = 0; l < 8; l++) { \
+			int kk = first + 2 * l; \
+			int iy = iy0 + tr * dh, ix = ix0 + ts * dw; \
+			int bytes = inRange && (k0) + kk < k && iy >= 0 && iy < height && ix >= 0 && ix < width ? 4: 0; \
+			const float * src = bytes ? X + ci * plane + (int64_t) iy * width + ix: x; \
+			copyAsync(Bs[buf] + kk * 136 + o, 1, (float *) src, 1, 4, bytes); \
+			ts += 2; \
+			while (ts >= kw) { ts -= kw; tr++; } \
+			while (tr >= kh) { tr -= kh; ci++; } \
+		}
+		int64_t slices = (k + 15) / 16;
+		tileAsync(As[0], 2720, W, 0, k, 1, tm, m, 0, k, wide);
+		WINDOW_ASYNC(0, 0)
+		copyCommit();
+		for (int64_t q = 0; q < slices; q++) {
+			int cur = q & 1;
+			if (q + 1 < slices) {
+				tileAsync(As[cur ^ 1], 2720, W, 0, k, 1, tm, m, (q + 1) * 16, k, wide);
+				WINDOW_ASYNC(cur ^ 1, (q + 1) * 16)
+				copyCommit();
+				copyWait(1);
+			} else {
+				copyWait(0);
+			}
+			__syncthreads();
+			warpTileTf32(As[cur], 2720, 20, 1, Bs[cur], 2720, 1, 136, acc, 64, (warp >> 2) * 64, (warp & 3) * 32, 4, 4);
+			__syncthreads();
+		}
+		#undef WINDOW_ASYNC
+		int fg = lane >> 2, ft = lane & 3;
+		// Column by column: one division per position, not per value.
+		#pragma unroll
+		for (int j = 0; j < 4; j++) {
+			#pragma unroll
+			for (int c2 = 0; c2 < 2; c2++) {
+				int64_t pn = tn + (warp & 3) * 32 + j * 8 + ft * 2 + c2;
+				if (pn >= n) continue;
+				int64_t pb = pn / positions, pp = pn % positions;
+				float * column = out + oo + pb * maps * positions + pp;
+				#pragma unroll
+				for (int i = 0; i < 4; i++) {
+					#pragma unroll
+					for (int r2 = 0; r2 < 2; r2++) {
+						int64_t gm = tm + (warp >> 2) * 64 + i * 16 + fg + r2 * 8;
+						if (gm >= m) continue;
+						float add = bo >= 0 ? bias[bo + g * mg + gm]: 0.0f;
+						column[(g * mg + gm) * positions] = acc[(i * 4 + j) * 4 + r2 * 2 + c2] + add;
+					}
+				}
 			}
 		}
 	}

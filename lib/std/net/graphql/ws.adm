@@ -1,0 +1,470 @@
+partial module std.net.graphql {
+	use (
+		std.data.encoding::(JSON)
+		std.net.http
+		std.net.http::(Context)
+		std.net.http.websocket
+		std.net.http.websocket::(Conn, Upgrader, DialOptions)
+		std.net.graphql.syntax
+		std.net.graphql.syntax::(Node, NodeKind)
+	)
+
+	// The WebSocket subprotocol of GraphQL over WebSocket (graphql-ws).
+	internal const wsProtocol = "graphql-transport-ws"
+
+	// Takes over a WebSocket upgrade and serves graphql-transport-ws on it
+	// until the socket closes: `connection_init` within the handler's
+	// initTimeout (else 4408), once (else 4429), accepted by onConnect (else
+	// 4403); then operations by id, each answered with `next` messages and
+	// `complete`, or `error` when it cannot run; `ping` answered with
+	// `pong`. A message the protocol has no place for closes with 4400, an
+	// operation before the acknowledgement with 4401, an id already running
+	// with 4409.
+	internal def serveSocket(handler Handler, ctx Context) !none {
+		let upgrader = new Upgrader()
+		upgrader.subprotocols = [wsProtocol]
+		let conn = try upgrader.upgrade(ctx)
+		if conn.subprotocol != wsProtocol {
+			conn.closeWith(4406, "Subprotocol not acceptable") onerror recover none
+			return none
+		}
+		let socket = new ServerSocket(conn)
+		socket.serve(handler, ctx)
+		return none
+	}
+
+	// One graphql-transport-ws connection of a server.
+	internal type ServerSocket {
+		conn      Conn
+		// The operations running, by id: their subscription, or none for a
+		// query or mutation.
+		running   map<string, ?Subscription>
+		tasks     AsyncScope
+		context   any                        = none
+		initiated bool                       = false
+		acked     bool                       = false
+
+		def new(conn Conn) {
+			self.conn = conn
+			running = map<string, ?Subscription>{}
+			tasks = new AsyncScope(failFast = false)
+		}
+
+		// Reads the client's messages until the socket closes, then stops
+		// what still runs.
+		def serve(handler Handler, ctx Context) {
+			context = ctx
+			conn.readTimeout = handler.initTimeout
+			for {
+				let failed = false
+				let text = conn.readText() onerror (err error) {
+					failed = true
+					recover ""
+				}
+				if failed {
+					// Before the init a failed read is the timeout running out.
+					close(4408, "Connection initialisation timeout") unless initiated
+					break
+				}
+				let message = JSON.parse(text.bytes()) onerror recover noneValue()
+				if !(message is map<string, any>) || !(message.hasKey("type") && message["type"] is string) {
+					close(4400, "Invalid message received")
+					break
+				}
+				let kind = string(message["type"])
+				match kind {
+					case "connection_init":
+						if initiated {
+							close(4429, "Too many initialisation requests")
+							break
+						}
+						initiated = true
+						let payload = message.hasKey("payload") ?? (message["payload"], noneValue())
+						if !(payload is none || payload is map<string, any>) {
+							close(4400, "Invalid message received")
+							break
+						}
+						let accept = handler.onConnect
+						if !(accept is none) {
+							let params = payload is map<string, any> ?? (payload, map<string, any>{})
+							let refused = false
+							context = accept(ctx, params) onerror (err error) {
+								refused = true
+								recover noneValue()
+							}
+							if refused {
+								close(4403, "Forbidden")
+								break
+							}
+						}
+						conn.readTimeout = 0s
+						acked = true
+						send(map<string, any>{"type": "connection_ack"}) onerror recover none
+					case "ping":
+						send(map<string, any>{"type": "pong"}) onerror recover none
+					case "pong":
+					case "subscribe":
+						let id = message.hasKey("id") ?? (message["id"], noneValue())
+						let payload = message.hasKey("payload") ?? (message["payload"], noneValue())
+						let request = noneRequest()
+						request = wsRequest(payload) when payload is map<string, any>
+						if !(id is string) || request is none {
+							close(4400, "Invalid message received")
+							break
+						}
+						if !acked {
+							close(4401, "Unauthorized")
+							break
+						}
+						if !claimId(id) {
+							close(4409, "Subscriber for {id} already exists")
+							break
+						}
+						start(handler.schema, id, request)
+					case "complete":
+						let id = message.hasKey("id") ?? (message["id"], noneValue())
+						if !(id is string) {
+							close(4400, "Invalid message received")
+							break
+						}
+						let sub = endOperation(id)
+						sub.close() unless sub is none
+					default:
+						close(4400, "Invalid message received")
+						break
+				}
+			}
+			tasks.cancel("socket closed")
+			for let sub in drain() {
+				sub.close()
+			}
+			conn.close() onerror recover none
+		}
+
+		def close(code int, reason string) {
+			conn.closeWith(code, reason) onerror recover none
+		}
+
+		// Sends one message; messages of different operations never
+		// interleave.
+		atomic def send(message map<string, any>) !none {
+			return try conn.writeText(string(JSON.encode(message)))
+		}
+
+		// Records an operation as running; false when its id already is.
+		atomic def claimId(id string) bool {
+			return false when running.hasKey(id)
+			running[id] = none
+			return true
+		}
+
+		atomic def attach(id string, sub Subscription) bool {
+			return false unless running.hasKey(id)
+			running[id] = sub
+			return true
+		}
+
+		// Ends an operation; its subscription, if it has one. An id not
+		// running gives none.
+		atomic def endOperation(id string) ?Subscription {
+			return none unless running.hasKey(id)
+			let sub = running[id]
+			running.delete(id)
+			return sub
+		}
+
+		atomic def isRunning(id string) bool {
+			return running.hasKey(id)
+		}
+
+		atomic def drain() Subscription[] {
+			let out Subscription[] = []
+			for let (_, sub) in running {
+				out.push(sub) unless sub is none
+			}
+			running = map<string, ?Subscription>{}
+			return out
+		}
+
+		// Runs an operation in its own task: a subscription's events as
+		// `next` messages, a query's or mutation's response as one, then
+		// `complete`; `error` when it cannot run.
+		def start(schema Schema, id string, request Request) {
+			let socket = self
+			let shared = context
+			async<tasks> socket.run(schema, id, request, shared)
+		}
+
+		async def run(schema Schema, id string, request Request, context any) {
+			if isSubscription(request) {
+				let (sub, errors) = beginSubscription(schema, request, context)
+				if sub is none {
+					let wasRunning = isRunning(id)
+					endOperation(id)
+					if wasRunning {
+						send(map<string, any>{"id": id, "type": "error", "payload": errors.mapElem(e => errorJSON(e))}) onerror recover none
+					}
+					return
+				}
+				if !attach(id, sub) {
+					sub.close()
+					return
+				}
+				for let response in sub.responses {
+					break unless isRunning(id)
+					send(map<string, any>{"id": id, "type": "next", "payload": responseValue(response)}) onerror recover none
+				}
+			} else {
+				let response = schema.execute(request, context)
+				if !executed(response) {
+					if isRunning(id) {
+						send(map<string, any>{"id": id, "type": "error", "payload": response.errors.mapElem(e => errorJSON(e))}) onerror recover none
+					}
+					endOperation(id)
+					return
+				}
+				if isRunning(id) {
+					send(map<string, any>{"id": id, "type": "next", "payload": responseValue(response)}) onerror recover none
+				}
+			}
+			let wasRunning = isRunning(id)
+			endOperation(id)
+			if wasRunning {
+				send(map<string, any>{"id": id, "type": "complete"}) onerror recover none
+			}
+		}
+	}
+
+	internal def noneRequest() ?Request {
+		return none
+	}
+
+	// The request of a `subscribe` payload; none when it is not one.
+	internal def wsRequest(payload map<string, any>) ?Request {
+		let query = payload.hasKey("query") ?? (payload["query"], noneValue())
+		return none unless query is string
+		let request = Request{query: query}
+		let name = payload.hasKey("operationName") ?? (payload["operationName"], noneValue())
+		return none unless name is none || name is string
+		request.operationName = name is string ?? (name, "")
+		let variables = payload.hasKey("variables") ?? (payload["variables"], noneValue())
+		return none unless variables is none || variables is map<string, any>
+		request.variables = variables when variables is map<string, any>
+		let extensions = payload.hasKey("extensions") ?? (payload["extensions"], noneValue())
+		return none unless extensions is none || extensions is map<string, any>
+		request.extensions = extensions when extensions is map<string, any>
+		return request
+	}
+
+	// Whether the operation a request names is a subscription; false when
+	// the document does not parse or names none (beginning it reports
+	// those).
+	internal def isSubscription(request Request) bool {
+		let doc = syntax.parseDocument(request.query) onerror recover new Node(NodeKind.Document)
+		let operation = operationOf(doc, request.operationName) onerror recover new Node(NodeKind.OperationDefinition)
+		return operation.text == "subscription"
+	}
+
+	// The responses a client socket received for one subscription, waiting
+	// for its task to hand them on: the socket's reader never waits for a
+	// slow subscription, so one does not hold up the others.
+	internal type Inbox {
+		items  Response[]    = []
+		ended  bool          = false
+		signal channel<bool>
+
+		def new() {
+			signal = new channel<bool>(1)
+		}
+
+		atomic def put(response Response) {
+			items.push(response)
+			signal.offer(true)
+		}
+
+		// No more responses come after those already put.
+		atomic def end() {
+			ended = true
+			signal.offer(true)
+		}
+
+		atomic def drain() (Response[], bool) {
+			let out = items
+			items = []
+			return (out, ended)
+		}
+	}
+
+	// Hands an inbox's responses on until it ends or the subscription is
+	// closed, then closes the responses channel, which only this task sends
+	// on.
+	internal async def forward(inbox Inbox, out channel<Response>) {
+		for !canceled() {
+			let (batch, ended) = inbox.drain()
+			for let response in batch {
+				break when canceled()
+				out <- response
+			}
+			break when ended
+			let _ = <-inbox.signal
+		}
+		out.close()
+	}
+
+	// A client's graphql-transport-ws connection: the subscriptions it
+	// carries, by id, and the task reading the server's messages.
+	internal type ClientSocket {
+		conn   Conn
+		subs   map<string, Inbox>
+		nextId int                = 0
+		reader AsyncScope
+
+		def new(conn Conn) {
+			self.conn = conn
+			subs = map<string, Inbox>{}
+			reader = new AsyncScope(failFast = false)
+		}
+
+		// Sends `connection_init` and waits for `connection_ack`, answering
+		// pings meanwhile; then starts reading.
+		def open(params map<string, any>) !none {
+			try send(map<string, any>{"type": "connection_init", "payload": params})
+			for {
+				let text = try conn.readText()
+				let message = try JSON.parse(text.bytes())
+				fail clientError("the server sent {text} before acknowledging the connection") unless message is map<string, any> && message.hasKey("type")
+				let kind = message["type"]
+				break when kind is string && kind == "connection_ack"
+				if kind is string && kind == "ping" {
+					try send(map<string, any>{"type": "pong"})
+					continue
+				}
+				fail clientError("the server sent {text} before acknowledging the connection")
+			}
+			let socket = self
+			async<reader> socket.read()
+			return none
+		}
+
+		atomic def send(message map<string, any>) !none {
+			return try conn.writeText(string(JSON.encode(message)))
+		}
+
+		atomic def register(inbox Inbox) string {
+			nextId++
+			let id = "{nextId}"
+			subs[id] = inbox
+			return id
+		}
+
+		atomic def lookup(id string) ?Inbox {
+			return subs.get(id)
+		}
+
+		atomic def take(id string) ?Inbox {
+			let inbox = subs.get(id)
+			subs.delete(id) unless inbox is none
+			return inbox
+		}
+
+		atomic def drain() Inbox[] {
+			let out Inbox[] = []
+			for let (_, inbox) in subs {
+				out.push(inbox)
+			}
+			subs = map<string, Inbox>{}
+			return out
+		}
+
+		// Starts a subscription (or any operation) on the socket; closing it
+		// sends `complete`.
+		def subscribe(request Request) !Subscription {
+			let sub = new Subscription()
+			let inbox = new Inbox()
+			let id = register(inbox)
+			let socket = self
+			sub.stop = def () {
+				let open = socket.take(id)
+				if !(open is none) {
+					open.end()
+					socket.send(map<string, any>{"id": id, "type": "complete"}) onerror recover none
+				}
+			}
+			async<sub.pump> forward(inbox, sub.responses)
+			send(map<string, any>{"id": id, "type": "subscribe", "payload": requestJSON(request)}) onerror (err error) {
+				take(id)
+				fail err
+			}
+			return sub
+		}
+
+		// Routes the server's messages to their subscriptions until the
+		// socket closes, then ends every subscription.
+		async def read() {
+			for {
+				let failed = false
+				let text = conn.readText() onerror (err error) {
+					failed = true
+					recover ""
+				}
+				break when failed
+				let message = JSON.parse(text.bytes()) onerror recover noneValue()
+				continue unless message is map<string, any>
+				let kind = message.hasKey("type") ?? (message["type"], noneValue())
+				let id = message.hasKey("id") ?? (message["id"], noneValue())
+				continue unless kind is string
+				match kind {
+					case "ping":
+						send(map<string, any>{"type": "pong"}) onerror recover none
+					case "next":
+						continue unless id is string
+						let inbox = lookup(id)
+						let payload = message.hasKey("payload") ?? (message["payload"], noneValue())
+						continue when inbox is none || !(payload is map<string, any>)
+						inbox.put(responseOf(payload) onerror recover new Response())
+					case "error":
+						continue unless id is string
+						let inbox = take(id)
+						continue when inbox is none
+						let response = new Response()
+						let payload = message.hasKey("payload") ?? (message["payload"], noneValue())
+						if payload is any[] {
+							for let e in payload {
+								response.errors.push(errorOf(e)) when e is map<string, any>
+							}
+						}
+						inbox.put(response)
+						inbox.end()
+					case "complete":
+						continue unless id is string
+						let inbox = take(id)
+						inbox.end() unless inbox is none
+					default:
+				}
+			}
+			for let inbox in drain() {
+				inbox.end()
+			}
+		}
+
+		def close() {
+			reader.cancel("closed")
+			conn.close() onerror recover none
+			for let inbox in drain() {
+				inbox.end()
+			}
+		}
+	}
+
+	// Opens a graphql-transport-ws socket to a client's endpoint.
+	internal def dialSocket(endpoint string, headers http.Header, params map<string, any>) !ClientSocket {
+		let (conn, _) = try websocket.dial(endpoint, DialOptions{subprotocols: [wsProtocol], headers: headers})
+		if conn.subprotocol != wsProtocol {
+			conn.close() onerror recover none
+			fail clientError("the server at {endpoint} does not speak {wsProtocol}")
+		}
+		let socket = new ClientSocket(conn)
+		try socket.open(params)
+		return socket
+	}
+}

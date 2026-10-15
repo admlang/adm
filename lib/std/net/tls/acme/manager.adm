@@ -1,0 +1,580 @@
+partial module std.net.tls.acme {
+	use (
+		std.time
+		std.os
+		std.crypto
+		std.crypto::(PrivateKey, generateECDSAKey, generateRSAKey, marshalPKCS8PrivateKey, parsePKCS8PrivateKey)
+		std.crypto.x509
+		std.data.encoding::(PEMBlock, pemEncode, pemDecodeAll)
+		std.net
+		std.net.http
+		std.net.tls
+		std.services.vault::(Vault)
+	)
+
+	// Where a Manager keeps its account key and certificates. Entries are
+	// small (a few kilobytes) and named by the manager.
+	interface CertificateStore {
+		// The entry's bytes, none when there is no such entry.
+		def load(name string) !?byte[]
+		def save(name string, data byte[]) !none
+		def remove(name string) !none
+	}
+
+	// Keeps entries as files in a folder, readable by the owner only.
+	type FolderStore {
+		path string
+
+		def new(path string) {
+			self.path = path
+		}
+
+		// load implements CertificateStore. Fails when the file cannot be
+		// read.
+		def load(name string) !?byte[] {
+			let file = path + "/" + name
+			return none unless try os.exists(file)
+			return try os.readFile(file)
+		}
+
+		// save implements CertificateStore: written beside, then renamed over
+		// the old file, so a reader never sees half of it. Fails when the
+		// folder cannot be made or the file written.
+		def save(name string, data byte[]) !none {
+			try os.mkdir(path, true) unless try os.exists(path)
+			let file = path + "/" + name
+			try os.writeFile(file + ".new", data)
+			try os.chmod(file + ".new", 0o600)
+			try os.rename(file + ".new", file)
+			return none
+		}
+
+		// remove implements CertificateStore. Fails when the file cannot be
+		// removed.
+		def remove(name string) !none {
+			let file = path + "/" + name
+			try os.remove(file) when try os.exists(file)
+			return none
+		}
+	}
+
+	// Keeps entries in the application's Vault, as secrets named
+	// `acme.` and the entry's name.
+	type VaultStore {
+		prefix string = "acme."
+
+		def new() {}
+
+		// load implements CertificateStore. Fails when the Vault cannot be
+		// opened or read.
+		def load(name string) !?byte[] {
+			try await Vault.start()
+			let secret = try Vault.get<byte[]>(prefix + name)
+			return none when secret is none
+			// A Secret zeroes its bytes when it is released: keep a copy.
+			return secret.reveal().clone()
+		}
+
+		// save implements CertificateStore. Fails when the Vault cannot be
+		// opened or written.
+		def save(name string, data byte[]) !none {
+			try await Vault.start()
+			// The Secret zeroes what it holds when released, so it gets a copy
+			// and the caller's bytes stay as they are.
+			return try Vault.put(prefix + name, new Secret<byte[]>(data.clone()))
+		}
+
+		// remove implements CertificateStore. Fails when the Vault cannot be
+		// opened or written.
+		def remove(name string) !none {
+			try await Vault.start()
+			return try Vault.remove(prefix + name)
+		}
+	}
+
+	// The key a Manager makes for each certificate.
+	enum CertificateKey {
+		// ECDSA on P-256: small, fast, taken everywhere.
+		EcdsaP256,
+		EcdsaP384,
+		Rsa2048,
+		Rsa3072,
+		Rsa4096,
+	}
+
+	// Obtains and renews certificates for the names it is given, from one
+	// ACME CA, and presents them to the TLS server: a name is issued the
+	// first time a client asks for it (or at start), kept in the store, and
+	// renewed in the background when the CA's renewal information says so
+	// (else when a third of its lifetime is left).
+	//
+	//     let manager = new acme.Manager(["example.com"], "ops@example.com")
+	//     manager.acceptTerms = true          // after reading the CA's terms
+	//     let server = new http.Server(":443", app)
+	//     server.tls = manager.tlsConfig()
+	//     try manager.start()
+	//     try server.listenAndServe()
+	//
+	// tls-alpn-01 answers on the TLS server itself; http-01 needs a plain
+	// HTTP server on port 80 with `handler(...)`; dns-01 (required for
+	// wildcard names) needs `dns`.
+	type Manager {
+		// The names certificates are issued for: DNS names, `*.` wildcards
+		// (dns-01 only) and IP addresses. A client asking for any other name
+		// gets no certificate.
+		names        string[]
+		// The account's contact; "" registers without one.
+		email        string
+		directoryURL string                  = letsEncrypt
+		// Agree to the CA's terms of service when registering; registration
+		// fails without it, naming the terms.
+		acceptTerms  bool                    = false
+		eab          ?ExternalAccountBinding = none
+		// Where the account key and the certificates are kept; the Vault
+		// unless set.
+		store        CertificateStore        = new VaultStore()
+		// The challenges to try, in order, where the CA offers them; dns-01
+		// is tried only with a DNS provider.
+		challenges   ChallengeType[]         = [ChallengeType.TlsAlpn01, ChallengeType.Http01, ChallengeType.Dns01]
+		dns          ?DNSProvider            = none
+		keyType      CertificateKey          = CertificateKey.EcdsaP256
+		// How often the background task looks at the certificates.
+		checkEvery   duration                = 12h
+		// The HTTP client the ACME requests go through; one with a minute's
+		// timeout unless set.
+		httpClient   ?http.Client            = none
+
+		internal atomic certs     map<string, tls.KeyPair>
+		internal atomic alpnCerts map<string, tls.KeyPair>
+		internal atomic tokens    map<string, string>
+		internal atomic inflight  map<string, bool>
+		internal atomic failures  map<string, string>
+		internal client           ?Client                  = none
+		internal renewal          AsyncScope               = new AsyncScope()
+
+		def new(names string[], email string = "") {
+			self.names = names
+			self.email = email
+		}
+
+		// The TLS server settings that present the managed certificates:
+		// `getCertificate`, and the ALPN protocols h2, http/1.1 and
+		// acme-tls/1 so tls-alpn-01 validations are answered.
+		def tlsConfig() tls.Config {
+			let config = new tls.Config()
+			config.alpn = ["h2", "http/1.1", acmeTLSProtocol]
+			config.getCertificate = def (info tls.ClientHelloInfo) !?tls.KeyPair {
+				return try certificateFor(info)
+			}
+			return config
+		}
+
+		// The handler of a plain HTTP server: answers http-01 validations
+		// from `/.well-known/acme-challenge/`, passes everything else to
+		// next, or redirects it to https when next is none.
+		def handler(next ?http.Handler = none) http.Handler {
+			let answers = def (token string) string {
+				let answer = tokenAnswer(token)
+				return answer is none ?? ("", answer)
+			}
+			return new ChallengeHandler(answers, next)
+		}
+
+		// The certificate for a name, from memory, the store, or the CA.
+		// Fails when the name is not one of `names`, or issuing fails.
+		def certificate(name string) !tls.KeyPair {
+			let host = name.lower().trim()
+			let managed = try managedName(host)
+			let cached = cachedCertificate(managed)
+			return cached unless cached is none
+			let stored = try loadCertificate(managed)
+			if !(stored is none) {
+				remember(managed, stored)
+				return stored
+			}
+			return try obtain(managed, "")
+		}
+
+		// Gets every name's certificate now and keeps renewing them in a
+		// background task until stop. Fails when a name cannot be issued.
+		def start() !none {
+			for let name in names {
+				try certificate(name)
+			}
+			renewal = new AsyncScope()
+			async<renewal> renewLoop()
+			return none
+		}
+
+		// Stops the background renewal.
+		def stop() {
+			renewal.cancel("stopped")
+		}
+
+		// Renews a name's certificate now, whatever its age. Fails when the
+		// name is not one of `names` or issuing fails.
+		def renew(name string) !tls.KeyPair {
+			let managed = try managedName(name.lower().trim())
+			let current = cachedCertificate(managed)
+			let replaces = current is none ?? ("", renewalId(current.chain[0]) onerror recover "")
+			return try obtain(managed, replaces)
+		}
+
+		// Revokes a name's certificate (RFC 5280 reason code, 0 unspecified)
+		// and drops it from memory and the store. Fails when the name is not
+		// managed, its certificate cannot be had, or the CA refuses.
+		def revoke(name string, reason int = 0) !none {
+			let managed = try managedName(name.lower().trim())
+			let current = try certificate(managed)
+			try (try account()).revoke(current.chain[0], reason)
+			forget(managed)
+			try store.remove(entryName(managed))
+			return none
+		}
+
+		// getCertificate of the TLS config.
+		internal def certificateFor(info tls.ClientHelloInfo) !?tls.KeyPair {
+			let host = info.serverName.lower()
+			return alpnCertificate(host) when info.alpnProtocols.len() == 1 && info.alpnProtocols[0] == acmeTLSProtocol
+			return none when host == ""
+			return try certificate(host)
+		}
+
+		// The managed name a requested host falls under: itself, or the
+		// wildcard covering it.
+		internal def managedName(host string) !string {
+			for let n in names {
+				return n.lower() when n.lower() == host
+			}
+			let dot = host.indexOf(".")
+			if dot > 0 {
+				let wildcard = "*" + host[dot:]
+				for let n in names {
+					return n.lower() when n.lower() == wildcard
+				}
+			}
+			fail acmeError("{host} is not one of the names this manager issues for", 0, none)
+		}
+
+		internal atomic def cachedCertificate(name string) ?tls.KeyPair {
+			return certs.get(name)
+		}
+
+		internal atomic def remember(name string, pair tls.KeyPair) {
+			certs[name] = pair
+		}
+
+		internal atomic def forget(name string) {
+			certs.delete(name)
+		}
+
+		internal atomic def alpnCertificate(serverName string) ?tls.KeyPair {
+			return alpnCerts.get(serverName)
+		}
+
+		internal atomic def setAlpn(serverName string, pair ?tls.KeyPair) {
+			if pair is none {
+				alpnCerts.delete(serverName)
+			} else {
+				alpnCerts[serverName] = pair
+			}
+		}
+
+		internal atomic def setToken(token string, keyAuthorization string) {
+			if keyAuthorization == "" {
+				tokens.delete(token)
+			} else {
+				tokens[token] = keyAuthorization
+			}
+		}
+
+		internal atomic def tokenAnswer(token string) ?string {
+			return tokens.get(token)
+		}
+
+		// Claims the name for one issue at a time: false when another task
+		// is issuing it.
+		internal atomic def claim(name string) bool {
+			return false when inflight.hasKey(name)
+			inflight[name] = true
+			return true
+		}
+
+		internal atomic def release(name string) {
+			inflight.delete(name)
+		}
+
+		// Issues a certificate for the name, or waits for the issue another
+		// task started.
+		internal def obtain(name string, replaces string) !tls.KeyPair {
+			if !claim(name) {
+				for !claim(name) {
+					time.sleep(200ms)
+				}
+				release(name)
+				let done = cachedCertificate(name)
+				return done unless done is none
+				return try obtain(name, replaces)
+			}
+			defer release(name)
+			let pair = try issue(name, replaces)
+			remember(name, pair)
+			return pair
+		}
+
+		internal def issue(name string, replaces string) !tls.KeyPair {
+			let c = try account()
+			let order = c.newOrder([name], replaces = replaces) onerror (err error) {
+				// A CA that does not know the certificate being replaced
+				// still issues without the link.
+				fail err when replaces == ""
+				recover try c.newOrder([name])
+			}
+			for let url in order.authorizations {
+				try authorize(c, url)
+			}
+			order = try c.waitOrder(order)
+			fail acmeError("the order for {name} is {order.status.value}, not ready", 0, order.problem) when order.status != Status.Ready && order.status != Status.Valid
+			let key = try newKey(keyType)
+			let template = x509.Template{}
+			let ip = net.parseIPText(name)
+			if ip is none {
+				template.dnsNames = [name]
+			} else {
+				template.ipAddresses = [ip]
+			}
+			if order.status == Status.Ready {
+				order = try c.finalize(order, try x509.createRequest(template, key))
+				order = try c.waitOrder(order)
+			}
+			fail acmeError("the order for {name} ended {order.status.value}", 0, order.problem) when order.status != Status.Valid
+			let (chain, _) = try c.certificate(order)
+			let pair = new tls.KeyPair(chain, key)
+			try store.save(entryName(name), encodePair(pair))
+			return pair
+		}
+
+		// Completes one authorization with the first challenge of
+		// `challenges` the CA offers and this manager can answer.
+		internal def authorize(c Client, url string) !none {
+			let a = try c.authorization(url)
+			return none when a.status == Status.Valid
+			let picked ?Challenge = none
+			for let kind in challenges {
+				continue unless picked is none
+				continue when kind == ChallengeType.Dns01 && dns is none
+				continue when a.wildcard && kind != ChallengeType.Dns01
+				picked = a.challenges.find(ch => ch.kind == kind.value, 0)
+			}
+			fail acmeError("no challenge of {a.identifier.value} can be answered (offered: {a.challenges.mapElem(ch => ch.kind).join(", ")})", 0, none) when picked is none
+			let keyAuth = c.keyAuthorization(picked.token)
+			let domain = a.wildcard ?? ("*." + a.identifier.value, a.identifier.value)
+			match picked.kind {
+				case "http-01":
+					setToken(picked.token, keyAuth)
+				case "tls-alpn-01":
+					let serverName = a.identifier.kind == "ip" ?? (reverseName(a.identifier.value), a.identifier.value)
+					setAlpn(serverName, try tlsAlpnCertificate(a.identifier.value, keyAuth))
+				default:
+					let provider = dns
+					fail acmeError("dns-01 needs a DNS provider", 0, none) when provider is none
+					try provider.present(dnsRecordName(domain), dnsRecordValue(keyAuth))
+			}
+			defer cleanup(picked, a, keyAuth, domain)
+			try c.accept(picked)
+			try c.waitAuthorization(url)
+			return none
+		}
+
+		internal def cleanup(ch Challenge, a Authorization, keyAuth string, domain string) {
+			match ch.kind {
+				case "http-01":
+					setToken(ch.token, "")
+				case "tls-alpn-01":
+					setAlpn(a.identifier.kind == "ip" ?? (reverseName(a.identifier.value), a.identifier.value), none)
+				default:
+					let provider = dns
+					if !(provider is none) {
+						provider.cleanup(dnsRecordName(domain), dnsRecordValue(keyAuth)) onerror recover none
+					}
+			}
+		}
+
+		// The client with its account: the key from the store (made and kept
+		// the first time), registered with the CA.
+		internal def account() !Client {
+			let cached = client
+			return cached unless cached is none
+			let keyName = "account-" + hostOf(directoryURL) + ".key"
+			let stored = try store.load(keyName)
+			let key PrivateKey = generateECDSAKey(crypto.p256) onerror (err error) {
+				fail err
+			}
+			if !(stored is none) {
+				let blocks = try pemDecodeAll(string(stored))
+				fail acmeError("the stored account key is not a PEM private key", 0, none) when blocks.len() == 0
+				key = try parsePKCS8PrivateKey(blocks[0].bytes)
+			} else {
+				try store.save(keyName, pemEncode(new PEMBlock("PRIVATE KEY", marshalPKCS8PrivateKey(key))).bytes())
+			}
+			let c = new Client(directoryURL, key)
+			let custom = httpClient
+			c.http = custom unless custom is none
+			let d = try c.directory()
+			if !acceptTerms && d.termsOfService != "" {
+				// Without agreeing to the terms only an account the key already
+				// has will do.
+				c.account() onerror (err error) {
+					fail acmeError("set acceptTerms after reading the CA's terms of service at {d.termsOfService}", 0, none)
+				}
+			} else {
+				try c.register(email == "" ?? ([], [email]), termsAgreed = acceptTerms, eab = eab)
+			}
+			client = c
+			return c
+		}
+
+		// Renews what needs it, then waits checkEvery, until stopped.
+		internal async def renewLoop() {
+			for {
+				break when canceled()
+				for let name in names {
+					renewIfDue(name) onerror (err error) {
+						noteFailure(name, err.message)
+						recover none
+					}
+				}
+				time.sleep(checkEvery)
+			}
+		}
+
+		internal atomic def noteFailure(name string, message string) {
+			failures[name] = message
+		}
+
+		// Renews the name's certificate when the CA's renewal window has
+		// started (or, without renewal information, when a third of the
+		// lifetime is left).
+		internal def renewIfDue(name string) !none {
+			let managed = name.lower()
+			let current = cachedCertificate(managed)
+			if current is none {
+				try certificate(managed)
+				return none
+			}
+			let leaf = try x509.parseCertificate(current.chain[0])
+			let now = time.now()
+			let lifetime = leaf.notAfter - leaf.notBefore
+			let due = now >= leaf.notAfter - duration(int(lifetime) / 3)
+			let c = try account()
+			let (offered, info) = renewalWindow(c, current.chain[0])
+			due = now >= info.start when offered
+			if due {
+				try obtain(managed, renewalId(current.chain[0]) onerror recover "")
+			}
+			return none
+		}
+
+		// The last background renewal failure of a name, "" when there was
+		// none.
+		def lastError(name string) string {
+			let message = failureOf(name.lower())
+			return message is none ?? ("", message)
+		}
+
+		internal atomic def failureOf(name string) ?string {
+			return failures.get(name)
+		}
+
+		internal def loadCertificate(name string) !?tls.KeyPair {
+			let data = try store.load(entryName(name))
+			return none when data is none
+			let blocks = try pemDecodeAll(string(data))
+			let chain byte[][] = []
+			let key ?PrivateKey = none
+			for let b in blocks {
+				if b.kind == "CERTIFICATE" {
+					chain.push(b.bytes)
+				} else if b.kind == "PRIVATE KEY" {
+					key = try parsePKCS8PrivateKey(b.bytes)
+				}
+			}
+			return none when chain.len() == 0 || key is none
+			let leaf = try x509.parseCertificate(chain[0])
+			return none when leaf.notAfter <= time.now()
+			return new tls.KeyPair(chain, key)
+		}
+	}
+
+	// Answers http-01 validations for a Manager.
+	internal type ChallengeHandler {
+		// The key authorization of a token, "" for an unknown one.
+		answer def (token string) string
+		next   ?http.Handler
+
+		def new(answer def (token string) string, next ?http.Handler) {
+			self.answer = answer
+			self.next = next
+		}
+
+		// serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let path = ctx.request.url.path
+			if path.startsWith(http01Prefix) {
+				let found = answer(path[http01Prefix.len():])
+				return try ctx.text(404, "no such challenge") when found == ""
+				return try ctx.blob(200, "application/octet-stream", found.bytes())
+			}
+			let inner = next
+			return try inner.serve(ctx) unless inner is none
+			let target = "https://" + ctx.request.hostname() + ctx.request.requestURI()
+			return try ctx.redirect(target, 308)
+		}
+	}
+
+	// The CA's renewal window of a certificate, and whether the CA gave one.
+	internal def renewalWindow(c Client, certificate byte[]) (bool, RenewalInfo) {
+		let offered = true
+		let info = c.renewalInfo(certificate) onerror (err error) {
+			offered = false
+			recover RenewalInfo{start: time.now(), end: time.now()}
+		}
+		return (offered, info)
+	}
+
+	// The store entry of a name's certificate and key.
+	internal def entryName(name string) string {
+		return name.replace("*", "_wildcard") + ".pem"
+	}
+
+	internal def encodePair(pair tls.KeyPair) byte[] {
+		let out = ""
+		for let der in pair.chain {
+			out += pemEncode(new PEMBlock("CERTIFICATE", der))
+		}
+		let key = pair.privateKey
+		out += pemEncode(new PEMBlock("PRIVATE KEY", marshalPKCS8PrivateKey(key))) unless key is none
+		return out.bytes()
+	}
+
+	internal def newKey(kind CertificateKey) !PrivateKey {
+		match kind {
+			case CertificateKey.EcdsaP384:
+				return try generateECDSAKey(crypto.p384)
+			case CertificateKey.Rsa2048:
+				return try generateRSAKey(2048)
+			case CertificateKey.Rsa3072:
+				return try generateRSAKey(3072)
+			case CertificateKey.Rsa4096:
+				return try generateRSAKey(4096)
+			default:
+				return try generateECDSAKey(crypto.p256)
+		}
+	}
+
+	internal def hostOf(url string) string {
+		let rest = url.contains("://") ?? (url[url.indexOf("://") + 3:], url)
+		let slash = rest.indexOf("/")
+		return slash < 0 ?? (rest, rest[:slash])
+	}
+}

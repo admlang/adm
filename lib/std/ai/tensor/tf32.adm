@@ -1,0 +1,384 @@
+internal std.ai partial module std.ai.tensor.gpu {
+	use std.gpu
+
+	// Tensor-core helpers for the TF32 forms of the tile kernels
+	// (`@launch(arch = 80)`): float32 values rounded to TF32 (10 bits of
+	// mantissa, float32's range) multiply in `mma.m16n8k8` steps and add
+	// in float32.
+	//
+	// A warp's fragments, with g = lane / 4 and t = lane % 4: A (16 × 8)
+	// holds (g, t), (g + 8, t), (g, t + 4), (g + 8, t + 4); B (8 × 8) holds
+	// (t, g), (t + 4, g); C (16 × 8) holds (g, 2t), (g, 2t + 1),
+	// (g + 8, 2t), (g + 8, 2t + 1).
+	//
+	// The kernels keep a 128 × 16 operand tile in shared memory as
+	// `s[o · so + k · sk]`, o its row (of A) or column (of B) and k the
+	// step: (20, 1) when k runs along memory (16 steps and 4 of padding),
+	// (1, 136) when o does (128 and 8 of padding); 2720 floats hold
+	// either. Both ways the 32 lanes of a fragment read reach 32 banks, and
+	// every 4 values along memory start on 16 bytes for `cp.async`.
+
+	// `v` rounded to the nearest TF32 value, ties away from zero, as
+	// float32 bits.
+	@kernelOnly
+	cuda def tf32(v float32) float32 {
+		uint32_t r;
+		asm("cvt.rna.tf32.f32 %0, %1;": "=r"(r): "f"(v));
+		return __uint_as_float(r);
+	}
+
+	// c[0..3] += a (16 × 8) · b (8 × 8), the fragments of this lane, the
+	// values already rounded to TF32.
+	@kernelOnly
+	cuda def mmaTf32(c float32[], a0, a1, a2, a3, b0, b1 float32) {
+		#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+		asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+			: "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+			: "r"(__float_as_uint(a0)), "r"(__float_as_uint(a1)), "r"(__float_as_uint(a2)), "r"(__float_as_uint(a3)), "r"(__float_as_uint(b0)), "r"(__float_as_uint(b1)));
+		#endif
+	}
+
+	// Starts copying `bytes` (0 to `size`) of `src` to the shared `dst`
+	// without waiting, zero-filling the rest of `size` bytes (4 or 16;
+	// both addresses aligned to it).
+	@kernelOnly
+	cuda def copyAsync(dst float32[], src float32[], size, bytes int) {
+		#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+		unsigned at = (unsigned) __cvta_generic_to_shared(dst);
+		if (size == 16) {
+			asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;":: "r"(at), "l"(src), "r"((unsigned) bytes));
+		} else {
+			asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;":: "r"(at), "l"(src), "r"((unsigned) bytes));
+		}
+		#endif
+	}
+
+	// Closes the group of copies started since the last one.
+	@kernelOnly
+	cuda def copyCommit() {
+		#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+		asm volatile("cp.async.commit_group;");
+		#endif
+	}
+
+	// Waits until at most `pending` (0 or 1) groups of this thread's
+	// copies are still running.
+	@kernelOnly
+	cuda def copyWait(pending int) {
+		#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+		if (pending == 0) {
+			asm volatile("cp.async.wait_group 0;");
+		} else {
+			asm volatile("cp.async.wait_group 1;");
+		}
+		#endif
+	}
+
+	// One warp's share of a tile product over 16 values of k: acc (mb ×
+	// nb blocks of 4, block i · nb + j) += the mb · 16 A rows from m0 times
+	// the nb · 8 B columns from n0, A at at[o · ao + k · ak] and B at
+	// bt[o · bo + k · bk] (see above), each value rounded to TF32 as it is
+	// read. mb and nb (at most 4) are constants at every call, so the
+	// loops unroll and acc stays in registers.
+	@kernelOnly
+	cuda def warpTileTf32(at float32[], ao, ak int, bt float32[], bo, bk int, acc float32[], m0, n0, mb, nb int) {
+		int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+		// 32-bit offsets of this lane's first value of each fragment.
+		int sa = (int) ao, ka = (int) ak, sb = (int) bo, kb = (int) bk;
+		int a0 = ((int) m0 + g) * sa + t * ka, b0 = ((int) n0 + g) * sb + t * kb;
+		#pragma unroll 1
+		for (int s = 0; s < 2; s++) {
+			float a[4][4], b[4][2];
+			int ak0 = a0 + s * 8 * ka, bk0 = b0 + s * 8 * kb;
+			#pragma unroll
+			for (int i = 0; i < mb; i++) {
+				const float * p = at + ak0 + i * 16 * sa;
+				a[i][0] = tf32(p[0]);
+				a[i][1] = tf32(p[8 * sa]);
+				a[i][2] = tf32(p[4 * ka]);
+				a[i][3] = tf32(p[8 * sa + 4 * ka]);
+			}
+			#pragma unroll
+			for (int j = 0; j < nb; j++) {
+				const float * p = bt + bk0 + j * 8 * sb;
+				b[j][0] = tf32(p[0]);
+				b[j][1] = tf32(p[4 * kb]);
+			}
+			#pragma unroll
+			for (int i = 0; i < mb; i++) {
+				#pragma unroll
+				for (int j = 0; j < nb; j++) {
+					mmaTf32(acc + (i * nb + j) * 4, 4, a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
+				}
+			}
+		}
+	}
+
+	// Starts the copy of a 128 × 16 operand tile of a row-major matrix
+	// into the shared `s`: element (o, k) of the tile is m[(o0 + o) · ld +
+	// k0 + k] when `along` (k runs along memory), else m[(k0 + k) · ld +
+	// o0 + o]; positions outside `rows` × `steps` read as 0. `wide`: ld
+	// and the matrix's start are multiples of 4 floats, so 16-byte copies
+	// can be used.
+	@kernelOnly
+	cuda def tileAsync(s float32[], m float32[], ld, along, o0, rows, k0, steps, wide int) {
+		int tid = threadIdx.x;
+		if (wide) {
+			// 512 runs of 4 values, 2 a thread.
+			for (int l = 0; l < 2; l++) {
+				int c = tid + l * 256, o, k;
+				if (along) { o = c >> 2; k = (c & 3) * 4; } else { k = c >> 5; o = (c & 31) * 4; }
+				int64_t go = o0 + o, gk = k0 + k;
+				int64_t left = along ? steps - gk: rows - go;
+				int inside = along ? go < rows: gk < steps;
+				int bytes = inside && left > 0 ? (left >= 4 ? 16: (int) left * 4): 0;
+				float * src = bytes > 0 ? m + (along ? go * ld + gk: gk * ld + go): m;
+				copyAsync(s + (along ? o * 20 + k: k * 136 + o), 4, src, 4, 16, bytes);
+			}
+		} else {
+			for (int l = 0; l < 8; l++) {
+				int c = tid + l * 256, o, k;
+				if (along) { o = c >> 4; k = c & 15; } else { k = c >> 7; o = c & 127; }
+				int64_t go = o0 + o, gk = k0 + k;
+				int bytes = go < rows && gk < steps ? 4: 0;
+				float * src = bytes > 0 ? m + (along ? go * ld + gk: gk * ld + go): m;
+				copyAsync(s + (along ? o * 20 + k: k * 136 + o), 1, src, 1, 4, bytes);
+			}
+		}
+	}
+
+	// This thread's 8 values of a 128 × 16 slice of weight rows from
+	// `row0` (`rows` of them left) at column c0, into v; 0 past the rows
+	// and from column `to` on (rows hold a multiple of 8 values).
+	@kernelOnly
+	cuda def weightSlice(w byte[], form int, row0, rows, cols, c0, to int, v float32[]) {
+		int o = threadIdx.x >> 1, k = (threadIdx.x & 1) * 8;
+		if (o < rows && c0 + k < to) {
+			weightsAt(w, w_len, form, row0 + o, cols, c0 + k, v, 8);
+		} else {
+			for (int q = 0; q < 8; q++) v[q] = 0.0f;
+		}
+	}
+
+	// Stores weightSlice's v in the shared tile `s` (k along memory).
+	@kernelOnly
+	cuda def storeSlice(s float32[], v float32[]) {
+		float * at = s + (threadIdx.x >> 1) * 20 + (threadIdx.x & 1) * 8;
+		*(float4 *) at = make_float4(v[0], v[1], v[2], v[3]);
+		*(float4 *) (at + 4) = make_float4(v[4], v[5], v[6], v[7]);
+	}
+
+	// Writes or adds a warp's share of a tile (see warpTileTf32: mb × nb
+	// blocks from the warp's corner m0, n0 within the tile) at out[r · rs +
+	// c · cs] for its rows r < rows and columns c < cols, counted from the
+	// tile's corner (r0, c0).
+	@kernelOnly
+	cuda def storeTileTf32(acc float32[], out float32[], rs, cs, r0, rows, c0, cols, add, m0, n0, mb, nb int) {
+		int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+		#pragma unroll
+		for (int i = 0; i < mb; i++) {
+			#pragma unroll
+			for (int j = 0; j < nb; j++) {
+				#pragma unroll
+				for (int e = 0; e < 4; e++) {
+					int64_t r = r0 + m0 + i * 16 + g + (e >> 1) * 8;
+					int64_t c = c0 + n0 + j * 8 + t * 2 + (e & 1);
+					if (r >= rows || c >= cols) continue;
+					float * o = out + r * rs + c * cs;
+					*o = add ? *o + acc[(i * nb + j) * 4 + e]: acc[(i * nb + j) * 4 + e];
+				}
+			}
+		}
+	}
+
+	// multiplyTiles on the tensor cores: tiles of 128 rows by 64 tokens
+	// (each warp 32 × 32), the weights expanded 16 columns at a time while
+	// the tokens' values are copied asynchronously; arguments as
+	// multiplyTiles', `threads` counting tiles of 128 by 64.
+	@launch(block = 256, x = "threads", cpu = false, arch = 80)
+	cuda def multiplyTilesTf32(w gpu.DeviceBuffer<byte>, form int, base int, x gpu.DeviceBuffer<float32>, xo, xs int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, threads int) !none {
+		__shared__ __align__(16) float As[2][2720];
+		__shared__ __align__(16) float Bs[2][1280];
+		int64_t tiles = (rows + 127) / 128, tokenTiles = (n + 63) / 64;
+		int64_t b = blockIdx.x % (tiles * tokenTiles), s = blockIdx.x / (tiles * tokenTiles);
+		int64_t r0 = (b % tiles) * 128, t0 = (b / tiles) * 64;
+		int64_t from = s * span, to = from + span < cols ? from + span: cols;
+		oo += s * n * os;
+		int warp = threadIdx.x >> 5;
+		int wide = xs % 4 == 0 && xo % 4 == 0;
+		int m0 = (warp >> 1) * 32, n0 = (warp & 1) * 32;
+		float acc[32], v[8];
+		#pragma unroll
+		for (int i = 0; i < 32; i++) acc[i] = 0.0f;
+		int64_t slices = (to - from + 15) / 16;
+		weightSlice(w, w_len, form, base + r0, rows - r0, cols, from, to, v, 8);
+		storeSlice(As[0], 2720, v, 8);
+		tokensAsync(Bs[0], 1280, x + xo, 0, xs, t0, n, from, to, wide);
+		copyCommit();
+		for (int64_t q = 0; q < slices; q++) {
+			int cur = q & 1;
+			int64_t next = from + (q + 1) * 16;
+			if (q + 1 < slices) {
+				tokensAsync(Bs[cur ^ 1], 1280, x + xo, 0, xs, t0, n, next, to, wide);
+				copyCommit();
+				weightSlice(w, w_len, form, base + r0, rows - r0, cols, next, to, v, 8);
+				copyWait(1);
+			} else {
+				copyWait(0);
+			}
+			__syncthreads();
+			warpTileTf32(As[cur], 2720, 20, 1, Bs[cur], 1280, 20, 1, acc, 32, m0, n0, 2, 4);
+			if (q + 1 < slices) storeSlice(As[cur ^ 1], 2720, v, 8);
+			__syncthreads();
+		}
+		storeTileTf32(acc, 32, out + oo, 0, 1, os, r0, rows, t0, n, 0, m0, n0, 2, 4);
+	}
+
+	// Starts the copy of a 64 × 16 tile of token rows into the shared `s`
+	// (k along memory, 20 floats a row): row o, step k is m[(o0 + o) · ld
+	// + k0 + k], 0 past `rows` rows or `steps` steps. `wide`: ld and m's
+	// start are multiples of 4 floats.
+	@kernelOnly
+	cuda def tokensAsync(s float32[], m float32[], ld, o0, rows, k0, steps, wide int) {
+		int tid = threadIdx.x;
+		for (int l = 0; l < (wide ? 1: 4); l++) {
+			int c = tid + l * 256, o = wide ? c >> 2: c >> 4, k = wide ? (c & 3) * 4: c & 15;
+			int64_t go = o0 + o, gk = k0 + k;
+			int64_t left = steps - gk;
+			int bytes = go < rows && left > 0 ? (wide ? (left >= 4 ? 16: (int) left * 4): 4): 0;
+			float * src = bytes > 0 ? m + go * ld + gk: m;
+			copyAsync(s + o * 20 + k, wide ? 4: 1, src, wide ? 4: 1, wide ? 16: 4, bytes);
+		}
+	}
+
+	// multiplyGrouped on the tensor cores: tiles of 128 rows by 64 picks
+	// of one expert (an expert has few picks in a prompt), each warp 32 ×
+	// 32 of them, the picks' rows of x gathered asynchronously; arguments
+	// as multiplyGrouped's, `threads` counting tiles of 128 rows by 64.
+	@launch(block = 256, x = "threads", cpu = false, arch = 80)
+	cuda def multiplyGroupedTf32(w gpu.DeviceBuffer<byte>, form int, slots gpu.DeviceBuffer<float32>, x gpu.DeviceBuffer<float32>, xs, per int, groups gpu.DeviceBuffer<float32>, experts int, out gpu.DeviceBuffer<float32>, rows, cols, n, threads int) !none {
+		__shared__ __align__(16) float As[2][2720];
+		__shared__ __align__(16) float Bs[2][1280];
+		int64_t tiles = (rows + 127) / 128, tokenTiles = (n + 63) / 64;
+		int64_t e = blockIdx.x / (tiles * tokenTiles), b = blockIdx.x % (tiles * tokenTiles);
+		int64_t r0 = (b % tiles) * 128, t0 = (b / tiles) * 64;
+		int64_t count = (int64_t) groups[e];
+		if (t0 >= count) return;
+		int64_t first = (int64_t) slots[e] * rows;
+		float * list = groups + experts + e * n + t0;
+		int tid = threadIdx.x, warp = tid >> 5;
+		int wide = xs % 4 == 0;
+		float acc[32], v[8];
+		#pragma unroll
+		for (int i = 0; i < 32; i++) acc[i] = 0.0f;
+		// 64 picks × 16 values: one run of 4 a thread, or 4 single values.
+		#define GATHER(buf, k0) \
+		for (int l = 0; l < (wide ? 1: 4); l++) { \
+			int c = tid + l * 256, o = wide ? c >> 2: c >> 4, k = wide ? (c & 3) * 4: c & 15; \
+			int64_t left = cols - (k0) - k; \
+			int bytes = t0 + o < count && left > 0 ? (wide ? (left >= 4 ? 16: (int) left * 4): 4): 0; \
+			const float * src = bytes ? x + (int64_t) list[o] / per * xs + (k0) + k: x; \
+			copyAsync(Bs[buf] + o * 20 + k, wide ? 4: 1, (float *) src, wide ? 4: 1, wide ? 16: 4, bytes); \
+		}
+		int64_t slices = (cols + 15) / 16;
+		weightSlice(w, w_len, form, first + r0, rows - r0, cols, 0, cols, v, 8);
+		storeSlice(As[0], 2720, v, 8);
+		GATHER(0, 0)
+		copyCommit();
+		for (int64_t q = 0; q < slices; q++) {
+			int cur = q & 1;
+			int64_t next = (q + 1) * 16;
+			if (q + 1 < slices) {
+				GATHER(cur ^ 1, next)
+				copyCommit();
+				weightSlice(w, w_len, form, first + r0, rows - r0, cols, next, cols, v, 8);
+				copyWait(1);
+			} else {
+				copyWait(0);
+			}
+			__syncthreads();
+			warpTileTf32(As[cur], 2720, 20, 1, Bs[cur], 1280, 20, 1, acc, 32, (warp >> 1) * 32, (warp & 1) * 32, 2, 4);
+			if (q + 1 < slices) storeSlice(As[cur ^ 1], 2720, v, 8);
+			__syncthreads();
+		}
+		#undef GATHER
+		int lane = tid & 31, g = lane >> 2, t = lane & 3;
+		#pragma unroll
+		for (int j = 0; j < 4; j++) {
+			#pragma unroll
+			for (int c2 = 0; c2 < 2; c2++) {
+				int64_t p = (warp & 1) * 32 + j * 8 + t * 2 + c2;
+				if (t0 + p >= count) continue;
+				float * o = out + (int64_t) list[p] * rows;
+				#pragma unroll
+				for (int i = 0; i < 2; i++) {
+					#pragma unroll
+					for (int r2 = 0; r2 < 2; r2++) {
+						int64_t r = r0 + (warp >> 1) * 32 + i * 16 + g + r2 * 8;
+						if (r < rows) o[r] = acc[(i * 4 + j) * 4 + r2 * 2 + c2];
+					}
+				}
+			}
+		}
+	}
+
+	// multiplyTilesBack on the tensor cores: tiles of 128 columns by 64
+	// tokens (each warp 32 × 32) over 16 rows at a time, a row's 8
+	// columns expanded per thread into the weights' tile (columns along
+	// shared memory) while the gradient's values are copied
+	// asynchronously; arguments as multiplyTilesBack's, `threads` counting
+	// tiles of 128 by 64.
+	@launch(block = 256, x = "threads", cpu = false, arch = 80)
+	cuda def multiplyTilesBackTf32(w gpu.DeviceBuffer<byte>, form int, base int, dy gpu.DeviceBuffer<float32>, yo, ys int, out gpu.DeviceBuffer<float32>, oo, os, rows, cols, n, span, add, threads int) !none {
+		__shared__ __align__(16) float As[2][2720];
+		__shared__ __align__(16) float Bs[2][1280];
+		int64_t colTiles = (cols + 127) / 128, tokenTiles = (n + 63) / 64;
+		int64_t b = blockIdx.x % (colTiles * tokenTiles), s = blockIdx.x / (colTiles * tokenTiles);
+		int64_t c0 = (b % colTiles) * 128, t0 = (b / colTiles) * 64;
+		int64_t from = s * span, to = from + span < rows ? from + span: rows;
+		oo += s * n * os;
+		int tid = threadIdx.x, warp = tid >> 5;
+		int wide = ys % 4 == 0 && yo % 4 == 0;
+		int m0 = (warp >> 1) * 32, n0 = (warp & 1) * 32;
+		// This thread's row (k) and 8 columns of the weights' slice.
+		int kr = tid >> 4, kc = (tid & 15) * 8;
+		float acc[32], v[8];
+		#pragma unroll
+		for (int i = 0; i < 32; i++) acc[i] = 0.0f;
+		#define ROW_SLICE(r0) \
+		if ((r0) + kr < to && c0 + kc < cols) { \
+			weightsAt(w, w_len, form, base + (r0) + kr, cols, c0 + kc, v, 8); \
+		} else { \
+			for (int q = 0; q < 8; q++) v[q] = 0.0f; \
+		}
+		#define ROW_STORE(buf) \
+		*(float4 *) (As[buf] + kr * 136 + kc) = make_float4(v[0], v[1], v[2], v[3]); \
+		*(float4 *) (As[buf] + kr * 136 + kc + 4) = make_float4(v[4], v[5], v[6], v[7]);
+		int64_t slices = (to - from + 15) / 16;
+		ROW_SLICE(from)
+		ROW_STORE(0)
+		tokensAsync(Bs[0], 1280, dy + yo, 0, ys, t0, n, from, to, wide);
+		copyCommit();
+		for (int64_t q = 0; q < slices; q++) {
+			int cur = q & 1;
+			int64_t next = from + (q + 1) * 16;
+			if (q + 1 < slices) {
+				tokensAsync(Bs[cur ^ 1], 1280, dy + yo, 0, ys, t0, n, next, to, wide);
+				copyCommit();
+				ROW_SLICE(next)
+				copyWait(1);
+			} else {
+				copyWait(0);
+			}
+			__syncthreads();
+			warpTileTf32(As[cur], 2720, 1, 136, Bs[cur], 1280, 20, 1, acc, 32, m0, n0, 2, 4);
+			if (q + 1 < slices) {
+				ROW_STORE(cur ^ 1)
+			}
+			__syncthreads();
+		}
+		#undef ROW_SLICE
+		#undef ROW_STORE
+		storeTileTf32(acc, 32, out + oo, 0, 1, os, c0, cols, t0, n, add, m0, n0, 2, 4);
+	}
+}

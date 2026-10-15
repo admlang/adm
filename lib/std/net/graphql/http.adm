@@ -1,0 +1,319 @@
+partial module std.net.graphql {
+	use (
+		std.errors
+		std.data.encoding::(JSON)
+		std.net.http
+		std.net.http::(Context, Method)
+		std.net.graphql.syntax
+		std.net.graphql.syntax::(Node, NodeKind)
+	)
+
+	internal const graphqlResponseType = "application/graphql-response+json"
+	internal const legacyResponseType = "application/json"
+
+	// Serves a schema over HTTP (GraphQL over HTTP): a POST with a JSON body
+	// runs any operation, a GET with the request in its query runs queries,
+	// and a WebSocket upgrade speaks graphql-transport-ws, which subscriptions
+	// need. Responses are `application/graphql-response+json`, or
+	// `application/json` for a client that accepts only that; the status
+	// says what happened: 200 when the operation ran, 294 when it ran with
+	// errors, 400 for a document that does not parse or a body that is not
+	// JSON, 422 for a request that does not validate, names no operation or
+	// has variables that do not fit, 405 for a mutation over GET, 406 and
+	// 415 for media types it cannot answer or read.
+	//
+	//     let mux = new http.Mux()
+	//     mux.handle("/graphql", new graphql.Handler(schema))
+	type Handler {
+		schema      Schema
+		// What the resolvers get as their context for an HTTP request: the
+		// authenticated user, a data loader. None hands them the
+		// http.Context itself.
+		context     ?def (ctx Context) !any                           = none
+		// Accepts a WebSocket connection: given its `connection_init`
+		// payload (credentials, as the client sends them), it returns the
+		// context of the connection's operations, or fails to refuse it
+		// (the socket closes with 4403 Forbidden). None takes every
+		// connection with the http.Context as the context.
+		onConnect   ?def (ctx Context, payload map<string, any>) !any = none
+		// How long a WebSocket client has to send `connection_init` before
+		// the socket closes with 4408.
+		initTimeout duration                                          = 3s
+		// Whether a GET may run queries.
+		allowGet    bool                                              = true
+
+		def new(schema Schema) {
+			self.schema = schema
+		}
+
+		// Serves one request; implements http.Handler. Fails when the body
+		// cannot be read (one beyond the server's limit, which the server
+		// answers with 413), the context function fails, or the response
+		// cannot be written.
+		def serve(ctx Context) !none {
+			return try serveSocket(self, ctx) when ctx.request.headers.hasToken("Upgrade", "websocket")
+			let method = ctx.method()
+			let allowed = allowGet ?? ("GET, POST", "POST")
+			if !(method == Method.POST || (allowGet && method == Method.GET)) {
+				ctx.setHeader("Allow", allowed)
+				return try ctx.error(405, "GraphQL is served over {allowed}")
+			}
+			let chosen = responseType(ctx.header("Accept"))
+			return try ctx.error(406, "the response is {graphqlResponseType} or {legacyResponseType}") when chosen is none
+			let legacy = chosen == legacyResponseType
+			let (request, problem, status) = method == Method.GET ?? (requestFromQuery(ctx), try requestFromBody(ctx))
+			return try replyProblem(ctx, status, problem) unless problem == ""
+			if method == Method.GET && isMutation(request) {
+				ctx.setHeader("Allow", "POST")
+				return try ctx.error(405, "a mutation is sent with POST")
+			}
+			let build = context
+			let resolverContext any = ctx
+			resolverContext = try build(ctx) unless (build is none)
+			let response = schema.execute(request, resolverContext)
+			let code = unparsedDocument(response) ?? (400, executed(response) ?? (response.errors.len() == 0 || legacy ?? (200, 294), 422))
+			let mediaType = legacy && code < 300 ?? (legacyResponseType, graphqlResponseType)
+			return try ctx.blob(code, mediaType + "; charset=utf-8", response.json().bytes())
+		}
+	}
+
+	// The media type to answer in: the one the Accept header prefers; for a
+	// client that names neither (no header, `*/*`), application/json, which
+	// a client that predates the GraphQL media type reads too. None when the
+	// header accepts neither.
+	internal def responseType(accept string) ?string {
+		let entries = http.parseAccept(accept)
+		let named = entries.find(e => e.value == graphqlResponseType && e.q > 0.0, 0)
+		let offers = named is none ?? ([legacyResponseType, graphqlResponseType], [graphqlResponseType, legacyResponseType])
+		return http.negotiate(offers, entries)
+	}
+
+	// A request that is not a well-formed GraphQL-over-HTTP request,
+	// answered as a request error result in `application/json`: it does not
+	// come from GraphQL, so it does not claim the GraphQL media type.
+	internal def replyProblem(ctx Context, status int, message string) !none {
+		let body = map<string, any>{"errors": [map<string, any>{"message": message}]}
+		return try ctx.blob(status, legacyResponseType + "; charset=utf-8", JSON.encode(body))
+	}
+
+	// The request a GET carries in its query: `query`, and `operationName`,
+	// `variables` and `extensions` (the last two as JSON), empty ones left
+	// out. Returns the request, or a problem and the status for it.
+	internal def requestFromQuery(ctx Context) (Request, string, int) {
+		let request = Request{query: ""}
+		let query = ctx.query("query")
+		return (request, "The \"query\" parameter is missing.", 422) when query is none
+		request.query = query
+		request.operationName = ctx.query("operationName", "")
+		for let name in ["variables", "extensions"] {
+			let text = ctx.query(name, "")
+			continue when text == ""
+			let parsed = JSON.parse(text.bytes()) onerror (err error) {
+				return (request, "The \"{name}\" parameter is not JSON: {err.message}", 400)
+			}
+			return (request, "The \"{name}\" parameter is not a JSON object.", 422) unless parsed is map<string, any>
+			if name == "variables" {
+				request.variables = parsed
+			} else {
+				request.extensions = parsed
+			}
+		}
+		return (request, "", 200)
+	}
+
+	// The request a POST carries as a JSON object. Fails when the body
+	// cannot be read (one beyond the server's limit fails with the error
+	// the server answers 413 for).
+	internal def requestFromBody(ctx Context) !(Request, string, int) {
+		let request = Request{query: ""}
+		let media = ctx.contentType() onerror recover none
+		return (request, "The request needs a Content-Type of application/json.", 415) when media is none
+		return (request, "The request body is {media.essence()}, not application/json.", 415) unless media.essence() == "application/json"
+		let charset = media.charset()
+		return (request, "The request body is {charset}, not utf-8.", 415) unless charset is none || charset.lower() == "utf-8"
+		let body = try ctx.bytes()
+		let parsed = JSON.parse(body) onerror (err error) {
+			return (request, "The request body is not JSON: {err.message}", 400)
+		}
+		return (request, "The request body is not a JSON object.", 422) unless parsed is map<string, any>
+		let query = parsed.hasKey("query") ?? (parsed["query"], noneValue())
+		return (request, "The \"query\" parameter must be a string.", 422) unless query is string
+		request.query = query
+		if parsed.hasKey("operationName") {
+			let name = parsed["operationName"]
+			return (request, "The \"operationName\" parameter must be a string.", 422) unless name is none || name is string
+			request.operationName = name is string ?? (name, "")
+		}
+		for let key in ["variables", "extensions"] {
+			continue unless parsed.hasKey(key)
+			let value = parsed[key]
+			continue when value is none
+			return (request, "The \"{key}\" parameter must be an object.", 422) unless value is map<string, any>
+			if key == "variables" {
+				request.variables = value
+			} else {
+				request.extensions = value
+			}
+		}
+		return (request, "", 200)
+	}
+
+	// Whether the operation a request names is a mutation; false when the
+	// document does not parse or names none (execution reports those).
+	internal def isMutation(request Request) bool {
+		let doc = syntax.parseDocument(request.query) onerror recover new Node(NodeKind.Document)
+		let operation = operationOf(doc, request.operationName) onerror recover new Node(NodeKind.OperationDefinition)
+		return operation.text == "mutation"
+	}
+
+	// A GraphQL service at a URL: requests are sent as GraphQL over HTTP
+	// (POST, JSON), subscriptions over one graphql-transport-ws WebSocket
+	// the client opens on first use and shares between them.
+	//
+	//     let client = new graphql.Client("https://api.example.com/graphql")
+	//     let response = try client.execute("query ($id: ID!) \{ user(id: $id) \{ name \} \}", {"id": "4"})
+	//     try response.decode(user)
+	type Client {
+		endpoint         string
+		// The HTTP client requests go through: its headers (Authorization),
+		// timeout and transport apply to the WebSocket handshake too.
+		httpClient       http.Client
+		// The payload of the WebSocket's `connection_init`: credentials as
+		// the server's onConnect expects them.
+		connectionParams map<string, any> = map<string, any>{}
+
+		internal socket ?ClientSocket = none
+
+		def new(endpoint string) {
+			self.endpoint = endpoint
+			httpClient = new http.Client()
+		}
+
+		// Sends a request and returns its response, errors included. Fails
+		// with the HTTP client's error when the request cannot be sent, and
+		// with a ClientError when the server's answer is not a GraphQL
+		// response (an HTTP error from something other than GraphQL).
+		def execute(query string, variables map<string, any> = map<string, any>{}, operationName string = "") !Response {
+			return try execute(Request{query: query, variables: variables, operationName: operationName})
+		}
+
+		// Sends a request; see execute(string, ...). Fails as that does.
+		def execute(request Request) !Response {
+			let req = try http.newRequest(Method.POST, endpoint, JSON.encode(requestJSON(request)))
+			req.headers.set("Content-Type", "application/json")
+			req.headers.set("Accept", "{graphqlResponseType}, {legacyResponseType};q=0.9")
+			let res = try httpClient.do(req)
+			let body = try res.bytes()
+			let mediaType = res.headers.get("Content-Type").split(";")[0].trim().lower()
+			let graphqlBody = mediaType == graphqlResponseType || (mediaType == legacyResponseType && res.status >= 200 && res.status < 300)
+			fail clientError("the server answered {res.status} with {mediaType == "" ?? ("no content type", mediaType)}: {string(body[0:body.len() < 200 ?? (body.len(), 200)])}") unless graphqlBody
+			return try parseResponse(body)
+		}
+
+		// Starts a subscription (or any operation) over the client's
+		// graphql-transport-ws socket, opening it first when it is not open:
+		// each result arrives on the subscription's responses, which close
+		// when the server completes the operation; closing the subscription
+		// tells the server to stop. An operation the server cannot run sends
+		// one response with its errors. Fails with the WebSocket's error when
+		// the socket cannot be opened, and with a ClientError when the server
+		// does not speak graphql-transport-ws or does not acknowledge the
+		// connection.
+		def subscribe(query string, variables map<string, any> = map<string, any>{}, operationName string = "") !Subscription {
+			return try subscribe(Request{query: query, variables: variables, operationName: operationName})
+		}
+
+		// Starts a subscription; see subscribe(string, ...). Fails as that
+		// does.
+		def subscribe(request Request) !Subscription {
+			let open = try openSocket()
+			return try open.subscribe(request)
+		}
+
+		// Closes the WebSocket the subscriptions share; they end.
+		def close() {
+			let open = takeSocket()
+			open.close() unless open is none
+		}
+
+		internal atomic def openSocket() !ClientSocket {
+			let open = socket
+			return open when !(open is none) && open.conn.isOpen()
+			let made = try dialSocket(endpoint, httpClient.headers, connectionParams)
+			socket = made
+			return made
+		}
+
+		internal atomic def takeSocket() ?ClientSocket {
+			let open = socket
+			socket = none
+			return open
+		}
+	}
+
+	// The request as the JSON object GraphQL over HTTP and graphql-ws send.
+	internal def requestJSON(request Request) map<string, any> {
+		let out = map<string, any>{"query": request.query}
+		out["operationName"] = request.operationName unless request.operationName == ""
+		out["variables"] = request.variables when request.variables.len() > 0
+		out["extensions"] = request.extensions when request.extensions.len() > 0
+		return out
+	}
+
+	// What a client could not do: send the request, or read the answer as a
+	// GraphQL response.
+	struct ClientError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
+
+	internal def clientError(message string) ClientError {
+		return ClientError{message: "graphql: " + message, code: "graphql-client"}
+	}
+
+	// A response read back from its JSON.
+	internal def parseResponse(body byte[]) !Response {
+		let parsed = try JSON.parse(body)
+		fail clientError("the response is not a JSON object") unless parsed is map<string, any>
+		return try responseOf(parsed)
+	}
+
+	internal def responseOf(parsed map<string, any>) !Response {
+		let response = new Response()
+		if parsed.hasKey("data") {
+			response.ran = true
+			response.data = parsed["data"]
+		}
+		let errors = parsed.hasKey("errors") ?? (parsed["errors"], noneValue())
+		if errors is any[] {
+			for let e in errors {
+				continue unless e is map<string, any>
+				response.errors.push(errorOf(e))
+			}
+		}
+		let extensions = parsed.hasKey("extensions") ?? (parsed["extensions"], noneValue())
+		response.extensions = extensions when extensions is map<string, any>
+		return response
+	}
+
+	internal def errorOf(e map<string, any>) GraphQLError {
+		let message = e.hasKey("message") ?? (e["message"], noneValue())
+		let out = GraphQLError{message: message is string ?? (message, "")}
+		let locations = e.hasKey("locations") ?? (e["locations"], noneValue())
+		if locations is any[] {
+			for let l in locations {
+				continue unless l is map<string, any>
+				let line = l.hasKey("line") ?? (l["line"], noneValue())
+				let column = l.hasKey("column") ?? (l["column"], noneValue())
+				out.locations.push(Location{line: line is int ?? (line, 0), column: column is int ?? (column, 0)})
+			}
+		}
+		let path = e.hasKey("path") ?? (e["path"], noneValue())
+		out.path = path when path is any[]
+		let extensions = e.hasKey("extensions") ?? (e["extensions"], noneValue())
+		out.extensions = extensions when extensions is map<string, any>
+		return out
+	}
+}

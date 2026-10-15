@@ -1,0 +1,555 @@
+partial module std.net.tls.acme {
+	use (
+		std.testing
+		std.time
+		std.crypto
+		std.crypto::(PrivateKey, generateECDSAKey, publicKeyOf)
+		std.crypto.hash::(Hash, digest)
+		std.crypto.x509
+		std.data.encoding::(JSON, PEMBlock, pemEncode, asn1Parse)
+		std.net
+		std.os
+		std.net.http
+		std.net.http.httptest
+		std.net.tls
+		std.proto.auth.jose
+	)
+
+	// One account the fake CA knows.
+	internal struct FakeAccount {
+		url     string
+		key     jose.Jwk
+		contact string[]
+		status  string
+	}
+
+	// One authorization of the fake CA: its identifier, token, status and
+	// the challenge the client answered.
+	internal struct FakeAuthz {
+		id       string
+		value    string
+		token    string
+		status   string
+		wildcard bool
+		answered string
+	}
+
+	// A small ACME CA for the suite. It checks every request's JWS (the
+	// nonce it issued, the url, the account key), refuses the first nonce it
+	// sees with badNonce, validates http-01 against `httpBase`, tls-alpn-01
+	// by dialling `tlsAddress` with ALPN acme-tls/1, and dns-01 against
+	// `dns`; it signs CSRs with its own CA key.
+	internal type FakeCA {
+		base        string                = ""
+		nonces      map<string, bool>     = map<string, bool>{}
+		counter     int                   = 0
+		accounts    FakeAccount[]         = []
+		authzs      FakeAuthz[]           = []
+		orders      map<string, string>   = map<string, string>{}
+		orderNames  map<string, string[]> = map<string, string[]>{}
+		certs       map<string, byte[]>   = map<string, byte[]>{}
+		caKey       PrivateKey
+		caCert      x509.Certificate
+		httpBase    string                = ""
+		tlsAddress  string                = ""
+		dns         ?RecordingDNS         = none
+		refusedOnce bool                  = false
+		revoked     string[]              = []
+		requireEAB  bool                  = false
+		eabKey      byte[]                = []
+		replaced    string[]              = []
+		failures    string[]              = []
+		lastJwk     ?jose.Jwk             = none
+		lastOrder   string                = ""
+
+		def new(caKey PrivateKey, caCert x509.Certificate) {
+			self.caKey = caKey
+			self.caCert = caCert
+		}
+
+		def fresh() string {
+			counter++
+			let n = "n{counter}"
+			nonces[n] = true
+			return n
+		}
+
+		// Serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let path = ctx.request.url.path
+			ctx.setHeader("Replay-Nonce", fresh())
+			if path == "/directory" {
+				let about = map<string, any>{"termsOfService": base + "/terms", "externalAccountRequired": requireEAB}
+				return try ctx.json(200, map<string, any>{"newNonce": base + "/nonce", "newAccount": base + "/account", "newOrder": base + "/order", "revokeCert": base + "/revoke", "keyChange": base + "/key-change", "renewalInfo": base + "/ari", "meta": about})
+			}
+			return try ctx.text(200, "") when path == "/nonce"
+			return try ctx.json(200, map<string, any>{"suggestedWindow": map<string, any>{"start": "2000-01-01T00:00:00Z", "end": "2000-01-02T00:00:00Z"}}) when path.startsWith("/ari/")
+			let body = try ctx.bytes()
+			let (payload, account) = checked(path, body) onerror (err error) {
+				failures.push(err.message)
+				recover (byte[], "bad")
+			}
+			return try problem(ctx, 400, "malformed", failures[failures.len() - 1]) when account == "bad"
+			return try problem(ctx, 400, "badNonce", "stale nonce") when account == "nonce"
+			return try route(ctx, path, payload, account)
+		}
+
+		def problem(ctx http.Context, status int, kind string, detail string) !none {
+			return try ctx.blob(status, "application/problem+json", JSON.encode(map<string, any>{"type": "urn:ietf:params:acme:error:" + kind, "detail": detail}))
+		}
+
+		// The payload and the account URL ("" for a jwk request, "nonce" when the
+		// nonce is refused); fails on any other flaw.
+		def checked(path string, body byte[]) !(byte[], string) {
+			let jws = try jose.parseJws(string(body))
+			let header = jws.signatures[0].protected
+			let url = header.get("url")
+			fail "url {url} is not {base + path}" unless url is string && url == base + path
+			let nonce = header.get("nonce")
+			fail "no nonce" unless nonce is string
+			fail "nonce {nonce} was not issued or was used" unless nonces.hasKey(nonce)
+			nonces.delete(nonce)
+			if !refusedOnce {
+				refusedOnce = true
+				return (byte[], "nonce")
+			}
+			let jwk = header.jwk
+			if !(jwk is none) {
+				let payload = try jws.verify(jwk, [jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.RS256])
+				lastJwk = jwk
+				return (payload, "")
+			}
+			let kid = header.kid
+			fail "neither jwk nor kid" when kid is none
+			let account = accounts.find(a => a.url == kid, 0)
+			fail "unknown account {kid}" when account is none
+			fail "account {kid} is {account.status}" when account.status != "valid"
+			let payload = try jws.verify(account.key, [jose.SignatureAlgorithm.ES256, jose.SignatureAlgorithm.ES384, jose.SignatureAlgorithm.RS256])
+			return (payload, kid)
+		}
+
+		def route(ctx http.Context, path string, payload byte[], account string) !none {
+			let doc = map<string, any>{}
+			if payload.len() > 0 {
+				let parsed = try JSON.parse(payload)
+				fail "payload is not an object" unless parsed is map<string, any>
+				doc = parsed
+			}
+			match path {
+				case "/account":
+					return try newAccount(ctx, doc)
+				case "/order":
+					return try newOrder(ctx, doc)
+				case "/revoke":
+					let der = try b64urlDecode(text(doc, "certificate"))
+					revoked.push((try x509.parseCertificate(der)).serialNumber.toRadix(16))
+					return try ctx.text(200, "")
+				case "/key-change":
+					let inner = try jose.parseJws(string(JSON.encode(doc)))
+					let newKey = inner.signatures[0].protected.jwk
+					fail "no new key" when newKey is none
+					let innerPayload = try JSON.parse(try inner.verify(newKey, [jose.SignatureAlgorithm.ES256]))
+					fail "inner payload is not an object" unless innerPayload is map<string, any>
+					fail "account mismatch" unless text(innerPayload, "account") == account
+					for let (i, a) in accounts {
+						accounts[i].key = newKey when a.url == account
+					}
+					return try ctx.text(200, "")
+				default:
+			}
+			if path.startsWith("/acct/") {
+				for let (i, a) in accounts {
+					if a.url == base + path {
+						accounts[i].status = text(doc, "status") when text(doc, "status") != ""
+						accounts[i].contact = texts(doc, "contact") when doc.hasKey("contact")
+						return try ctx.json(200, map<string, any>{"status": accounts[i].status, "contact": accounts[i].contact})
+					}
+				}
+			}
+			if path.startsWith("/authz/") {
+				let index = path[7:].toInt<int>()
+				return try ctx.json(200, authzDoc(index))
+			}
+			if path.startsWith("/chall/") {
+				let index = path[7:path.lastIndexOf("/")].toInt<int>()
+				let kind = path[path.lastIndexOf("/") + 1:]
+				try validate(index, kind, account)
+				return try ctx.json(200, challengeDoc(index, kind))
+			}
+			if path.startsWith("/orders/") && path.endsWith("/finalize") {
+				let id = path[8:path.len() - 9]
+				let names = orderNames[id]
+				let csr = try asn1Parse(try b64urlDecode(text(doc, "csr")))
+				let spki = csr.children[0].children[2].encode()
+				let template = x509.Template{notBefore: time.now() - 1h, notAfter: time.now() + 2160h}
+				template.dnsNames = names.filter(n => net.parseIPText(n) is none)
+				for let n in names {
+					let ip = net.parseIPText(n)
+					template.ipAddresses.push(ip) unless ip is none
+				}
+				let leafDer = try x509.createCertificate(template, try crypto.parsePKIXPublicKey(spki), caCert, caKey)
+				certs[id] = leafDer
+				lastOrder = id
+				orders[id] = "valid"
+				return try ctx.json(200, orderDoc(id))
+			}
+			if path.startsWith("/orders/") {
+				let id = path[8:]
+				let allValid = true
+				for let i in orderAuthz(id) {
+					allValid = false when authzs[i].status != "valid"
+				}
+				orders[id] = "ready" when allValid && orders[id] == "pending"
+				return try ctx.json(200, orderDoc(id))
+			}
+			if path.startsWith("/cert/") {
+				let id = path[6:]
+				ctx.setHeader("Link", "<{base}/cert/{id}/alt>;rel=\"alternate\"")
+				let pem = pemEncode(new PEMBlock("CERTIFICATE", certs[id])) + pemEncode(new PEMBlock("CERTIFICATE", caCert.raw))
+				return try ctx.blob(200, "application/pem-certificate-chain", pem.bytes())
+			}
+			return try problem(ctx, 404, "malformed", "no such resource {path}")
+		}
+
+		def newAccount(ctx http.Context, doc map<string, any>) !none {
+			let key = lastJwk
+			fail "no key" when key is none
+			let thumb = key.thumbprint(Hash.SHA256)
+			let only = doc.get("onlyReturnExisting")
+			for let a in accounts {
+				if a.key.thumbprint(Hash.SHA256).equals(thumb) {
+					return try problem(ctx, 403, "unauthorized", "the account is {a.status}") when a.status != "valid"
+					ctx.setHeader("Location", a.url)
+					return try ctx.json(200, map<string, any>{"status": a.status})
+				}
+			}
+			return try problem(ctx, 400, "accountDoesNotExist", "no account for this key") when only is bool && only
+			let agreed = doc.get("termsOfServiceAgreed")
+			return try problem(ctx, 403, "userActionRequired", "agree to the terms") unless agreed is bool && agreed
+			if requireEAB {
+				let binding = doc.get("externalAccountBinding")
+				return try problem(ctx, 403, "externalAccountRequired", "bind an external account") unless binding is map<string, any>
+				let inner = try jose.parseJws(string(JSON.encode(binding)))
+				let kid = inner.signatures[0].protected.kid
+				fail "eab kid" unless !(kid is none) && kid == "kid-1"
+				try inner.verify(new jose.Jwk(eabKey), [jose.SignatureAlgorithm.HS256])
+			}
+			let url = base + "/acct/{accounts.len() + 1}"
+			accounts.push(FakeAccount{url: url, key: key, contact: texts(doc, "contact"), status: "valid"})
+			ctx.setHeader("Location", url)
+			return try ctx.json(201, map<string, any>{"status": "valid", "contact": texts(doc, "contact")})
+		}
+
+		def newOrder(ctx http.Context, doc map<string, any>) !none {
+			counter++
+			let id = "o{counter}"
+			let names string[] = []
+			let ids = doc.get("identifiers")
+			if ids is any[] {
+				for let i in ids {
+					names.push(text(i, "value")) when i is map<string, any>
+				}
+			}
+			let replaces = text(doc, "replaces")
+			replaced.push(replaces) unless replaces == ""
+			for let n in names {
+				let wildcard = n.startsWith("*.")
+				authzs.push(FakeAuthz{id: id, value: wildcard ?? (n[2:], n), token: "tok{authzs.len()}", status: "pending", wildcard: wildcard})
+			}
+			orders[id] = "pending"
+			orderNames[id] = names
+			ctx.setHeader("Location", base + "/orders/" + id)
+			return try ctx.json(201, orderDoc(id))
+		}
+
+		def orderAuthz(id string) int[] {
+			let out int[] = []
+			for let (i, a) in authzs {
+				out.push(i) when a.id == id
+			}
+			return out
+		}
+
+		def orderDoc(id string) map<string, any> {
+			let urls any[] = []
+			for let i in orderAuthz(id) {
+				urls.push(base + "/authz/{i}")
+			}
+			let ids any[] = []
+			for let n in orderNames[id] {
+				ids.push(map<string, any>{"type": net.parseIPText(n) is none ?? ("dns", "ip"), "value": n})
+			}
+			let out = map<string, any>{"status": orders[id], "identifiers": ids, "authorizations": urls, "finalize": base + "/orders/" + id + "/finalize"}
+			out["certificate"] = base + "/cert/" + id when orders[id] == "valid"
+			return out
+		}
+
+		def authzDoc(index int) map<string, any> {
+			let a = authzs[index]
+			let challenges any[] = []
+			for let kind in a.wildcard ?? (["dns-01"], ["http-01", "dns-01", "tls-alpn-01"]) {
+				challenges.push(challengeDoc(index, kind))
+			}
+			let out = map<string, any>{"status": a.status, "identifier": map<string, any>{"type": net.parseIPText(a.value) is none ?? ("dns", "ip"), "value": a.value}, "challenges": challenges}
+			out["wildcard"] = true when a.wildcard
+			return out
+		}
+
+		def challengeDoc(index int, kind string) map<string, any> {
+			let a = authzs[index]
+			let status = a.answered == kind ?? (a.status, "pending")
+			return map<string, any>{"type": kind, "url": base + "/chall/{index}/{kind}", "token": a.token, "status": status}
+		}
+
+		// Checks the response the way a CA does, and marks the authorization.
+		def validate(index int, kind string, account string) !none {
+			let a = authzs[index]
+			let accountKey = accounts.find(acct => acct.url == account, 0)
+			fail "no account" when accountKey is none
+			let keyAuth = a.token + "." + b64url(accountKey.key.thumbprint(Hash.SHA256))
+			let ok = false
+			match kind {
+				case "http-01":
+					let res = try http.get(httpBase + "/.well-known/acme-challenge/" + a.token)
+					ok = res.status == 200 && (try res.text()) == keyAuth
+				case "dns-01":
+					let records = dns
+					ok = !(records is none) && records.has(dnsRecordName(a.wildcard ?? ("*." + a.value, a.value)), dnsRecordValue(keyAuth))
+				default:
+					let config = new tls.Config()
+					config.alpn = [acmeTLSProtocol]
+					config.serverName = net.parseIPText(a.value) is none ?? (a.value, reverseName(a.value))
+					config.insecureSkipVerify = true
+					let conn = try tls.dial(tlsAddress, config, 5s)
+					try conn.handshake(5s)
+					let state = conn.connectionState()
+					let leaf = state.peerCertificates[0]
+					let ext = leaf.extensions.find(e => e.id.equals(oidAcmeIdentifier), 0)
+					fail "the tls-alpn-01 certificate has no acmeIdentifier" when ext is none
+					let proof = (try asn1Parse(ext.value)).content
+					ok = state.alpn == acmeTLSProtocol && ext.critical && proof.equals(digest(Hash.SHA256, keyAuth.bytes()))
+					conn.close() onerror recover none
+			}
+			authzs[index].answered = kind
+			authzs[index].status = ok ?? ("valid", "invalid")
+			return none
+		}
+	}
+
+	// A DNS provider that keeps the records in memory.
+	internal type RecordingDNS {
+		records map<string, string[]> = map<string, string[]>{}
+		removed int                   = 0
+
+		// present implements DNSProvider.
+		def present(name string, value string) !none {
+			let list = records.get(name)
+			records[name] = list is none ?? ([value], list + [value])
+			return none
+		}
+
+		// cleanup implements DNSProvider.
+		def cleanup(name string, value string) !none {
+			let list = records.get(name)
+			records[name] = list.filter(v => v != value) unless list is none
+			removed++
+			return none
+		}
+
+		def has(name string, value string) bool {
+			let list = records.get(name)
+			return !(list is none) && list.includes(value)
+		}
+	}
+
+	check "ACME" {
+		// The pieces a validation checks: key authorizations, dns-01 names and
+		// values, the tls-alpn-01 certificate, reverse names, ARI ids.
+		@test()
+		def buildsChallengeResponses() !none {
+			assert dnsRecordName("*.example.com") == "_acme-challenge.example.com" && dnsRecordName("www.example.com") == "_acme-challenge.www.example.com"
+			assert dnsRecordValue("token.thumb") == b64url(digest(Hash.SHA256, "token.thumb".bytes()))
+			let pair = try tlsAlpnCertificate("example.com", "tok.thumb")
+			let leaf = try x509.parseCertificate(pair.chain[0])
+			assert leaf.dnsNames.equals(["example.com"])
+			let ext = leaf.extensions.find(e => e.id.equals(oidAcmeIdentifier), 0)
+			assert !(ext is none) && ext.critical && (try asn1Parse(ext.value)).content.equals(digest(Hash.SHA256, "tok.thumb".bytes()))
+			let ipPair = try tlsAlpnCertificate("192.0.2.1", "x")
+			assert (try x509.parseCertificate(ipPair.chain[0])).ipAddresses[0].equals(byte[192, 0, 2, 1])
+			assert reverseName("192.0.2.1") == "1.2.0.192.in-addr.arpa" && reverseName("2001:db8::1").endsWith(".8.b.d.0.1.0.0.2.ip6.arpa") && reverseName("x") == ""
+			assert serialBytes(bigint(0x80)).equals(byte[0, 0x80]) && serialBytes(bigint(0x7F01)).equals(byte[0x7F, 0x01])
+			assert identifierOf("10.0.0.1").kind == "ip" && identifierOf("Example.COM").value == "example.com"
+		}
+
+		// Both stores keep, read back and remove entries.
+		@test()
+		def keepsEntries() !none {
+			let stores CertificateStore[] = [new FolderStore(try os.appHome() + "/acme-store-test"), new VaultStore()]
+			for let store in stores {
+				try store.save("a.pem", "one".bytes())
+				try store.save("a.pem", "two".bytes())
+				let back = try store.load("a.pem")
+				assert !(back is none) && string(back) == "two"
+				try store.remove("a.pem")
+				assert (try store.load("a.pem")) is none
+			}
+		}
+
+		// The protocol calls one by one, as a program that drives ACME itself
+		// makes them: directory, account, contact update, order, authorization,
+		// key authorization, accept, wait, finalize, download, deactivating an
+		// authorization.
+		@test()
+		def speaksTheProtocol() !none {
+			let caKey PrivateKey = try generateECDSAKey(crypto.p256)
+			let caTemplate = x509.Template{isCA: true}
+			caTemplate.subject.commonName = "Fake ACME CA"
+			let caCert = try x509.parseCertificate(try x509.createCertificate(caTemplate, publicKeyOf(caKey), none, caKey))
+			let ca = new FakeCA(caKey, caCert)
+			let caServer = new httptest.Server(ca)
+			try caServer.startTLS()
+			defer caServer.close()
+			ca.base = caServer.url
+			let dns = new RecordingDNS()
+			ca.dns = dns
+			let key PrivateKey = try generateECDSAKey(crypto.p256)
+			let c = new Client(caServer.url + "/directory", key)
+			c.http = caServer.client()
+			let d = try c.directory()
+			assert d.termsOfService == ca.base + "/terms" && d.renewalInfo == ca.base + "/ari" && !d.externalAccountRequired
+			assert c.account() is error
+			let account = try c.register(["ops@example.test"], termsAgreed = true)
+			assert account.contact.equals(["mailto:ops@example.test"]) && account.url == c.accountURL
+			assert (try c.updateContact(["mailto:new@example.test"])).contact.equals(["mailto:new@example.test"])
+			let order = try c.newOrder(["*.example.test"])
+			assert order.status == Status.Pending && order.authorizations.len() == 1 && order.identifiers[0].value == "*.example.test"
+			let a = try c.authorization(order.authorizations[0])
+			assert a.wildcard && a.identifier.value == "example.test" && a.challenges.len() == 1
+			let ch = a.challenges[0]
+			let keyAuth = c.keyAuthorization(ch.token)
+			assert keyAuth.startsWith(ch.token + ".") && keyAuth.len() == ch.token.len() + 44
+			try dns.present(dnsRecordName("*.example.test"), dnsRecordValue(keyAuth))
+			try c.accept(ch)
+			assert (try c.waitAuthorization(a.url)).status == Status.Valid
+			let ready = try c.waitOrder(try c.order(order.url))
+			assert ready.status == Status.Ready
+			let certKey PrivateKey = try generateECDSAKey(crypto.p256)
+			let done = try c.waitOrder(try c.finalize(ready, try x509.createRequest(x509.Template{dnsNames: ["*.example.test"]}, certKey)))
+			let (chain, _) = try c.certificate(done)
+			assert (try x509.parseCertificate(chain[0])).dnsNames.equals(["*.example.test"])
+			try c.deactivateAuthorization(a.url)
+		}
+
+		// The whole flow against the fake CA: a key that has no account, the
+		// terms refused then accepted, EAB, an order with http-01, tls-alpn-01 and
+		// dns-01 (a wildcard), finalize, download with an alternate, ARI, renewal
+		// with `replaces`, the store, key change, revocation.
+		@test()
+		def issuesThroughTheManager() !none {
+			let caKey PrivateKey = try generateECDSAKey(crypto.p256)
+			let caTemplate = x509.Template{isCA: true, keyUsage: [x509.KeyUsage.CertSign]}
+			caTemplate.subject.commonName = "Fake ACME CA"
+			let caCert = try x509.parseCertificate(try x509.createCertificate(caTemplate, publicKeyOf(caKey), none, caKey))
+			let ca = new FakeCA(caKey, caCert)
+			let caServer = new httptest.Server(ca)
+			try caServer.startTLS()
+			defer caServer.close()
+			ca.base = caServer.url
+			let dns = new RecordingDNS()
+			ca.dns = dns
+			let folder = new FolderStore(try os.appHome() + "/acme-test")
+			let manager = new Manager(["localhost", "*.example.test", "127.0.0.1"], "ops@example.test")
+			manager.directoryURL = caServer.url + "/directory"
+			manager.httpClient = caServer.client()
+			manager.store = folder
+			manager.dns = dns
+			let challengeServer = try httptest.Server.start(manager.handler())
+			defer challengeServer.close()
+			ca.httpBase = challengeServer.url
+			// tls-alpn-01 validations dial the manager's own TLS config.
+			let sock = try net.socket(net.SocketDomain.IPv4, net.SocketType.Stream)
+			try sock.bind("127.0.0.1:0")
+			let tlsListener = try sock.listen(8)
+			defer tlsListener.close()
+			ca.tlsAddress = tlsListener.address().str()
+			let validations = new AsyncScope()
+			async<validations> acceptValidations(tlsListener, manager.tlsConfig())
+			defer validations.cancel()
+
+			assert manager.certificate("localhost") is error
+			manager.acceptTerms = true
+			ca.requireEAB = true
+			manager.client = none
+			assert manager.certificate("localhost") is error
+			ca.eabKey = try crypto.rand(32)
+			manager.eab = ExternalAccountBinding{keyId: "kid-1", hmacKey: ca.eabKey}
+			manager.client = none
+			manager.challenges = [ChallengeType.Http01]
+			let first = try manager.certificate("localhost")
+			let leaf = try x509.parseCertificate(first.chain[0])
+			assert leaf.dnsNames.equals(["localhost"]) && first.chain.len() == 2 && ca.failures.len() == 0
+			manager.challenges = [ChallengeType.TlsAlpn01]
+			let byIP = try manager.certificate("127.0.0.1")
+			assert (try x509.parseCertificate(byIP.chain[0])).ipAddresses[0].equals(byte[127, 0, 0, 1])
+			manager.challenges = [ChallengeType.TlsAlpn01, ChallengeType.Dns01]
+			let wild = try manager.certificate("a.example.test")
+			assert (try x509.parseCertificate(wild.chain[0])).dnsNames.equals(["*.example.test"]) && dns.removed == 1
+			assert manager.certificate("other.test") is error
+			let fromCache = try manager.certificate("LOCALHOST")
+			assert fromCache.chain[0].equals(first.chain[0])
+			let stored = try folder.load("localhost.pem")
+			assert !(stored is none) && string(stored).contains("PRIVATE KEY")
+
+			let c = new Client(manager.directoryURL, try generateECDSAKey(crypto.p256))
+			c.http = caServer.client()
+			try c.register(["ops@example.test"], termsAgreed = true, eab = manager.eab)
+			let (chain, alternates) = try c.chainAt(ca.base + "/cert/" + ca.lastOrder)
+			assert chain.len() == 2 && alternates.len() == 1 && alternates[0].endsWith("/cert/{ca.lastOrder}/alt")
+			let info = try c.renewalInfo(first.chain[0])
+			assert info.start.unixNs() == int64(946684800) * 1000000000
+			let renewed = try manager.renew("localhost")
+			assert !renewed.chain[0].equals(first.chain[0]) && ca.replaced.len() == 1 && ca.replaced[0] == (try renewalId(first.chain[0]))
+			// The CA's window has started (it says 2000), so the background task
+			// renews every name at once.
+			try manager.start()
+			for let i = 0; i < 100 && ca.replaced.len() < 4; i++ {
+				time.sleep(50ms)
+			}
+			manager.stop()
+			assert ca.replaced.len() >= 4 && manager.lastError("localhost") == ""
+
+			let fresh = new Manager(["localhost"])
+			fresh.directoryURL = manager.directoryURL
+			fresh.store = folder
+			fresh.httpClient = caServer.client()
+			let reloaded = try fresh.certificate("localhost")
+			assert reloaded.chain[0].equals((try manager.certificate("localhost")).chain[0])
+
+			let newKey PrivateKey = try generateECDSAKey(crypto.p256)
+			try c.changeKey(newKey)
+			let again = try c.account()
+			assert again.status == Status.Valid && again.url == c.accountURL
+			try c.deactivate()
+			assert c.account() is error
+			try manager.revoke("localhost", 4)
+			assert ca.revoked.len() == 1 && (try folder.load("localhost.pem")) is none
+			try folder.remove("account-" + hostOf(manager.directoryURL) + ".key")
+		}
+	}
+
+	// Completes TLS handshakes on the listener so tls-alpn-01 validations get
+	// an answer, until it closes.
+	internal async def acceptValidations(listener net.Listener, config tls.Config) {
+		for {
+			let failed = false
+			let raw = listener.accept() onerror (err error) {
+				failed = true
+				recover new net.Connection(-1)
+			}
+			break when failed || canceled()
+			let conn = tls.server(raw, config)
+			conn.handshake(5s) onerror recover none
+			conn.close() onerror recover none
+		}
+	}
+}

@@ -1,0 +1,739 @@
+partial module std.crypto.openpgp {
+	use (
+		std.bytes
+		std.crypto
+		std.crypto.cipher::(AEAD)
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+		std.data.compress.bzip2
+		std.data.compress.flate
+		std.data.compress.zlib
+		std.time
+	)
+
+	// What checking one signature found.
+	struct Verification {
+		// The Key ID the signature names as its issuer.
+		keyID       string
+		// The fingerprint of the key that made it, when the keyring has it.
+		fingerprint string    = ""
+		key         ?Key      = none
+		created     time.Time
+		valid       bool      = false
+		// Why the signature does not hold, when it does not.
+		problem     string    = ""
+	}
+
+	// A read message: the literal data, what it says about itself, whether
+	// it was encrypted, and its signatures as checked against the keyring.
+	type Message {
+		data       byte[]         = []
+		// The sender marked the data as UTF-8 text (its line endings are
+		// CR LF as sent).
+		text       bool           = false
+		// The file name and time the literal data carries. Signatures do not
+		// cover them (RFC 9580 §5.9).
+		filename   string         = ""
+		modified   ?time.Time     = none
+		encrypted  bool           = false
+		signatures Verification[] = []
+
+		def new() {}
+
+		// Whether at least one signature holds.
+		def verified() bool {
+			for let v in signatures {
+				return true when v.valid
+			}
+			return false
+		}
+	}
+
+	// How encrypt builds a message.
+	struct EncryptOptions {
+		// Keys that sign the data inside the encryption.
+		signers     Key[]                = []
+		// A passphrase that also decrypts the message.
+		passphrase  string               = ""
+		// Marks the data as UTF-8 text (signatures are then text
+		// signatures).
+		text        bool                 = false
+		filename    string               = ""
+		compression CompressionAlgorithm = CompressionAlgorithm.Uncompressed
+	}
+
+	// encrypt encrypts data to the recipients' encryption keys (and to
+	// `options.passphrase` when given): SEIPD version 2 with AEAD when every
+	// recipient supports it, else version 1, with the strongest cipher all
+	// recipients accept. The result is binary; armor it with `armor`.
+	// Fails when a recipient has no usable encryption key (none, expired or
+	// revoked), a signer cannot sign, or there is no recipient and no
+	// passphrase.
+	def encrypt(data byte[], recipients Key[], options EncryptOptions = EncryptOptions{}) !byte[] {
+		fail pgpError("a message needs a recipient or a passphrase") when recipients.len() == 0 && options.passphrase == ""
+		let now = nowSeconds()
+		let targets KeyPacket[] = []
+		let aead = true
+		let strong = true
+		for let key in recipients {
+			let usable = usableKeys(key, now, 0x0C)
+			fail pgpError("key {key.fingerprint()} has no usable encryption key") when usable.len() == 0
+			let binding = bindingOf(key, now)
+			let features = binding is none ?? (none, binding.find(spFeatures))
+			let seipd2 = key.primary.version == 6 || (!(features is none) && features.body.len() > 0 && int(features.body[0]) & 0x08 != 0)
+			aead = aead && seipd2
+			if aead {
+				let pairs = binding is none ?? (none, binding.find(spPrefAEAD))
+				strong = strong && !(pairs is none) && hasPair(pairs.body, 9, 2)
+			} else {
+				let ciphers = binding is none ?? (none, binding.find(spPrefCiphers))
+				strong = strong && !(ciphers is none) && ciphers.body.includes(byte(9))
+			}
+			targets += usable
+		}
+		let cipherID = strong ?? (9, 7)
+		let mode = 2
+		let sessionKey = try crypto.rand(try keySize(cipherID))
+		let inner = try messagePackets(data, options.signers, options.text, options.filename, options.compression)
+		let out byte[] = []
+		for let k in targets {
+			out += packetBytes(tagPKESK, try pkeskBody(k, aead ?? (6, 3), cipherID, sessionKey))
+		}
+		out += packetBytes(tagSKESK, try skeskBody(aead ?? (6, 4), cipherID, mode, sessionKey, options.passphrase.bytes())) when options.passphrase != ""
+		let body = aead ?? (try seipd2Encrypt(cipherID, mode, 12, sessionKey, inner), try seipd1Encrypt(cipherID, sessionKey, inner))
+		out += packetBytes(tagSEIPD, body)
+		return out
+	}
+
+	// encrypt encrypts data with a passphrase only (Argon2, SEIPD version 2).
+	// Fails when the passphrase is empty or a signer cannot sign.
+	def encrypt(data byte[], passphrase string, options EncryptOptions = EncryptOptions{}) !byte[] {
+		fail pgpError("the passphrase is empty") when passphrase == ""
+		return try encrypt(data, [], EncryptOptions{...options, passphrase: passphrase})
+	}
+
+	internal def hasPair(body byte[], cipherID int, mode int) bool {
+		for let i = 0; i + 1 < body.len(); i += 2 {
+			return true when int(body[i]) == cipherID && int(body[i + 1]) == mode
+		}
+		return false
+	}
+
+	// The packets of the message inside encryption: the literal data,
+	// signed by the signers (one-pass), compressed when asked.
+	internal def messagePackets(data byte[], signers Key[], text bool, filename string, compression CompressionAlgorithm) !byte[] {
+		let literal = literalPacket(data, text, filename)
+		let inner = signers.len() == 0 ?? (literal, try onePassSigned(data, literal, signers, text))
+		return inner when compression == CompressionAlgorithm.Uncompressed
+		let body byte[] = [byte(compression.value)]
+		body += try compressBytes(compression, inner)
+		return packetBytes(tagCompressed, body)
+	}
+
+	// A Literal Data packet; text is stored with CR LF line endings (§5.9).
+	internal def literalPacket(data byte[], text bool, filename string) byte[] {
+		let name = filename.bytes()
+		let body byte[] = [byte(text ?? (0x75, 0x62)), byte(name.len())]
+		body += name
+		body += [byte(0), byte(0), byte(0), byte(0)]
+		body += text ?? (canonicalText(data), data)
+		return packetBytes(tagLiteral, body)
+	}
+
+	// One-pass signature packets, the literal data, and the signatures in
+	// the reverse order (§5.4).
+	internal def onePassSigned(data byte[], literal byte[], signers Key[], text bool) !byte[] {
+		let sigs SignaturePacket[] = []
+		let packets KeyPacket[] = []
+		for let signer in signers {
+			let k = try signingPacket(signer)
+			sigs.push(try documentSignature(k, data, text))
+			packets.push(k)
+		}
+		let out byte[] = []
+		for let (i, s) in sigs {
+			out += packetBytes(tagOnePass, onePassBody(s, packets[i], i == sigs.len() - 1))
+		}
+		out += literal
+		for let i = sigs.len() - 1; i >= 0; i-- {
+			out += sigs[i].packet()
+		}
+		return out
+	}
+
+	internal def onePassBody(s SignaturePacket, k KeyPacket, last bool) byte[] {
+		if s.version == 6 {
+			let out byte[] = [byte(6), byte(s.sigType), byte(s.hashID), byte(s.algorithm), byte(s.salt.len())]
+			out += s.salt
+			out += k.fingerprint()
+			out.push(byte(last ?? (1, 0)))
+			return out
+		}
+		let out byte[] = [byte(3), byte(s.sigType), byte(s.hashID), byte(s.algorithm)]
+		out += k.keyID()
+		out.push(byte(last ?? (1, 0)))
+		return out
+	}
+
+	// The key packet a key signs documents with: an unlocked signing subkey,
+	// else the primary key.
+	internal def signingPacket(key Key) !KeyPacket {
+		let usable = usableKeys(key, nowSeconds(), 0x02)
+		let chosen ?KeyPacket = none
+		for let k in usable {
+			continue unless k.hasSecret
+			chosen = k
+		}
+		fail pgpError("key {key.fingerprint()} has no usable signing key with a secret part") when chosen is none
+		fail pgpError("key {key.fingerprint()} is locked: unlock it with its passphrase") unless chosen.unlocked
+		return chosen
+	}
+
+	internal def documentSignature(k KeyPacket, data byte[], text bool) !SignaturePacket {
+		let s = try newSignature(k, text ?? (sigText, sigBinary), [])
+		try signParts(k, s, [text ?? (canonicalText(data), data)])
+		return s
+	}
+
+	internal def compressBytes(algorithm CompressionAlgorithm, data byte[]) !byte[] {
+		let out = new bytes.Buffer()
+		switch algorithm {
+			case CompressionAlgorithm.ZIP:
+				let w = new flate.Writer(out, 6)
+				try w.write(data)
+				try w.close()
+			case CompressionAlgorithm.ZLIB:
+				let w = new zlib.Writer(out)
+				try w.write(data)
+				try w.close()
+			case CompressionAlgorithm.BZip2:
+				let w = new bzip2.Writer(out)
+				try w.write(data)
+				try w.close()
+			default:
+				return data
+		}
+		return out.bytes()
+	}
+
+	internal def decompressBytes(algorithm int, data byte[]) !byte[] {
+		switch algorithm {
+			case 0:
+				return data
+			case 1:
+				let inflater = new flate.Inflater()
+				let out = try inflater.feed(data)
+				fail pgpError("the compressed data ends early") unless inflater.finished()
+				return out
+			case 2:
+				return try zlib.decompress(data)
+			case 3:
+				let out = new bytes.Buffer()
+				try out.readFrom(new bzip2.Reader(new bytes.Reader(data)))
+				return out.bytes()
+			default:
+				fail pgpError("compression algorithm {algorithm} is not known")
+		}
+	}
+
+	// SEIPD version 1 (§5.13.1): CFB over a random prefix, the data, and
+	// the SHA-1 modification detection code.
+	internal def seipd1Encrypt(cipherID int, key byte[], data byte[]) !byte[] {
+		let size = try blockSizeOf(cipherID)
+		let prefix = try crypto.rand(size)
+		let plain = prefix + prefix[size - 2:]
+		plain += data
+		plain += [byte(0xD3), byte(0x14)]
+		plain += hash.digest(Hash.SHA1, plain)
+		let out byte[] = [byte(1)]
+		out += try cfbEncrypt(cipherID, key, zeroBytes(size), plain)
+		return out
+	}
+
+	internal def seipd1Decrypt(cipherID int, key byte[], data byte[]) !byte[] {
+		let size = try blockSizeOf(cipherID)
+		fail pgpError("the session key does not fit algorithm {cipherID}") unless key.len() == (try keySize(cipherID))
+		fail pgpError("the encrypted data is cut short") when data.len() < size + 2 + 22
+		let plain = try cfbDecrypt(cipherID, key, zeroBytes(size), data)
+		let mdc = plain.len() - 22
+		let digest = hash.digest(Hash.SHA1, plain[0:plain.len() - 20])
+		let intact = plain[mdc] == byte(0xD3) && plain[mdc + 1] == byte(0x14) && crypto.constantTimeEqual(digest, plain[plain.len() - 20:])
+		fail pgpError("the message was modified: its integrity check fails") unless intact
+		return plain[size + 2:mdc]
+	}
+
+	// SEIPD version 2 (§5.13.2): HKDF of the session key and a salt gives
+	// the message key and nonce prefix; chunks of 2^(c+6) octets are sealed
+	// in turn, then a final tag over the total length.
+	internal def seipd2Encrypt(cipherID int, mode int, chunkOctet int, sessionKey byte[], data byte[]) !byte[] {
+		let salt = try crypto.rand(32)
+		let header byte[] = [byte(2), byte(cipherID), byte(mode), byte(chunkOctet)]
+		let (aead, iv, ad) = try seipd2Keys(cipherID, mode, chunkOctet, sessionKey, salt)
+		let out = header + salt
+		let chunk = 1 << (chunkOctet + 6)
+		let index = 0
+		let pos = 0
+		for pos < data.len() || index == 0 {
+			let end = pos + chunk < data.len() ?? (pos + chunk, data.len())
+			out += aead.seal(iv + uint64Bytes(index), data[pos:end], ad)
+			pos = end
+			index++
+			break when pos >= data.len()
+		}
+		out += aead.seal(iv + uint64Bytes(index), [], ad + uint64Bytes(data.len()))
+		return out
+	}
+
+	internal def seipd2Decrypt(sessionKey byte[], body byte[]) !(byte[], int) {
+		let r = new BodyReader(body)
+		fail pgpError("SEIPD version {int(body[0])} is not known") unless (try r.byte1()) == 2
+		let cipherID = try r.byte1()
+		let mode = try r.byte1()
+		let chunkOctet = try r.byte1()
+		fail pgpError("a chunk size octet of {chunkOctet} is out of range") when chunkOctet > 16
+		let salt = try r.take(32)
+		fail pgpError("the session key does not fit algorithm {cipherID}") unless sessionKey.len() == (try keySize(cipherID))
+		let (aead, iv, ad) = try seipd2Keys(cipherID, mode, chunkOctet, sessionKey, salt)
+		let rest = r.rest()
+		fail pgpError("the encrypted data is cut short") when rest.len() < 32
+		let sealed = rest[0:rest.len() - 16]
+		let final = rest[rest.len() - 16:]
+		let step = (1 << (chunkOctet + 6)) + 16
+		let out byte[] = []
+		let index = 0
+		let pos = 0
+		for pos < sealed.len() {
+			let end = pos + step < sealed.len() ?? (pos + step, sealed.len())
+			fail pgpError("the encrypted data is cut short") when end - pos < 16
+			let plain = aead.open(iv + uint64Bytes(index), sealed[pos:end], ad) onerror (err error) {
+				fail pgpError("the message was modified: chunk {index} fails its authentication")
+			}
+			out += plain
+			pos = end
+			index++
+		}
+		aead.open(iv + uint64Bytes(index), final, ad + uint64Bytes(out.len())) onerror (err error) {
+			fail pgpError("the message was cut short or modified: its final tag fails")
+		}
+		return (out, cipherID)
+	}
+
+	internal def seipd2Keys(cipherID int, mode int, chunkOctet int, sessionKey byte[], salt byte[]) !(AEAD, byte[], byte[]) {
+		let ad byte[] = [byte(0xC0 | tagSEIPD), byte(2), byte(cipherID), byte(mode), byte(chunkOctet)]
+		let size = try keySize(cipherID)
+		let nonceSize = try aeadNonceSize(mode)
+		let derived = try hash.hkdf(Hash.SHA256, sessionKey, salt, ad, size + nonceSize - 8)
+		let aead = try aeadOf(mode, cipherID, derived[0:size])
+		return (aead, derived[size:], ad)
+	}
+
+	internal def uint64Bytes(v int) byte[] {
+		return uint32Bytes(v >> 32) + uint32Bytes(v & 0xFFFFFFFF)
+	}
+
+	// What reading a message works with and finds.
+	internal struct ReadContext {
+		keys       Key[]
+		passphrase byte[]
+		message    Message
+		locked     bool    = false
+	}
+
+	// Reads an OpenPGP Message (§10.3) into the context: decrypting,
+	// decompressing, and checking signatures over the literal data.
+	internal def readMessage(ctx ReadContext, packets Packet[], depth int) !none {
+		fail pgpError("the message nests more than 16 layers") when depth > 16
+		let list Packet[] = []
+		for let p in packets {
+			continue when p.tag == tagMarker
+			// Unknown non-critical packets are ignored (§4.3).
+			continue when p.tag >= 40
+			list.push(p)
+		}
+		for list.len() > 0 && list[list.len() - 1].tag == tagPadding {
+			list.pop()
+		}
+		fail pgpError("the message holds no data") when list.len() == 0
+		let first = list[0]
+		switch first.tag {
+			case tagPKESK, tagSKESK, tagSEIPD, tagSED:
+				let i = 0
+				for i < list.len() && (list[i].tag := tagPKESK || tagSKESK) {
+					i++
+				}
+				fail pgpError("the session keys are not followed by encrypted data") when i >= list.len()
+				let payload = list[i]
+				fail pgpError("packet type {payload.tag} follows the session keys") unless payload.tag == tagSEIPD || payload.tag == tagSED
+				fail pgpError("data follows the encrypted data") unless i == list.len() - 1
+				fail pgpError("the message uses the unprotected SED packet, which is not accepted (RFC 9580 §5.7)") when payload.tag == tagSED
+				let plain = try decryptPayload(ctx, list[0:i], payload.body)
+				ctx.message.encrypted = true
+				try readMessage(ctx, try readPackets(plain), depth + 1)
+			case tagCompressed:
+				fail pgpError("data follows the compressed data") unless list.len() == 1
+				fail pgpError("the compressed data packet is empty") when first.body.len() == 0
+				let inner = try decompressBytes(int(first.body[0]), first.body[1:])
+				try readMessage(ctx, try readPackets(inner), depth + 1)
+			case tagLiteral:
+				fail pgpError("data follows the literal data") unless list.len() == 1
+				try readLiteral(ctx.message, first.body)
+			case tagOnePass:
+				let count = 0
+				for count < list.len() && list[count].tag == tagOnePass {
+					count++
+				}
+				fail pgpError("the one-pass signatures have no closing signatures") when list.len() < 2 * count + 1
+				for let j = 0; j < count; j++ {
+					fail pgpError("a one-pass signature is not closed by a signature") unless list[list.len() - 1 - j].tag == tagSignature
+				}
+				try readMessage(ctx, list[count:list.len() - count], depth + 1)
+				for let j = 0; j < count; j++ {
+					let ops = list[j].body
+					let sig = readableSignature(list[list.len() - 1 - j].body)
+					ctx.message.signatures.push(checkDocument(sig, ctx.message.data, ctx.keys, ops))
+				}
+			case tagSignature:
+				let count = 0
+				for count < list.len() && list[count].tag == tagSignature {
+					count++
+				}
+				fail pgpError("the signatures sign no message") when count == list.len()
+				try readMessage(ctx, list[count:], depth + 1)
+				for let j = 0; j < count; j++ {
+					ctx.message.signatures.push(checkDocument(readableSignature(list[j].body), ctx.message.data, ctx.keys, []))
+				}
+			default:
+				fail pgpError("packet type {first.tag} does not start a message")
+		}
+		return none
+	}
+
+	internal def readLiteral(m Message, body byte[]) !none {
+		let r = new BodyReader(body)
+		let format = try r.byte1()
+		let nameSize = try r.byte1()
+		m.filename = string(try r.take(nameSize))
+		let date = try r.uint32()
+		m.modified = date == 0 ?? (none, secondsTime(date))
+		m.text = format := 0x75 || 0x74
+		m.data = r.rest()
+		return none
+	}
+
+	// Decrypts the encrypted data with the first session key a secret key
+	// or the passphrase opens: ESK packets whose version does not match the
+	// payload's are skipped (§10.3.2.1).
+	internal def decryptPayload(ctx ReadContext, esks Packet[], body byte[]) !byte[] {
+		fail pgpError("the encrypted data is empty") when body.len() == 0
+		let version = int(body[0])
+		fail pgpError("SEIPD version {version} is not known") unless version := 1 || 2
+		let candidates (int, byte[])[] = []
+		for let p in esks {
+			if p.tag == tagPKESK {
+				let pkesk = parsePKESK(p.body) onerror (err error) {
+					continue
+				}
+				continue unless (pkesk.version == 6) == (version == 2)
+				for let key in ctx.keys {
+					for let k in secretPacketsOf(key) {
+						continue unless pkeskFor(pkesk, k)
+						if !k.unlocked {
+							ctx.locked = true
+							continue
+						}
+						let opened = pkeskOpen(pkesk, k) onerror (err error) {
+							continue
+						}
+						candidates.push(opened)
+					}
+				}
+			} else if ctx.passphrase.len() > 0 {
+				let skesk = parseSKESK(p.body) onerror (err error) {
+					continue
+				}
+				continue unless (skesk.version == 6) == (version == 2)
+				let opened = skeskOpen(skesk, ctx.passphrase) onerror (err error) {
+					continue
+				}
+				candidates.push(opened)
+			}
+		}
+		for let candidate in candidates {
+			let (cipherID, key) = candidate
+			if version == 1 {
+				let plain = seipd1Decrypt(cipherID, key, body[1:]) onerror (err error) {
+					continue
+				}
+				return plain
+			}
+			let (plain, _) = seipd2Decrypt(key, body) onerror (err error) {
+				continue
+			}
+			return plain
+		}
+		fail pgpError("a secret key that could decrypt the message is locked: unlock it with its passphrase") when ctx.locked && candidates.len() == 0
+		fail pgpError("no key or passphrase decrypts the message")
+	}
+
+	// Checks a document signature over data against the keyring; `ops` is
+	// the one-pass packet announcing it (its salt must match, §5.4).
+	internal def checkDocument(sig ?SignaturePacket, data byte[], keys Key[], ops byte[]) Verification {
+		return Verification{keyID: "", created: secondsTime(0), problem: "the signature cannot be read"} when sig is none
+		let ids = sig.issuerKeyIDs()
+		let issuer = ids.len() > 0 ?? (ids[0].hex(), "")
+		let v = Verification{keyID: issuer, created: secondsTime(sig.created())}
+		if !(sig.sigType := sigBinary || sigText) {
+			v.problem = "signature type {sig.sigType} does not sign a document"
+			return v
+		}
+		if ops.len() > 0 && int(ops[0]) == 6 && sig.version == 6 {
+			let saltSize = ops.len() > 5 ?? (int(ops[4]), 0)
+			if ops.len() < 5 + saltSize || ops[5:5 + saltSize].hex() != sig.salt.hex() {
+				v.problem = "the one-pass signature's salt differs from the signature's"
+				return v
+			}
+		}
+		let fp = sig.issuerFingerprint()
+		for let key in keys {
+			let k = packetByID(key, fp.len() > 0 ?? (fp, ids.len() > 0 ?? (ids[0], [])))
+			continue when k is none
+			v.key = key
+			v.fingerprint = k.fingerprint().hex()
+			v.keyID = k.keyID().hex()
+			let t = sig.created()
+			let can = false
+			for let usable in usableKeys(key, t, 0x02) {
+				can = true when usable.fingerprint().hex() == v.fingerprint
+			}
+			if !can {
+				v.problem = "the key could not sign then: it was expired, revoked or not a signing key"
+				return v
+			}
+			v.problem = signatureProblem(k, sig, [sig.sigType == sigText ?? (canonicalText(data), data)], true, nowSeconds())
+			v.valid = v.problem == ""
+			return v
+		}
+		v.problem = "no key in the keyring made it"
+		return v
+	}
+
+	// A set of keys: certificates to verify and encrypt with, and secret keys
+	// to decrypt and sign with. Adding a key that is already there merges the
+	// two copies.
+	type Keyring {
+		keys Key[] = []
+
+		def new(keys Key[] = []) {
+			for let key in keys {
+				add(key)
+			}
+		}
+
+		// Adds a key; a copy of a key already there is merged into it.
+		def add(key Key) {
+			for let mine in keys {
+				if mine.fingerprint() == key.fingerprint() {
+					// Same fingerprint, so the merge cannot fail.
+					mine.merge(key) onerror (err error) {
+						recover none
+					}
+					return
+				}
+			}
+			keys.push(key)
+		}
+
+		// The keys a query names: a fingerprint, a Key ID (of the key or a
+		// subkey), a user ID or the e-mail address in one.
+		def find(query string) Key[] {
+			let out Key[] = []
+			for let key in keys {
+				out.push(key) when key.matches(query)
+			}
+			return out
+		}
+
+		// The keys as one packet sequence, secret keys as secret.
+		def bytes() byte[] {
+			let out byte[] = []
+			for let key in keys {
+				out += key.bytes()
+			}
+			return out
+		}
+
+		// decrypt reads a binary or armored message: decrypts it with the
+		// keyring's (unlocked) secret keys or the passphrase, decompresses it,
+		// and checks its signatures against the keyring. A message that is
+		// only signed reads too.
+		// Fails when no key or passphrase decrypts it, it was modified
+		// (an integrity check fails), or it is not an OpenPGP message.
+		def decrypt(message byte[], passphrase string = "") !Message {
+			let ctx = ReadContext{keys: keys, passphrase: passphrase.bytes(), message: new Message()}
+			try readMessage(ctx, try readPackets(try binaryOf(message)), 0)
+			return ctx.message
+		}
+
+		// decrypt reads an armored message. Fails as the binary form does.
+		def decrypt(message string, passphrase string = "") !Message {
+			return try decrypt(message.bytes(), passphrase)
+		}
+
+		// verify reads a signed (and possibly compressed) message and checks
+		// its signatures. Read `Message.verified()`, or each signature.
+		// Fails when the data is not an OpenPGP message or is encrypted to
+		// a key the keyring cannot use.
+		def verify(message byte[]) !Message {
+			return try decrypt(message)
+		}
+
+		// verify checks a detached signature (binary or armored, one or more
+		// signatures) over data.
+		// Fails when the signature data is not OpenPGP signatures.
+		def verify(data byte[], signature byte[]) !Verification[] {
+			let out Verification[] = []
+			for let p in try readPackets(try binaryOf(signature)) {
+				continue when p.tag := tagMarker || tagPadding
+				fail pgpError("packet type {p.tag} is not a signature") unless p.tag == tagSignature
+				out.push(checkDocument(readableSignature(p.body), data, keys, []))
+			}
+			fail pgpError("the data holds no signature") when out.len() == 0
+			return out
+		}
+
+		// verify checks an armored detached signature. Fails as the binary
+		// form does.
+		def verify(data byte[], signature string) !Verification[] {
+			return try verify(data, signature.bytes())
+		}
+
+		// verifyCleartext checks a cleartext signed message (§7) and returns
+		// its text (dash-escaping undone, line endings as LF) with the
+		// signatures checked.
+		// Fails when the text is not a cleartext signed message.
+		def verifyCleartext(text string) !Message {
+			return try readCleartext(text, keys)
+		}
+	}
+
+	// The text names of the hash algorithms for the Hash armor header
+	// (§9.5).
+	internal def hashTextName(id int) string {
+		switch id {
+			case 1:
+				return "MD5"
+			case 2:
+				return "SHA1"
+			case 3:
+				return "RIPEMD160"
+			case 8:
+				return "SHA256"
+			case 9:
+				return "SHA384"
+			case 10:
+				return "SHA512"
+			case 11:
+				return "SHA224"
+			case 12:
+				return "SHA3-256"
+			case 14:
+				return "SHA3-512"
+			default:
+				return ""
+		}
+	}
+
+	// The lines of a cleartext with trailing spaces and tabs removed, joined
+	// with CR LF: what a cleartext signature signs.
+	internal def cleartextSigned(lines string[]) byte[] {
+		let out byte[] = []
+		for let (i, line) in lines {
+			out += [byte(13), byte(10)] when i > 0
+			out += line.trimEnd(" \t").bytes()
+		}
+		return out
+	}
+
+	internal def textLines(text string) string[] {
+		return text.replace("\r\n", "\n", -1).replace("\r", "\n", -1).split("\n")
+	}
+
+	internal def readCleartext(text string, keys Key[]) !Message {
+		let lines = textLines(text)
+		let i = 0
+		for i < lines.len() && lines[i].trimEnd(" \t") != "-----BEGIN PGP SIGNED MESSAGE-----" {
+			i++
+		}
+		fail pgpError("the text has no -----BEGIN PGP SIGNED MESSAGE----- line") when i >= lines.len()
+		i++
+		// Only well-formed Hash headers may stand here (§7.1).
+		let headerProblem = ""
+		for i < lines.len() && lines[i].trimEnd(" \t") != "" {
+			let line = lines[i]
+			i++
+			if !line.startsWith("Hash: ") {
+				headerProblem = "the cleartext carries the armor header \"{line}\", which is not allowed"
+				continue
+			}
+			for let name in line.slice(6, line.len()).split(",") {
+				let known = false
+				for let id in [1, 2, 3, 8, 9, 10, 11, 12, 14] {
+					known = true when hashTextName(id) == name.trim()
+				}
+				headerProblem = "the Hash header names \"{name.trim()}\"" unless known
+			}
+		}
+		i++
+		let body string[] = []
+		for i < lines.len() && !lines[i].startsWith("-----BEGIN PGP SIGNATURE-----") {
+			let line = lines[i]
+			body.push(line.startsWith("- ") ?? (line.slice(2, line.len()), line))
+			i++
+		}
+		fail pgpError("the cleartext has no signature") when i >= lines.len()
+		let rest = lines[i:].join("\n")
+		let blocks = try dearmor(rest)
+		fail pgpError("the cleartext has no signature") when blocks.len() == 0 || blocks[0].kind != ArmorKind.Signature
+		let m = new Message()
+		m.text = true
+		m.data = body.join("\n").bytes()
+		let signed = cleartextSigned(body)
+		for let p in try readPackets(blocks[0].data) {
+			continue when p.tag := tagMarker || tagPadding
+			fail pgpError("packet type {p.tag} is not a signature") unless p.tag == tagSignature
+			let sig = readableSignature(p.body)
+			let v = Verification{keyID: "", created: secondsTime(0)}
+			if headerProblem != "" {
+				v.problem = headerProblem
+			} else if !(sig is none) && sig.sigType != sigText {
+				v.problem = "a cleartext signature must be a text signature"
+			} else {
+				v = checkDocument(sig, signed, keys, [])
+			}
+			m.signatures.push(v)
+		}
+		return m
+	}
+
+	// The cleartext signed form of a text (§7): dash-escaped, then the
+	// armored text signature over its lines.
+	internal def cleartextSign(text string, signer Key) !string {
+		let lines = textLines(text)
+		let k = try signingPacket(signer)
+		let s = try newSignature(k, sigText, [])
+		try signParts(k, s, [cleartextSigned(lines)])
+		let out = "-----BEGIN PGP SIGNED MESSAGE-----\n"
+		out += "Hash: " + hashTextName(s.hashID) + "\n" when s.version == 4
+		out += "\n"
+		for let line in lines {
+			out += (line.startsWith("-") || line.startsWith("From ") ?? ("- " + line, line)) + "\n"
+		}
+		out += armor(ArmorKind.Signature, s.packet())
+		return out
+	}
+
+	internal def detachedSign(data byte[], signer Key, text bool) !byte[] {
+		let k = try signingPacket(signer)
+		return (try documentSignature(k, data, text)).packet()
+	}
+}

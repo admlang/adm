@@ -1,0 +1,545 @@
+partial module std.net.http.openapi {
+	use (
+		std.net.http
+		std.data.encoding::(JSON)
+		std.data.encoding.jsonschema
+	)
+
+	// How a Validator checks.
+	struct ValidatorOptions {
+		// Whether `format` asserts (`date-time`, `email`, `uuid`, ... and
+		// the OpenAPI formats `int32` and `int64`), as a request validator is
+		// expected to; false leaves formats as annotations.
+		formats   bool             = true
+		// Other documents the description refers to, by URI.
+		documents map<string, any>
+	}
+
+	// The operation a request is for.
+	struct Match {
+		// The method as the request sent it, upper case.
+		method     string
+		// The path template (`/users/{id}`).
+		template   string
+		operation  Operation
+		item       PathItem
+		// The path parameters as they appear in the path (percent-encoded).
+		pathValues map<string, string>
+		// Where the Path Item is in the document (a JSON Pointer).
+		pointer    string              = ""
+	}
+
+	partial type Document {
+		// A validator of requests and responses against the document. The
+		// document is read as it is now; later changes are not seen. Fails
+		// with an OpenAPIError when a schema does not compile.
+		def validator(options ValidatorOptions = ValidatorOptions{}) !Validator {
+			let schemas = try compileSchemas(self, options.documents, options.formats)
+			return new Validator(self, schemas)
+		}
+	}
+
+	internal struct Route {
+		template string
+		pattern  regex
+		names    string[]
+		// How many template expressions, and how much literal text: a
+		// concrete path wins over a templated one.
+		params   int
+		literal  int
+		item     PathItem
+	}
+
+	// Validator checks requests and responses against a description:
+	// the path and method, security credentials, parameters in every style,
+	// and bodies of every media type the description can describe (JSON,
+	// YAML, forms, multipart, XML, JSON Lines and other sequences,
+	// server-sent events, text and binary) against their schemas.
+	//
+	//     let v = try doc.validator()
+	//     mux.apply(v.middleware())          // 400, 401, 405 or 415 with problem+json
+	//     let problems = v.request(req)      // or check by hand
+	partial type Validator {
+		internal doc      Document
+		internal schemas  Schemas
+		internal routes   Route[]                    = []
+		// Path prefixes the servers put before the templates.
+		internal prefixes regex[]                    = []
+		internal plans    map<string, OperationPlan>
+
+		internal def new(doc Document, schemas Schemas) {
+			self.doc = doc
+			self.schemas = schemas
+			plans = map<string, OperationPlan>{}
+			for let (template, item) in doc.paths {
+				let resolved = resolvePathItem(item)
+				routes.push(routeOf(template, resolved))
+			}
+			routes.sort((a Route, b Route) => a.params < b.params || (a.params == b.params && a.literal > b.literal))
+			let seen = map<string, bool>{}
+			for let server in allServers(doc) {
+				let prefix = serverPathPattern(server.url)
+				continue when prefix == "" || seen.hasKey(prefix)
+				seen[prefix] = true
+				prefixes.push(new regex("^" + prefix, ""))
+			}
+		}
+
+		// A Path Item that is a reference, read from its target.
+		internal def resolvePathItem(item PathItem) PathItem {
+			return item when item.ref == ""
+			let target = schemas.resolve(item.ref, "") onerror recover none
+			return item unless target is map<string, any>
+			return pathItemOf(target, schemas.localPointer(item.ref)) onerror (err error) {
+				return item
+			}
+		}
+
+		// The operation for a method and a request path (percent-encoded,
+		// with or without a server's path in front); none when no template
+		// matches the path. A path that matches when no operation has the
+		// method gives a Match with the method "" and an empty operation.
+		// HEAD falls back to GET.
+		def operationFor(method string, path string) ?Match {
+			let candidates = [path]
+			for let prefix in prefixes {
+				let found = prefix.find(path)
+				if !(found is none) {
+					let rest = path[found.end:]
+					candidates.push(rest == "" ?? ("/", rest))
+				}
+			}
+			for let candidate in candidates {
+				for let route in routes {
+					let found = route.pattern.find(candidate)
+					continue when found is none
+					let values = map<string, string>{}
+					for let (i, name) in route.names {
+						values[name] = found.groups[i]
+					}
+					let op = route.item.operation(method)
+					op = route.item.operation("GET") when op is none && method.upper() == "HEAD"
+					return Match{method: "", template: route.template, operation: new Operation(), item: route.item, pathValues: values, pointer: "/paths/" + escapePointer(route.template)} when op is none
+					return Match{method: method.upper(), template: route.template, operation: op, item: route.item, pathValues: values, pointer: "/paths/" + escapePointer(route.template)}
+				}
+			}
+			return none
+		}
+
+		// What is wrong with a request: no operation for its path or
+		// method, missing credentials, parameters that are missing, do not
+		// parse or do not match their schemas, a body of a media type the
+		// operation does not take or that does not match its schema. Empty
+		// when the request is valid. Reads (and keeps) the body.
+		def request(req http.Request) Problem[] {
+			let path = req.url.rawPath == "" ?? (req.url.path, req.url.rawPath)
+			let found = operationFor(methodOf(req), path)
+			return [Problem{location: "path", message: "no path of the description matches {path}"}] when found is none
+			return [Problem{location: "method", message: "{found.template} has no {methodOf(req)} operation"}] when found.method == ""
+			return checkRequest(req, found)
+		}
+
+		// What is wrong with a request of a webhook the API sends (one of
+		// `webhooks`, by name), as `request` checks a request to the API.
+		def webhook(name string, req http.Request) Problem[] {
+			let given = doc.webhooks.get(name)
+			return [Problem{location: "path", message: "the description has no webhook \"{name}\""}] when given is none
+			let item = resolvePathItem(given)
+			let op = item.operation(methodOf(req))
+			return [Problem{location: "method", message: "the webhook {name} has no {methodOf(req)} operation"}] when op is none
+			return checkRequest(req, Match{method: methodOf(req), template: name, operation: op, item: item, pathValues: map<string, string>{}, pointer: "/webhooks/" + escapePointer(name)})
+		}
+
+		internal def checkRequest(req http.Request, found Match) Problem[] {
+			let plan = planFor(found)
+			let problems Problem[] = []
+			problems += checkSecurity(req, found.operation)
+			for let p in plan.parameters {
+				problems += checkParameter(p, req, found.pathValues)
+			}
+			problems += checkRequestBody(plan, req)
+			return problems
+		}
+
+		// What is wrong with a response to a request: a status the
+		// operation does not document, a missing or invalid header, a body
+		// of another media type or not matching its schema. Empty when it is
+		// valid, and when no operation matches the request (`request` says
+		// so).
+		def response(req http.Request, status int, headers http.Header, body byte[]) Problem[] {
+			let path = req.url.rawPath == "" ?? (req.url.path, req.url.rawPath)
+			let found = operationFor(methodOf(req), path)
+			return [] when found is none
+			return [] when found.method == ""
+			let plan = planFor(found)
+			let chosen = plan.responseFor(status)
+			return [Problem{location: "status", message: "the operation documents no response {status}"}] when chosen is none
+			let (resp, at) = chosen
+			let problems Problem[] = []
+			for let (name, given) in resp.headers {
+				continue when name.lower() == "content-type"
+				let (h, hat) = resolveHeaderAt(given, at + "/headers/" + escapePointer(name))
+				let values = headers.values(name)
+				if values.len() == 0 {
+					problems.push(Problem{location: "header", name: name, message: "the response has no {name} header"}) when h.required
+					continue
+				}
+				problems += checkHeaderValue(name, values.join(", "), h, hat)
+			}
+			problems += checkContent(resp.content, at, headers.get("Content-Type"), body, "body")
+			return problems
+		}
+
+		// Middleware that refuses requests the description does not allow,
+		// with an RFC 9457 problem document (`application/problem+json`)
+		// listing what is wrong: 405 for a method no operation has, 401 for
+		// missing credentials, 415 for a body of another media type, 400
+		// for the rest. A request whose path no template matches is passed
+		// on, for the mux to answer.
+		def middleware() http.Middleware {
+			return new http.MiddlewareFunc(def (ctx http.Context, next http.Handler) !none {
+				let problems = request(ctx.request)
+				return try next.serve(ctx) when problems.len() == 0 || (problems.len() == 1 && problems[0].location == "path")
+				let status = 400
+				for let p in problems {
+					status = 405 when p.location == "method"
+					status = 401 when p.location == "security" && status == 400
+					status = 415 when p.location == "content-type" && status == 400
+				}
+				let problemDoc = map<string, any>{}
+				problemDoc["type"] = "about:blank"
+				problemDoc["title"] = status == 405 ?? ("Method Not Allowed", status == 401 ?? ("Unauthorized", status == 415 ?? ("Unsupported Media Type", "Bad Request")))
+				problemDoc["status"] = status
+				problemDoc["detail"] = problems[0].message
+				let list any[] = []
+				for let p in problems {
+					let item = map<string, any>{}
+					item["in"] = p.location
+					item["name"] = p.name unless p.name == ""
+					item["pointer"] = p.pointer unless p.pointer == ""
+					item["message"] = p.message
+					list.push(item)
+				}
+				problemDoc["errors"] = list
+				if status == 405 {
+					let path = ctx.request.url.rawPath == "" ?? (ctx.request.url.path, ctx.request.url.rawPath)
+					let found = operationFor("GET", path)
+					if !(found is none) {
+						let allowed string[] = []
+						for let entry in found.item.all() {
+							let (m, _) = entry
+							allowed.push(m)
+						}
+						ctx.response.headers.set("Allow", allowed.join(", "))
+					}
+				}
+				return try ctx.blob(status, "application/problem+json", new JSON().encode(problemDoc))
+			})
+		}
+
+		// The parameters and bodies of an operation, resolved once.
+		internal def planFor(found Match) OperationPlan {
+			let key = found.method + " " + found.pointer
+			let known = plans.get(key)
+			return known unless known is none
+			let plan = new OperationPlan()
+			let opAt = operationPointer(found.pointer, found.method, found.item)
+			// Operation parameters override path-item ones of the same name
+			// and location.
+			let byKey = map<string, int>{}
+			for let (i, p) in found.item.parameters {
+				let (resolved, at) = resolveParameterAt(p, found.pointer + "/parameters/{i}")
+				let k = parameterKey(resolved)
+				byKey[k] = plan.parameters.len()
+				plan.parameters.push(ParameterPlan{parameter: resolved, at: at})
+			}
+			for let (i, p) in found.operation.parameters {
+				let (resolved, at) = resolveParameterAt(p, opAt + "/parameters/{i}")
+				let k = parameterKey(resolved)
+				let earlier = byKey.get(k)
+				if earlier is none {
+					byKey[k] = plan.parameters.len()
+					plan.parameters.push(ParameterPlan{parameter: resolved, at: at})
+				} else {
+					plan.parameters[earlier] = ParameterPlan{parameter: resolved, at: at}
+				}
+			}
+			let body = found.operation.requestBody
+			if !(body is none) {
+				let (resolved, at) = resolveRequestBodyAt(body, opAt + "/requestBody")
+				plan.hasBody = true
+				plan.bodyRequired = resolved.required
+				plan.body = resolved.content
+				plan.bodyAt = at
+			}
+			for let (code, r) in found.operation.responses {
+				let (resolved, at) = resolveResponseAt(r, opAt + "/responses/" + escapePointer(code))
+				plan.responses[code] = (resolved, at)
+			}
+			plans[key] = plan
+			return plan
+		}
+
+		// The value a reference names, with its location (a pointer here, a
+		// URI for another document).
+		internal def follow(ref string, at string) (any, string) {
+			let target = schemas.resolve(ref, at) onerror recover none
+			let local = schemas.localPointer(ref)
+			let place = local != "" || ref.startsWith("#") ?? (local, resolveReference(schemas.base, ref))
+			return (target, place)
+		}
+
+		internal def resolveParameterAt(p Parameter, at string) (Parameter, string) {
+			let current = p
+			let place = at
+			for let hops = 0; hops < 16 && current.ref != ""; hops++ {
+				let (target, there) = follow(current.ref, place)
+				break unless target is map<string, any>
+				current = parameterOf(target, there) onerror (err error) {
+					break
+				}
+				place = there
+			}
+			return (current, place)
+		}
+
+		internal def resolveRequestBodyAt(b RequestBody, at string) (RequestBody, string) {
+			let current = b
+			let place = at
+			for let hops = 0; hops < 16 && current.ref != ""; hops++ {
+				let (target, there) = follow(current.ref, place)
+				break unless target is map<string, any>
+				current = requestBodyOf(target, there) onerror (err error) {
+					break
+				}
+				place = there
+			}
+			return (current, place)
+		}
+
+		internal def resolveResponseAt(r Response, at string) (Response, string) {
+			let current = r
+			let place = at
+			for let hops = 0; hops < 16 && current.ref != ""; hops++ {
+				let (target, there) = follow(current.ref, place)
+				break unless target is map<string, any>
+				current = responseOf(target, there) onerror (err error) {
+					break
+				}
+				place = there
+			}
+			return (current, place)
+		}
+
+		internal def resolveHeaderAt(h Header, at string) (Header, string) {
+			let current = h
+			let place = at
+			for let hops = 0; hops < 16 && current.ref != ""; hops++ {
+				let (target, there) = follow(current.ref, place)
+				break unless target is map<string, any>
+				current = headerOf(target, there) onerror (err error) {
+					break
+				}
+				place = there
+			}
+			return (current, place)
+		}
+
+		internal def resolveMediaTypeAt(m MediaType, at string) (MediaType, string) {
+			let current = m
+			let place = at
+			for let hops = 0; hops < 16 && current.ref != ""; hops++ {
+				let (target, there) = follow(current.ref, place)
+				break unless target is map<string, any>
+				current = mediaTypeOf(target, there) onerror (err error) {
+					break
+				}
+				place = there
+			}
+			return (current, place)
+		}
+
+		// The problems of an instance against the schema at a location.
+		internal def checkSchema(at string, value any, place string, name string) Problem[] {
+			let v = schemas.at(at) onerror (err error) {
+				return [Problem{location: place, name: name, message: "the description's schema at {at} cannot be used: {err.message}"}]
+			}
+			let out Problem[] = []
+			for let e in v.validate(value) {
+				out.push(Problem{location: place, name: name, pointer: e.instanceLocation, message: e.message})
+			}
+			return out
+		}
+
+		// Whether credentials one of the security requirements asks for are
+		// there. Only their presence is checked: verifying them is the
+		// application's.
+		internal def checkSecurity(req http.Request, op Operation) Problem[] {
+			let own = op.security
+			let requirements = own is none ?? (doc.security, own)
+			return [] when requirements is none || requirements.len() == 0
+			let missing string[] = []
+			for let r in requirements {
+				let satisfied = true
+				for let (name, _) in r {
+					if !credentialsPresent(req, name) {
+						satisfied = false
+						missing.push(name) unless missing.includes(name)
+					}
+				}
+				return [] when satisfied
+			}
+			return [Problem{location: "security", message: "the request has no credentials for {missing.join(", ")}"}]
+		}
+
+		internal def credentialsPresent(req http.Request, name string) bool {
+			let given = doc.components.securitySchemes.get(name)
+			return false when given is none
+			let scheme = given
+			if scheme.ref != "" {
+				let (target, _) = follow(scheme.ref, "")
+				if target is map<string, any> {
+					scheme = securitySchemeOf(target, "") onerror (err error) {
+						return false
+					}
+				}
+			}
+			let authorization = req.header("Authorization").trim()
+			let authScheme = authorization.split(" ")[0].lower()
+			switch scheme.kind {
+				case SchemeKind.ApiKey:
+					switch scheme.location {
+						case ParameterIn.Query:
+							return !(req.query(scheme.name) is none)
+						case ParameterIn.Cookie:
+							return !(req.cookie(scheme.name) is none)
+						default:
+							return req.headers.has(scheme.name)
+					}
+				case SchemeKind.Http:
+					return authorization != "" && authScheme == scheme.scheme.lower()
+				case SchemeKind.MutualTLS:
+					let state = req.tlsState
+					return !(state is none) && state.peerCertificates.len() > 0
+				default:
+					return authScheme == "bearer"
+			}
+		}
+	}
+
+	// A request's method as sent, upper case.
+	internal def methodOf(req http.Request) string {
+		return req.rawMethod.upper() when req.method == http.Method.Other && req.rawMethod != ""
+		return req.method.value
+	}
+
+	internal def parameterKey(p Parameter) string {
+		return locationName(p.location) + " " + (p.location == ParameterIn.Header ?? (p.name.lower(), p.name))
+	}
+
+	internal def operationPointer(base string, method string, item PathItem) string {
+		let lower = method.lower()
+		lower = "get" when lower == "head" && item.operations.get("head") is none
+		return fixedMethods.includes(lower) ?? (base + "/" + lower, base + "/additionalOperations/" + escapePointer(method.upper()))
+	}
+
+	// Every server of a document: its own, its path items' and operations'.
+	internal def allServers(doc Document) Server[] {
+		let out Server[] = []
+		out += doc.servers
+		for let (_, item) in doc.paths {
+			out += item.servers
+			for let entry in item.all() {
+				let (_, op) = entry
+				out += op.servers
+			}
+		}
+		return out
+	}
+
+	// The path of a server URL as a regular expression (its variables
+	// match anything within a segment), without a trailing slash; "" for
+	// none.
+	internal def serverPathPattern(serverURL string) string {
+		let rest = serverURL
+		let scheme = rest.indexOf("://")
+		if scheme >= 0 {
+			rest = rest[scheme + 3:]
+			let slash = rest.indexOf("/")
+			rest = slash < 0 ?? ("", rest[slash:])
+		}
+		let query = rest.indexOf("?")
+		rest = rest[0:query] when query >= 0
+		rest = rest.trimSuffix("/")
+		return "" when rest == ""
+		return templatePattern(rest, "[^/]*")
+	}
+
+	// A template as a regular expression: literal text escaped, each
+	// expression as the given pattern in a group.
+	internal def templatePattern(template string, expression string) string {
+		let out = ""
+		let i = 0
+		for i < template.len() {
+			let open = template.indexOf("\{", i)
+			if open < 0 {
+				out += regexEscape(template.slice(i, template.len()))
+				break
+			}
+			let close = template.indexOf("\}", open)
+			if close < 0 {
+				out += regexEscape(template.slice(i, template.len()))
+				break
+			}
+			out += regexEscape(template.slice(i, open)) + "(" + expression + ")"
+			i = close + 1
+		}
+		return out
+	}
+
+	internal def regexEscape(text string) string {
+		let out = ""
+		for let (_, ch) in text {
+			let alnum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+			out += alnum || int(ch) > 127 ?? (string(ch), "\\" + string(ch))
+		}
+		return out
+	}
+
+	internal def routeOf(template string, item PathItem) Route {
+		let names = templateNames(template)
+		let literal = templateShape(template).replace("\{\}", "", -1).len()
+		let pattern = new regex("^" + templatePattern(template, "[^/]+") + "$", "")
+		return Route{template: template, pattern: pattern, names: names, params: names.len(), literal: literal, item: item}
+	}
+
+	internal struct ParameterPlan {
+		parameter Parameter
+		// Where the Parameter Object is.
+		at        string
+	}
+
+	internal type OperationPlan {
+		parameters   ParameterPlan[]                 = []
+		hasBody      bool                            = false
+		bodyRequired bool                            = false
+		body         map<string, MediaType>
+		bodyAt       string                          = ""
+		responses    map<string, (Response, string)>
+
+		def new() {
+			body = map<string, MediaType>{}
+			responses = map<string, (Response, string)>{}
+		}
+
+		// The Response Object for a status: its own code, else its range
+		// (`4XX`), else `default`.
+		def responseFor(status int) ?(Response, string) {
+			let exact = responses.get("{status}")
+			return exact unless exact is none
+			let range = responses.get("{status / 100}XX")
+			return range unless range is none
+			return responses.get("default")
+		}
+	}
+}

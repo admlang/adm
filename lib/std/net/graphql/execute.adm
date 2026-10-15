@@ -1,0 +1,726 @@
+partial module std.net.graphql {
+	use (
+		std.errors
+		std.reflection
+		std.reflection::(FieldKind)
+		std.data.encoding::(JSON)
+		std.net.graphql.syntax
+		std.net.graphql.syntax::(Node, NodeKind)
+	)
+
+	// One GraphQL request: the document, the operation to run when it holds
+	// several, and the variables.
+	struct Request {
+		query         string
+		operationName string           = ""
+		variables     map<string, any> = map<string, any>{}
+		extensions    map<string, any> = map<string, any>{}
+	}
+
+	// Where an error is in the document: line and column from 1.
+	struct Location {
+		line   int
+		column int
+	}
+
+	// An error of a response (spec 7.1.2): the message, where in the document,
+	// and the path to the field it happened at.
+	struct GraphQLError {
+		message    string
+		locations  Location[]       = []
+		// Response keys and list indexes; empty for an error before
+		// execution.
+		path       any[]            = []
+		extensions map<string, any> = map<string, any>{}
+	}
+
+	// What running a request gives (spec 7.1): the data, none when the
+	// request could not run, and the errors.
+	type Response {
+		data       any
+		errors     GraphQLError[]   = []
+		extensions map<string, any> = map<string, any>{}
+
+		def new() {}
+
+		// The response as JSON: `data` when the request ran (null when a
+		// non-null root field failed), `errors` when there are any.
+		def json() string {
+			return string(JSON.encode(responseValue(self)))
+		}
+
+		// Decodes `data` into target, a struct or type whose fields are the
+		// response's keys, as the JSON codec decodes (`@json` names a field
+		// after an alias). Fails when there is no data or it does not fit.
+		def decode(target any) !none {
+			fail clientError("the response has no data: {errors.len() > 0 ?? (errors[0].message, "none was sent")}") when data is none
+			return try new JSON().decode(JSON.encode(data), target)
+		}
+
+		// Whether the request reached execution, so `data` is written even
+		// when it is null.
+		internal ran      bool = false
+		// Whether the document did not parse (a GraphQL-over-HTTP 400).
+		internal unparsed bool = false
+	}
+
+	// A response as the JSON object it is written as.
+	internal def responseValue(r Response) map<string, any> {
+		let out = map<string, any>{}
+		out["errors"] = r.errors.mapElem(e => errorJSON(e)) when r.errors.len() > 0
+		out["data"] = r.data unless r.data is none && r.errors.len() > 0 && !r.ran
+		out["extensions"] = r.extensions when r.extensions.len() > 0
+		return out
+	}
+
+	// Whether the request of a response reached execution.
+	internal def executed(r Response) bool {
+		return r.ran
+	}
+
+	// Whether the document of a response's request did not parse.
+	internal def unparsedDocument(r Response) bool {
+		return r.unparsed
+	}
+
+	internal def errorJSON(e GraphQLError) map<string, any> {
+		let out = map<string, any>{"message": e.message}
+		out["locations"] = e.locations.mapElem(l => map<string, any>{"line": l.line, "column": l.column}) when e.locations.len() > 0
+		out["path"] = e.path when e.path.len() > 0
+		out["extensions"] = e.extensions when e.extensions.len() > 0
+		return out
+	}
+
+	// The state of one execution.
+	internal type Execution {
+		schema     Schema
+		doc        Node
+		fragments  map<string, Node>
+		operation  Node
+		variables  map<string, any>
+		context    any
+		root       any
+		errors     GraphQLError[]    = []
+		// The request's extensions, for the resolvers.
+		extensions map<string, any>  = map<string, any>{}
+
+		def new(schema Schema, doc Node, operation Node, variables map<string, any>, context any, root any) {
+			self.schema = schema
+			self.doc = doc
+			self.operation = operation
+			self.variables = variables
+			self.context = context
+			self.root = root
+			fragments = map<string, Node>{}
+			for let d in doc.items {
+				fragments[d.name] = d when d.kind == NodeKind.FragmentDefinition
+			}
+		}
+
+		def report(message string, nodes Node[], path any[]) {
+			errors.push(GraphQLError{message: message, locations: nodes.mapElem(n => Location{line: n.line, column: n.column}), path: path.clone()})
+		}
+	}
+
+	// The operation a request names (spec GetOperation). Fails when there is
+	// no such operation, or none was named and the document has several.
+	internal def operationOf(doc Node, name string) !Node {
+		let found ?Node = none
+		for let d in doc.items {
+			continue unless d.kind == NodeKind.OperationDefinition
+			if name == "" {
+				fail requestError("Must provide operation name if query contains multiple operations.") unless found is none
+				found = d
+			} else if d.name == name {
+				found = d
+			}
+		}
+		fail requestError(name == "" ?? ("Must provide an operation.", "Unknown operation named \"{name}\".")) when found is none
+		return found
+	}
+
+	internal struct RequestError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
+
+	internal def requestError(message string) RequestError {
+		return RequestError{message: message, code: "graphql-request"}
+	}
+
+	// Parses, validates, coerces and executes one request.
+	internal def runRequest(schema Schema, request Request, context any, root any) Response {
+		let response = new Response()
+		let doc = syntax.parseDocument(request.query) onerror (err error) {
+			response.errors.push(syntaxErrorOf(err))
+			response.unparsed = true
+			recover new Node(NodeKind.Document)
+		}
+		return response when response.errors.len() > 0
+		response.errors = validateDocument(schema, doc)
+		return response when response.errors.len() > 0
+		let failure = ""
+		let operation = operationOf(doc, request.operationName) onerror (err error) {
+			failure = err.message
+			recover new Node(NodeKind.OperationDefinition)
+		}
+		failure = "Subscriptions run through executeSubscription." when failure == "" && operation.text == "subscription"
+		if failure != "" {
+			response.errors.push(GraphQLError{message: failure})
+			return response
+		}
+		let (variables, problems) = coerceVariables(schema, operation, request.variables)
+		if problems.len() > 0 {
+			response.errors = problems
+			return response
+		}
+		let ex = new Execution(schema, doc, operation, variables, context, root)
+		ex.extensions = request.extensions
+		return runOperation(ex)
+	}
+
+	internal def syntaxErrorOf(err error) GraphQLError {
+		return GraphQLError{message: err.message, locations: [Location{line: err.line, column: err.column}]} when err is syntax.SyntaxError
+		return GraphQLError{message: err.message}
+	}
+
+	// Starts a subscription's event stream and a task that turns each event
+	// into a response (spec CreateSourceEventStream, MapSourceToResponseEvent).
+	// Returns the subscription, or none with the errors that stopped it: the
+	// syntax error, the validation errors, the variables that do not fit, or
+	// the root field's arguments or subscriber failing (at its path).
+	internal def beginSubscription(schema Schema, request Request, context any) (?Subscription, GraphQLError[]) {
+		let failed GraphQLError[] = []
+		let doc = syntax.parseDocument(request.query) onerror (err error) {
+			failed.push(syntaxErrorOf(err))
+			recover new Node(NodeKind.Document)
+		}
+		return (none, failed) when failed.len() > 0
+		let invalid = validateDocument(schema, doc)
+		return (none, invalid) when invalid.len() > 0
+		let operation = operationOf(doc, request.operationName) onerror (err error) {
+			failed.push(GraphQLError{message: err.message})
+			recover new Node(NodeKind.OperationDefinition)
+		}
+		return (none, failed) when failed.len() > 0
+		return (none, [GraphQLError{message: "The operation is a {operation.text}, not a subscription."}]) unless operation.text == "subscription"
+		let (variables, problems) = coerceVariables(schema, operation, request.variables)
+		return (none, problems) when problems.len() > 0
+		let rootType = schema.types.get(schema.subscriptionType)
+		return (none, [GraphQLError{message: "The subscription operation is not supported by the schema."}]) when rootType is none
+		let ex = new Execution(schema, doc, operation, variables, context, none)
+		ex.extensions = request.extensions
+		let fields = collectFields(ex, rootType, operation.selections, [])
+		let (key, nodes) = firstField(fields)
+		let field = rootType.field(nodes[0].name)
+		let at = [Location{line: nodes[0].line, column: nodes[0].column}]
+		return (none, [GraphQLError{message: "The subscription type has no field \"{nodes[0].name}\".", locations: at, path: [key]}]) when field is none
+		let subscriber = field.subscriber
+		let boxed = field.boxedSubscriber
+		return (none, [GraphQLError{message: "The subscription field \"{field.name}\" has no subscriber.", locations: at, path: [key]}]) when subscriber is none && boxed is none
+		let info = new ResolveInfo()
+		info.source = schema.subscriptionRoot
+		info.args = coerceArguments(schema, field.args, "{rootType.name}.{field.name}", nodes[0], variables) onerror (err error) {
+			return (none, [GraphQLError{message: err.message, locations: at, path: [key]}])
+		}
+		info.context = context
+		info.fieldName = field.name
+		info.parentType = rootType.name
+		info.path = [key]
+		info.operationName = operation.name
+		info.variables = variables
+		info.extensions = request.extensions
+		let events any = none
+		if boxed is none {
+			if !(subscriber is none) {
+				events = subscriber(info) onerror (err error) {
+					return (none, [GraphQLError{message: err.message, locations: at, path: [key]}])
+				}
+			}
+		} else {
+			events = boxed(info) onerror (err error) {
+				return (none, [GraphQLError{message: err.message, locations: at, path: [key]}])
+			}
+		}
+		let sub = new Subscription()
+		async<sub.pump> pumpEvents(schema, doc, operation, variables, request.extensions, context, events, sub.responses)
+		return (sub, [])
+	}
+
+	// A running subscription: its responses, one per event, until the events
+	// end or close is called.
+	type Subscription {
+		// The responses, in the order of the events; closed at the end.
+		responses channel<Response>
+
+		internal pump AsyncScope
+		// What else close does: a client's subscription tells the server.
+		internal stop ?def ()    = none
+
+		internal def new() {
+			responses = new channel<Response>(16)
+			pump = new AsyncScope(failFast = false)
+		}
+
+		// Stops the subscription: no more responses are sent and the
+		// responses channel closes (the task that sends them closes it, so
+		// a response is never sent on a closed channel).
+		def close() {
+			pump.cancel("closed")
+			let then = stop
+			stop = none
+			then() unless then is none
+		}
+	}
+
+	internal def firstField(fields map<string, Node[]>) (string, Node[]) {
+		for let (key, nodes) in fields {
+			return (key, nodes)
+		}
+		return ("", [])
+	}
+
+	// Runs the subscription's selection set for each event until the events
+	// end, then closes the responses.
+	internal async def pumpEvents(schema Schema, doc Node, operation Node, variables map<string, any>, extensions map<string, any>, context any, events any, out channel<Response>) {
+		// The events channel may carry any element type: a subscriber's
+		// `channel<any>` or a `@graphql` method's `channel<T>`.
+		for {
+			let (event, ok) = reflection.receive(events)
+			break unless ok
+			break when canceled()
+			let ex = new Execution(schema, doc, operation, variables, context, event)
+			ex.extensions = extensions
+			out <- runOperation(ex)
+		}
+		out.close() unless out.closed
+	}
+
+	// The variables of an operation coerced from the request (spec
+	// CoerceVariableValues): a variable left out without a default is left
+	// out. Every variable that does not fit is reported, as graphql-js
+	// words it, at its definition.
+	internal def coerceVariables(schema Schema, operation Node, given map<string, any>) (map<string, any>, GraphQLError[]) {
+		let out = map<string, any>{}
+		let errors GraphQLError[] = []
+		for let v in operation.items {
+			let ref = refOr(v.typeRef)
+			let at = [Location{line: v.line, column: v.column}]
+			let has = given.hasKey(v.name)
+			if !has {
+				let d = v.value
+				if !(d is none) {
+					let (ok, dv) = coerceInputLiteral(schema, d, ref, noneVariables())
+					if ok {
+						out[v.name] = dv
+					} else {
+						let problems InputProblem[] = []
+						validateInputLiteral(schema, d, ref, noneVariables(), [], problems)
+						for let p in problems {
+							errors.push(GraphQLError{message: "Variable \"${v.name}\" has invalid default value{printPath(p.path)}: {p.message}", locations: at})
+						}
+					}
+					continue
+				}
+				continue unless isNonNull(ref)
+			}
+			let value = has ?? (given[v.name], noneValue())
+			let (ok, coerced) = coerceInputValue(schema, value, has, ref)
+			if ok {
+				out[v.name] = coerced
+				continue
+			}
+			let problems InputProblem[] = []
+			validateInputValue(schema, value, has, ref, [], problems)
+			for let p in problems {
+				errors.push(GraphQLError{message: "Variable \"${v.name}\" has invalid value{printPath(p.path)}: {p.message}", locations: at})
+			}
+		}
+		return (out, errors)
+	}
+
+	// Runs a parsed and validated operation (spec ExecuteQuery,
+	// ExecuteMutation).
+	internal def runOperation(ex Execution) Response {
+		let response = new Response()
+		response.ran = true
+		let rootName = ex.operation.text == "mutation" ?? (ex.schema.mutationType, ex.operation.text == "subscription" ?? (ex.schema.subscriptionType, ex.schema.queryType))
+		let rootType = ex.schema.types.get(rootName)
+		if rootType is none {
+			response.ran = false
+			response.errors.push(GraphQLError{message: "Schema is not configured for {ex.operation.text}s."})
+			return response
+		}
+		let fields = collectFields(ex, rootType, ex.operation.selections, [])
+		let source = ex.root is none ?? (ex.operation.text == "mutation" ?? (ex.schema.mutationRoot, ex.schema.queryRoot), ex.root)
+		let (data, ok) = executeFields(ex, rootType, source, fields, [])
+		response.data = data when ok
+		response.errors = ex.errors
+		return response
+	}
+
+	// The fields of a selection set grouped by response key, in order, with
+	// @skip and @include applied and fragments that apply to the type
+	// spread in (spec CollectFields).
+	internal def collectFields(ex Execution, objectType TypeDef, selections Node[], visited string[]) map<string, Node[]> {
+		let out = map<string, Node[]>{}
+		for let s in selections {
+			continue unless included(ex, s.directives)
+			match s.kind {
+				case NodeKind.Field:
+					let key = s.alias == "" ?? (s.name, s.alias)
+					let list = out.get(key)
+					out[key] = list is none ?? ([s], list + [s])
+				case NodeKind.FragmentSpread:
+					continue when visited.includes(s.name)
+					visited.push(s.name)
+					let fragment = ex.fragments.get(s.name)
+					continue when fragment is none || !fragmentApplies(ex.schema, objectType, fragment.text)
+					for let (key, nodes) in collectFields(ex, objectType, fragment.selections, visited) {
+						let list = out.get(key)
+						out[key] = list is none ?? (nodes, list + nodes)
+					}
+				default:
+					continue unless s.text == "" || fragmentApplies(ex.schema, objectType, s.text)
+					for let (key, nodes) in collectFields(ex, objectType, s.selections, visited) {
+						let list = out.get(key)
+						out[key] = list is none ?? (nodes, list + nodes)
+					}
+			}
+		}
+		return out
+	}
+
+	internal def fragmentApplies(schema Schema, objectType TypeDef, condition string) bool {
+		return true when condition == objectType.name
+		let t = schema.types.get(condition)
+		return !(t is none) && t.isAbstract() && isPossible(t, objectType)
+	}
+
+	// Whether @skip and @include let a selection in.
+	internal def included(ex Execution, directives Node[]) bool {
+		for let d in directives {
+			continue unless d.name := "skip" || "include"
+			let arg = d.arguments.find(a => a.name == "if", 0)
+			continue when arg is none
+			let (ok, value) = coerceInputLiteral(ex.schema, valueOr(arg.value), nonNullNamed("Boolean"), ex.variables)
+			let set = ok && value is bool && value
+			return false when d.name == "skip" && set
+			return false when d.name == "include" && !set
+		}
+		return true
+	}
+
+	// Executes the fields of an object (spec ExecuteSelectionSet). The bool
+	// is false when a non-null field failed, so the object is null.
+	internal def executeFields(ex Execution, objectType TypeDef, source any, fields map<string, Node[]>, path any[]) (map<string, any>, bool) {
+		let out = map<string, any>{}
+		for let (key, nodes) in fields {
+			let name = nodes[0].name
+			if name == "__typename" {
+				out[key] = objectType.name
+				continue
+			}
+			let field = fieldDefinition(ex.schema, objectType, name)
+			continue when field is none
+			let (value, ok) = executeField(ex, objectType, source, field, nodes, path + [key])
+			return (out, false) unless ok
+			out[key] = value
+		}
+		return (out, true)
+	}
+
+	// A field's definition, the introspection fields of the query type
+	// included.
+	internal def fieldDefinition(schema Schema, objectType TypeDef, name string) ?FieldDef {
+		if objectType.name == schema.queryType {
+			return metaSchemaField when name == "__schema"
+			return metaTypeField when name == "__type"
+		}
+		return objectType.field(name)
+	}
+
+	internal const metaSchemaField = metaField("__schema", "__Schema!", false)
+	internal const metaTypeField = metaField("__type", "__Type", true)
+
+	internal def metaField(name string, ref string, withName bool) FieldDef {
+		let f = new FieldDef(name, syntax.parseTypeText(ref) onerror recover new Node(NodeKind.NamedType))
+		f.args = [new InputDef("name", syntax.parseTypeText("String!") onerror recover new Node(NodeKind.NamedType))] when withName
+		return f
+	}
+
+	internal def executeField(ex Execution, objectType TypeDef, source any, field FieldDef, nodes Node[], path any[]) (any, bool) {
+		let failed = false
+		let args = coerceArguments(ex.schema, field.args, "{objectType.name}.{field.name}", nodes[0], ex.variables) onerror (err error) {
+			ex.report(err.message, [nodes[0]], path)
+			failed = true
+			recover map<string, any>{}
+		}
+		return (noneValue(), !isNonNull(field.typeRef)) when failed
+		let info = new ResolveInfo()
+		info.source = source
+		info.args = args
+		info.context = ex.context
+		info.fieldName = field.name
+		info.parentType = objectType.name
+		info.path = path
+		info.operationName = ex.operation.name
+		info.variables = ex.variables
+		info.extensions = ex.extensions
+		let result = resolveField(ex, objectType, field, info) onerror (err error) {
+			ex.report(err.message, [nodes[0]], path)
+			failed = true
+			recover noneValue()
+		}
+		return (noneValue(), !isNonNull(field.typeRef)) when failed
+		return completeValue(ex, objectType.name, field.typeRef, field, nodes, result, path)
+	}
+
+	// The arguments of a field or directive coerced (spec
+	// CoerceArgumentValues), owner its schema coordinate (`Query.user`,
+	// `@skip`). Fails with the first problem, as graphql-js words it.
+	internal def coerceArguments(schema Schema, args InputDef[], owner string, node Node, variables map<string, any>) !map<string, any> {
+		let out = map<string, any>{}
+		for let a in args {
+			let coordinate = "{owner}({a.name}:)"
+			let given = node.arguments.find(x => x.name == a.name, 0)
+			if given is none {
+				fail requestError("Argument \"{coordinate}\" of required type \"{syntax.print(a.typeRef)}\" was not provided.") when isRequiredInput(a)
+				try argumentDefault(schema, a, coordinate, out)
+				continue
+			}
+			let value = valueOr(given.value)
+			if value.kind == NodeKind.Variable && !variables.hasKey(value.name) && !isRequiredInput(a) {
+				try argumentDefault(schema, a, coordinate, out)
+				continue
+			}
+			let (ok, v) = coerceInputLiteral(schema, value, a.typeRef, variables)
+			if !ok {
+				let problems InputProblem[] = []
+				validateInputLiteral(schema, value, a.typeRef, variables, [], problems)
+				fail requestError("Argument \"{coordinate}\" has invalid value{problems.len() > 0 ?? (printPath(problems[0].path) + ": " + problems[0].message, ".")}")
+			}
+			out[a.name] = v
+		}
+		return out
+	}
+
+	// Sets an argument left out to its default, when it has one.
+	internal def argumentDefault(schema Schema, a InputDef, coordinate string, out map<string, any>) !none {
+		let d = a.defaultValue
+		return none when d is none
+		let (ok, dv) = coerceInputLiteral(schema, d, a.typeRef, noneVariables())
+		if !ok {
+			let problems InputProblem[] = []
+			validateInputLiteral(schema, d, a.typeRef, noneVariables(), [], problems)
+			fail requestError("Argument \"{coordinate}\" has invalid default value{problems.len() > 0 ?? (printPath(problems[0].path) + ": " + problems[0].message, ".")}")
+		}
+		out[a.name] = dv
+		return none
+	}
+
+	// Calls the field's resolver, the introspection one for the `__` types,
+	// or the default: the map entry, field or zero-argument method of the
+	// source named like the field.
+	internal def resolveField(ex Execution, objectType TypeDef, field FieldDef, info ResolveInfo) !any {
+		let resolver = field.resolver
+		return try resolver(info) unless resolver is none
+		return ex.schema when field.name == "__schema"
+		if field.name == "__type" {
+			let name = info.arg("name")
+			return none unless name is string
+			let t = ex.schema.types.get(name)
+			return none when t is none
+			return IntroType{schema: ex.schema, ref: namedRef(name)}
+		}
+		return try introspect(ex.schema, objectType.name, field.name, info) when objectType.name.startsWith("__")
+		return defaultResolve(info.source, field.name)
+	}
+
+	// The default resolver: a map's entry, an object's field, or the result
+	// of an object's method of that name taking no argument.
+	internal def defaultResolve(source any, name string) any {
+		return none when source is none
+		if source is map<string, any> {
+			return none unless source.hasKey(name)
+			return source[name]
+		}
+		let f = reflection.field(source, name)
+		return fieldValue(f) unless (f is none)
+		let descriptor = reflection.descriptorOf(source)
+		if !(descriptor is none) {
+			for let m in reflection.methods(descriptor) {
+				return reflection.invoke(m, source, []) when m.node.name == name && m.signature.parameters.len() == 0
+			}
+		}
+		return none
+	}
+
+	// A field's value boxed as any: an enum field its member, an array
+	// field an any[] of its elements read the same way.
+	internal def fieldValue(f reflection.Field) any {
+		match f.kind {
+			case FieldKind.Enum:
+				return enumMember(f.descriptor, "{f.asInt()}")
+			case FieldKind.Array:
+				let out any[] = []
+				for let i = 0; i < f.len(); i++ {
+					out.push(elementValue(f.at(i), f.elemKind, f.elemDescriptor))
+				}
+				return out
+			case FieldKind.Optional:
+				let v = f.value()
+				return none when v is none
+				return enumMember(f.elemDescriptor, reflection.scalarText(v)) when f.elemKind == FieldKind.Enum
+				return v
+			default:
+				return elementValue(f, f.kind, f.descriptor)
+		}
+	}
+
+	// One value read through a Field: the field itself, or an element of an
+	// array field, whose kind is given.
+	internal def elementValue(f reflection.Field, kind FieldKind, described ?reflection.TypeDescriptor) any {
+		match kind {
+			case FieldKind.String:
+				return f.asString()
+			case FieldKind.Bool:
+				return f.asBool()
+			case FieldKind.Int:
+				return f.asInt()
+			case FieldKind.Uint:
+				return int(f.asUint())
+			case FieldKind.Float:
+				return f.asFloat()
+			case FieldKind.Enum:
+				return enumMember(described, "{f.asInt()}")
+			default:
+				let v = f.value()
+				return none when v is none
+				return v
+		}
+	}
+
+	// The member of an enum whose number is number, boxed as any; none when
+	// there is none.
+	internal def enumMember(described ?reflection.TypeDescriptor, number string) any {
+		return none when described is none
+		for let m in reflection.members(described) {
+			return m.value when reflection.scalarText(m.value) == number
+		}
+		return none
+	}
+
+	// Completes a resolved value to the field's type (spec CompleteValue).
+	// The bool is false when a non-null value is null: the error is recorded
+	// and the null travels up to the nearest nullable position.
+	internal def completeValue(ex Execution, owner string, ref Node, field FieldDef, nodes Node[], result any, path any[]) (any, bool) {
+		if ref.kind == NodeKind.NonNullType {
+			let (value, ok) = completeValue(ex, owner, inner(ref), field, nodes, result, path)
+			return (noneValue(), false) unless ok
+			if value is none {
+				ex.report("Cannot return null for non-nullable field {owner}.{field.name}.", [nodes[0]], path)
+				return (noneValue(), false)
+			}
+			return (value, true)
+		}
+		let (value, ok) = completeNullable(ex, owner, ref, field, nodes, result, path)
+		return (noneValue(), true) unless ok
+		return (value, true)
+	}
+
+	internal def completeNullable(ex Execution, owner string, ref Node, field FieldDef, nodes Node[], result any, path any[]) (any, bool) {
+		return (noneValue(), true) when result is none
+		if ref.kind == NodeKind.ListType {
+			let items = listOf(result)
+			if items is none {
+				ex.report("Expected Iterable, but did not find one for field \"{field.name}\".", [nodes[0]], path)
+				return (noneValue(), false)
+			}
+			let out any[] = []
+			for let (i, item) in items {
+				let (value, ok) = completeValue(ex, owner, inner(ref), field, nodes, item, path + [i])
+				return (noneValue(), false) unless ok
+				out.push(value)
+			}
+			return (out, true)
+		}
+		let t = ex.schema.types.get(ref.name)
+		return (noneValue(), false) when t is none
+		if t.isLeaf() {
+			let failure = ""
+			let value = serializeLeaf(t, result) onerror (err error) {
+				failure = err.message
+				recover noneValue()
+			}
+			if failure != "" {
+				ex.report(failure, [nodes[0]], path)
+				return (noneValue(), false)
+			}
+			return (value, true)
+		}
+		let objectType = t
+		if t.isAbstract() {
+			let failure = ""
+			let named = runtimeType(ex, t, result, field, path) onerror (err error) {
+				failure = err.message
+				recover ""
+			}
+			let found = ex.schema.types.get(named)
+			failure = named == "" ?? ("Abstract type \"{t.name}\" must resolve to an Object type at runtime for field \"{field.name}\".", "Abstract type \"{t.name}\" was resolved to a type \"{named}\" that does not exist inside the schema.") when failure == "" && found is none
+			if failure != "" || found is none {
+				ex.report(failure, [nodes[0]], path)
+				return (noneValue(), false)
+			}
+			if found.kind != TypeKind.Object || !isPossible(t, found) {
+				ex.report("Runtime Object type \"{named}\" is not a possible type for \"{t.name}\".", [nodes[0]], path)
+				return (noneValue(), false)
+			}
+			objectType = found
+		}
+		let selections Node[] = []
+		for let n in nodes {
+			selections += n.selections
+		}
+		let fields = collectFields(ex, objectType, selections, [])
+		let (data, ok) = executeFields(ex, objectType, result, fields, path)
+		return (noneValue(), false) unless ok
+		return (data, true)
+	}
+
+	// The elements of a list value: an array of any kind, none for anything
+	// else.
+	internal def listOf(value any) ?any[] {
+		return value when value is any[]
+		return reflection.elements(value) when reflection.kindOf(value) == FieldKind.Array
+		return none
+	}
+
+	// The object type of a value of an abstract type: the schema's resolver,
+	// else the `__typename` of a map, else the value's ADM type name.
+	internal def runtimeType(ex Execution, t TypeDef, value any, field FieldDef, path any[]) !string {
+		let resolver = t.resolveType
+		if !(resolver is none) {
+			let info = new ResolveInfo()
+			info.source = value
+			info.context = ex.context
+			info.fieldName = field.name
+			info.path = path
+			return try resolver(value, info)
+		}
+		if value is map<string, any> {
+			let named = value.get("__typename")
+			return named is string ?? (named, "")
+		}
+		let parts = reflection.typeName(value).split(".")
+		return parts[parts.len() - 1]
+	}
+
+	internal def namedRef(name string) Node {
+		let n = new Node(NodeKind.NamedType)
+		n.name = name
+		return n
+	}
+}

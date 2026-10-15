@@ -1,0 +1,445 @@
+partial module std.net.http.openapi {
+	use (
+		std.bytes
+		std.formats
+		std.net.http
+		std.net.multipart
+		std.data.encoding::(JSON, YAML, XML, XMLNode, XMLNodeKind)
+	)
+
+	// A body the schemas cannot see into (an image, an octet stream): its
+	// size is all that is checked, against `maxLength`.
+	internal struct BinaryBody {
+		size int
+	}
+
+	partial type Validator {
+		// The problems of a request's body: missing when required, of a
+		// media type the operation does not take, or not matching its
+		// schema.
+		internal def checkRequestBody(plan OperationPlan, req http.Request) Problem[] {
+			return [] unless plan.hasBody
+			let data = req.bytes() onerror (err error) {
+				return [Problem{location: "body", message: "the body cannot be read: {err.message}"}]
+			}
+			let contentType = req.header("Content-Type")
+			return plan.bodyRequired ?? ([Problem{location: "body", message: "the request body is required"}], []) when data.len() == 0 && contentType == ""
+			return checkContent(plan.body, plan.bodyAt, contentType, data, "body")
+		}
+
+		// The problems of a body against a Content map: its media type
+		// among the map's (the most specific match), then its value.
+		internal def checkContent(content map<string, MediaType>, at string, contentType string, data byte[], place string) Problem[] {
+			return [] when content.len() == 0
+			return [] when contentType == "" && data.len() == 0
+			return [Problem{location: "content-type", message: "the body has no Content-Type"}] when contentType == ""
+			let actual = formats.parseMediaType(contentType) onerror (err error) {
+				return [Problem{location: "content-type", message: "the Content-Type \"{contentType}\" does not parse: {err.message}"}]
+			}
+			let key = bestMediaKey(content, actual)
+			if key == "" {
+				let keys string[] = []
+				for let (k, _) in content {
+					keys.push(k)
+				}
+				return [Problem{location: "content-type", message: "the Content-Type {actual.essence()} is not one of {keys.join(", ")}"}]
+			}
+			let given = content.get(key)
+			return [] when given is none
+			let (m, mat) = resolveMediaTypeAt(given, at + "/content/" + escapePointer(key))
+			return checkMediaValue(key, contentType, data, m, mat, place, "")
+		}
+
+		// The problems of content of a media type: read into the JSON data
+		// model as the media type has it, then checked against `schema`
+		// (the whole) and `itemSchema` (each item of a sequence).
+		internal def checkMediaValue(key string, contentType string, data byte[], m MediaType, at string, place string, name string) Problem[] {
+			let actual = formats.parseMediaType(contentType) onerror recover (formats.parseMediaType(key) onerror recover new formats.MediaType("application", "octet-stream"))
+			let problems Problem[] = []
+			let value = decodeMedia(actual, contentType, data, m, at) onerror (err error) {
+				return [Problem{location: place, name: name, message: err.message}]
+			}
+			if value is BinaryBody {
+				let limit = schemas.keyword(m.schema, "maxLength")
+				problems.push(Problem{location: place, name: name, message: "the content is {value.size} bytes, more than maxLength {limit}"}) when limit is int && value.size > limit
+				return problems
+			}
+			problems += checkSchema(at + "/schema", value, place, name) unless m.schema is none
+			if !(m.itemSchema is none) && value is any[] {
+				for let (i, item) in value {
+					for let p in checkSchema(at + "/itemSchema", item, place, name) {
+						p.pointer = "/{i}" + p.pointer
+						problems.push(p)
+					}
+				}
+			}
+			return problems
+		}
+
+		// Content as a value of the JSON data model.
+		internal def decodeMedia(actual formats.MediaType, contentType string, data byte[], m MediaType, at string) !any {
+			let essence = actual.essence()
+			let sub = actual.subtype
+			if (essence := "application/json" || "text/json") || sub.endsWith("+json") {
+				return new JSON().parse(data) onerror (err error) {
+					fail openapiError(at, "the content is not JSON: {err.message}")
+				}
+			}
+			if (essence := "application/yaml" || "application/x-yaml" || "text/yaml" || "text/x-yaml") || sub.endsWith("+yaml") {
+				return new YAML().parse(data) onerror (err error) {
+					fail openapiError(at, "the content is not YAML: {err.message}")
+				}
+			}
+			if essence := "application/jsonl" || "application/x-ndjson" || "application/x-jsonlines" || "application/jsonlines" {
+				return try jsonSequence(data, byte(10), at)
+			}
+			return try jsonSequence(data, byte(0x1E), at) when essence == "application/json-seq" || sub.endsWith("+json-seq")
+			return eventStream(string(data)) when essence == "text/event-stream"
+			return formObject(queryPairs(string(data)), m) when essence == "application/x-www-form-urlencoded"
+			return try multipartForm(data, contentType, m, at) when essence == "multipart/form-data"
+			return try multipartList(data, contentType, at) when actual.mainType == "multipart"
+			if (essence := "application/xml" || "text/xml") || sub.endsWith("+xml") {
+				let root = new XML().parse(data) onerror (err error) {
+					fail openapiError(at, "the content is not XML: {err.message}")
+				}
+				return xmlValue(root, m.schema, 0)
+			}
+			return string(data) when actual.mainType == "text"
+			return BinaryBody{size: data.len()}
+		}
+
+		// Name-value pairs as an object, each value read as its property's
+		// Encoding Object says: by RFC 6570 chosen when it sets `chosen`,
+		// `explode` or `allowReserved`, else by its content type (JSON for
+		// objects and arrays by default) or as the property's type.
+		internal def formObject(pairs (string, string)[], m MediaType) map<string, any> {
+			let schema = m.schema
+			let out = map<string, any>{}
+			let seen = map<string, bool>{}
+			for let pair in pairs {
+				let (rawName, _) = pair
+				let name = formDecode(rawName)
+				continue when seen.hasKey(name)
+				seen[name] = true
+				let propertySchema = schemas.propertySchema(schema, name)
+				let encoding = m.encoding.get(name)
+				if !(encoding is none) && (encoding.style != Style.Default || !(encoding.explode is none) || !(encoding.allowReserved is none)) {
+					let chosen = encoding.style == Style.Default ?? (Style.Form, encoding.style)
+					let explode = encoding.explode
+					let exploded = explode is none ?? (chosen == Style.Form, explode)
+					let found = chosen == Style.DeepObject ?? (deepObject(name, pairs, propertySchema), pairsStyled(name, exploded, pairs, propertySchema, decode = true, query = true))
+					if !(found is none) {
+						let (_, value) = found
+						out[name] = value
+					}
+					continue
+				}
+				let values string[] = []
+				for let other in pairs {
+					let (otherName, otherValue) = other
+					values.push(formDecode(otherValue)) when formDecode(otherName) == name
+				}
+				let contentType = encoding is none ?? ("", encoding.contentType)
+				let types = schemas.typesOf(propertySchema)
+				if types.includes("array") {
+					let items = schemas.itemSchema(propertySchema)
+					let list any[] = []
+					for let v in values {
+						list.push(fieldValue(v, items, contentType))
+					}
+					out[name] = list
+				} else {
+					out[name] = fieldValue(values[0], propertySchema, contentType)
+				}
+			}
+			return out
+		}
+
+		// A form field's text as its content type or schema has it: JSON
+		// parsed for an object or array (or a JSON content type), else the
+		// text as the schema's type.
+		internal def fieldValue(text string, schema any, contentType string) any {
+			let types = schemas.typesOf(schema)
+			let json = contentType.lower().contains("json") || (contentType == "" && (types.includes("object") || types.includes("array")) && !types.includes("string"))
+			if json {
+				let parsed = new JSON().parse(text) onerror recover text
+				return parsed
+			}
+			return scalar(text, schema)
+		}
+
+		// `multipart/form-data` as an object: each part under its name (a
+		// name sent more than once, or of an array property, as a list),
+		// read by its Content-Type: JSON, text, or binary content as text
+		// (its UTF-8 when it is that, else "").
+		internal def multipartForm(data byte[], contentType string, m MediaType, at string) !map<string, any> {
+			let reader = multipart.readerFor(new bytes.Reader(data), contentType) onerror (err error) {
+				fail openapiError(at, "the multipart content does not parse: {err.message}")
+			}
+			let out = map<string, any>{}
+			let counts = map<string, int>{}
+			for {
+				let part = reader.nextPart() onerror (err error) {
+					fail openapiError(at, "the multipart content does not parse: {err.message}")
+				}
+				break when part is none
+				let name = part.formName()
+				let content = part.bytes() onerror (err error) {
+					fail openapiError(at, "the part \"{name}\" cannot be read: {err.message}")
+				}
+				let propertySchema = schemas.propertySchema(m.schema, name)
+				let isArray = schemas.typesOf(propertySchema).includes("array")
+				let itemSchema = isArray ?? (schemas.itemSchema(propertySchema), propertySchema)
+				let value = partValue(part.header("Content-Type"), part.fileName(), content, itemSchema)
+				let count = counts.get(name)
+				if isArray {
+					if count is none {
+						let list any[] = []
+						out[name] = list
+					}
+					let list = out[name]
+					list.push(value) when list is any[]
+				} else if count is none {
+					out[name] = value
+				} else if count == 1 {
+					// Sent twice for a property that is not an array: a list,
+					// which its schema refuses.
+					let first = out.get(name)
+					out[name] = [first, value]
+				}
+				counts[name] = count is none ?? (1, count + 1)
+			}
+			return out
+		}
+
+		internal def partValue(partType string, fileName ?string, content byte[], schema any) any {
+			let lower = partType.lower()
+			if lower.contains("json") {
+				let parsed = new JSON().parse(content) onerror recover string(content)
+				return parsed
+			}
+			let text = string(content)
+			let isText = lower.startsWith("text/") || (lower == "" && fileName is none)
+			return "" when !isText && !string(content).isUTF8()
+			return isText ?? (scalar(text, schema), text)
+		}
+
+		// Other `multipart` types as the list of their parts, in order.
+		internal def multipartList(data byte[], contentType string, at string) !any[] {
+			let reader = multipart.readerFor(new bytes.Reader(data), contentType) onerror (err error) {
+				fail openapiError(at, "the multipart content does not parse: {err.message}")
+			}
+			let out any[] = []
+			for {
+				let part = reader.nextPart() onerror (err error) {
+					fail openapiError(at, "the multipart content does not parse: {err.message}")
+				}
+				break when part is none
+				let content = part.bytes() onerror (err error) {
+					fail openapiError(at, "a part cannot be read: {err.message}")
+				}
+				out.push(partValue(part.header("Content-Type"), part.fileName(), content, none))
+			}
+			return out
+		}
+
+		// An XML element as the JSON data model, as the XML Objects of its
+		// schema map them: properties from attributes, child elements and
+		// text, arrays wrapped or not, a primitive from the element's text,
+		// `xsi:nil` as null.
+		internal def xmlValue(element XMLNode, schema any, depth int) any {
+			return none when depth > 64
+			let nil = element.attribute("nil", "http://www.w3.org/2001/XMLSchema-instance")
+			return none when !(nil is none) && nil == "true"
+			let types = schemas.typesOf(schema)
+			if types.includes("array") {
+				let items = schemas.itemSchema(schema)
+				let out any[] = []
+				for let child in element.children {
+					out.push(xmlValue(child, items, depth + 1)) when child.kind == XMLNodeKind.Element
+				}
+				return out
+			}
+			let hasProperties = schemas.keyword(schema, "properties") is map<string, any>
+			return scalar(element.text(), schema) when !types.includes("object") && !hasProperties
+			let out = map<string, any>{}
+			let props = collectProperties(schema, 0)
+			for let entry in props {
+				let (name, propertySchema) = entry
+				let xml = schemas.keyword(propertySchema, "xml")
+				let xmlName = name
+				let nodeType = ""
+				let wrapped = false
+				if xml is map<string, any> {
+					let n = xml.hasKey("name") ?? (xml["name"], none)
+					xmlName = n when n is string
+					let t = xml.hasKey("nodeType") ?? (xml["nodeType"], none)
+					nodeType = t when t is string
+					let a = xml.hasKey("attribute") ?? (xml["attribute"], none)
+					nodeType = "attribute" when a is bool && a
+					let w = xml.hasKey("wrapped") ?? (xml["wrapped"], none)
+					wrapped = w is bool && w
+				}
+				let propertyTypes = schemas.typesOf(propertySchema)
+				if nodeType == "attribute" {
+					let value = element.attribute(xmlName)
+					if value is none {
+						out[name] = none when propertyTypes.includes("null")
+					} else {
+						out[name] = scalar(value, propertySchema)
+					}
+					continue
+				}
+				if nodeType := "text" || "cdata" {
+					out[name] = scalar(element.text(), propertySchema)
+					continue
+				}
+				if propertyTypes.includes("array") {
+					let items = schemas.itemSchema(propertySchema)
+					let itemName = xmlName
+					let itemXml = schemas.keyword(items, "xml")
+					if itemXml is map<string, any> && itemXml.hasKey("name") {
+						let n = itemXml["name"]
+						itemName = n when n is string
+					}
+					let container = element
+					if nodeType == "element" || wrapped {
+						let wrapper = element.child(xmlName)
+						continue when wrapper is none
+						container = wrapper
+					}
+					let list any[] = []
+					for let child in container.children {
+						list.push(xmlValue(child, items, depth + 1)) when child.kind == XMLNodeKind.Element && child.localName == itemName
+					}
+					out[name] = list unless list.len() == 0 && container == element
+					continue
+				}
+				let child = element.child(xmlName)
+				out[name] = xmlValue(child, propertySchema, depth + 1) unless child is none
+			}
+			return out
+		}
+
+		// The properties of a schema with their schemas, through `$ref` and
+		// `allOf`.
+		internal def collectProperties(schema any, depth int) (string, any)[] {
+			let out (string, any)[] = []
+			return out when depth > 32 || !(schema is map<string, any>)
+			let props = schema.hasKey("properties") ?? (schema["properties"], none)
+			if props is map<string, any> {
+				for let (name, sub) in props {
+					out.push((name, sub))
+				}
+			}
+			let ref = schema.hasKey("$ref") ?? (schema["$ref"], none)
+			if ref is string {
+				let target = schemas.resolve(ref, "") onerror recover none
+				out += collectProperties(target, depth + 1)
+			}
+			let all = schema.hasKey("allOf") ?? (schema["allOf"], none)
+			if all is any[] {
+				for let item in all {
+					out += collectProperties(item, depth + 1)
+				}
+			}
+			return out
+		}
+	}
+
+	// The key of a Content map a media type falls under: its own type with
+	// any parameters the key names, else `type/*`, else `*/*`; "" for none.
+	internal def bestMediaKey(content map<string, MediaType>, actual formats.MediaType) string {
+		let best = ""
+		let bestScore = 0
+		for let (key, _) in content {
+			let candidate = formats.parseMediaType(key) onerror (err error) {
+				continue
+			}
+			let score = 0
+			if candidate.mainType == "*" {
+				score = 1
+			} else if candidate.subtype == "*" {
+				score = candidate.mainType == actual.mainType ?? (2, 0)
+			} else if candidate.essence() == actual.essence() {
+				score = 3
+				for let (name, value) in candidate.params {
+					let given = actual.param(name)
+					score = 0 when given is none || given.lower() != value.lower()
+				}
+				score = 4 when score == 3 && candidate.params.len() > 0
+			}
+			if score > bestScore {
+				best = key
+				bestScore = score
+			}
+		}
+		return best
+	}
+
+	// JSON texts separated by a byte (a line feed for JSON Lines, RS for
+	// json-seq) as a list.
+	internal def jsonSequence(data byte[], separator byte, at string) !any[] {
+		let out any[] = []
+		let json = new JSON()
+		let start = 0
+		for let i = 0; i <= data.len(); i++ {
+			if i == data.len() || data[i] == separator {
+				let piece = string(data[start:i]).trim()
+				start = i + 1
+				continue when piece == ""
+				out.push(json.parse(piece) onerror (err error) {
+					fail openapiError(at, "item {out.len()} is not JSON: {err.message}")
+				})
+			}
+		}
+		return out
+	}
+
+	// A `text/event-stream` as its events, parsed as the HTML standard
+	// parses them: each an object with `data` and, when sent, `event`, `id`
+	// and `retry` (an integer).
+	internal def eventStream(text string) any[] {
+		let out any[] = []
+		let data = ""
+		let hasData = false
+		let event = ""
+		let id ?string = none
+		let retry ?int = none
+		let lines = text.replace("\r\n", "\n", -1).replace("\r", "\n", -1).split("\n")
+		for let line in lines {
+			if line == "" {
+				if hasData {
+					let item = map<string, any>{}
+					item["data"] = data.trimSuffix("\n")
+					item["event"] = event unless event == ""
+					item["id"] = id unless id is none
+					item["retry"] = retry unless retry is none
+					out.push(item)
+				}
+				data = ""
+				hasData = false
+				event = ""
+				retry = none
+				continue
+			}
+			continue when line.startsWith(":")
+			let colon = line.indexOf(":")
+			let field = colon < 0 ?? (line, line[0:colon])
+			let value = colon < 0 ?? ("", line[colon + 1:].trimPrefix(" "))
+			switch field {
+				case "data":
+					data += value + "\n"
+					hasData = true
+				case "event":
+					event = value
+				case "id":
+					id = value
+				case "retry":
+					retry = parseInt<int>(value) when /^[0-9]+$/.test(value)
+				default:
+			}
+		}
+		return out
+	}
+}

@@ -1,6 +1,412 @@
+// Web Push for application servers: the protocol of RFC 8030, message
+// encryption with aes128gcm (RFC 8291 over RFC 8188) and VAPID
+// identification (RFC 8292).
+//
+//     let key = try webpush.generateVapidKey("mailto:ops@example.com")
+//     // give key.publicKey() to the page's PushManager.subscribe, keep
+//     // key.privateKey(), store the PushSubscription JSON it returns
+//     let sub = try webpush.parseSubscription(json)
+//     let sender = new webpush.Sender(key)
+//     let sent = sender.send(sub, "{\"title\":\"Hi\"}", ttl = 1h) onerror (err error) {
+//         // err is webpush.PushError; kind Gone means drop the subscription
+//     }
 partial module std.net.http.webpush {
-	// Web Push: the protocol (RFC 8030), message encryption with aes128gcm
-	// (RFC 8291) and VAPID (RFC 8292). Application server keys, a
-	// subscription (endpoint, p256dh, auth), send with TTL, urgency and
-	// topic, the push service's answers (expired subscriptions)
+	use (
+		std.time
+		std.errors
+		std.crypto
+		std.crypto::(ECDSAPrivateKey, ECDHKeyPair, generateECDSAKey, scalarBaseMult, marshalPoint, unmarshalPoint, ecdh, ecdhKeyPair)
+		std.crypto.cipher::(newAES, newGCM)
+		std.crypto.hash::(Hash, hkdf)
+		std.data.encoding::(Base64, JSON)
+		std.net.http
+		std.net.http::(Method)
+		std.net.url
+		std.proto.auth.jose
+	)
+
+	// The most plaintext one aes128gcm record of 4096 bytes carries after
+	// the 86-byte header, the 16-byte tag and the padding delimiter: what
+	// every push service must accept (RFC 8291 §4).
+	const maxPayload = 3993
+
+	// The record size the header announces.
+	internal const recordSize = 4096
+
+	// The application server's VAPID key: an ECDSA P-256 key pair and the
+	// contact sent with every token (a `mailto:` or `https:` URI). Push
+	// services tie a subscription to the public key the page subscribed
+	// with, so keep the private key and use the same one for as long as the
+	// subscriptions live.
+	type VapidKey {
+		internal key ECDSAPrivateKey
+		// The "sub" claim: who the push service may contact about this
+		// application server.
+		subject      string
+
+		def new(key ECDSAPrivateKey, subject string) {
+			self.key = key
+			self.subject = subject
+		}
+
+		// The public key as the browser takes it for `applicationServerKey`:
+		// the uncompressed point, base64url without padding.
+		def publicKey() string {
+			return b64url(marshalPoint(key.curve, key.point))
+		}
+
+		// The private key, base64url without padding (32 bytes), for
+		// parseVapidKey to read back.
+		def privateKey() Secret<string> {
+			let d = key.d.bytes(32) onerror recover byte[]
+			return b64url(d)
+		}
+
+		// The JWT of RFC 8292 for a push service origin, valid until expires:
+		// ES256, "aud" the origin, "exp", "sub" the subject. Fails when
+		// signing does.
+		def token(audience string, expires time.Time) !string {
+			let claims = map<string, any>{"aud": audience, "exp": expires.unixNs() / 1000000000}
+			claims["sub"] = subject unless subject == ""
+			let header = new jose.Header()
+			header.typ = "JWT"
+			return try jose.sign(JSON.encode(claims), new jose.Jwk(key), jose.SignatureAlgorithm.ES256, header)
+		}
+	}
+
+	// generateVapidKey makes a new P-256 key pair for an application server
+	// whose contact is subject. Fails when the random source does.
+	def generateVapidKey(subject string) !VapidKey {
+		return new VapidKey(try generateECDSAKey(crypto.p256), subject)
+	}
+
+	// parseVapidKey reads a private key as privateKey writes it (the 32-byte
+	// scalar in base64url, padded or not) and derives its public key. Fails
+	// when the text is not base64url of 32 bytes or the scalar is out of
+	// range.
+	def parseVapidKey(privateKey string, subject string) !VapidKey {
+		let d = try b64urlDecode(privateKey)
+		fail "webpush: a VAPID private key is 32 bytes, not {d.len()}" when d.len() != 32
+		let scalar = parseBigInt(d)
+		fail "webpush: the VAPID private key is out of range" when scalar <= bigint(0) || scalar >= crypto.p256.n
+		return new VapidKey(new ECDSAPrivateKey(crypto.p256, scalar, scalarBaseMult(crypto.p256, scalar)), subject)
+	}
+
+	// Where and how to deliver to one browser: the push service URL and the
+	// user agent's keys, as `PushSubscription.toJSON()` gives them.
+	struct Subscription {
+		endpoint string
+		// The user agent's P-256 public key, base64url.
+		p256dh   string
+		// The 16-byte authentication secret, base64url.
+		auth     string
+	}
+
+	// parseSubscription reads the JSON of `PushSubscription.toJSON()`:
+	// `{"endpoint": …, "keys": {"p256dh": …, "auth": …}}`. Fails when a
+	// member is missing, the endpoint is not an https URL, or the keys are
+	// not a P-256 point and 16 bytes.
+	def parseSubscription(json string) !Subscription {
+		let doc = try JSON.parse(json)
+		fail "webpush: a subscription is a JSON object" unless doc is map<string, any>
+		let endpoint = doc.get("endpoint")
+		let keys = doc.get("keys")
+		fail "webpush: the subscription has no endpoint" unless endpoint is string
+		fail "webpush: the subscription has no keys" unless keys is map<string, any>
+		let p256dh = keys.get("p256dh")
+		let auth = keys.get("auth")
+		fail "webpush: the subscription has no p256dh and auth keys" unless p256dh is string && auth is string
+		let sub = Subscription{endpoint: endpoint, p256dh: p256dh, auth: auth}
+		try checkSubscription(sub)
+		return sub
+	}
+
+	// How soon a push service should deliver a message (RFC 8030 §5.3); a
+	// device on battery may hold back the lower ones.
+	enum Urgency {
+		// Advertisements and the like: on power and Wi-Fi.
+		VeryLow = "very-low",
+		// Topic updates: on power or Wi-Fi.
+		Low = "low",
+		Normal = "normal",
+		// Time-sensitive: incoming calls, alarms.
+		High = "high",
+	}
+
+	// What a push service answered about a message it took: where the
+	// message now lives (for cancel) and the status.
+	struct PushMessage {
+		// The message's URL at the push service (the Location header);
+		// "" when the service gave none.
+		location string
+		status   int
+	}
+
+	// Why a push failed.
+	enum PushErrorKind {
+		// The subscription has expired or was revoked (404 or 410): stop
+		// sending to it and delete it.
+		Gone,
+		// The push service refused the size (413).
+		TooLarge,
+		// Too many requests (429): wait retryAfter before sending again.
+		RateLimited,
+		// The service refused the VAPID token or the headers (400, 401, 403).
+		Unauthorized,
+		// Another 4xx answer.
+		Rejected,
+		// A 5xx answer: the service is failing; try later.
+		Unavailable,
+		// The request did not reach the service or the answer did not come
+		// back.
+		Transport,
+	}
+
+	// The error a push fails with. `kind` says what to do about it.
+	struct PushError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       PushErrorKind
+		// The HTTP status, 0 when none came back.
+		status     int
+		// The pause a 429 or 503 asked for; none when it gave none.
+		retryAfter ?duration
+		// The start of the answer's body: the push service's explanation.
+		body       string
+	}
+
+	// Sends push messages for one application server.
+	type Sender {
+		key       VapidKey
+		// The client requests go through; a client with a 30-second timeout
+		// unless replaced.
+		client    http.Client
+		// How long a VAPID token is valid; at most 24 hours (RFC 8292). A
+		// token is reused per push service until an hour before it expires.
+		tokenLife duration    = 12h
+
+		internal atomic tokens map<string, CachedToken>
+
+		def new(key VapidKey) {
+			self.key = key
+			client = new http.Client(timeout = 30s)
+		}
+
+		// send encrypts the payload for the subscription and asks its push
+		// service to deliver it: kept for at most ttl when the browser is
+		// offline (0 means deliver now or drop), at the urgency, replacing an
+		// undelivered message of the same topic (up to 32 base64url
+		// characters). Fails with a PushError: Gone when the subscription has
+		// expired, TooLarge for a payload over maxPayload bytes, the other
+		// kinds from the service's answer; and when the subscription's keys or
+		// the topic are malformed.
+		def send(sub Subscription, payload byte[], ttl duration = 672h, urgency Urgency = Urgency.Normal, topic ?string = none) !PushMessage {
+			fail PushError{message: "webpush: a payload of {payload.len()} bytes is over the {maxPayload} a push carries", code: "webpush", kind: PushErrorKind.TooLarge} when payload.len() > maxPayload
+			try checkSubscription(sub)
+			let uaPublic = try b64urlDecode(sub.p256dh)
+			let authSecret = try b64urlDecode(sub.auth)
+			let ephemeral = try ecdhKeyPair(crypto.p256)
+			let salt = try crypto.rand(16)
+			let body = try encryptPayload(uaPublic, authSecret, payload, ephemeral, salt)
+			return try post(sub, body, ttl, urgency, topic)
+		}
+
+		// send delivers text as UTF-8. Fails as send(Subscription, byte[])
+		// does.
+		def send(sub Subscription, payload string, ttl duration = 672h, urgency Urgency = Urgency.Normal, topic ?string = none) !PushMessage {
+			return try send(sub, payload.bytes(), ttl, urgency, topic)
+		}
+
+		// send asks for a push with no payload: the page's service worker
+		// wakes with an empty push event. Fails as the other forms do.
+		def send(sub Subscription, ttl duration = 672h, urgency Urgency = Urgency.Normal, topic ?string = none) !PushMessage {
+			try checkSubscription(sub)
+			return try post(sub, byte[], ttl, urgency, topic)
+		}
+
+		// cancel withdraws a message the push service has not delivered yet
+		// (RFC 8030 §6.3). A message already delivered or expired is gone
+		// either way, so a 404 or 410 counts as done. Fails with a PushError
+		// for other answers, and when the message has no location.
+		def cancel(message PushMessage) !none {
+			fail PushError{message: "webpush: the push service gave the message no location", code: "webpush", kind: PushErrorKind.Rejected} when message.location == ""
+			let target = try url.parse(message.location)
+			let req = try client.request(Method.DELETE, message.location)
+			req.headers.set("Authorization", try authorization(target.origin()))
+			let res = client.do(req) onerror (err error) {
+				fail PushError{message: "webpush: {err.message}", code: "webpush", cause: err, kind: PushErrorKind.Transport}
+			}
+			let status = res.status
+			let text = errorText(res)
+			return none when status < 300 || status == 404 || status == 410
+			fail answerError(status, res, text)
+		}
+
+		internal def post(sub Subscription, body byte[], ttl duration, urgency Urgency, topic ?string) !PushMessage {
+			let target = try url.parse(sub.endpoint)
+			let req = try client.request(Method.POST, sub.endpoint)
+			req.replaceBody(body)
+			req.headers.set("TTL", "{ttl > 0s ?? (int(ttl) / 1000000000, 0)}")
+			req.headers.set("Urgency", urgency.value) unless urgency == Urgency.Normal
+			if !(topic is none) {
+				fail PushError{message: "webpush: topic \"{topic}\" is not 1 to 32 base64url characters", code: "webpush", kind: PushErrorKind.Rejected} unless validTopic(topic)
+				req.headers.set("Topic", topic)
+			}
+			if body.len() > 0 {
+				req.headers.set("Content-Encoding", "aes128gcm")
+				req.headers.set("Content-Type", "application/octet-stream")
+			}
+			req.headers.set("Authorization", try authorization(target.origin()))
+			let res = client.do(req) onerror (err error) {
+				fail PushError{message: "webpush: {err.message}", code: "webpush", cause: err, kind: PushErrorKind.Transport}
+			}
+			let status = res.status
+			let text = errorText(res)
+			return PushMessage{location: res.headers.get("Location"), status: status} when status >= 200 && status < 300
+			fail answerError(status, res, text)
+		}
+
+		// The Authorization header for a push service origin, from a cached
+		// token while it has an hour left.
+		internal def authorization(audience string) !string {
+			let now = time.now()
+			let cached = tokens.get(audience)
+			return "vapid t={cached.token}, k={key.publicKey()}" when !(cached is none) && cached.expires - now > 1h
+			let life = tokenLife < 24h ?? (tokenLife, 24h)
+			let expires = now + life
+			let jwt = try key.token(audience, expires)
+			tokens[audience] = CachedToken{token: jwt, expires: expires}
+			return "vapid t={jwt}, k={key.publicKey()}"
+		}
+	}
+
+	internal struct CachedToken {
+		token   string
+		expires time.Time
+	}
+
+	// The error a push service's non-success answer stands for.
+	internal def answerError(status int, res http.Response, text string) PushError {
+		let kind = PushErrorKind.Rejected
+		if status := 404 || 410 {
+			kind = PushErrorKind.Gone
+		} else if status == 413 {
+			kind = PushErrorKind.TooLarge
+		} else if status == 429 {
+			kind = PushErrorKind.RateLimited
+		} else if status == 400 || status == 401 || status == 403 {
+			kind = PushErrorKind.Unauthorized
+		} else if status >= 500 {
+			kind = PushErrorKind.Unavailable
+		}
+		return PushError{message: "webpush: the push service answered {status}: {text}", code: "webpush", kind: kind, status: status, retryAfter: res.retryAfter(), body: text}
+	}
+
+	// Up to 1 KiB of the answer's body as text; the body is read to the end
+	// either way, so the connection can be reused.
+	internal def errorText(res http.Response) string {
+		let body = res.bytes() onerror recover byte[]
+		let cut = body.len() > 1024 ?? (body[:1024], body)
+		return string(cut).trim()
+	}
+
+	internal def checkSubscription(sub Subscription) !none {
+		let target = url.parse(sub.endpoint) onerror (err error) {
+			fail "webpush: endpoint \"{sub.endpoint}\" is not a URL"
+		}
+		fail "webpush: endpoint \"{sub.endpoint}\" is not an https URL" unless target.scheme.lower() == "https"
+		let point = try b64urlDecode(sub.p256dh)
+		unmarshalPoint(crypto.p256, point) onerror (err error) {
+			fail "webpush: p256dh is not a P-256 public key"
+		}
+		let auth = try b64urlDecode(sub.auth)
+		fail "webpush: auth is {auth.len()} bytes, not 16" when auth.len() != 16
+		return none
+	}
+
+	internal def validTopic(topic string) bool {
+		return false when topic.len() < 1 || topic.len() > 32
+		for let c in topic {
+			return false unless c.isAlphanumeric() || c == '-' || c == '_'
+		}
+		return true
+	}
+
+	// The aes128gcm body of RFC 8291: the header (salt, record size, the
+	// sender's ephemeral public key) and one record holding the payload and
+	// the 0x02 delimiter, under a key and nonce derived from the ECDH secret
+	// with the user agent and its authentication secret.
+	internal def encryptPayload(uaPublic byte[], authSecret byte[], payload byte[], ephemeral ECDHKeyPair, salt byte[]) !byte[] {
+		let asPublic = marshalPoint(crypto.p256, ephemeral.public)
+		let peer = try unmarshalPoint(crypto.p256, uaPublic)
+		let shared = try ecdh(crypto.p256, ephemeral.scalar, peer)
+		let (cek, nonce) = try contentKeys(shared, authSecret, uaPublic, asPublic, salt)
+		let plain = payload + byte[2]
+		let sealed = (try newGCM(try newAES(cek))).seal(nonce, plain, byte[])
+		let out byte[]
+		out.cap(86 + sealed.len())
+		out.push(...salt)
+		out.push(byte(recordSize >> 24), byte((recordSize >> 16) & 0xFF), byte((recordSize >> 8) & 0xFF), byte(recordSize & 0xFF))
+		out.push(byte(asPublic.len()))
+		out.push(...asPublic)
+		out.push(...sealed)
+		return out
+	}
+
+	// The user agent's side of RFC 8291: the payload of an aes128gcm body,
+	// padding removed. Fails on a malformed header or record, a record that
+	// does not open, or a body of more than one record.
+	internal def decryptPayload(uaPrivate bigint, uaPublic byte[], authSecret byte[], body byte[]) !byte[] {
+		expects {
+			assert body.len() >= 21 onerror fail "webpush: the body is shorter than its header"
+		}
+		let salt = body[:16]
+		let rs = (int(body[16]) << 24) | (int(body[17]) << 16) | (int(body[18]) << 8) | int(body[19])
+		let idlen = int(body[20])
+		fail "webpush: the body is shorter than its header" when body.len() < 21 + idlen
+		let asPublic = body[21:21 + idlen]
+		let record = body[21 + idlen:]
+		fail "webpush: the record does not fit the record size {rs}" when record.len() > rs || rs < 18
+		let peer = try unmarshalPoint(crypto.p256, asPublic)
+		let shared = try ecdh(crypto.p256, uaPrivate, peer)
+		let (cek, nonce) = try contentKeys(shared, authSecret, uaPublic, asPublic, salt)
+		let plain = try (try newGCM(try newAES(cek))).open(nonce, record, byte[])
+		let end = plain.len() - 1
+		for end >= 0 && plain[end] == 0 {
+			end--
+		}
+		fail "webpush: the record has no last-record delimiter" unless end >= 0 && plain[end] == 2
+		return plain[:end]
+	}
+
+	// The content encryption key and nonce (RFC 8291 §3.3 and §3.4, RFC 8188
+	// §2.2 and §2.3).
+	internal def contentKeys(shared byte[], authSecret byte[], uaPublic byte[], asPublic byte[], salt byte[]) !(byte[], byte[]) {
+		let keyInfo = "WebPush: info".bytes() + byte[0] + uaPublic + asPublic
+		let ikm = try hkdf(Hash.SHA256, shared, authSecret, keyInfo, 32)
+		let cek = try hkdf(Hash.SHA256, ikm, salt, "Content-Encoding: aes128gcm".bytes() + byte[0], 16)
+		let nonce = try hkdf(Hash.SHA256, ikm, salt, "Content-Encoding: nonce".bytes() + byte[0], 12)
+		return (cek, nonce)
+	}
+
+	internal def b64url(data byte[]) string {
+		let codec = new Base64()
+		codec.urlSafe = true
+		codec.padded = false
+		return codec.encode(data)
+	}
+
+	// Base64url with or without padding (browsers and libraries write both),
+	// and the standard alphabet some write by mistake.
+	internal def b64urlDecode(text string) !byte[] {
+		let codec = new Base64()
+		codec.urlSafe = true
+		codec.padded = false
+		let clean = text.trim().replace("=", "").replace("+", "-").replace("/", "_")
+		return codec.decode(clean) onerror (err error) {
+			fail "webpush: \"{text}\" is not base64url"
+		}
+	}
 }
