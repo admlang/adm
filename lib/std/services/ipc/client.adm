@@ -1,0 +1,1057 @@
+// The client side of a link: connections to the servers of one interface,
+// each carrying many calls at once, and the pool that shares calls between
+// servers (docs/archived/requirements/ipc.md, "Calls" and "Several servers").
+internal partial module std.services.ipc.link {
+	use (
+		std.crypto::(randRange)
+		std.crypto.hash::(Hash, hmac)
+		std.net
+		std.net.tls
+		std.services.ipc::*
+		std.services.ipc.wire::(Reader)
+		std.time
+		std.time::(Time)
+	)
+
+	// Where an address leads: what std.net dials or binds, whether it is a
+	// Unix socket, and the host a TLS certificate is checked against.
+	struct Target {
+		dial string
+		unix bool
+		host string
+	}
+
+	// Reads an address: `host:port`, `[v6]:port` or `unix:/path`. Fails on
+	// anything else.
+	def targetOf(address string) !Target {
+		if address.startsWith("unix:") {
+			let path = address[5:]
+			fail linkError(IPCErrorKind.Unreachable, "the Unix socket address {address} has no path", address) when path == ""
+			return Target{dial: path, unix: true, host: ""}
+		}
+		let parsed = net.parseAddress(address) onerror (err error) {
+			fail linkError(IPCErrorKind.Unreachable, "{address} is not host:port, [v6]:port or unix:/path", address)
+		}
+		fail linkError(IPCErrorKind.Unreachable, "{address} names no port", address) when parsed.isUnix || parsed.port == 0 && !address.endsWith(":0")
+		return Target{dial: address, unix: false, host: parsed.host}
+	}
+
+	// A stream to the other side, with the TLS connection under it when
+	// there is one (what the proof of a secret is tied to).
+	struct Opened {
+		stream net.Stream
+		secure ?tls.Conn  = none
+	}
+
+	// The keying material of the TLS connection under a stream, which ties a
+	// proof to that connection; empty on a plain one.
+	def exporterOf(opened Opened) !byte[] {
+		let secure = opened.secure
+		return [] when secure is none
+		return try secure.exportKeyingMaterial(exporterLabel, none, 32)
+	}
+
+	// The proof of a secret: HMAC-SHA256 over the server's nonce and the
+	// connection's exporter value.
+	def secretProof(secret string, nonce byte[], exporter byte[]) byte[] {
+		let data = nonce.clone()
+		data.push(...exporter)
+		return hmac(Hash.SHA256, secret.bytes(), data)
+	}
+
+	// Opens a stream to the server at `address`: TCP or a Unix socket, then
+	// TLS unless the link is plain (a Unix socket only with a TLS config).
+	def dialServer(address string, options Link) !Opened {
+		let target = try targetOf(address)
+		let conn = net.dialStream(target.dial, options.connectTimeout) onerror (err error) {
+			fail IPCError{message: "ipc: cannot reach {address}: {err.message}", code: "ipc.unreachable", cause: err, kind: IPCErrorKind.Unreachable, address: address}
+		}
+		let config = options.tls
+		let secure = target.unix ?? (!(config is none), !options.plain)
+		return Opened{stream: conn} unless secure
+		let base = config is none ?? (tls.Config{minVersion: tls.Version.TLS13}, tls.Config{...config, minVersion: tls.Version.TLS13})
+		base = tls.withServerName(base, target.host) when base.serverName == "" && !target.unix
+		let wrapped = tls.client(conn, base)
+		wrapped.handshake(options.connectTimeout) onerror (err error) {
+			conn.close() onerror recover none
+			fail IPCError{message: "ipc: TLS with {address} failed: {err.message}", code: "ipc.refused", cause: err, kind: IPCErrorKind.Refused, address: address}
+		}
+		return Opened{stream: wrapped, secure: wrapped}
+	}
+
+	// What a waiting call receives: a `Result` or `Failure` body after the
+	// call id, or the failure of the link.
+	struct Reply {
+		kind    int
+		body    byte[]    = []
+		failure ?IPCError = none
+	}
+
+	// What a call came back with: its encoded result, or the members the
+	// node sent it on to.
+	struct Answered {
+		body     byte[]
+		redirect ?Redirect = none
+	}
+
+	// What a node says of its cluster: its own address and the other
+	// members a client may use.
+	struct Roster {
+		own     string
+		members Candidate[]
+	}
+
+	// A call that went out: where its reply arrives.
+	struct Sent {
+		id    int
+		reply channel<Reply>
+	}
+
+	// The server's number of each method this side knows, when the server
+	// provides another version of the interface that this side can call:
+	// every method this side declares is there with the same signature, and
+	// every type it sends or reads has the same shape. Fails when one is
+	// missing or differs.
+	def methodsOn(info InterfaceInfo, answer Answer) !int[] {
+		for let (_, line) in info.types {
+			fail "type differs" unless answer.types.includes(line)
+		}
+		let out int[] = []
+		for let (_, method) in info.methods {
+			let at = answer.methods.indexOf(method)
+			fail "method missing" when at < 0
+			out.push(at)
+		}
+		return out
+	}
+
+	// The message that names why this side cannot call the server's version
+	// of the interface: the first method of this side's that the server
+	// lacks, else the first type this side sends or reads that the server
+	// declares otherwise.
+	def mismatchText(info InterfaceInfo, answer Answer) string {
+		for let (_, method) in info.methods {
+			return "the server's {info.name} has no method {method}" unless answer.methods.includes(method)
+		}
+		for let (_, line) in info.types {
+			continue when answer.types.includes(line)
+			let parts = line.split(" ")
+			let name = parts.len() > 1 ?? (parts[1].split("\{")[0], line)
+			return "{info.name} differs in type {name}: the server declares it otherwise"
+		}
+		return "the server provides another version of {info.name}"
+	}
+
+	// One connection to a server, carrying the calls of one interface.
+	// A task reads what the server sends and hands each reply to the call
+	// that waits for it; another pings the server when the connection is
+	// idle.
+	type ClientConn {
+		address string
+
+		internal opened      Opened
+		internal stream      net.Stream
+		internal pending     map<int, channel<Reply>> = {}
+		internal next        int                      = 1
+		internal credit      int                      = 0
+		internal serverFrame int                      = 0
+		internal ownFrame    int
+		// This side's method numbers as the server numbers them, when it
+		// provides another, compatible version; empty when they agree.
+		internal methodMap   int[]                    = []
+		internal keepAlive   duration
+		internal ended       bool                     = false
+		internal draining    bool                     = false
+		internal failure     ?IPCError                = none
+		internal heard       Time
+		internal pinged      bool                     = false
+		internal creditFreed channel<none>
+		internal closing     channel<none>
+		// What the server said last of its cluster, and whether the pool has
+		// read it.
+		internal roster      ?Roster                  = none
+		internal rosterFresh bool                     = false
+		// Calls to cancel, sent by the housekeeping task.
+		internal cancels     channel<int>
+
+		def new(address string, opened Opened, options Link) {
+			self.address = address
+			self.opened = opened
+			self.stream = opened.stream
+			self.ownFrame = options.maxFrame
+			self.keepAlive = options.keepAlive
+			self.heard = time.now()
+			self.creditFreed = new channel<none>(1)
+			self.closing = new channel<none>(1)
+			self.cancels = new channel<int>(4096)
+		}
+
+		// Speaks the preface, proves the client and asks for the interface;
+		// then starts the tasks that serve the connection. Fails with an
+		// IPCError: Refused, Mismatch, Protocol or Lost.
+		def open(info InterfaceInfo, auth Auth, options Link) !none {
+			let timeout = options.connectTimeout
+			try net.writeAll(stream, prefaceBytes(), timeout)
+			let first = try readFrame(stream, 1024, 0, timeout)
+			fail parseRefuse(first.body, address) when first.kind == frameRefuse
+			fail linkError(IPCErrorKind.Protocol, "the server sent frame {first.kind} before its hello", address) unless first.kind == frameHello
+			let hello = try parseHello(first.body)
+			let frame = AuthFrame{kind: 0, proof: [], maxFrame: options.maxFrame, wanted: [Wanted{name: info.name, hash: try hexBytes(info.hash)}]}
+			let secret = auth.secret
+			let token = auth.token
+			if !(secret is none) && hello.proofs & proofSecret != 0 {
+				frame.kind = proofSecret
+				frame.proof = secretProof(secret.reveal(), hello.nonce, try exporterOf(opened))
+			} else if !(token is none) && hello.proofs & proofToken != 0 {
+				let target = try targetOf(address)
+				fail linkError(IPCErrorKind.Refused, "a token is sent only over TLS or a Unix socket, and the link to {address} is plain", address) when opened.secure is none && !target.unix
+				frame.kind = proofToken
+				frame.proof = token.reveal().bytes()
+			}
+			try net.writeAll(stream, frameBytes(frameAuth, authBytes(frame)), timeout)
+			let reply = try readFrame(stream, hello.maxFrame, 1024, timeout)
+			fail parseRefuse(reply.body, address) when reply.kind == frameRefuse
+			fail linkError(IPCErrorKind.Protocol, "the server answered the proof with frame {reply.kind}", address) unless reply.kind == frameWelcome
+			let answers = try parseWelcome(reply.body)
+			fail linkError(IPCErrorKind.Protocol, "the server answered {answers.len()} interfaces, 1 was asked", address) unless answers.len() == 1
+			let answer = answers[0]
+			fail IPCError{message: "ipc: {address} does not provide {info.name}", code: "ipc.mismatch", kind: IPCErrorKind.Mismatch, address: address} when answer.status == interfaceMissing
+			if answer.status == interfaceDiffers {
+				methodMap = methodsOn(info, answer) onerror (err error) {
+					fail IPCError{message: "ipc: {address}: {mismatchText(info, answer)}", code: "ipc.mismatch", kind: IPCErrorKind.Mismatch, address: address}
+				}
+			}
+			credit = hello.maxCalls
+			serverFrame = hello.maxFrame
+			heard = time.now()
+			let reader = async readLoop()
+			reader.keepAlive()
+			let keeper = async housekeeping()
+			keeper.keepAlive()
+			return none
+		}
+
+		// Whether the connection takes new calls.
+		atomic def usable() bool {
+			return !ended && !draining
+		}
+
+		// Whether the connection has ended, and why.
+		atomic def lost() ?IPCError {
+			return none unless ended
+			return failure is none ?? (linkError(IPCErrorKind.Closed, "the connection was closed", address), failure)
+		}
+
+		// Calls waiting for their reply.
+		atomic def inFlight() int {
+			return pending.len()
+		}
+
+		// Sends a call when the server grants one more, waiting for a grant
+		// until `deadline`. Fails without having sent anything: with
+		// `Closed`/`Lost` when the connection ended or is draining (another
+		// server may take the call), `Protocol` when the call is larger than
+		// either side accepts, `TimedOut` or `Canceled` while waiting.
+		def send(iface int, method int, arguments byte[], deadline ?Time, flags int = 0, previous float = 0.0) !Sent {
+			let size = arguments.len() + 32
+			fail linkError(IPCErrorKind.Protocol, "a call of {arguments.len()} bytes is larger than the {serverFrame} the server accepts", address) when size > serverFrame + 64 || arguments.len() > ownFrame
+			for {
+				let granted = try take()
+				if !(granted is none) {
+					let remaining = 0
+					if !(deadline is none) {
+						let left = deadline - time.now()
+						remaining = left <= 0ms ?? (1, int(left.milliseconds()) + 1)
+					}
+					let number = methodMap.len() > 0 ?? (methodMap[method], method)
+					let body = callBytes(CallHead{id: granted.id, iface: iface, method: number, flags: flags, previous: previous, remaining: remaining}, arguments)
+					write(frameCall, body) onerror (err error) {
+						stop(linkError(IPCErrorKind.Lost, "the link to {address} broke while sending a call: {err.message}", address))
+						fail linkError(IPCErrorKind.Lost, "the link to {address} broke while sending a call: {err.message}", address)
+					}
+					return granted
+				}
+				// No call left: wait until a reply returns one.
+				if deadline is none {
+					select {
+						case creditFreed:
+							<-creditFreed
+					}
+				} else {
+					let left = deadline - time.now()
+					fail linkError(IPCErrorKind.TimedOut, "no call was free on {address} before the deadline", address) when left <= 0ms
+					let sleep = time.sleepChan(left)
+					select {
+						case creditFreed:
+							<-creditFreed
+						case sleep:
+					}
+				}
+				fail linkError(IPCErrorKind.Canceled, "the call was canceled while waiting for a free call", address) when canceled()
+			}
+		}
+
+		// Takes one of the calls the server granted: the id and channel of a
+		// new call, or none when none is left. Fails when the connection
+		// takes no more calls.
+		internal atomic def take() !?Sent {
+			fail failure is none ?? (linkError(IPCErrorKind.Closed, "the connection was closed", address), failure) when ended
+			fail linkError(IPCErrorKind.Closed, "{address} is shutting down", address) when draining
+			return none when credit <= 0
+			credit -= 1
+			let id = next
+			next += 1
+			let reply = new channel<Reply>(1)
+			pending[id] = reply
+			return Sent{id: id, reply: reply}
+		}
+
+		// Waits for the reply of a call until `deadline`. A deadline that
+		// passes, or a task that is canceled, sends a cancel and fails with
+		// `TimedOut` or `Canceled`. Fails with the remote method's failure,
+		// or with `Lost` when the link breaks.
+		def wait(sent Sent, deadline ?Time) !Answered {
+			let reply = Reply{kind: 0}
+			let arrived = false
+			if deadline is none {
+				select {
+					case sent.reply:
+						reply = <-sent.reply
+						arrived = true
+				}
+			} else {
+				let left = deadline - time.now()
+				if left > 0ms {
+					let sleep = time.sleepChan(left)
+					select {
+						case sent.reply:
+							reply = <-sent.reply
+							arrived = true
+						case sleep:
+					}
+				}
+			}
+			if !arrived {
+				// The reply still returns the call to the server's grant, so
+				// the call stays pending until it comes. A canceled task's
+				// own socket writes fail, so the connection's housekeeping
+				// task sends the cancel.
+				cancels.offer(sent.id)
+				fail linkError(IPCErrorKind.Canceled, "the call was canceled", address) when canceled()
+				fail linkError(IPCErrorKind.TimedOut, "no answer from {address} before the deadline", address)
+			}
+			let broken = reply.failure
+			fail broken unless broken is none
+			fail try parseFailure(new Reader(reply.body)) when reply.kind == frameFailure
+			return Answered{body: [], redirect: try parseSeeOther(new Reader(reply.body))} when reply.kind == frameSeeOther
+			return Answered{body: reply.body}
+		}
+
+		// The member list the server sent last, none before the first, and
+		// whether it came since the last look.
+		atomic def takeMembers() (?Roster, bool) {
+			let fresh = rosterFresh
+			rosterFresh = false
+			return (roster, fresh)
+		}
+
+		// Writes one frame as one unit.
+		internal atomic def write(kind int, body byte[]) !none {
+			return try net.writeAll(stream, frameBytes(kind, body), 30s)
+		}
+
+		// Hands a reply to the call that waits for it and returns the call
+		// to the grant.
+		internal atomic def deliver(id int, reply Reply) {
+			return unless pending.hasKey(id)
+			let waiting = pending[id]
+			pending.delete(id)
+			credit += 1
+			waiting.offer(reply)
+			creditFreed.offer(none)
+		}
+
+		// Adds calls the server granted.
+		internal atomic def grant(count int) {
+			credit += count
+			creditFreed.offer(none)
+		}
+
+		// The server sends no answer to calls after `last`: they fail as
+		// never sent, and the connection takes no new ones.
+		internal atomic def goAway(last int) {
+			draining = true
+			let kept map<int, channel<Reply>> = {}
+			for let (id, waiting) in pending {
+				if id > last {
+					waiting.offer(Reply{kind: 0, failure: unsentError(address)})
+				} else {
+					kept[id] = waiting
+				}
+			}
+			pending = kept
+			creditFreed.offer(none)
+		}
+
+		internal atomic def noteMembers(latest Roster) {
+			roster = latest
+			rosterFresh = true
+		}
+
+		internal atomic def noteHeard() {
+			heard = time.now()
+			pinged = false
+		}
+
+		// Ends the connection: every waiting call fails with `failure`.
+		atomic def stop(why IPCError) {
+			return when ended
+			ended = true
+			failure = why
+			for let (_, waiting) in pending {
+				waiting.offer(Reply{kind: 0, failure: why})
+			}
+			pending = {}
+			creditFreed.offer(none)
+			closing.offer(none)
+			// Cancels still queued go out first, so the server stops work
+			// nobody waits for.
+			for cancels.len() > 0 {
+				let id = <-cancels
+				net.writeAll(stream, frameBytes(frameCancel, numberBytes(id)), 1s) onerror recover none
+			}
+			stream.close() onerror recover none
+		}
+
+		// Closes the connection from this side: waiting calls fail with
+		// `Closed`.
+		def close() {
+			stop(linkError(IPCErrorKind.Closed, "the link to {address} was closed", address))
+		}
+
+		internal def readLoop() {
+			for {
+				let frame = readFrame(stream, ownFrame, 64, 0s) onerror (err error) {
+					stop(linkError(IPCErrorKind.Lost, "the link to {address} broke: {err.message}", address))
+					return
+				}
+				noteHeard()
+				dispatchFrame(frame) onerror (err error) {
+					stop(linkError(IPCErrorKind.Protocol, "{address} broke the protocol: {err.message}", address))
+					return
+				}
+			}
+		}
+
+		internal def dispatchFrame(frame Frame) !none {
+			switch frame.kind {
+				case frameResult, frameFailure, frameSeeOther:
+					let r = new Reader(frame.body)
+					let id = int(r.readUintOf(62))
+					try r.verify()
+					deliver(id, Reply{kind: frame.kind, body: frame.body[frame.body.len() - r.left():]})
+				case frameCredit:
+					grant(try parseNumber(frame.body))
+				case framePing:
+					try write(framePong, frame.body)
+				case framePong:
+				case frameGoAway:
+					goAway(try parseNumber(frame.body))
+				case frameMembers:
+					let (own, members) = try parseMembers(frame.body)
+					noteMembers(Roster{own: own, members: members})
+				case frameLoad:
+				default:
+					fail linkError(IPCErrorKind.Protocol, "frame {frame.kind} is not one a server sends", address)
+			}
+			return none
+		}
+
+		// Sends the cancels of calls whose callers stopped waiting, and pings
+		// the server once the connection was idle for `keepAlive`, ending it
+		// when the next `keepAlive` brings nothing back.
+		internal def housekeeping() {
+			let step = keepAlive > 0s ?? (keepAlive.scale(0.5), 24h)
+			let sleep = time.sleepChan(step)
+			for {
+				let woke = false
+				select {
+					case closing:
+						return
+					case cancels:
+						let id = <-cancels
+						write(frameCancel, numberBytes(id)) onerror recover none
+					case sleep:
+						woke = true
+				}
+				continue unless woke
+				sleep = time.sleepChan(step)
+				continue when keepAlive <= 0s
+				return when !inspect()
+			}
+		}
+
+		// One look at the connection: whether to keep watching it.
+		internal def inspect() bool {
+			let (over, ping) = idleState()
+			if over {
+				stop(linkError(IPCErrorKind.Lost, "{address} stopped answering", address))
+				return false
+			}
+			if ping {
+				let payload byte[]
+				payload.len(8)
+				write(framePing, payload) onerror (err error) {
+					stop(linkError(IPCErrorKind.Lost, "the link to {address} broke: {err.message}", address))
+					return false
+				}
+			}
+			return true
+		}
+
+		// Whether the server missed its time to answer, and whether to ping.
+		internal atomic def idleState() (bool, bool) {
+			return (false, false) when ended
+			let idle = time.since(heard)
+			return (true, false) when pinged && idle >= keepAlive.scale(2.0)
+			if !pinged && idle >= keepAlive {
+				pinged = true
+				return (false, true)
+			}
+			return (false, false)
+		}
+
+		def dispose() {
+			close()
+		}
+	}
+
+	// The code of a call a server shut down before taking: never run, so
+	// free to move to another server.
+	const unsentCode = "ipc.unsent"
+
+	def unsentError(address string) IPCError {
+		return IPCError{message: "ipc: {address} shut down before taking the call", code: unsentCode, kind: IPCErrorKind.Closed, address: address}
+	}
+
+	// Reads a hash written in hex.
+	def hexBytes(text string) !byte[] {
+		fail linkError(IPCErrorKind.Protocol, "a hash is 64 hex digits") unless text.len() == 64
+		let out byte[] = []
+		for let i = 0; i < 64; i += 2 {
+			out.push(byte(try hexDigit(text[i]) * 16 + try hexDigit(text[i + 1])))
+		}
+		return out
+	}
+
+	def hexDigit(c char) !int {
+		return int(c) - int('0') when c >= '0' && c <= '9'
+		return int(c) - int('a') + 10 when c >= 'a' && c <= 'f'
+		fail linkError(IPCErrorKind.Protocol, "{c} is no hex digit")
+	}
+
+	// One server of a pool: its connections, and when to try it again after
+	// it was set aside.
+	type ServerSlot {
+		address     string
+		// The address the server gives for itself in its cluster, when it
+		// differs from the one this pool reaches it at.
+		alias       string       = ""
+		// Learned from a cluster's member list, not given to `connect`.
+		learned     bool         = false
+		// No longer listed: takes no new calls, and goes once idle.
+		retired     bool         = false
+		conns       ClientConn[] = []
+		// When the server may be tried again; none while it is in use.
+		retryAt     ?Time        = none
+		delay       duration     = 1s
+		// A task is connecting to it now.
+		repairing   bool         = false
+		// Why it was set aside last.
+		lastFailure string       = ""
+
+		def new(address string, learned bool = false) {
+			self.address = address
+			self.learned = learned
+		}
+
+		// Whether the server is reached at `address`.
+		def answersAt(address string) bool {
+			return self.address == address || alias != "" && alias == address
+		}
+
+		// Whether one of its connections takes calls.
+		def usable() bool {
+			for let (_, conn) in conns {
+				return true when conn.usable()
+			}
+			return false
+		}
+
+		// Calls waiting on its connections.
+		def inFlight() int {
+			let count = 0
+			for let (_, conn) in conns {
+				count += conn.inFlight()
+			}
+			return count
+		}
+
+		def dispose() {
+			for let (_, conn) in conns {
+				conn.close()
+			}
+		}
+	}
+
+	// What `Pool.choose` picked: a connection to send on, or a server to
+	// connect to first, and a server to connect to in the background.
+	struct Choice {
+		conn   ?ClientConn = none
+		slot   string      = ""
+		repair string      = ""
+	}
+
+	// The connections behind one value `IPC.connect` returned: one or more
+	// servers of one interface, sharing its calls by `Link.balance`. With
+	// `Link.follow`, the members a server's cluster lists join the servers,
+	// and a call a node sends on goes where it says.
+	type Pool {
+		info    InterfaceInfo
+		auth    Auth
+		options Link
+
+		internal slots  ServerSlot[] = []
+		internal turn   int          = 0
+		internal pinned string       = ""
+		internal closed bool         = false
+
+		def new(info InterfaceInfo, addresses string[], auth Auth, options Link) {
+			self.info = info
+			self.auth = auth
+			self.options = options
+			for let (_, address) in addresses {
+				slots.push(new ServerSlot(address))
+			}
+		}
+
+		// Connects to every server at once. Succeeds when one accepts; fails
+		// when none can be reached (`Unreachable`), or when a reachable one
+		// refuses the client (`Refused`) or provides a version this side
+		// cannot call (`Mismatch`). Servers that cannot be reached are set
+		// aside.
+		def start() !none {
+			fail linkError(IPCErrorKind.Unreachable, "no address to connect to") when slots.len() == 0
+			let group = new AsyncScope(failFast = false)
+			let attempts (async !ClientConn[])[] = []
+			let addresses string[] = []
+			for let (_, slot) in slots {
+				addresses.push(slot.address)
+				attempts.push(async<group> connectServer(slot.address, info, auth, options))
+			}
+			await group onerror recover none
+			let refusal ?IPCError = none
+			let reasons string[] = []
+			for let (i, attempt) in attempts {
+				let conns = await attempt onerror (err error) {
+					let kind = err is IPCError ?? (err.kind, IPCErrorKind.Unreachable)
+					refusal = err is IPCError ?? (err, linkError(kind, err.message)) when (kind := IPCErrorKind.Refused || IPCErrorKind.Mismatch || IPCErrorKind.Protocol) && refusal is none
+					reasons.push(err.message)
+					setAside(addresses[i], err.message)
+					recover []
+				}
+				installed(addresses[i], conns) when conns.len() > 0
+			}
+			if !(refusal is none) {
+				close()
+				fail refusal
+			}
+			if !anyLive() {
+				close()
+				fail IPCError{message: "ipc: no server of {info.name} could be reached: {reasons.join("; ")}", code: "ipc.unreachable", kind: IPCErrorKind.Unreachable, address: slots.len() == 1 ?? (slots[0].address, "")}
+			}
+			return none
+		}
+
+		// Sends one call on the connection `options.balance` picks and waits
+		// for its answer. A call that was never sent moves to another server;
+		// one that was sent and lost its link fails with `Lost`. A node that
+		// sends the call on names less busy members: they are asked in turn,
+		// each once, and after the node's `forceAfter` refusals, or with no
+		// member left, the least busy that answered is told to take it.
+		def call(method int, arguments byte[]) !byte[] {
+			let deadline ?Time = none
+			deadline = time.now() + options.timeout when options.timeout > 0s
+			let tries = 0
+			let target = ""
+			let flags = 0
+			let previous = 0.0
+			let asked string[] = []
+			let answers Candidate[] = []
+			let redirects = 0
+			let last ?Redirect = none
+			for {
+				tries += 1
+				let conn ?ClientConn = none
+				if target == "" {
+					let choice = try choose()
+					if choice.repair != "" {
+						let job = async repair(choice.repair)
+						job.keepAlive()
+					}
+					conn = choice.conn
+					if conn is none {
+						try repair(choice.slot)
+						continue
+					}
+				} else {
+					conn = reachable(target)
+					if conn is none {
+						// A member that cannot be reached counts as asked.
+						asked.push(target)
+						let (next, force) = nextTarget(asked, answers, redirects, last)
+						fail linkError(IPCErrorKind.Unreachable, "no member of {info.name} named after a refusal can be reached", target) when next == ""
+						target = next
+						flags = force ?? (callForced, flags)
+						continue
+					}
+				}
+				let held = conn
+				continue when held is none
+				let sent = held.send(0, method, arguments, deadline, flags, previous) onerror (err error) {
+					let kind = err is IPCError ?? (err.kind, IPCErrorKind.Lost)
+					fail err unless (kind == IPCErrorKind.Closed || kind == IPCErrorKind.Lost) && tries <= slots.len() * (options.connections + 1) + redirects && !isClosed()
+					recover Sent{id: -1, reply: new channel<Reply>(1)}
+				}
+				continue when sent.id < 0
+				let answered = held.wait(sent, deadline) onerror (err error) {
+					// A call the server shut down before taking was never run:
+					// it moves to another server.
+					fail err unless err.code == unsentCode
+					fail linkError(IPCErrorKind.Closed, err.message) when tries > slots.len() * (options.connections + 1) + redirects || isClosed()
+					recover Answered{body: [], redirect: Redirect{load: -1.0, forceAfter: 0, candidates: []}}
+				}
+				let redirect = answered.redirect
+				return answered.body when redirect is none
+				if redirect.load < 0.0 {
+					target = ""
+					continue
+				}
+				asked.push(held.address)
+				answers.push(Candidate{address: held.address, load: redirect.load})
+				previous = redirect.load
+				redirects += 1
+				last = redirect
+				let (next, force) = nextTarget(asked, answers, redirects, last)
+				target = next == "" ?? (held.address, next)
+				flags = force ?? (callForced, callRefusedBefore)
+			}
+		}
+
+		// Where a refused call goes next: the first member named that was not
+		// asked, unless `forceAfter` refusals came or none is left; then the
+		// least busy node that answered, told to take it (`force`).
+		internal def nextTarget(asked string[], answers Candidate[], redirects int, last ?Redirect) (string, bool) {
+			if !(last is none) && redirects < last.forceAfter && options.follow {
+				for let (_, candidate) in last.candidates {
+					return (candidate.address, false) unless asked.includes(candidate.address)
+				}
+			}
+			let best = ""
+			let lowest = 0.0
+			for let (_, answer) in answers {
+				if best == "" || answer.load < lowest {
+					best = answer.address
+					lowest = answer.load
+				}
+			}
+			return (best, true)
+		}
+
+		// A usable connection to the server at `address`, none when it cannot
+		// be reached.
+		internal def reachable(address string) ?ClientConn {
+			let conn = connAt(address) onerror (err error) {
+				return none
+			}
+			return conn
+		}
+
+		// A usable connection to the server at `address`, which joins the
+		// pool's servers when it is new. Fails when it cannot be reached.
+		internal def connAt(address string) !ClientConn {
+			let held = connectionTo(address)
+			return held unless held is none
+			try repair(address)
+			let again = connectionTo(address)
+			fail linkError(IPCErrorKind.Unreachable, "{address} cannot be reached", address) when again is none
+			return again
+		}
+
+		// The least loaded usable connection to the server at `address`,
+		// none when there is none; a server not known yet joins as learned.
+		internal atomic def connectionTo(address string) ?ClientConn {
+			for let (_, slot) in slots {
+				continue unless slot.answersAt(address)
+				return leastLoaded(slot)
+			}
+			let slot = new ServerSlot(address, true)
+			slot.repairing = true
+			slots.push(slot)
+			return none
+		}
+
+		internal def leastLoaded(slot ServerSlot) ?ClientConn {
+			let best ?ClientConn = none
+			let fewest = 0
+			for let (_, conn) in slot.conns {
+				continue unless conn.usable()
+				let load = conn.inFlight()
+				if best is none || load < fewest {
+					best = conn
+					fewest = load
+				}
+			}
+			return best
+		}
+
+		internal atomic def isClosed() bool {
+			return closed
+		}
+
+		internal atomic def anyLive() bool {
+			for let (_, slot) in slots {
+				return true when slot.usable()
+			}
+			return false
+		}
+
+		internal def slotAt(address string) ?ServerSlot {
+			for let (_, slot) in slots {
+				return slot when slot.address == address
+			}
+			return none
+		}
+
+		// Takes in the member lists the servers sent since the last look:
+		// new members join as learned servers, due at once; learned ones no
+		// longer listed retire, and go once idle.
+		internal def absorbMembers() {
+			return unless options.follow
+			// Every node leaves itself out of its list: the cluster is the
+			// union of the lists and of the nodes that sent them.
+			let listed string[] = []
+			let heard = false
+			for let (_, slot) in slots {
+				for let (_, conn) in slot.conns {
+					let (roster, fresh) = conn.takeMembers()
+					continue when roster is none
+					heard = true when fresh
+					slot.alias = roster.own unless roster.own == slot.address
+					listed.push(roster.own)
+					for let (_, member) in roster.members {
+						listed.push(member.address)
+					}
+				}
+			}
+			return unless heard
+			for let (_, address) in listed {
+				let known = false
+				for let (_, slot) in slots {
+					known = true when slot.answersAt(address)
+				}
+				continue when known
+				let slot = new ServerSlot(address, true)
+				slot.retryAt = time.now()
+				slots.push(slot)
+			}
+			for let (_, slot) in slots {
+				continue unless slot.learned
+				let still = listed.includes(slot.address) || slot.alias != "" && listed.includes(slot.alias)
+				slot.retired = !still
+			}
+			let kept ServerSlot[] = []
+			for let (_, slot) in slots {
+				if slot.retired && slot.inFlight() == 0 {
+					for let (_, conn) in slot.conns {
+						conn.close()
+					}
+					continue
+				}
+				kept.push(slot)
+			}
+			slots = kept
+		}
+
+		// Picks the connection for the next call, or a server to connect to
+		// when none is in use. Fails when the pool is closed, or when every
+		// server is set aside and none is due for another try.
+		internal atomic def choose() !Choice {
+			fail linkError(IPCErrorKind.Closed, "the link to {info.name} was closed") when closed
+			absorbMembers()
+			let live string[] = []
+			let due = ""
+			let soonest ?Time = none
+			let now = time.now()
+			for let (_, slot) in slots {
+				continue when slot.retired
+				if slot.usable() {
+					live.push(slot.address)
+					continue
+				}
+				if slot.retryAt is none && !slot.repairing {
+					// Its connections ended since the last look: set it aside.
+					let why = "its connections ended"
+					for let (_, conn) in slot.conns {
+						let lost = conn.lost()
+						why = lost.message unless lost is none
+					}
+					markAside(slot, why)
+				}
+				continue when slot.repairing
+				let at = slot.retryAt
+				if !(at is none) && at <= now {
+					due = slot.address when due == ""
+				} else if !(at is none) && (soonest is none || at < soonest) {
+					soonest = at
+				}
+			}
+			if live.len() == 0 {
+				if due != "" {
+					markRepairing(due)
+					return Choice{slot: due}
+				}
+				let wait = soonest is none ?? ("", " until {soonest - now} from now")
+				fail IPCError{message: "ipc: no server of {info.name} can be reached{wait}: {lastFailures()}", code: "ipc.unreachable", kind: IPCErrorKind.Unreachable, address: slots.len() == 1 ?? (slots[0].address, "")}
+			}
+			let chosen = live[0]
+			switch options.balance {
+				case Balance.RoundRobin:
+					chosen = live[turn % live.len()]
+					turn += 1
+				case Balance.Random:
+					chosen = live[randRange<int>(0, live.len()) % live.len()]
+				case Balance.Pinned:
+					pinned = live[0] when pinned == "" || !live.includes(pinned)
+					chosen = pinned
+			}
+			let chosenSlot = slotAt(chosen)
+			fail linkError(IPCErrorKind.Closed, "the link to {chosen} was closed", chosen) when chosenSlot is none
+			let choice = Choice{conn: leastLoaded(chosenSlot)}
+			if due != "" {
+				markRepairing(due)
+				choice.repair = due
+			}
+			return choice
+		}
+
+		internal def markRepairing(address string) {
+			let slot = slotAt(address)
+			slot.repairing = true unless slot is none
+		}
+
+		internal def lastFailures() string {
+			let reasons string[] = []
+			for let (_, slot) in slots {
+				reasons.push("{slot.address}: {slot.lastFailure}") when slot.lastFailure != ""
+			}
+			return reasons.join("; ")
+		}
+
+		internal def markAside(slot ServerSlot, why string) {
+			slot.retryAt = time.now() + slot.delay
+			slot.lastFailure = why
+			slot.delay = slot.delay.scale(2.0) > 30s ?? (30s, slot.delay.scale(2.0))
+			for let (_, conn) in slot.conns {
+				conn.close()
+			}
+			slot.conns = []
+		}
+
+		internal atomic def setAside(address string, why string) {
+			let slot = slotAt(address)
+			return when slot is none
+			slot.repairing = false
+			markAside(slot, why)
+		}
+
+		internal atomic def installed(address string, conns ClientConn[]) {
+			let slot = slotAt(address)
+			if closed || slot is none {
+				for let (_, conn) in conns {
+					conn.close()
+				}
+				return
+			}
+			slot.repairing = false
+			slot.conns = conns
+			slot.retryAt = none
+			slot.delay = 1s
+			slot.lastFailure = ""
+			pinned = address when pinned == ""
+		}
+
+		// Connects to the server at `address` again. Fails as connecting
+		// does; the server is then set aside for longer.
+		internal def repair(address string) !none {
+			let conns = connectServer(address, info, auth, options) onerror (err error) {
+				setAside(address, err.message)
+				fail err
+			}
+			installed(address, conns)
+			return none
+		}
+
+		// Closes every connection; calls in flight fail with `Closed`.
+		atomic def close() {
+			return when closed
+			closed = true
+			for let (_, slot) in slots {
+				for let (_, conn) in slot.conns {
+					conn.close()
+				}
+				slot.conns = []
+			}
+		}
+
+		// The open connections, as `IPC.links` reports them.
+		atomic def links() LinkInfo[] {
+			let out LinkInfo[] = []
+			for let (_, slot) in slots {
+				for let (_, conn) in slot.conns {
+					out.push(LinkInfo{name: info.name, address: slot.address, accepted: false, inFlight: conn.inFlight()}) when conn.usable()
+				}
+			}
+			return out
+		}
+
+		def dispose() {
+			close()
+		}
+	}
+
+	// Opens `options.connections` connections to one server. Fails as the
+	// first one does; the others are closed then.
+	def connectServer(address string, info InterfaceInfo, auth Auth, options Link) !ClientConn[] {
+		let conns ClientConn[] = []
+		let count = options.connections < 1 ?? (1, options.connections)
+		for let i = 0; i < count; i++ {
+			let opened = dialServer(address, options) onerror (err error) {
+				for let (_, conn) in conns {
+					conn.close()
+				}
+				fail err
+			}
+			let conn = new ClientConn(address, opened, options)
+			conn.open(info, auth, options) onerror (err error) {
+				conn.close()
+				for let (_, other) in conns {
+					other.close()
+				}
+				fail err is IPCError ?? (err, IPCError{message: "ipc: {address}: {err.message}", code: "ipc.protocol", cause: err, kind: IPCErrorKind.Protocol, address: address})
+			}
+			conns.push(conn)
+		}
+		return conns
+	}
+}

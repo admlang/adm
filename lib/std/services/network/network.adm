@@ -5,6 +5,7 @@ partial module std.services.network {
 		std.services.diagnostics::(Diagnostics)
 		std.net
 		std.net.dns
+		std.net.stun
 		std.time
 		std.glob::(Glob)
 	)
@@ -47,6 +48,15 @@ partial module std.services.network {
 		// Nothing arrives: a read waits its timeout out and fails with
 		// `ETIMEDOUT`, as with a peer that went silent.
 		silent bool = false
+	}
+
+	// The Network's settings (`Network.config`).
+	struct NetworkConfig {
+		// The STUN servers (RFC 8489) `publicAddr` asks, in order, as
+		// `host:port`: the first that answers gives the address. Both
+		// defaults answer Binding requests without an account. Empty turns
+		// `publicAddr` off.
+		stunServers string[] = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
 	}
 
 	// Describes an open socket. Only the descriptor for now.
@@ -139,8 +149,19 @@ partial module std.services.network {
 
 		lab = new ServiceLab<NetworkConditions>()
 
-		// Applies the service's settings. There are none yet, and it does not fail.
-		def config<T>(val T) !none {}
+		settings = NetworkConfig{}
+
+		// Applies the service's settings.
+		//
+		// Fails when a STUN server is not `host:port`.
+		def config(val NetworkConfig) !none {
+			for let (_, server) in val.stunServers {
+				let parsed = net.parseAddress(server) onerror recover new net.Address()
+				fail Error{message: "{server}: a STUN server is written host:port", code: "EINVAL"} when parsed.host == "" || parsed.port <= 0
+			}
+			settings = val
+			return none
+		}
 
 		// Fails for an endpoint the lab makes unreachable or refusing.
 		def reachable(endpoint string) !none {
@@ -751,6 +772,17 @@ partial module std.services.network {
 			return __net_local_addr(fd)
 		}
 
+		// The user id of the process at the other end of a connected Unix
+		// socket, as the kernel recorded it when the connection was made: who
+		// is calling, without anything the caller sends.
+		//
+		// Fails when fd is not a connected Unix socket, or on a platform that
+		// does not report it (Windows).
+		@query()
+		def peerUserId(fd int) !int {
+			return __net_peer_uid(fd)
+		}
+
 		// Return the remote endpoint of a connected socket FD, formatted as an
 		// address string.
 		//
@@ -760,12 +792,109 @@ partial module std.services.network {
 			return __net_remote_addr(fd)
 		}
 
-		// Returns the host's public address as seen from outside the local network.
+		// Returns the host's public address as seen from outside the local
+		// network: the IP address a STUN server (RFC 8489) saw a Binding
+		// request come from. Behind a NAT that is the NAT's outside address;
+		// a host with an address of its own on the internet gets that one.
+		// The servers of `NetworkConfig.stunServers` are asked in turn, each
+		// with a request sent three times (after 0.5, 1 and 2 seconds of
+		// silence), so a server that never answers costs 3.5 seconds.
 		//
-		// Fails always: not implemented yet.
+		// Fails when no STUN server is configured, the policy denies
+		// connecting to one (`adm.network.connect`), or none answers.
 		@query()
 		def publicAddr() !string {
-			fail "publicAddr is not implemented yet"
+			let servers = settings.stunServers
+			fail Error{message: "publicAddr: no STUN server is configured (NetworkConfig.stunServers)", code: "EINVAL"} when servers.len() == 0
+			let failures string[] = []
+			for let (_, server) in servers {
+				let failure ?error = none
+				let host = askStun(server) onerror (err error) {
+					failure = err
+					recover ""
+				}
+				return host when failure is none
+				failures.push("{server}: {failure.message}")
+			}
+			fail Error{message: "publicAddr: no STUN server answered ({failures.join("; ")})", code: "EHOSTUNREACH"}
+		}
+
+		// The address `server` saw a Binding request come from, from the
+		// first of its addresses that answers.
+		def askStun(server string) !string {
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", server)
+			try reachable(server)
+			let failure ?error = none
+			for let (_, candidate) in try candidates(server) {
+				failure = none
+				let host = bindingFrom(candidate) onerror (err error) {
+					failure = err
+					recover ""
+				}
+				return host when failure is none
+			}
+			fail failure unless failure is none
+			fail Error{message: "{server} has no address", code: "EADDRNOTAVAIL"}
+		}
+
+		// The address the STUN server at `candidate` (numeric) saw a
+		// Binding request come from, over a UDP socket of its own.
+		def bindingFrom(candidate string) !string {
+			let fd = try __net_socket(candidate.startsWith("[") ?? (AF_INET6, AF_INET), SOCK_DGRAM)
+			let failure ?error = none
+			let host = bindingOn(fd, candidate) onerror (err error) {
+				failure = err
+				recover ""
+			}
+			__net_close(fd) onerror recover none
+			fail failure unless failure is none
+			return host
+		}
+
+		// One Binding transaction on `fd`, retransmitted as RFC 8489 §6.2.1
+		// has it with Rc = 3. An answer that is not a STUN response to this
+		// request is skipped.
+		def bindingOn(fd int, candidate string) !string {
+			try __net_connect(fd, candidate, 5s)
+			let request = try stun.request(stun.Method.Binding)
+			let bytes = request.encode()
+			let buffer byte[] = []
+			buffer.len(1500)
+			let wait = 500ms
+			for let attempt = 0; attempt < 3; attempt++ {
+				if !lab.chance(lab.conditions.datagramLoss) {
+					try __net_write(fd, bytes, wait)
+				}
+				let deadline = time.now() + wait
+				for {
+					let left = deadline - time.now()
+					break when left <= 0s
+					let timedOut = false
+					try heard(left)
+					let n = __net_read(fd, buffer, left) onerror (err error) {
+						fail err unless err.code == "ETIMEDOUT"
+						timedOut = true
+						recover 0
+					}
+					break when timedOut
+					let malformed = false
+					let reply = stun.parseMessage(buffer[0:n].clone()) onerror (err error) {
+						malformed = true
+						recover request
+					}
+					continue when malformed
+					continue unless reply.method == stun.Method.Binding && reply.transactionID.equals(request.transactionID)
+					let refusal = reply.refusal()
+					fail Error{message: "the server refused the Binding request: {refusal.code} {refusal.reason}", code: "ECONNREFUSED"} unless refusal is none
+					continue unless reply.class == stun.MessageClass.SuccessResponse
+					let mapped = reply.xorAddress(stun.AttributeType.XorMappedAddress)
+					mapped = reply.address(stun.AttributeType.MappedAddress) when mapped is none
+					fail Error{message: "the Binding response carries no address", code: "EPROTO"} when mapped is none
+					return mapped.host
+				}
+				wait = wait + wait
+			}
+			fail Error{message: "no answer after 3 requests", code: "ETIMEDOUT"}
 		}
 
 		// Lists the host's network interfaces with their addresses and

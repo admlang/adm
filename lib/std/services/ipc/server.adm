@@ -1,0 +1,694 @@
+// The server side of a link: what a process provides, the listeners that
+// accept clients, and the connections that run their calls
+// (docs/archived/requirements/ipc.md, "Security" and "Calls").
+internal partial module std.services.ipc.link {
+	use (
+		std.crypto::(constantTimeEqual, rand)
+		std.net
+		std.net.tls
+		std.os
+		std.services.ipc::*
+		std.services.ipc.wire::(Reader, Writer)
+		std.time
+		std.time::(Time)
+	)
+
+	// Who calls the method running on this task; none outside a served call.
+	let callerOfTask = new TaskLocal<Caller>()
+
+	// One provided interface: its handler and the instance behind it.
+	struct Provided {
+		handler Handler
+		owner   any
+	}
+
+	// The interfaces this process provides, shared by every listener.
+	type Catalog {
+		internal entries Provided[] = []
+
+		// Adds the handlers of `owner`. Fails when another instance already
+		// provides one of their interfaces; then none is added.
+		atomic def add(handlers Handler[], owner any) !none {
+			for let (_, handler) in handlers {
+				for let (_, entry) in entries {
+					fail "ipc: {handler.info.name} is already provided by another instance" when entry.handler.info.name == handler.info.name
+				}
+			}
+			for let (_, handler) in handlers {
+				entries.push(Provided{handler: handler, owner: owner})
+			}
+			return none
+		}
+
+		// Removes what `owner` provides. Fails when it provides nothing.
+		atomic def remove(owner any) !none {
+			let kept Provided[] = []
+			for let (_, entry) in entries {
+				kept.push(entry) unless entry.owner == owner
+			}
+			fail "ipc: the instance is not provided" when kept.len() == entries.len()
+			entries = kept
+			return none
+		}
+
+		// The handler of the interface named `name`, none when none is
+		// provided.
+		atomic def find(name string) ?Handler {
+			for let (_, entry) in entries {
+				return entry.handler when entry.handler.info.name == name
+			}
+			return none
+		}
+
+		atomic def clear() {
+			entries = []
+		}
+
+		// The names of the interfaces provided, gossip's own left out.
+		atomic def names() string[] {
+			let out string[] = []
+			for let (_, entry) in entries {
+				let name = entry.handler.info.name
+				out.push(name) unless name == "std.services.ipc.link.ClusterPeer" || out.includes(name)
+			}
+			return out
+		}
+	}
+
+	// Whether `host` is this machine: a client there reaches the listener
+	// without the network.
+	def isLoopback(host string) bool {
+		return true when host == "localhost" || host == "::1" || host.startsWith("127.")
+		return false
+	}
+
+	// Reads the allow or deny list of a listener. Fails on an entry that is
+	// no address or CIDR range.
+	def blocksOf(texts string[], list string) !net.IPBlock[] {
+		let out net.IPBlock[] = []
+		for let (_, text) in texts {
+			let block = net.parseIPBlock(text)
+			fail "ipc: {text} in the {list} list is no IP address or CIDR range" when block is none
+			out.push(block)
+		}
+		return out
+	}
+
+	// A listener: where clients connect, and the connections it accepted.
+	type ServerListener {
+		// The address bound, `unix:/path` for a Unix socket.
+		address string
+		options Listener
+
+		// Where the listener binds, the interfaces it serves, and how busy
+		// the process is.
+		target        Target
+		catalog       Catalog
+		meter         LoadMeter
+		// The registry holds its listeners; a listener reaches back for the
+		// cluster.
+		weak registry ?Registry
+		// Whether connections speak TLS, and whether a client must prove
+		// itself.
+		secure        bool      = false
+		required      bool      = false
+
+		internal socket  ?net.Listener = none
+		internal conns   ServerConn[]  = []
+		internal closed  bool          = false
+		internal allowed net.IPBlock[] = []
+		internal denied  net.IPBlock[] = []
+
+		def new(target Target, options Listener, registry Registry) {
+			self.target = target
+			self.options = options
+			self.catalog = registry.catalog
+			self.meter = registry.meter
+			self.registry = registry
+			self.address = ""
+		}
+
+		// Tells every client of this listener the members it may use now.
+		def pushMembers() {
+			for let (_, conn) in openConns() {
+				conn.sendMembers()
+			}
+		}
+
+		internal atomic def openConns() ServerConn[] {
+			return conns
+		}
+
+		// Checks the settings, binds the address and starts accepting.
+		// Returns the address bound. Fails when the address cannot be bound,
+		// a TCP address has neither a certificate nor `plain`, or nothing is
+		// asked of clients on an address other machines reach and `open` is
+		// not set.
+		def start(address string) !string {
+			allowed = try blocksOf(options.allow, "allow")
+			denied = try blocksOf(options.deny, "deny")
+			let config = options.tls
+			secure = target.unix ?? (!(config is none), !options.plain)
+			if secure {
+				fail "ipc: a TLS listener on {address} needs a certificate in Listener.tls" when config is none
+				fail "ipc: a TLS listener on {address} needs a certificate in Listener.tls" when config.certificates.len() == 0 && config.getCertificate is none
+			}
+			let certificates = secure && !(config is none) && config.clientAuth != tls.ClientAuthType.NoClientCert
+			required = options.secrets.len() > 0 || !(options.verifyToken is none) || certificates || target.unix && options.users.len() > 0
+			if !target.unix && !required && !options.open {
+				let parsed = try net.parseAddress(address)
+				fail "ipc: the listener on {address} asks clients for no proof and other machines can reach it; give it secrets, a token check or client certificates, or set Listener.open" unless isLoopback(parsed.host)
+			}
+			fail "ipc: maxCalls must be at least 1" when options.maxCalls < 1
+			let domain = target.unix ?? (net.SocketDomain.Unix, net.SocketDomain.IPv4)
+			if !target.unix {
+				let parsed = try net.parseAddress(address)
+				domain = net.SocketDomain.IPv6 when parsed.isIPv6
+			}
+			let sock = try net.socket(domain, net.SocketType.Stream)
+			sock.setReuseAddr(true) onerror recover none
+			sock.bind(target.dial) onerror (err error) {
+				// A socket file nobody answers on is what a process that
+				// ended without closing left behind: it is replaced.
+				fail err unless target.unix && stale(target.dial)
+				try os.remove(target.dial)
+				try sock.bind(target.dial)
+				recover none
+			}
+			let ln = try sock.listen(128)
+			socket = ln
+			self.address = target.unix ?? ("unix:{target.dial}", ln.address().str())
+			let loop = async acceptLoop(ln)
+			loop.keepAlive()
+			return self.address
+		}
+
+		// Whether the Unix socket file at `path` is one nothing listens on.
+		internal def stale(path string) bool {
+			let reached = true
+			let probe = net.dialStream(path, 1s) onerror (err error) {
+				reached = false
+				recover new net.Connection(-1)
+			}
+			return true unless reached
+			probe.close() onerror recover none
+			return false
+		}
+
+		internal def acceptLoop(ln net.Listener) {
+			for {
+				let conn = ln.accept() onerror (err error) {
+					return when isClosed()
+					time.sleep(10ms)
+					continue
+				}
+				if !admitted(conn) {
+					conn.close() onerror recover none
+					continue
+				}
+				let served = new ServerConn(self, conn)
+				if !track(served) {
+					conn.close() onerror recover none
+					return
+				}
+				let task = async served.serve()
+				task.keepAlive()
+			}
+		}
+
+		// Whether the allow and deny lists let the connection in, read
+		// before anything from it. A Unix socket has no address to check.
+		internal def admitted(conn net.Connection) bool {
+			return true when target.unix
+			let host = conn.remoteAddr().host
+			for let (_, block) in denied {
+				return false when block.contains(host)
+			}
+			return true when allowed.len() == 0
+			for let (_, block) in allowed {
+				return true when block.contains(host)
+			}
+			return false
+		}
+
+		internal atomic def isClosed() bool {
+			return closed
+		}
+
+		internal atomic def track(conn ServerConn) bool {
+			return false when closed
+			conns.push(conn)
+			return true
+		}
+
+		atomic def forget(conn ServerConn) {
+			let kept ServerConn[] = []
+			for let (_, other) in conns {
+				kept.push(other) unless other == conn
+			}
+			conns = kept
+		}
+
+		// Stops accepting clients; each connection takes no new calls and
+		// closes once its running calls finish.
+		def close() {
+			let (ln, open) = shut()
+			if !(ln is none) {
+				let held net.Listener = ln
+				held.close() onerror recover none
+				if target.unix {
+					os.remove(target.dial) onerror recover none
+				}
+			}
+			for let (_, conn) in open {
+				conn.drain()
+			}
+		}
+
+		internal atomic def shut() (?net.Listener, ServerConn[]) {
+			return (none, []) when closed
+			closed = true
+			let held = socket
+			socket = none
+			return (held, conns)
+		}
+
+		// The connections open now.
+		atomic def links() LinkInfo[] {
+			let out LinkInfo[] = []
+			for let (_, conn) in conns {
+				out.push(...conn.links())
+			}
+			return out
+		}
+	}
+
+	// One accepted connection: its handshake, then the calls it carries,
+	// each on a task of its own.
+	type ServerConn {
+		address string
+
+		// The listener holds its connections; a connection reaches back only
+		// to leave the list, and keeps what it reads of the listener.
+		weak listener        ?ServerListener
+		internal options     Listener
+		internal target      Target
+		internal catalog     Catalog
+		internal meter       LoadMeter
+		weak registry        ?Registry
+		internal useTLS      bool
+		internal required    bool
+		internal conn        net.Connection
+		internal stream      net.Stream
+		internal secure      ?tls.Conn               = none
+		internal identity    string                  = ""
+		internal names       string[]                = []
+		internal running     map<int, async !byte[]> = {}
+		// Calls canceled before their task was recorded.
+		internal early       map<int, bool>          = {}
+		internal clientFrame int                     = 0
+		internal lastId      int                     = 0
+		internal draining    bool                    = false
+		internal ended       bool                    = false
+
+		def new(listener ServerListener, conn net.Connection) {
+			self.listener = listener
+			self.options = listener.options
+			self.target = listener.target
+			self.catalog = listener.catalog
+			self.meter = listener.meter
+			self.registry = listener.registry
+			self.useTLS = listener.secure
+			self.required = listener.required
+			self.conn = conn
+			self.stream = conn
+			self.address = target.unix ?? (listener.address, conn.remoteAddr().str())
+		}
+
+		// Runs the connection to its end.
+		def serve() {
+			handshake() onerror (err error) {
+				let kind = err is IPCError ?? (err.kind, IPCErrorKind.Refused)
+				write(frameRefuse, refuseBytes(kind, err.message)) onerror recover none
+				stop()
+				return
+			}
+			for {
+				let frame = readFrame(stream, options.maxFrame, 64, 0s) onerror (err error) {
+					stop()
+					return
+				}
+				dispatchFrame(frame) onerror (err error) {
+					write(frameGoAway, numberBytes(lastId)) onerror recover none
+					stop()
+					return
+				}
+			}
+		}
+
+		internal def handshake() !none {
+			let timeout = 10s
+			if useTLS {
+				let given = options.tls
+				fail linkError(IPCErrorKind.Refused, "the listener has no TLS settings") when given is none
+				let wrapped = tls.server(conn, tls.Config{...given, minVersion: tls.Version.TLS13})
+				try wrapped.handshake(timeout)
+				stream = wrapped
+				secure = wrapped
+			}
+			try readPreface(stream, timeout)
+			let nonce = try rand(32)
+			let proofs = 0
+			proofs |= proofSecret when options.secrets.len() > 0
+			proofs |= proofToken when !(options.verifyToken is none)
+			proofs |= proofCertificate when !(secure is none) && !(options.tls is none)
+			proofs |= proofUser when target.unix && options.users.len() > 0
+			try write(frameHello, helloBytes(Hello{nonce: nonce, proofs: proofs, maxCalls: options.maxCalls, maxFrame: options.maxFrame}))
+			let frame = try readFrame(stream, 64 * 1024, 0, timeout)
+			fail linkError(IPCErrorKind.Protocol, "the client sent frame {frame.kind} where its proof belongs") unless frame.kind == frameAuth
+			let auth = try parseAuth(frame.body)
+			clientFrame = auth.maxFrame
+			identity = try prove(auth, nonce)
+			let answers Answer[] = []
+			for let (_, wanted) in auth.wanted {
+				let handler = catalog.find(wanted.name)
+				if handler is none {
+					answers.push(Answer{status: interfaceMissing})
+					names.push("")
+					continue
+				}
+				let hash = try hexBytes(handler.info.hash)
+				if !constantTimeEqual(hash, wanted.hash) {
+					// Another version: the client compares the description
+					// and calls by this side's method numbers when every
+					// method and type it uses is the same here.
+					answers.push(Answer{status: interfaceDiffers, methods: handler.info.methods, types: handler.info.types})
+					names.push(wanted.name)
+					continue
+				}
+				answers.push(Answer{status: interfaceAccepted})
+				names.push(wanted.name)
+			}
+			try write(frameWelcome, welcomeBytes(answers))
+			sendMembers()
+			return none
+		}
+
+		// Checks what the client proved and returns who it is. Fails with
+		// `Refused` when the proof is wrong, or missing where one is asked.
+		internal def prove(auth AuthFrame, nonce byte[]) !string {
+			let who = ""
+			let proved = false
+			switch auth.kind {
+				case proofSecret:
+					let exporter byte[] = []
+					let held = secure
+					exporter = try held.exportKeyingMaterial(exporterLabel, none, 32) unless held is none
+					for let (_, secret) in options.secrets {
+						if constantTimeEqual(secretProof(secret.reveal(), nonce, exporter), auth.proof) {
+							proved = true
+							break
+						}
+					}
+					fail linkError(IPCErrorKind.Refused, "the secret is wrong") unless proved
+					who = "secret"
+				case proofToken:
+					fail linkError(IPCErrorKind.Refused, "a token is accepted only over TLS or a Unix socket") when secure is none && !target.unix
+					let verify = options.verifyToken
+					fail linkError(IPCErrorKind.Refused, "this server takes no tokens") when verify is none
+					let token = new Secret<string>(string(auth.proof))
+					who = verify(token) onerror (err error) {
+						fail linkError(IPCErrorKind.Refused, "the token was refused: {err.message}")
+					}
+					proved = true
+				case 0:
+				default:
+					fail linkError(IPCErrorKind.Protocol, "unknown proof kind {auth.kind}")
+			}
+			let held = secure
+			if !(held is none) {
+				let peers = held.connectionState().peerCertificates
+				if peers.len() > 0 {
+					who = peers[0].subject.str() when who == ""
+					proved = true
+				}
+			}
+			if target.unix && options.users.len() > 0 {
+				let uid = conn.peerUserId() onerror (err error) {
+					fail linkError(IPCErrorKind.Refused, "the client's user cannot be read: {err.message}")
+				}
+				fail linkError(IPCErrorKind.Refused, "user {uid} may not connect") unless options.users.includes(uid)
+				who = "{uid}" when who == ""
+				proved = true
+			}
+			fail linkError(IPCErrorKind.Refused, "the client proved nothing, and this server asks for a proof") when required && !proved
+			return who
+		}
+
+		internal def dispatchFrame(frame Frame) !none {
+			switch frame.kind {
+				case frameCall:
+					let r = new Reader(frame.body)
+					let head = try parseCall(r)
+					let arguments = frame.body[frame.body.len() - r.left():]
+					fail linkError(IPCErrorKind.Protocol, "call {head.id} is larger than this server accepts") when arguments.len() > options.maxFrame
+					admit(head, arguments)
+				case frameCancel:
+					cancelCall(try parseNumber(frame.body))
+				case framePing:
+					try write(framePong, frame.body)
+				case framePong, frameCredit:
+				default:
+					fail linkError(IPCErrorKind.Protocol, "frame {frame.kind} is not one a client sends")
+			}
+			return none
+		}
+
+		// Starts a call on a task of its own, or answers at once when the
+		// interface is not served or the connection is at its limit.
+		internal def admit(head CallHead, arguments byte[]) {
+			let arrived = time.now()
+			let redirect = steer(head)
+			if !(redirect is none) {
+				noteId(head.id)
+				write(frameSeeOther, seeOtherBytes(head.id, redirect)) onerror recover none
+				return
+			}
+			let refusal = register(head)
+			if refusal is none {
+				refusal = overloaded(head)
+				done(head.id) unless refusal is none
+			}
+			if !(refusal is none) {
+				write(frameFailure, failureBytes(head.id, refusal)) onerror recover none
+				return
+			}
+			let job = async run(head, arguments, arrived)
+			job.keepAlive()
+		}
+
+		internal atomic def noteId(id int) {
+			lastId = id when id > lastId
+		}
+
+		// The other members to send a call to instead of running it here:
+		// none unless this node is in a cluster, busier than its
+		// `refuseAbove`, the call is not forced, this node is no less busy
+		// than one that refused the call before, and a less busy member
+		// provides the interface.
+		internal def steer(head CallHead) ?Redirect {
+			let reg = registry
+			return none when reg is none
+			let node = reg.node()
+			return none when node is none
+			let settings = node.settings
+			return none when settings.refuseAbove <= 0.0 || head.flags & callForced != 0
+			let name = interfaceAt(head.iface)
+			return none when name == ""
+			let load = node.loadNow()
+			return none when load < settings.refuseAbove
+			return none when head.flags & callRefusedBefore != 0 && load < head.previous
+			let candidates = node.lessLoaded(name, load)
+			return none when candidates.len() == 0
+			return Redirect{load: load, forceAfter: settings.forceAfter, candidates: candidates}
+		}
+
+		// Why a forced call fails here: this node is above its cluster's
+		// `failAbove`.
+		internal def overloaded(head CallHead) ?IPCError {
+			return none when head.flags & callForced == 0
+			let reg = registry
+			return none when reg is none
+			let node = reg.node()
+			return none when node is none
+			let limit = node.settings.failAbove
+			let load = node.loadNow()
+			return none when limit <= 0.0 || load < limit
+			return linkError(IPCErrorKind.Overloaded, "this node's load {load} is above {limit}")
+		}
+
+		internal atomic def interfaceAt(index int) string {
+			return "" when index >= names.len()
+			return names[index]
+		}
+
+		// Tells the client the other members of this node's cluster that
+		// provide its interfaces; nothing outside a cluster.
+		def sendMembers() {
+			let reg = registry
+			return when reg is none
+			let node = reg.node()
+			return when node is none
+			let wanted = acceptedNames()
+			return when wanted.len() == 0
+			write(frameMembers, membersBytes(node.settings.advertise, node.membersFor(wanted))) onerror recover none
+		}
+
+		internal atomic def acceptedNames() string[] {
+			let out string[] = []
+			return out when ended
+			for let (_, name) in names {
+				out.push(name) when name != ""
+			}
+			return out
+		}
+
+		// Records a call that starts: none, or why it does not.
+		internal atomic def register(head CallHead) ?IPCError {
+			lastId = head.id when head.id > lastId
+			return linkError(IPCErrorKind.Closed, "the server is shutting down") when draining
+			return linkError(IPCErrorKind.Mismatch, "interface {head.iface} was not accepted on this connection") when head.iface >= names.len() || names[head.iface] == ""
+			return linkError(IPCErrorKind.Overloaded, "{running.len()} calls are running, the most this server takes") when running.len() >= options.maxCalls
+			return linkError(IPCErrorKind.Protocol, "call {head.id} is already running") when running.hasKey(head.id)
+			let placeholder async !byte[] = async noResult()
+			running[head.id] = placeholder
+			return none
+		}
+
+		// Runs one call and sends its answer. The method runs on a task of
+		// its own, which a cancel or the caller's deadline cancels.
+		internal def run(head CallHead, arguments byte[], arrived Time) {
+			let name = names[head.iface]
+			let handler = catalog.find(name)
+			if handler is none {
+				respond(head.id, frameFailure, failureBytes(head.id, linkError(IPCErrorKind.Mismatch, "{name} is no longer provided")))
+				return
+			}
+			let methodName = head.method < handler.info.methods.len() ?? (handler.info.methods[head.method].split("(")[0], "{head.method}")
+			let caller = Caller{address: address, identity: identity, method: "{name}.{methodName}"}
+			let depth = options.maxDepth
+			let job = async runMethod(handler, head.method, arguments, caller, depth, meter, arrived)
+			job.timeout((1ms).scale(float(head.remaining))) when head.remaining > 0
+			started(head.id, job)
+			let value = await job onerror (err error) {
+				respond(head.id, frameFailure, failureBytes(head.id, err))
+				return
+			}
+			if value.len() > clientFrame {
+				respond(head.id, frameFailure, failureBytes(head.id, linkError(IPCErrorKind.Protocol, "the result of {value.len()} bytes is larger than the {clientFrame} the client accepts")))
+				return
+			}
+			respond(head.id, frameResult, resultBytes(head.id, value))
+		}
+
+		internal atomic def started(id int, job async !byte[]) {
+			running[id] = job
+			if early.hasKey(id) {
+				early.delete(id)
+				job.cancel("canceled by the client")
+			}
+		}
+
+		// Sends a call's answer and forgets the call; a draining connection
+		// closes after its last one.
+		internal def respond(id int, kind int, body byte[]) {
+			write(kind, body) onerror recover none
+			stop() when done(id)
+		}
+
+		internal atomic def done(id int) bool {
+			running.delete(id) when running.hasKey(id)
+			early.delete(id) when early.hasKey(id)
+			return draining && running.len() == 0
+		}
+
+		// Cancels a running call. One whose task is not recorded yet is
+		// canceled when it is.
+		internal atomic def cancelCall(id int) {
+			return unless running.hasKey(id)
+			early[id] = true
+			running[id].cancel("canceled by the client")
+		}
+
+		// Takes no new calls: tells the client which was the last call it
+		// will answer, and closes once the running ones finish.
+		def drain() {
+			if markDraining() {
+				write(frameGoAway, numberBytes(lastId)) onerror recover none
+				stop()
+				return
+			}
+			write(frameGoAway, numberBytes(lastId)) onerror recover none
+		}
+
+		internal atomic def markDraining() bool {
+			draining = true
+			return running.len() == 0
+		}
+
+		// Writes one frame as one unit.
+		internal atomic def write(kind int, body byte[]) !none {
+			return try net.writeAll(stream, frameBytes(kind, body), 30s)
+		}
+
+		// Closes the connection and leaves the listener's list.
+		def stop() {
+			if markEnded() {
+				stream.close() onerror recover none
+				let owner = listener
+				owner.forget(self) unless owner is none
+			}
+		}
+
+		// Marks the connection ended and cancels its running calls: nobody
+		// receives their results any more.
+		internal atomic def markEnded() bool {
+			return false when ended
+			ended = true
+			for let (_, job) in running {
+				job.cancel("the client is gone")
+			}
+			return true
+		}
+
+		atomic def links() LinkInfo[] {
+			let out LinkInfo[] = []
+			return out when ended
+			for let (_, name) in names {
+				out.push(LinkInfo{name: name, address: address, accepted: true, inFlight: running.len()}) when name != ""
+			}
+			return out
+		}
+	}
+
+	// The result of a call that has not started yet, held in its place.
+	async def noResult() !byte[] {
+		return []
+	}
+
+	// Runs method number `method` of `handler` on this task, for `caller`.
+	async def runMethod(handler Handler, method int, arguments byte[], caller Caller, depth int, meter LoadMeter, arrived Time) !byte[] {
+		meter.started(time.since(arrived))
+		defer meter.finished()
+		callerOfTask.set(caller)
+		let from = new Reader(arguments, depth)
+		let to = new Writer(depth)
+		try handler.call(method, from, to)
+		return to.bytes()
+	}
+
+	// Who is calling the method running on this task.
+	def currentCaller() ?Caller {
+		return callerOfTask.get()
+	}
+}

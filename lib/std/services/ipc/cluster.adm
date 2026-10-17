@@ -1,0 +1,497 @@
+// The cluster layer inside (docs/archived/requirements/ipc-cluster.md): the load a
+// node measures, its table of members, and the gossip that keeps the tables
+// of all nodes alike. Gossip is a remote interface of its own, served on the
+// node's listeners and called through generated proxies like any other.
+internal partial module std.services.ipc.link {
+	use (
+		std.crypto::(randRange)
+		std.services.ipc::*
+		std.time
+		std.time::(Time)
+	)
+
+	// How busy this node is: the calls running on it, and how long the last
+	// calls waited between their arrival and the start of their method.
+	type LoadMeter {
+		internal running int     = 0
+		internal waits   float[] = []
+		internal next    int     = 0
+
+		// A call's method starts, `waited` after the call arrived.
+		atomic def started(waited duration) {
+			running += 1
+			let ms = waited.seconds() * 1000.0
+			if waits.len() < 64 {
+				waits.push(ms)
+			} else {
+				waits[next] = ms
+				next = (next + 1) % 64
+			}
+		}
+
+		// A call's method ended.
+		atomic def finished() {
+			running -= 1 when running > 0
+		}
+
+		// The calls running now.
+		atomic def runningNow() int {
+			return running
+		}
+
+		// The mean wait of the last 64 calls, in milliseconds.
+		atomic def waitMean() float {
+			return 0.0 when waits.len() == 0
+			let sum = 0.0
+			for let (_, ms) in waits {
+				sum += ms
+			}
+			return sum / float(waits.len())
+		}
+	}
+
+	// A member as gossip carries it.
+	struct MemberRecord {
+		address     string
+		// The node's start, in Unix nanoseconds: a restarted node outranks
+		// what was known of it before.
+		incarnation int64
+		heartbeat   int64
+		left        bool
+		interfaces  string[]
+		load        float
+		running     int
+		waitMs      float
+	}
+
+	// Whether `a` says more recent things about its node than `b`.
+	def newer(a MemberRecord, b MemberRecord) bool {
+		return a.incarnation > b.incarnation when a.incarnation != b.incarnation
+		return a.heartbeat > b.heartbeat
+	}
+
+	// The gossip between the nodes of a cluster.
+	interface ClusterPeer {
+		// Merges `table` into this node's and returns this node's. Fails
+		// when `cluster` is not this node's cluster.
+		def exchange(cluster string, table MemberRecord[]) !MemberRecord[]
+	}
+
+	// What serves `ClusterPeer` on a node's listeners.
+	@remote<ClusterPeer>
+	type PeerDesk {
+		weak node ?ClusterNode
+
+		def new(node ClusterNode) {
+			self.node = node
+		}
+
+		def exchange(cluster string, table MemberRecord[]) !MemberRecord[] {
+			let held = node
+			fail IPCError{message: "ipc: this node left the cluster", code: "ipc.closed", kind: IPCErrorKind.Closed} when held is none
+			return try held.received(cluster, table)
+		}
+	}
+
+	// One member of this node's table: what it last said, when, and where
+	// it stands.
+	type Entry {
+		record MemberRecord
+		heard  Time
+		state  MemberState  = MemberState.Alive
+		// Dropped as dead: kept only to refuse older records of it.
+		dead   bool         = false
+
+		def new(record MemberRecord) {
+			self.record = record
+			self.heard = time.now()
+			self.state = record.left ?? (MemberState.Left, MemberState.Alive)
+		}
+	}
+
+	// A member to send a call to, with its load.
+	struct Candidate {
+		address string
+		load    float
+	}
+
+	// This node's part in a cluster: its table of members, the gossip that
+	// keeps it current, and what clients are told of the others.
+	type ClusterNode {
+		settings Cluster
+
+		// The registry holds the node; the node reaches back only for the
+		// load and to tell clients of changes.
+		weak registry         ?Registry
+		internal catalog      Catalog
+		internal meter        LoadMeter
+		internal incarnation  int64
+		internal heartbeat    int64                    = 0
+		internal table        map<string, Entry>       = {}
+		internal peers        map<string, ClusterPeer> = {}
+		internal pools        map<string, Pool>        = {}
+		internal desk         ?PeerDesk                = none
+		internal closing      channel<none>
+		internal stopped      bool                     = false
+		internal lastAnnounce Time
+		// Told of members that become alive, and of those that leave or die.
+		onJoined              ?def (member Member)     = none
+		onLeft                ?def (member Member)     = none
+
+		def new(settings Cluster, registry Registry) {
+			self.settings = settings
+			self.registry = registry
+			self.catalog = registry.catalog
+			self.meter = registry.meter
+			self.incarnation = time.now().unixNs()
+			self.closing = new channel<none>(1)
+			self.lastAnnounce = time.now()
+		}
+
+		// Serves gossip, announces this node, asks the nodes discovery
+		// knows, and starts gossiping. Fails when gossip cannot be served or
+		// the record cannot be written; nodes that do not answer are no
+		// failure (this may be the first).
+		def start() !none {
+			fail "ipc: a cluster needs a name" when settings.name == ""
+			fail "ipc: a cluster needs the address this node is reached at" when settings.advertise == ""
+			let served = new PeerDesk(self)
+			desk = served
+			let owner any = served
+			try catalog.add(served<PeerDesk>(served), owner)
+			try settings.discovery.announce(settings.advertise)
+			let known = settings.discovery.nodes() onerror recover []
+			for let (_, address) in known {
+				continue when address == settings.advertise
+				gossipWith(address)
+			}
+			let loop = async gossipLoop()
+			loop.keepAlive()
+			return none
+		}
+
+		// Tells the others this node leaves (unless `farewell` is false, as
+		// when a process ends without a word), takes it out of discovery and
+		// stops serving gossip.
+		def stop(farewell bool = true) {
+			let (targets, record) = leaving()
+			return when record is none
+			if farewell {
+				let records MemberRecord[] = [record]
+				for let (_, address) in targets {
+					sayGoodbye(address, records)
+				}
+				settings.discovery.withdraw(settings.advertise) onerror recover none
+			}
+			let held = desk
+			if !(held is none) {
+				let owner any = held
+				catalog.remove(owner) onerror recover none
+			}
+			closeLinks()
+		}
+
+		internal def sayGoodbye(address string, farewell MemberRecord[]) {
+			let peer = peerAt(address) onerror (err error) {
+				return
+			}
+			peer.exchange(settings.name, farewell) onerror recover []
+		}
+
+		internal atomic def leaving() (string[], ?MemberRecord) {
+			return ([], none) when stopped
+			stopped = true
+			closing.offer(none)
+			heartbeat += 1
+			let record = ownRecord()
+			record.left = true
+			return (aliveAddresses(), record)
+		}
+
+		internal atomic def closeLinks() {
+			for let (_, pool) in pools {
+				pool.close()
+			}
+			pools = {}
+			peers = {}
+		}
+
+		// What a peer told this node: merged into the table, answered with
+		// the table.
+		def received(cluster string, records MemberRecord[]) !MemberRecord[] {
+			fail IPCError{message: "ipc: this node is in cluster {settings.name}, not {cluster}", code: "ipc.refused", kind: IPCErrorKind.Refused} when cluster != settings.name
+			merge(records)
+			return snapshot()
+		}
+
+		// This node's own record now.
+		internal def ownRecord() MemberRecord {
+			return MemberRecord{
+				address:     settings.advertise,
+				incarnation: incarnation,
+				heartbeat:   heartbeat,
+				left:        stopped,
+				interfaces:  catalog.names(),
+				load:        loadNow(),
+				running:     meter.runningNow(),
+				waitMs:      meter.waitMean(),
+			}
+		}
+
+		// This node's load figure: `Cluster.load` when set, else the calls
+		// running plus the mean wait in milliseconds before a call starts.
+		def loadNow() float {
+			let given = settings.load
+			return given() unless given is none
+			return float(meter.runningNow()) + meter.waitMean()
+		}
+
+		// Tells the clients of this node's listeners what changed.
+		internal def tellClients() {
+			let held = registry
+			held.pushMembers() unless held is none
+		}
+
+		// The records of the members known alive or left, this node's first.
+		internal atomic def snapshot() MemberRecord[] {
+			let out MemberRecord[] = [ownRecord()]
+			for let (_, entry) in table {
+				out.push(entry.record) unless entry.dead
+			}
+			return out
+		}
+
+		// Takes in what a peer knows; tells clients when the view changed.
+		internal def merge(records MemberRecord[]) {
+			let (joined, left) = mergeRecords(records)
+			for let (_, member) in joined {
+				let call = onJoined
+				call(member) unless call is none
+			}
+			for let (_, member) in left {
+				let call = onLeft
+				call(member) unless call is none
+			}
+			tellClients() when joined.len() > 0 || left.len() > 0
+		}
+
+		internal atomic def mergeRecords(records MemberRecord[]) (Member[], Member[]) {
+			let joined Member[] = []
+			let left Member[] = []
+			for let (_, record) in records {
+				continue when record.address == settings.advertise
+				let known = table.get(record.address)
+				if known is none {
+					let entry = new Entry(record)
+					table[record.address] = entry
+					joined.push(memberOf(entry)) unless record.left
+					continue
+				}
+				continue unless newer(record, known.record)
+				let before = known.state
+				let wasDead = known.dead
+				known.record = record
+				known.heard = time.now()
+				known.dead = false
+				if record.left {
+					known.state = MemberState.Left
+					left.push(memberOf(known)) unless before == MemberState.Left || wasDead
+				} else {
+					known.state = MemberState.Alive
+					joined.push(memberOf(known)) when before != MemberState.Alive || wasDead
+				}
+			}
+			return (joined, left)
+		}
+
+		internal def memberOf(entry Entry) Member {
+			let r = entry.record
+			return Member{address: r.address, interfaces: r.interfaces, state: entry.state, load: r.load, running: r.running, waitMs: r.waitMs, own: false}
+		}
+
+		// Every member this node knows, itself first.
+		atomic def members() Member[] {
+			let own = ownRecord()
+			let out Member[] = [Member{address: own.address, interfaces: own.interfaces, state: MemberState.Alive, load: own.load, running: own.running, waitMs: own.waitMs, own: true}]
+			for let (_, entry) in table {
+				out.push(memberOf(entry)) unless entry.dead
+			}
+			return out
+		}
+
+		// The live members other than this node that provide one of `names`,
+		// with their loads.
+		atomic def membersFor(names string[]) Candidate[] {
+			let out Candidate[] = []
+			for let (_, entry) in table {
+				continue unless !entry.dead && entry.state == MemberState.Alive
+				let serves = false
+				for let (_, name) in names {
+					serves = true when entry.record.interfaces.includes(name)
+				}
+				out.push(Candidate{address: entry.record.address, load: entry.record.load}) when serves
+			}
+			return out
+		}
+
+		// Up to two live members providing `name` that are less busy than
+		// `load`: two picked at random among them, the less loaded first, so
+		// busy nodes do not all name the same one.
+		atomic def lessLoaded(name string, load float) Candidate[] {
+			let pool Candidate[] = []
+			for let (_, entry) in table {
+				continue unless !entry.dead && entry.state == MemberState.Alive && entry.record.load < load && entry.record.interfaces.includes(name)
+				pool.push(Candidate{address: entry.record.address, load: entry.record.load})
+			}
+			return pool when pool.len() <= 1
+			let first = randRange<int>(0, pool.len()) % pool.len()
+			let second = randRange<int>(0, pool.len() - 1) % (pool.len() - 1)
+			second += 1 when second >= first
+			let a = pool[first]
+			let b = pool[second]
+			return b.load < a.load ?? ([b, a], [a, b])
+		}
+
+		internal def gossipLoop() {
+			for {
+				let sleep = time.sleepChan(settings.gossipEvery)
+				let ended = false
+				select {
+					case closing:
+						ended = true
+					case sleep:
+				}
+				return when ended || isStopped()
+				gossipRound()
+			}
+		}
+
+		internal atomic def isStopped() bool {
+			return stopped
+		}
+
+		// One round: a new heartbeat, the silent marked, `fanout` peers told,
+		// the record renewed when it is due.
+		internal def gossipRound() {
+			let (targets, joinedOrLeft) = tick()
+			for let (_, member) in joinedOrLeft {
+				let call = onLeft
+				call(member) unless call is none
+			}
+			tellClients() when joinedOrLeft.len() > 0
+			let addresses = targets
+			if addresses.len() == 0 {
+				// Alone: ask discovery again, as a starting node does.
+				let known = settings.discovery.nodes() onerror recover []
+				for let (_, address) in known {
+					addresses.push(address) unless address == settings.advertise
+				}
+			}
+			for let (_, address) in addresses {
+				gossipWith(address)
+			}
+			if time.since(lastAnnounce) >= settings.announceEvery {
+				lastAnnounce = time.now()
+				settings.discovery.announce(settings.advertise) onerror recover none
+			}
+		}
+
+		// Raises the heartbeat, marks silent members, drops dead ones, and
+		// picks the peers of this round. Returns them and the members that
+		// left the view.
+		internal atomic def tick() (string[], Member[]) {
+			heartbeat += 1
+			let gone Member[] = []
+			let drop string[] = []
+			let now = time.now()
+			for let (address, entry) in table {
+				let silent = now - entry.heard
+				if entry.dead || entry.state == MemberState.Left {
+					// Tombstones and farewells are kept a while against
+					// stale records, then forgotten.
+					drop.push(address) when silent >= settings.deadAfter.scale(2.0)
+					entry.dead = true when entry.state == MemberState.Left && silent >= settings.deadAfter
+					continue
+				}
+				if silent >= settings.deadAfter {
+					entry.dead = true
+					gone.push(memberOf(entry))
+					continue
+				}
+				if silent >= settings.suspectAfter && entry.state == MemberState.Alive {
+					entry.state = MemberState.Suspect
+					gone.push(memberOf(entry))
+				}
+			}
+			for let (_, address) in drop {
+				table.delete(address)
+			}
+			let alive = aliveAddresses()
+			let picked string[] = []
+			for picked.len() < settings.fanout && alive.len() > 0 {
+				let at = randRange<int>(0, alive.len()) % alive.len()
+				picked.push(alive[at])
+				alive.remove(at)
+			}
+			return (picked, gone)
+		}
+
+		// The addresses of the members alive or suspect: a suspect one is
+		// still asked, which is how it comes back.
+		internal def aliveAddresses() string[] {
+			let out string[] = []
+			for let (address, entry) in table {
+				out.push(address) unless entry.dead || entry.state == MemberState.Left
+			}
+			return out
+		}
+
+		// One exchange with the node at `address`; one that fails is
+		// forgotten, and its silence does the rest.
+		internal def gossipWith(address string) {
+			let peer = peerAt(address) onerror (err error) {
+				return
+			}
+			let answer = peer.exchange(settings.name, snapshot()) onerror (err error) {
+				forgetPeer(address)
+				return
+			}
+			merge(answer)
+		}
+
+		// The gossip proxy of the node at `address`, connected once.
+		internal def peerAt(address string) !ClusterPeer {
+			let known = cachedPeer(address)
+			return known unless known is none
+			let info = describe<ClusterPeer>()
+			let link = Link{...settings.link, follow: false, timeout: settings.gossipEvery.scale(2.0) > 2s ?? (settings.gossipEvery.scale(2.0), 2s)}
+			let pool = new Pool(info, [address], settings.auth, link)
+			try pool.start()
+			let peer = proxy<ClusterPeer>(new Remote(info, pool, link.maxDepth))
+			keepPeer(address, pool, peer)
+			return peer
+		}
+
+		internal atomic def cachedPeer(address string) ?ClusterPeer {
+			return peers.get(address)
+		}
+
+		internal atomic def keepPeer(address string, pool Pool, peer ClusterPeer) {
+			let old = pools.get(address)
+			old.close() unless old is none
+			pools[address] = pool
+			peers[address] = peer
+		}
+
+		internal atomic def forgetPeer(address string) {
+			let pool = pools.get(address)
+			pool.close() unless pool is none
+			pools.delete(address) when pools.hasKey(address)
+			peers.delete(address) when peers.hasKey(address)
+		}
+
+		def dispose() {
+			closeLinks()
+		}
+	}
+}
