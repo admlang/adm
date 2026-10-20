@@ -1,10 +1,14 @@
 #!/bin/sh
-# Installs ADM on Linux for the current user:
+# Installs ADM on Linux or macOS for the current user:
 #
 #   curl -fsSL https://raw.githubusercontent.com/admlang/adm/main/install.sh | sh
 #
 # Downloads the latest language package from the GitHub releases, unpacks it
 # into ~/.adm (bin/, lib/, tools/) and puts ~/.adm/bin on PATH. No sudo.
+# macOS needs the Xcode Command Line Tools (clang and the SDK): the script
+# names `xcode-select --install` when they are missing. A package fetched by
+# curl, as here, carries no quarantine mark, so Gatekeeper does not stop it;
+# one downloaded with a browser does (xattr -dr com.apple.quarantine <dir>).
 #
 #   ADM_VERSION=0.1      install that release instead of the latest
 #   ADM_INSTALL_DIR=...  install somewhere other than ~/.adm
@@ -33,8 +37,11 @@ for tool in curl tar grep sed; do
     available "$tool" || error "$tool is required but missing"
 done
 
-OS="$(uname -s)"
-[ "$OS" = "Linux" ] || error "only Linux packages are published today (got $OS)"
+case "$(uname -s)" in
+    Linux) OS=linux ;;
+    Darwin) OS=darwin ;;
+    *) error "packages are published for Linux and macOS (got $(uname -s))" ;;
+esac
 ARCH="$(uname -m)"
 case "$ARCH" in
     x86_64) ARCH=amd64 ;;
@@ -42,18 +49,30 @@ case "$ARCH" in
     *) error "unsupported architecture: $ARCH" ;;
 esac
 
-# The package is built against glibc 2.35 (docker/package): musl systems and
-# older glibc cannot run it.
-if ldd --version 2>&1 | grep -qi musl || ls /lib/ld-musl-* >/dev/null 2>&1; then
-    error "this system uses musl libc (Alpine?); ADM needs a glibc-based Linux (glibc 2.35 or newer)"
-fi
-GLIBC="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
-if [ -n "$GLIBC" ]; then
-    major="${GLIBC%%.*}"
-    minor="${GLIBC#*.}"
-    minor="${minor%%.*}"
-    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 35 ]; }; then
-        error "glibc $GLIBC is too old; ADM needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Mint 21, Fedora 36 or later)"
+if [ "$OS" = "linux" ]; then
+    # The package is built against glibc 2.35 (docker/package): musl systems and
+    # older glibc cannot run it.
+    if ldd --version 2>&1 | grep -qi musl || ls /lib/ld-musl-* >/dev/null 2>&1; then
+        error "this system uses musl libc (Alpine?); ADM needs a glibc-based Linux (glibc 2.35 or newer)"
+    fi
+    GLIBC="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+    if [ -n "$GLIBC" ]; then
+        major="${GLIBC%%.*}"
+        minor="${GLIBC#*.}"
+        minor="${minor%%.*}"
+        if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 35 ]; }; then
+            error "glibc $GLIBC is too old; ADM needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Mint 21, Fedora 36 or later)"
+        fi
+    fi
+else
+    # adm builds programs with Apple's clang and links them against the SDK
+    # the Command Line Tools install; the package carries neither.
+    if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --show-sdk-path >/dev/null 2>&1; then
+        error "the Xcode Command Line Tools are missing; install them with: xcode-select --install"
+    fi
+    version="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+    if [ "${version%%.*}" -lt 12 ]; then
+        error "macOS $version is too old; ADM needs macOS 12 or newer"
     fi
 fi
 
@@ -73,9 +92,9 @@ fi
 if [ -z "${ADM_PACKAGE:-}" ]; then
 status "Looking up the release..."
 ASSET_URL="$(curl -fsSL "$RELEASE_URL" \
-    | grep -o "\"browser_download_url\": *\"[^\"]*adm-[^\"]*-linux-$ARCH\.tar\.gz\"" \
+    | grep -o "\"browser_download_url\": *\"[^\"]*adm-[^\"]*-$OS-$ARCH\.tar\.gz\"" \
     | head -n 1 | sed 's/.*"\(https[^"]*\)"/\1/')"
-[ -n "$ASSET_URL" ] || error "no linux-$ARCH package in ${ADM_VERSION:+release v$ADM_VERSION of }$REPO"
+[ -n "$ASSET_URL" ] || error "no $OS-$ARCH package in ${ADM_VERSION:+release v$ADM_VERSION of }$REPO"
 fi
 ARCHIVE="$TEMP_DIR/$(basename "$ASSET_URL")"
 
@@ -139,6 +158,10 @@ case ":$PATH:" in
     *)
         LINE="export PATH=\"$BIN:\$PATH\""
         ADDED=""
+        # zsh is macOS's login shell, and a new account has no ~/.zshrc yet.
+        if [ "$OS" = "darwin" ] && [ "${SHELL##*/}" = "zsh" ] && [ ! -e "$HOME/.zshrc" ]; then
+            : > "$HOME/.zshrc"
+        fi
         for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
             if [ -f "$rc" ] && ! grep -Fq "$BIN" "$rc"; then
                 printf '\n# ADM\n%s\n' "$LINE" >> "$rc"
@@ -164,9 +187,9 @@ status "Installed $("$BIN/adm" version 2>/dev/null | head -n 1 || echo adm)"
 
 # Programs link against the system C library, so its headers and crt objects
 # must be installed. install.sh never installs system packages; it names the
-# one to install.
+# one to install. (macOS: the SDK, checked above.)
 CLANG="$INSTALL_DIR/tools/clang"
-if [ -x "$CLANG" ]; then
+if [ "$OS" = "linux" ] && [ -x "$CLANG" ]; then
     if ! printf '#include <stdio.h>\n#include <time.h>\n' | "$CLANG" -x c -fsyntax-only - >/dev/null 2>&1 \
         || [ "$("$CLANG" -print-file-name=crt1.o)" = "crt1.o" ]; then
         ids="$(sed -n 's/^\(ID\|ID_LIKE\)=//p' /etc/os-release 2>/dev/null | tr -d '"' | tr '\n' ' ')"

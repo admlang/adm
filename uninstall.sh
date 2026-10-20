@@ -115,10 +115,10 @@ KEPT=""
 for part in cache pkg catalog; do
     [ -e "$INSTALL_DIR/$part" ] || continue
     if [ "$PURGE" = "1" ]; then
-        status "Deleting $INSTALL_DIR/$part ($(du -sh "$INSTALL_DIR/$part" 2>/dev/null | cut -f1))"
+        status "Deleting $INSTALL_DIR/$part ($(du -sh "$INSTALL_DIR/$part" 2>/dev/null | awk '{print $1}'))"
         rm -rf "${INSTALL_DIR:?}/$part"
     else
-        KEPT="$KEPT $part($(du -sh "$INSTALL_DIR/$part" 2>/dev/null | cut -f1))"
+        KEPT="$KEPT $part($(du -sh "$INSTALL_DIR/$part" 2>/dev/null | awk '{print $1}'))"
     fi
 done
 
