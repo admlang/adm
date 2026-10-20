@@ -6,23 +6,16 @@ is checked against.
 
 ## Install
 
-**Automatic** (Linux, current user, no sudo):
 **Automatic** (Linux and macOS, current user, no sudo):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/admlang/adm/main/install.sh | sh
 ```
 
-The script downloads the latest release into `~/.adm` and adds `~/.adm/bin` to your `PATH`.
-`ADM_VERSION=0.1` installs a specific release; `ADM_INSTALL_DIR` changes the location.
 The script downloads the latest release for your system into `~/.adm` and adds `~/.adm/bin`
 to your `PATH`. `ADM_VERSION=0.1` installs a specific release; `ADM_INSTALL_DIR` changes the
 location.
 
-**Manual**: download `adm-<version>-linux-amd64.tar.gz` from the
-[releases](https://github.com/admlang/adm/releases), unpack it anywhere, and put its `bin/`
-directory on `PATH`. The package is self-contained: the compiler finds `lib/` (prelude and
-standard library) and `tools/` (bundled clang and lld) relative to itself.
 - **Linux** x86-64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
 - **macOS** 12 or newer on Apple Silicon, with the Xcode Command Line Tools
   (`xcode-select --install`): programs build with their clang and the macOS SDK. Not on macOS
@@ -35,8 +28,6 @@ from the [releases](https://github.com/admlang/adm/releases), unpack it anywhere
 Linux, `tools/` (bundled clang and lld) relative to itself.
 
 ```sh
-tar -xzf adm-<version>-linux-amd64.tar.gz
-export PATH="$PWD/adm-<version>-linux-amd64/bin:$PATH"
 tar -xzf adm-<version>-<os>-<arch>.tar.gz
 export PATH="$PWD/adm-<version>-<os>-<arch>/bin:$PATH"
 adm version
@@ -90,4 +81,3 @@ adm run hello.adm
 
 Documentation: https://adm-lang.dev. Libraries are published through the
 [registry](https://github.com/admlang/registry).
-
