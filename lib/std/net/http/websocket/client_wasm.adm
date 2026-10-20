@@ -1,0 +1,248 @@
+@os("wasm")
+partial module std.net.http.websocket {
+	use (
+		std.bytes
+		std.data.encoding::(JSON)
+		std.net
+		std.net.http::(Response)
+		std.net.http.transport::(joinHostPort)
+		std.net.url
+		std.services.policy::(Policy, PolicyRequest)
+		std.time
+	)
+
+	// dial opens a WebSocket connection through the browser and returns it
+	// with a `101` response that holds the subprotocol and extensions the
+	// browser agreed on. The browser makes the handshake: it offers
+	// permessage-deflate and compresses on its own (`Conn.compression` stays
+	// false), answers the server's pings, and sends the page's cookies; it sets
+	// no header fields a page gives, and it cannot send a ping. The network
+	// policy is asked as a connection to the URL's host and port would be.
+	//
+	// Fails with WebSocketError Handshake when the URL's scheme is not one of
+	// ws, wss, http and https, when `options.headers` holds fields, or when the
+	// browser could not connect (it does not say why); HttpError for a URL that
+	// does not parse.
+	def dial(target string, options DialOptions = DialOptions{}) !(Conn, Response) {
+		let parsed = try url.parse(target)
+		let scheme = parsed.scheme.lower()
+		fail wsError(ErrorKind.Handshake, "scheme {parsed.scheme} is not ws or wss") unless scheme := "ws" || "wss" || "http" || "https"
+		parsed.scheme = (scheme := "wss" || "https") ?? ("wss", "ws")
+		let given = options.headers
+		fail wsError(ErrorKind.Handshake, "the browser sets the handshake's header fields itself; send credentials in the URL or in the first message") unless given is none || given.len() == 0
+		try Policy.require(PolicyRequest{action: "adm.network.connect", constrained: true})
+		try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", joinHostPort(parsed.hostname(), parsed.effectivePort()))
+		let args = WebSocketOpen{url: parsed.str(), protocols: options.subprotocols}
+		args.timeoutMs = int(float(options.timeout) / float(1ms)) when options.timeout > 0s
+		let status = __webBrowser("wsOpen", string(new JSON().encode(args)))
+		fail wsError(ErrorKind.Handshake, "the browser could not connect to {parsed.str()}: {__webAnswer()}") unless status == 0
+		let opened = WebSocketOpened{}
+		try new JSON().decode(__webAnswer(), opened)
+		let conn = new Conn(new BrowserSocket(opened.id), new bytes.Reader(byte[]), true)
+		conn.subprotocol = opened.protocol
+		let res = new Response()
+		res.status = 101
+		res.reason = "Switching Protocols"
+		res.headers.set("Upgrade", "websocket")
+		res.headers.set("Connection", "Upgrade")
+		res.headers.set("Sec-WebSocket-Protocol", opened.protocol) when opened.protocol != ""
+		res.headers.set("Sec-WebSocket-Extensions", opened.extensions) when opened.extensions != ""
+		return (conn, res)
+	}
+
+	// The stream a `Conn` runs over on the web: the browser's WebSocket,
+	// spoken in frames. What `Conn` writes is read back as frames: a text or
+	// binary message goes out whole once its last frame came, a close frame
+	// closes the browser socket, a ping or pong goes nowhere (the browser
+	// keeps the connection alive). What the browser receives is handed to
+	// `Conn` as one final, unmasked frame per message, and its close as a
+	// close frame.
+	internal type BrowserSocket {
+		internal id       int32
+		internal open     bool   = true
+		// Bytes written that do not make a whole frame yet.
+		internal outgoing byte[]
+		// The message whose frames are being written, and its type.
+		internal message  byte[]
+		internal binary   bool
+		// Frames waiting to be read.
+		internal incoming byte[]
+		internal at       int
+
+		def new(id int32) {
+			self.id = id
+		}
+
+		// Implements net.Stream: the frames of what the browser received.
+		//
+		// Fails with NetError TimedOut when nothing arrives within the
+		// timeout (0s or less: no limit), Closed once the browser socket
+		// closed and its close frame was read.
+		def read(data byte[], timeout duration) !int {
+			if at >= incoming.len() {
+				fail net.errorOf(net.ErrorCode.Closed, "read", "", "the WebSocket is closed") unless open
+				try receive(timeout)
+			}
+			let n = (incoming[at:]).copy(data)
+			at += n
+			return n
+		}
+
+		// Waits for the next message or the close and queues it as a frame.
+		internal def receive(timeout duration) !none {
+			let args = WebSocketWait{id: id}
+			args.timeoutMs = int(float(timeout) / float(1ms)) when timeout > 0s
+			let status = __webBrowser("wsReceive", string(new JSON().encode(args)))
+			fail net.errorOf(net.ErrorCode.Closed, "read", "", "the browser socket is gone") unless status == 0
+			let event = WebSocketEvent{}
+			try new JSON().decode(__webAnswer(), event)
+			switch event.kind {
+				case "timeout":
+					fail net.errorOf(net.ErrorCode.TimedOut, "read", "", "no message within {timeout}")
+				case "close":
+					open = false
+					let payload = event.code == int(CloseCode.NoStatus) || event.code == 0 ?? (byte[], encodeClose(event.code, event.reason))
+					incoming = encodeFrame(true, opcodeClose, payload)
+				default:
+					let payload byte[]
+					payload.len(event.size)
+					let n = __webWsTake(id, payload, payload.len())
+					incoming = encodeFrame(true, event.kind == "text" ?? (opcodeText, opcodeBinary), payload[0:int(n)])
+			}
+			at = 0
+			return none
+		}
+
+		// Implements net.Stream: takes `Conn`'s frames and sends the messages
+		// they finish.
+		//
+		// Fails with NetError Closed once the socket is closed, Pipe when the
+		// browser refuses the message.
+		def write(data byte[], timeout duration) !int {
+			fail net.errorOf(net.ErrorCode.Closed, "write", "", "the WebSocket is closed") unless open
+			outgoing = outgoing.len() == 0 ?? (data.clone(), outgoing + data)
+			for {
+				let (frame, used) = takeFrame(outgoing)
+				break when used == 0
+				outgoing = outgoing[used:]
+				try deliver(frame)
+			}
+			return data.len()
+		}
+
+		// Sends what a whole frame finishes.
+		internal def deliver(frame Frame) !none {
+			switch frame.opcode {
+				case opcodeText, opcodeBinary:
+					binary = frame.opcode == opcodeBinary
+					message = frame.payload
+				case opcodeContinuation:
+					message = message + frame.payload
+				case opcodeClose:
+					let (code, reason) = decodeClose(frame.payload) onerror recover (int(CloseCode.Normal), "")
+					closeSocket(code, reason)
+					return none
+				default:
+					// Pings and pongs: the browser answers and sends its own.
+					return none
+			}
+			return none unless frame.fin
+			let status = __webWsSend(id, binary ?? (int32(1), int32(0)), message, message.len())
+			message = byte[]
+			fail net.errorOf(net.ErrorCode.Pipe, "write", "", "the browser did not send the message") unless status == 0
+			return none
+		}
+
+		// Implements net.Stream.
+		//
+		// Does not fail.
+		def close() !none {
+			closeSocket(int(CloseCode.Normal), "")
+			return none
+		}
+
+		// Implements net.Stream.
+		def isOpen() bool {
+			return open
+		}
+
+		internal def closeSocket(code int, reason string) {
+			return unless open
+			let _ = __webBrowser("wsClose", string(new JSON().encode(WebSocketClose{id: id, code: code, reason: reason})))
+		}
+	}
+
+	// The first whole frame at the start of data, and how many bytes it took;
+	// 0 when data does not hold one yet.
+	internal def takeFrame(data byte[]) (Frame, int) {
+		let nothing = (Frame{fin: true, opcode: opcodePong, masked: false, payload: byte[]}, 0)
+		return nothing when data.len() < 2
+		let length = int(data[1] & 0x7f)
+		let at = 2
+		if length == 126 {
+			return nothing when data.len() < 4
+			length = int(data[2]) << 8 | int(data[3])
+			at = 4
+		} else if length == 127 {
+			return nothing when data.len() < 10
+			length = 0
+			for let i = 2; i < 10; i++ {
+				length = length << 8 | int(data[i])
+			}
+			at = 10
+		}
+		let masked = (data[1] & 0x80) != 0
+		let key byte[]
+		if masked {
+			return nothing when data.len() < at + 4
+			key = data[at:at + 4]
+			at += 4
+		}
+		return nothing when data.len() < at + length
+		let payload = data[at:at + length].clone()
+		payload = maskBytes(payload, key) when masked
+		return (Frame{fin: (data[0] & 0x80) != 0, opcode: int(data[0] & 0x0f), masked: masked, payload: payload}, at + length)
+	}
+
+	internal struct WebSocketOpen {
+		url       string
+		protocols string[] = []
+		timeoutMs int
+	}
+
+	internal struct WebSocketOpened {
+		id         int32
+		protocol   string = ""
+		extensions string = ""
+	}
+
+	internal struct WebSocketWait {
+		id        int32
+		timeoutMs int
+	}
+
+	internal struct WebSocketEvent {
+		kind   string
+		size   int
+		code   int
+		reason string = ""
+	}
+
+	internal struct WebSocketClose {
+		id     int32
+		code   int
+		reason string
+	}
+
+	@c("adm_web.h", symbol = "adm_web_browser", ret = "int32_t", params = ["const char*", "const char*"])
+	def __webBrowser(op string, args string) int32;
+
+	@c("adm_web.h", symbol = "adm_web_answer", ret = "const char*", params = [])
+	def __webAnswer() string;
+
+	@c("adm_web.h", symbol = "adm_web_ws_send", ret = "int32_t", params = ["int32_t", "int32_t", "const uint8_t*", "int64_t"])
+	def __webWsSend(id int32, binary int32, data byte[], length int) int32;
+
+	@c("adm_web.h", symbol = "adm_web_ws_take", ret = "int64_t", params = ["int32_t", "uint8_t*", "int64_t"])
+	def __webWsTake(id int32, buf byte[], cap int) int64;
+}

@@ -29,7 +29,11 @@ uniform int uOp;               // 0 fill, 1 layer, 2 blit copy, 3 blit, 4 atop, 
 uniform sampler2D uPlane;      // an effect plane over the box (R32F)
 uniform int uCoverageFromPlane;
 uniform int uHasQuad;          // coverage from a convex quadrilateral
-uniform int uHardQuad;         // ... without antialias
+uniform int uHardQuad;         // ... or the path's, without antialias
+uniform sampler2D uEdges;      // a path's edges (RGBA32F, EdgeRow texels a row): per band of
+                               // EdgeBandRows rows its first edge and count, then x0 y0 x1 y1
+uniform int uEdgeBands;        // coverage from the path's edges: their bands, 0 for none
+uniform int uEvenOdd;          // ... filled even-odd, else nonzero
 uniform double uQuad[8];
 uniform vec4 uMatrix[5];       // colour matrix columns
 uniform usampler2D uTable;     // gradient colours, 8.8 fixed point
@@ -394,6 +398,60 @@ uvec4 noise(ivec2 at) {
 	return tableColor(tableIndex(t, 0), at);
 }
 
+// The layout of uEdges (FrameRenderer.bindEdges).
+const int EdgeRow = 1024;
+const int EdgeBandRows = 16;
+
+vec4 edgeTexel(int i) {
+	return texelFetch(uEdges, ivec2(i % EdgeRow, i / EdgeRow), 0);
+}
+
+// The share of a unit of height an edge crossing a pixel's row covers to
+// its right inside the pixel, the edge running from x = a to x = b
+// (relative to the pixel's left side) over that height: the mean of
+// clamp(1 - x, 0, 1) along it.
+float rightOf(float a, float b) {
+	float lo = min(a, b), hi = max(a, b);
+	float span = hi - lo;
+	if (span < 1e-6) return clamp(1.0 - 0.5 * (lo + hi), 0.0, 1.0);
+	float left = max(min(hi, 0.0) - lo, 0.0);
+	float m0 = clamp(lo, 0.0, 1.0), m1 = clamp(hi, 0.0, 1.0);
+	return (left + (m1 - m0) * (1.0 - 0.5 * (m0 + m1))) / span;
+}
+
+// The coverage byte of the pixel at `at` by the path whose edges are in
+// uEdges, as the canvas's rasterizer finds it: the winding-weighted area
+// of the pixel square right of each edge of its band, summed, then folded
+// by the rule and rounded.
+uint pathCoverage(ivec2 at) {
+	vec4 band = edgeTexel((at.y - uBox.y) / EdgeBandRows);
+	int first = int(band.x), count = int(band.y);
+	float px = float(at.x), py = float(at.y);
+	float acc = 0.0;
+	for (int i = 0; i < count; i++) {
+		vec4 e = edgeTexel(first + i);
+		float dir = 1.0;
+		if (e.y > e.w) {
+			e = e.zwxy;
+			dir = -1.0;
+		}
+		float ya = max(e.y, py), yb = min(e.w, py + 1.0);
+		if (ya >= yb) continue;
+		float dxdy = (e.z - e.x) / (e.w - e.y);
+		float xa = e.x + (ya - e.y) * dxdy - px;
+		float xb = e.x + (yb - e.y) * dxdy - px;
+		acc += dir * (yb - ya) * rightOf(xa, xb);
+	}
+	float a = abs(acc);
+	if (uEvenOdd != 0) {
+		a = a - 2.0 * floor(a * 0.5);
+		a = min(a, 2.0 - a);
+	} else {
+		a = min(a, 1.0);
+	}
+	return uint(a * 255.0 + 0.5);
+}
+
 // The exact area of the pixel square at `at` inside the convex quad:
 // the quad clipped to the square's four sides, then the shoelace sum.
 double quadArea(ivec2 at) {
@@ -590,6 +648,12 @@ void main() {
 		}
 		uint a = uAlpha;
 		bool unbounded = uComposite == SourceIn || uComposite == SourceOut || uComposite == DestinationIn || uComposite == DestinationAtop || uComposite == Copy;
+		if (uEdgeBands != 0) {
+			k = pathCoverage(at);
+			if (uHardQuad != 0) k = k >= 128u ? 255u : 0u;
+			// lowerFill's clipCoverage, for an operator that keeps what lies outside.
+			if (uHasClip != 0 && !unbounded) k = div255(k * byteOf(texelFetch(uClip, local, 0).r));
+		}
 		uint m = (unbounded && uHasClip != 0) ? byteOf(texelFetch(uClip, local, 0).r) : 255u;
 		bool shadedPaint = uPaintKind != 0;
 		if (uOp == 1) {
