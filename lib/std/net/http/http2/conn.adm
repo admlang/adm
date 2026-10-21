@@ -304,10 +304,39 @@ partial module std.net.http.http2 {
 		return Http2Error{message: "http2: stream {streamID}: timed out", code: "timeout", errorCode: ErrorCode.Cancel, streamID: streamID}
 	}
 
+	// How many frames may wait for the writer task before a peer that
+	// keeps asking for them (PINGs, SETTINGS) loses the connection.
+	internal const maxQueuedControlFrames = 10000
+
+	// A frame for the writer task: WINDOW_UPDATE (`increment`), a PING or
+	// SETTINGS ACK, RST_STREAM (`code`).
+	internal struct ControlFrame {
+		kind      FrameType
+		streamID  int
+		increment int
+		code      ErrorCode
+		data      byte[]
+	}
+
+	// The lock header blocks are encoded and written under, apart from
+	// the connection's: a block waiting on the transport keeps no frame
+	// from being read. Opening a stream takes the connection's lock only
+	// to number it, so identifiers still rise in wire order.
+	internal type BlockLock {
+		def new() {}
+
+		atomic def run(body def () !none) !none {
+			return try body()
+		}
+	}
+
 	// Conn is one HTTP/2 connection: the framer over the transport, the
 	// HPACK codecs, the streams, the windows and the settings of both
-	// sides. A reader task started by `handshake` dispatches every frame;
-	// writes go straight out, serialised by the framer. A client opens
+	// sides. A reader task started by `handshake` dispatches every frame
+	// and never waits on the transport: the frames it answers with (ACKs,
+	// WINDOW_UPDATE, RST_STREAM) go out through a writer task. Streams
+	// write DATA straight out, serialised by the framer, and header blocks
+	// under a lock of their own (`BlockLock`). A client opens
 	// streams with `newStream`; a server gets each stream the peer opens
 	// through `onStream`, run in its own task. Safe from many tasks.
 	type Conn {
@@ -367,6 +396,13 @@ partial module std.net.http.http2 {
 		internal lastRead          time.Time             = time.now()
 		// Stream 1 of an upgraded connection, until `handshake` runs it.
 		internal upgraded          ?Stream               = none
+		// Frames waiting for the writer task, and its wake-up.
+		internal control           ControlFrame[]        = []
+		internal controlReady      channel<none>
+		// SETTINGS_HEADER_TABLE_SIZE values the encoder has yet to take,
+		// in the order they came.
+		internal tableSizes        int[]                 = []
+		internal blocks            BlockLock             = new BlockLock()
 
 		def new(reader io.Reader, writer io.Writer, isClient bool, closer ?io.Closer = none) {
 			self.framer = new Framer(reader, writer)
@@ -378,6 +414,7 @@ partial module std.net.http.http2 {
 			self.nextStreamID = isClient ?? (1, 2)
 			self.signal = new channel<none>(1)
 			self.ended = new channel<none>(1)
+			self.controlReady = new channel<none>(1)
 		}
 
 		// Blocks until the connection has closed, by either side or by a
@@ -413,7 +450,7 @@ partial module std.net.http.http2 {
 				try io.readFull(framer.reader, magic)
 				fail connError(ErrorCode.ProtocolError, "bad connection preface") unless string(magic) == clientPreface
 			}
-			let settings = [Setting{id:int(SettingID.HeaderTableSize), value:defaultHeaderTableSize}, Setting{id:int(SettingID.InitialWindowSize), value:initialWindow}, Setting{id:int(SettingID.MaxFrameSize), value:framer.maxReadFrameSize}, Setting{id:int(SettingID.MaxHeaderListSize), value:maxHeaderListBytes}]
+			let settings = [Setting{id: int(SettingID.HeaderTableSize), value: defaultHeaderTableSize}, Setting{id: int(SettingID.InitialWindowSize), value: initialWindow}, Setting{id: int(SettingID.MaxFrameSize), value: framer.maxReadFrameSize}, Setting{id: int(SettingID.MaxHeaderListSize), value: maxHeaderListBytes}]
 			// Stream priorities of RFC 7540 are ignored here, RFC 9218 signals
 			// are taken.
 			settings.push(Setting{id: int(SettingID.NoRFC7540Priorities), value: 1})
@@ -426,6 +463,8 @@ partial module std.net.http.http2 {
 			}
 			idleSince = time.now()
 			lastRead = idleSince
+			let writer = async writeLoop()
+			writer.keepAlive()
 			let task = async readLoop()
 			task.keepAlive()
 			if idleTimeout > 0s || pingInterval > 0s {
@@ -584,8 +623,28 @@ partial module std.net.http.http2 {
 		// opening block, as one unit so identifiers rise in wire order.
 		// Fails when the connection is closed or closing, the identifiers
 		// ran out, or the write did.
-		atomic def openStream(s Stream, fields HeaderField[], endStream bool) !none {
-			fail connError(ErrorCode.RefusedStream, "connection is closed") when closed
+		def openStream(s Stream, fields HeaderField[], endStream bool) !none {
+			return try blocks.run(def () !none {
+				try assignStream(s, fields)
+				return try framer.writeHeaders(s.id, endStream, encodeBlock(fields))
+			})
+		}
+
+		// Encodes and writes a header block as one unit, so blocks reach
+		// the peer in the order the encoder produced them. Fails when the
+		// connection is closed or the write does.
+		def writeHeaderBlock(streamID int, fields HeaderField[], endStream bool) !none {
+			return try blocks.run(def () !none {
+				try checkOpen()
+				return try framer.writeHeaders(streamID, endStream, encodeBlock(fields))
+			})
+		}
+
+		// Gives a client stream the next identifier and registers it. Fails
+		// when the connection is closed or closing, or the identifiers ran
+		// out.
+		internal atomic def assignStream(s Stream, fields HeaderField[]) !none {
+			try checkOpen()
 			fail connError(ErrorCode.RefusedStream, "connection is closing") when goAwayReceived || goAwaySent
 			fail connError(ErrorCode.RefusedStream, "stream identifiers exhausted") when nextStreamID >= maxStreamID
 			s.id = nextStreamID
@@ -593,17 +652,28 @@ partial module std.net.http.http2 {
 			streams[s.id] = s
 			setPriority(s, joinedValues(fields, "priority"))
 			lastLocalStreamID = s.id
-			let block = encoder.encode(fields)
-			return try framer.writeHeaders(s.id, endStream, block)
+			return none
 		}
 
-		// Encodes and writes a header block as one unit, so blocks reach
-		// the peer in the order the encoder produced them. Fails when the
-		// connection is closed or the write does.
-		atomic def writeHeaderBlock(streamID int, fields HeaderField[], endStream bool) !none {
+		// Fails when the connection is closed.
+		internal def checkOpen() !none {
 			fail connError(ErrorCode.RefusedStream, "connection is closed") when closed
-			let block = encoder.encode(fields)
-			return try framer.writeHeaders(streamID, endStream, block)
+			return none
+		}
+
+		// The header block for the fields, after the encoder took the table
+		// sizes the peer set since the last one. Caller holds `blocks`.
+		internal def encodeBlock(fields HeaderField[]) byte[] {
+			for let n in takeTableSizes() {
+				encoder.applyPeerTableSize(n)
+			}
+			return encoder.encode(fields)
+		}
+
+		internal atomic def takeTableSizes() int[] {
+			let sizes = tableSizes
+			tableSizes = []
+			return sizes
 		}
 
 		// Takes up to n bytes of send window for a stream; 0 when either
@@ -612,8 +682,12 @@ partial module std.net.http.http2 {
 		// The stream counts as sending until `release`.
 		atomic def reserve(s Stream, n int) int {
 			sending[s.id] = s.urgency
-			if connSendWindow > 0 && yieldsTo(s) {
+			let ahead = connSendWindow > 0 ?? (aheadOf(s), none)
+			if !(ahead is none) {
 				deferred++
+				// It may be waiting itself, for a window that came while
+				// it held nothing back: it goes now.
+				ahead.wake()
 				return 0
 			}
 			let room = n
@@ -642,15 +716,15 @@ partial module std.net.http.http2 {
 			wakeDeferred()
 		}
 
-		// yieldsTo reports whether a stream that goes before s is sending
-		// and has stream window left to do so.
-		internal def yieldsTo(s Stream) bool {
+		// aheadOf is a stream that goes before s, is sending and has stream
+		// window left to do so; none when s goes first.
+		internal def aheadOf(s Stream) ?Stream {
 			for let (id, urgency) in sending {
 				continue when id == s.id || urgency > s.urgency
 				let other = streams.get(id)
-				return true when !(other is none) && other.sendWindow > 0 && other.state != StreamState.Closed && (urgency < s.urgency || goesBefore(other, s))
+				return other when !(other is none) && other.sendWindow > 0 && other.state != StreamState.Closed && (urgency < s.urgency || goesBefore(other, s))
 			}
-			return false
+			return none
 		}
 
 		// goesBefore orders two streams of one urgency (RFC 9218 §10): a
@@ -693,12 +767,12 @@ partial module std.net.http.http2 {
 			s.unacked += n
 			connUnacked += n
 			if s.unacked >= initialWindow / 2 && !s.endReceived {
-				framer.writeWindowUpdate(s.id, s.unacked) onerror recover none
+				queueWindowUpdate(s.id, s.unacked)
 				s.recvWindow += s.unacked
 				s.unacked = 0
 			}
 			if connUnacked >= connWindow / 2 {
-				framer.writeWindowUpdate(0, connUnacked) onerror recover none
+				queueWindowUpdate(0, connUnacked)
 				connRecvWindow += connUnacked
 				connUnacked = 0
 			}
@@ -821,7 +895,7 @@ partial module std.net.http.http2 {
 				let h = asHttp2Error(failure)
 				if !(h is none) && h.streamID != 0 {
 					// A stream error: reset that stream and carry on.
-					framer.writeRstStream(h.streamID, h.errorCode) onerror recover none
+					queueReset(h.streamID, h.errorCode)
 					let s = lookup(h.streamID)
 					if !(s is none) {
 						s.failure = h when s.failure is none
@@ -833,6 +907,81 @@ partial module std.net.http.http2 {
 				fatal(failure)
 				return
 			}
+		}
+
+		// The writer task: sends the frames the reader and the streams'
+		// consumption queue, until the connection closes. A failed write
+		// ends the connection.
+		internal def writeLoop() {
+			for {
+				let batch = takeControl()
+				if batch.len() == 0 {
+					return when closed
+					select {
+						case controlReady:
+						case ended:
+							markEnded()
+							return
+					}
+					continue
+				}
+				for let f in batch {
+					// A closed connection's descriptor may already be another
+					// connection's.
+					return when closed
+					let failure ?error = none
+					writeControl(f) onerror (err error) {
+						failure = err
+						recover none
+					}
+					if !(failure is none) {
+						terminate(failure) unless closed
+						return
+					}
+				}
+			}
+		}
+
+		internal atomic def takeControl() ControlFrame[] {
+			let batch = control
+			control = []
+			return batch
+		}
+
+		internal def writeControl(f ControlFrame) !none {
+			match f.kind {
+				case FrameType.WindowUpdate:
+					return try framer.writeWindowUpdate(f.streamID, f.increment)
+				case FrameType.Ping:
+					return try framer.writePing(true, f.data)
+				case FrameType.Settings:
+					return try framer.writeSettingsAck()
+				case FrameType.RstStream:
+					return try framer.writeRstStream(f.streamID, f.code)
+				default:
+					return none
+			}
+		}
+
+		// Queues a frame the peer asked for (a PING or SETTINGS ACK). Fails
+		// with ENHANCE_YOUR_CALM when the peer asks faster than the
+		// connection writes. Caller holds the lock.
+		internal def queueControl(f ControlFrame) !none {
+			fail connError(ErrorCode.EnhanceYourCalm, "{control.len()} frames wait to be written") when control.len() >= maxQueuedControlFrames
+			control.push(f)
+			controlReady.offer(none)
+			return none
+		}
+
+		// Queues a WINDOW_UPDATE. Caller holds the lock.
+		internal def queueWindowUpdate(streamID int, increment int) {
+			control.push(ControlFrame{kind: FrameType.WindowUpdate, streamID: streamID, increment: increment, code: ErrorCode.NoError, data: []})
+			controlReady.offer(none)
+		}
+
+		internal atomic def queueReset(streamID int, code ErrorCode) {
+			control.push(ControlFrame{kind: FrameType.RstStream, streamID: streamID, increment: 0, code: code, data: []})
+			controlReady.offer(none)
 		}
 
 		// Ends the connection on a connection error: GOAWAY with the
@@ -875,7 +1024,7 @@ partial module std.net.http.http2 {
 						signal.offer(none)
 						return none
 					}
-					return try framer.writePing(true, frame.data)
+					return try queueControl(ControlFrame{kind: FrameType.Ping, streamID: 0, increment: 0, code: ErrorCode.NoError, data: frame.data})
 				case FrameType.GoAway:
 					goAwayReceived = true
 					peerLastStreamID = frame.lastStreamID
@@ -904,7 +1053,7 @@ partial module std.net.http.http2 {
 				return none
 			}
 			try applySettings(frame.settings)
-			try framer.writeSettingsAck()
+			try queueControl(ControlFrame{kind: FrameType.Settings, streamID: 0, increment: 0, code: ErrorCode.NoError, data: []})
 			wakeStreams()
 			signal.offer(none)
 			return none
@@ -916,7 +1065,7 @@ partial module std.net.http.http2 {
 			for let s in settings {
 				match s.id {
 					case 1:
-						encoder.applyPeerTableSize(s.value)
+						tableSizes.push(s.value)
 					case 3:
 						peerMaxConcurrent = s.value
 					case 4:
@@ -1008,7 +1157,7 @@ partial module std.net.http.http2 {
 		internal def creditConn(n int) {
 			connUnacked += n
 			return when connUnacked < connWindow / 2
-			framer.writeWindowUpdate(0, connUnacked) onerror recover none
+			queueWindowUpdate(0, connUnacked)
 			connRecvWindow += connUnacked
 			connUnacked = 0
 		}
