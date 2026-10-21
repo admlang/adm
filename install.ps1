@@ -123,7 +123,9 @@ function Install-Adm {
         $bin = Join-Path $installDir "bin"
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         $entries = @()
-        if ($userPath) { $entries = $userPath.Split(";") | Where-Object { $_ -ne "" } }
+        # @(): one entry would come back as a string, and + would join it to
+        # $bin with no separator.
+        if ($userPath) { $entries = @($userPath.Split(";") | Where-Object { $_ -ne "" }) }
         if (-not ($entries | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") })) {
             [Environment]::SetEnvironmentVariable("Path", (($entries + $bin) -join ";"), "User")
             $pathAdded = $true
@@ -151,7 +153,9 @@ function Install-Adm {
         if (-not $installed) { $installed = "adm" }
         Status "Installed $installed"
         Status "Run 'adm --help' to get started; 'adm doctor' checks the toolchain."
-        Status "To remove ADM later: & '$(Join-Path $installDir "uninstall.ps1")'"
+        # Windows runs no script file by its path under the default execution
+        # policy; the irm line the website shows needs none.
+        Status "To remove ADM later: powershell -ExecutionPolicy Bypass -File '$(Join-Path $installDir "uninstall.ps1")'"
     } finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
