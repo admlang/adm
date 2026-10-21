@@ -1,6 +1,6 @@
 # Removes an ADM installation made by install.ps1:
 #
-#   & "$env:LOCALAPPDATA\adm\uninstall.ps1"            or
+#   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\adm\uninstall.ps1"   or
 #   irm https://raw.githubusercontent.com/admlang/adm/main/uninstall.ps1 | iex
 #
 # Removes only what install.ps1 recorded in <install dir>\install-manifest:
