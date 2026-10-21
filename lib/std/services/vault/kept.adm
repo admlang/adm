@@ -6,6 +6,7 @@ internal std partial module std.services.vault.kept {
 		std.services::(Dependencies, Lifecycle, RestartMode, StartMode)
 		std.services.ipc::(pack, unpack)
 		std.services.vault::Vault
+		std.sync
 		std.time
 	)
 
@@ -53,12 +54,28 @@ internal std partial module std.services.vault.kept {
 		key string
 	}
 
-	// The changes `Persistence.take` hands over: what writes each one, by key, and the
-	// keys in the order they first changed.
+	// A change that is not written yet: what writes it, and which change of the run it
+	// is, so that writing it does not count a later change of its key as written.
+	struct WaitingChange {
+		write  def () !none
+		number int
+	}
+
+	// The changes `Persistence.pending` hands over: each one by key, and the keys in the
+	// order they first changed.
 	struct WaitingValues {
-		writes map<string, def () !none>
+		writes map<string, WaitingChange>
 		order  string[]
 	}
+
+	// Held by the task that writes kept values or removes one, so that one task does it
+	// at a time: a value is never overwritten by an earlier one another task was still
+	// writing, and `writeKept` returns once what waited is in the vault, whichever task
+	// had started to write it.
+	internal let writeLock = new sync.Mutex()
+
+	// Opens the vault for kept values once a run; a task that asks while it opens waits.
+	internal let opening = new sync.Once()
 
 	// The kept values of this run: the ones read or changed, in the vault's encoding, and
 	// the changes that are not written yet. Stopping it writes them, which is how a
@@ -82,17 +99,18 @@ internal std partial module std.services.vault.kept {
 		// The value itself, for the keys read or kept through `restoredPlain` and
 		// `keepPlain`; a `NothingKept` for one the vault holds nothing readable for.
 		plain   map<string, any>
-		// The changes not written yet, and when the last of them was made.
-		writes  map<string, def () !none>
+		// The changes not written yet (one being written included), how many changes
+		// the run made, and when the last of them was made.
+		writes  map<string, WaitingChange>
 		order   string[]
-		touched ?time.Time                = none
+		made    int
+		touched ?time.Time                 = none
 		// A task is waiting for them to rest, and how long they rest before it writes.
 		writing bool
-		rest    duration                  = keepDelay
+		rest    duration                   = keepDelay
 		// The service was stopped: nothing waits any more.
 		ended   bool
-		// The vault was asked to open, and whether it did.
-		asked   bool
+		// The vault opened.
 		open    bool
 
 		// Applies the service's settings. There are none, and it does not fail.
@@ -183,7 +201,8 @@ internal std partial module std.services.vault.kept {
 			}
 			return AfterChange.WriteNow when ended
 			order.push(key) unless writes.hasKey(key)
-			writes = writes.set(key, write)
+			made += 1
+			writes = writes.set(key, WaitingChange{write: write, number: made})
 			touched = now
 			return AfterChange.Nothing when writing
 			writing = true
@@ -196,15 +215,28 @@ internal std partial module std.services.vault.kept {
 			return order.clone()
 		}
 
-		// Hands over the waiting changes; none is waiting afterwards.
+		// The waiting changes. They wait until `written` is told they were written.
+		@query()
+		def pending() WaitingValues {
+			return WaitingValues{writes: writes, order: order.clone()}
+		}
+
+		// Records that the changes of `taken` were written or given up: each stops
+		// waiting unless its key changed again since.
 		@commit()
-		def take() WaitingValues {
-			let taken = WaitingValues{writes: writes, order: order}
-			let nothing map<string, def () !none>
-			writes = nothing
-			order = []
-			touched = none
-			return taken
+		def written(taken WaitingValues) {
+			let left string[]
+			for let key in order {
+				let change = writes.get(key)
+				let was = taken.writes.get(key)
+				if !(change is none) && !(was is none) && change.number == was.number {
+					writes = writes.delete(key)
+				} else {
+					left.push(key)
+				}
+			}
+			order = left
+			touched = none when order.len() == 0
 		}
 
 		// Forgets what is known and waiting for `key`.
@@ -236,14 +268,6 @@ internal std partial module std.services.vault.kept {
 			return last + rest - now
 		}
 
-		// Whether the vault was asked to open; it counts as asked from here on.
-		@commit()
-		def askedBefore() bool {
-			let before = asked
-			asked = true
-			return before
-		}
-
 		// Records whether the vault opened.
 		@commit()
 		def opened(did bool) {
@@ -261,17 +285,18 @@ internal std partial module std.services.vault.kept {
 	// (no home folder, a file from another machine) is not asked again: nothing is kept
 	// and nothing is restored in this run.
 	def keptOpen() bool {
-		return Persistence.isOpen() when Persistence.askedBefore()
-		let did = true
-		await Vault.start() onerror (err error) {
-			did = false
-			recover none
-		}
-		// Started, the service is stopped with the others when the program ends, and
-		// what waits is written then.
-		await Persistence.start() onerror recover none
-		Persistence.opened(did)
-		return did
+		opening.run(def () {
+			let did = true
+			await Vault.start() onerror (err error) {
+				did = false
+				recover none
+			}
+			// Started, the service is stopped with the others when the program ends, and
+			// what waits is written then.
+			await Persistence.start() onerror recover none
+			Persistence.opened(did)
+		})
+		return Persistence.isOpen()
 	}
 
 	// The value the vault holds under `name`; none when there is none, and when the
@@ -386,9 +411,11 @@ internal std partial module std.services.vault.kept {
 			case AfterChange.StartWriter:
 				async writeWhenRested()
 			case AfterChange.WriteNow:
+				writeLock.lock()
 				if keptOpen() {
 					write() onerror recover none
 				}
+				writeLock.unlock()
 			case AfterChange.Nothing:
 				return
 		}
@@ -415,21 +442,27 @@ internal std partial module std.services.vault.kept {
 		writeKept() when left <= 0s
 	}
 
-	// Writes every waiting change now. One that cannot be written (the vault did not
-	// open, the disk is full) is given up.
+	// Writes every waiting change now, once a write another task started has ended. One
+	// that cannot be written (the vault did not open, the disk is full) is given up.
 	def writeKept() {
-		let waiting = Persistence.take()
+		writeLock.lock()
+		defer writeLock.unlock()
+		let waiting = Persistence.pending()
 		return when waiting.order.len() == 0
-		return unless keptOpen()
-		for let key in waiting.order {
-			let write = waiting.writes.get(key)
-			continue when write is none
-			write() onerror recover none
+		if keptOpen() {
+			for let key in waiting.order {
+				let change = waiting.writes.get(key)
+				continue when change is none
+				change.write() onerror recover none
+			}
 		}
+		Persistence.written(waiting)
 	}
 
 	// Forgets the value kept under `key`.
 	def forget(key string) {
+		writeLock.lock()
+		defer writeLock.unlock()
 		Persistence.drop(key)
 		return unless keptOpen()
 		Vault.remove(keptPrefix + key) onerror recover none
