@@ -1,0 +1,566 @@
+// Serial ports: USB serial adapters, modems, GPS receivers, boards' UARTs,
+// microcontrollers. A `SerialPort` reads and writes bytes at the speed and
+// framing the other end expects, with timeouts, and drives the modem lines.
+//
+// Example: ask a modem for its name
+// ```example
+// use std.devices
+//
+// let port = try devices.openSerial("serial:ttyACM0", 115200)
+// defer port.close()
+// try port.write("ATI\r".bytes())
+// let answer = try port.read(1s)
+// ```
+partial module std.devices {
+	use (
+		std.services.storage::(Storage)
+		std.services.devices::(Device, DeviceKind, Devices)
+		std.time
+		std.devices.termios::*
+		std.devices.structs::*
+	)
+
+	// The parity bit after each character's data bits.
+	enum Parity {
+		// No parity bit.
+		None,
+		// Set so the character has an odd number of ones.
+		Odd,
+		// Set so the character has an even number of ones.
+		Even,
+		// Always one.
+		Mark,
+		// Always zero.
+		Space,
+	}
+
+	// How the two ends hold each other back when one cannot take more.
+	enum FlowControl {
+		// Neither does: the program paces what it sends.
+		None,
+		// The RTS and CTS lines.
+		Hardware,
+		// The XON and XOFF characters (0x11, 0x13) in the data.
+		Software,
+	}
+
+	// The modem lines of a port: the two it drives and the four it reads.
+	struct ModemLines {
+		// Data terminal ready and request to send, which this end drives.
+		dtr     bool
+		rts     bool
+		// Clear to send, data set ready, carrier detect and ring indicator,
+		// which the other end drives.
+		cts     bool
+		dsr     bool
+		carrier bool
+		ring    bool
+	}
+
+	// An open serial port, in raw mode: every byte passes as it is, nothing
+	// is echoed, translated or taken as a signal. `openSerial` returns one;
+	// close it when done, or let it go: dispose closes it. The port is this
+	// program's alone while it is open: another program opening it fails
+	// busy (one that opened it in the moment between this program's open
+	// and its claim keeps it too). Closing puts back the settings the port
+	// had and leaves DTR and RTS as they are; drop DTR with `dtr(false)`
+	// first to reset a board that resets on it.
+	//
+	// The fields are what the driver set, which may differ from what was
+	// asked: a driver that cannot divide its clock to a rate keeps the
+	// nearest it can.
+	type SerialPort {
+		// The device the port belongs to.
+		device   Device
+		// Bits a second on the line, start, parity and stop bits included.
+		baud     int         = 0
+		// Bits of data in a character, 5 to 8.
+		dataBits int         = 8
+		parity   Parity      = Parity.None
+		// Stop bits after a character, 1 or 2.
+		stopBits int         = 1
+		flow     FlowControl = FlowControl.None
+
+		// The node's descriptor, -1 once closed.
+		internal fd       int    = -1
+		// The termios2 the port had before, put back on close.
+		internal original byte[]
+
+		internal def new(device Device, fd int) {
+			self.device = device
+			self.fd = fd
+		}
+
+		// Reads what has arrived into data, waiting up to timeout for the
+		// first byte; returns how many it copied. Implements std.net.Stream.
+		//
+		// Fails with the code `ETIMEDOUT` when nothing arrived in time, and
+		// when the port is closed, or gone, as it is when unplugged.
+		def read(data byte[], timeout duration) !int {
+			fail "devices: {device.id} is closed" when fd < 0
+			return 0 when data.len() == 0
+			let ready = try Storage.wait(fd, timeout)
+			fail Error{message: "devices: nothing arrived from {device.id} in {timeout}", code: "ETIMEDOUT"} unless ready
+			let n = try Storage.read(fd, data)
+			// A port poll calls readable that then holds nothing was hung up.
+			fail "devices: {device.id} is gone" when n == 0
+			return n
+		}
+
+		// Reads what has arrived into data, waiting for the first byte
+		// without end. Implements std.io.Reader.
+		//
+		// Fails when the port is closed or gone.
+		def read(data byte[]) !int {
+			for {
+				let n = read(data, FOREVER) onerror (err error) {
+					fail err unless err.code == "ETIMEDOUT"
+					recover -1
+				}
+				return n when n >= 0
+			}
+			fail "unreachable"
+		}
+
+		// What has arrived, waiting up to timeout for the first byte; empty
+		// when nothing arrived in time.
+		//
+		// Fails when the port is closed or gone.
+		def read(timeout duration) !byte[] {
+			let buf byte[]
+			buf.len(READ_CHUNK)
+			let n = read(buf, timeout) onerror (err error) {
+				fail err unless err.code == "ETIMEDOUT"
+				recover 0
+			}
+			return buf.slice(0, n).clone()
+		}
+
+		// Writes all of data, waiting up to timeout for room in the driver
+		// each time it is full; returns data's length. Implements
+		// std.net.Stream.
+		//
+		// Fails with the code `ETIMEDOUT` when the driver had no room in
+		// time (the other end holds the flow back), and when the port is
+		// closed or gone.
+		def write(data byte[], timeout duration) !int {
+			fail "devices: {device.id} is closed" when fd < 0
+			let sent = 0
+			for sent < data.len() {
+				let n = Storage.write(fd, data[sent:]) onerror (err error) {
+					fail err unless err.code == "EAGAIN"
+					recover 0
+				}
+				sent += n
+				continue when n > 0
+				let ready = try Storage.wait(fd, timeout, true)
+				fail Error{message: "devices: {device.id} took no more for {timeout}", code: "ETIMEDOUT"} unless ready
+			}
+			return sent
+		}
+
+		// Writes all of data, waiting for room without end. Implements
+		// std.io.Writer.
+		//
+		// Fails when the port is closed or gone.
+		def write(data byte[]) !int {
+			return write(data, FOREVER)
+		}
+
+		// Changes the speed or framing; a 0 or none keeps what the port has.
+		// What was written before goes out at the old settings first.
+		//
+		// Fails when the port is closed or the driver refuses the settings.
+		def configure(baud int = 0, dataBits int = 0, parity ?Parity = none, stopBits int = 0, flow ?FlowControl = none) !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			try drain()
+			let p Parity = self.parity
+			p = parity unless parity is none
+			let f FlowControl = self.flow
+			f = flow unless flow is none
+			return applySettings(self, baud == 0 ?? (self.baud, baud), dataBits == 0 ?? (self.dataBits, dataBits), p, stopBits == 0 ?? (self.stopBits, stopBits), f, TCSETS2)
+		}
+
+		// Waits until everything written has left the port.
+		//
+		// Fails when the port is closed.
+		def drain() !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			let queued = zeroed(4)
+			for {
+				try Storage.control(fd, TIOCOUTQ, queued)
+				let left = u32(queued, 0)
+				break when left == 0
+				time.sleep(characterTime(left))
+			}
+			// The last characters in the UART's own buffer.
+			time.sleep(characterTime(UART_FIFO))
+			return none
+		}
+
+		// Throws away what arrived and was not read, and what was written
+		// and has not left yet.
+		//
+		// Fails when the port is closed.
+		def discard() !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			try Storage.control(fd, TCFLSH, TCIOFLUSH)
+			return none
+		}
+
+		// Holds the line at zero for length after what was written has left:
+		// the break that resets some devices or starts a LIN frame.
+		//
+		// Fails when the port is closed or the driver cannot send a break.
+		def sendBreak(length duration = 250ms) !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			try drain()
+			try Storage.control(fd, TIOCSBRK, 0)
+			time.sleep(length)
+			try Storage.control(fd, TIOCCBRK, 0)
+			return none
+		}
+
+		// The modem lines as they are now.
+		//
+		// Fails when the port is closed or has no modem lines.
+		def lines() !ModemLines {
+			fail "devices: {device.id} is closed" when fd < 0
+			let bits = zeroed(4)
+			try Storage.control(fd, TIOCMGET, bits)
+			let v = u32(bits, 0)
+			return ModemLines{
+				dtr:     (v & TIOCM_DTR) != 0,
+				rts:     (v & TIOCM_RTS) != 0,
+				cts:     (v & TIOCM_CTS) != 0,
+				dsr:     (v & TIOCM_DSR) != 0,
+				carrier: (v & TIOCM_CAR) != 0,
+				ring:    (v & TIOCM_RNG) != 0,
+			}
+		}
+
+		// Raises or drops data terminal ready (an Arduino resets when it
+		// drops).
+		//
+		// Fails when the port is closed or has no modem lines.
+		def dtr(on bool) !none {
+			return line(TIOCM_DTR, on)
+		}
+
+		// Raises or drops request to send. Under hardware flow control the
+		// driver drives it.
+		//
+		// Fails when the port is closed or has no modem lines.
+		def rts(on bool) !none {
+			return line(TIOCM_RTS, on)
+		}
+
+		// Closes the port; a closed port stays closed. Implements
+		// std.io.Closer; does not fail.
+		def close() !none {
+			return none when fd < 0
+			if original.len() == TERMIOS2_SIZE {
+				// The hang-up on close stays off: it would drop DTR.
+				putU32(original, C_CFLAG, u32(original, C_CFLAG) & ~HUPCL)
+				Storage.control(fd, TCSETS2, original) onerror recover 0
+			}
+			Storage.control(fd, TIOCNXCL, 0) onerror recover 0
+			Devices.close(fd) onerror recover none
+			fd = -1
+			return none
+		}
+
+		// Whether the port is open.
+		def isOpen() bool {
+			return fd >= 0
+		}
+
+		// Closing on dispose, so a port nobody holds any more is released.
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Raises or drops one modem line.
+		internal def line(bit int, on bool) !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			let bits = zeroed(4)
+			putU32(bits, 0, bit)
+			try Storage.control(fd, on ?? (TIOCMBIS, TIOCMBIC), bits)
+			return none
+		}
+
+		// How long `count` characters take on the line at the port's
+		// framing, at least a millisecond.
+		internal def characterTime(count int) duration {
+			let parityBits = parity == Parity.None ?? (0, 1)
+			let bits = 1 + dataBits + parityBits + stopBits
+			let ns = int64(count) * int64(bits) * 1000000000 / int64(baud.max(1))
+			return duration(ns.max(1000000))
+		}
+	}
+
+	// The serial ports, GPS receivers among them (`DeviceKind.Gps`, a port
+	// whose USB ids are a GPS maker's).
+	//
+	// Fails when the policy denies listing the devices.
+	def serialPorts() !Device[] {
+		let out Device[]
+		for let (_, d) in try Devices.list() {
+			out.push(d) when d.id.startsWith("serial:")
+		}
+		return out
+	}
+
+	// Opens the serial port behind an id from serialPorts, raw, at the
+	// speed and framing given (9600 8N1 by default, any rate the driver
+	// can make).
+	//
+	// Fails when the policy denies serial ports (the `serial` permission,
+	// and its `device` rules for this id), there is no such port, it cannot
+	// be opened (on Linux the user needs the `dialout` group, or the
+	// `uucp` group on some systems), another program holds it, or the
+	// driver refuses the settings.
+	@requires("adm.devices.serial")
+	def openSerial(id string, baud int = 9600, dataBits int = 8, parity Parity = Parity.None, stopBits int = 1, flow FlowControl = FlowControl.None) !SerialPort {
+		expects {
+			assert id.startsWith("serial:") onerror fail "devices: {id} is not a serial port"
+		}
+		try admitDevice("adm.devices.serial", id)
+		return openPort(id, baud, dataBits, parity, stopBits, flow)
+	}
+
+	// Opens a serial port, Serial or Gps, without a policy check of its
+	// own: the caller made the one its kind needs.
+	//
+	// Fails as openSerial does.
+	internal def openPort(id string, baud int, dataBits int, parity Parity, stopBits int, flow FlowControl) !SerialPort {
+		let fd = Devices.open(id) onerror (err error) {
+			fail Error{message: "devices: {id} is busy: another program holds it", code: "EBUSY", cause: err} when err.code == "EBUSY"
+			fail err
+		}
+		let found = Devices.opened(fd)
+		if found is none {
+			Devices.close(fd) onerror recover none
+			fail "devices: no device with the id {id}"
+		}
+		let device Device = found
+		if !(device.kind := DeviceKind.Serial || DeviceKind.Gps) {
+			Devices.close(fd) onerror recover none
+			fail "devices: {id} is not a serial port"
+		}
+		return portOn(device, fd, baud, dataBits, parity, stopBits, flow)
+	}
+
+	// A serial port on an open descriptor, which it then owns; the
+	// descriptor is closed when the port cannot be set up.
+	//
+	// Fails when another program holds the port or the driver refuses the
+	// settings.
+	internal def portOn(device Device, fd int, baud int, dataBits int, parity Parity, stopBits int, flow FlowControl) !SerialPort {
+		let port = new SerialPort(device, fd)
+		setUpPort(port, baud, dataBits, parity, stopBits, flow) onerror (err error) {
+			Devices.close(fd) onerror recover none
+			fail Error{message: "devices: {device.id} is busy: another program holds it", code: "EBUSY", cause: err} when err.code == "EBUSY"
+			fail err
+		}
+		return port
+	}
+
+	// Takes the descriptor over: makes it this program's alone, never
+	// blocking, and raw at the settings asked for.
+	//
+	// Fails when another program holds the port or the driver refuses
+	// the settings.
+	internal def setUpPort(port SerialPort, baud int, dataBits int, parity Parity, stopBits int, flow FlowControl) !none {
+		try Storage.control(port.fd, TIOCEXCL, 0)
+		let original = zeroed(TERMIOS2_SIZE)
+		try Storage.control(port.fd, TCGETS2, original)
+		port.original = original
+		let on = zeroed(4)
+		putU32(on, 0, 1)
+		try Storage.control(port.fd, FIONBIO, on)
+		try applySettings(port, baud, dataBits, parity, stopBits, flow, TCSETS2)
+		// What was left in the driver from before is not this program's.
+		try Storage.control(port.fd, TCFLSH, TCIOFLUSH)
+		return none
+	}
+
+	// Sets the port raw at the settings and reads back what the driver
+	// kept.
+	//
+	// Fails when the settings are out of range or the driver refuses
+	// them.
+	internal def applySettings(port SerialPort, baud int, dataBits int, parity Parity, stopBits int, flow FlowControl, request int) !none {
+		expects {
+			assert baud > 0 onerror fail "devices: a baud rate is positive, not {baud}"
+			assert dataBits >= 5 && dataBits <= 8 onerror fail "devices: a character has 5 to 8 data bits, not {dataBits}"
+			assert stopBits == 1 || stopBits == 2 onerror fail "devices: a character has 1 or 2 stop bits, not {stopBits}"
+		}
+		let settings = zeroed(TERMIOS2_SIZE)
+		try Storage.control(port.fd, TCGETS2, settings)
+		rawSettings(settings, baud, dataBits, parity, stopBits, flow)
+		try Storage.control(port.fd, request, settings)
+		try Storage.control(port.fd, TCGETS2, settings)
+		port.baud = u32(settings, C_OSPEED)
+		port.baud = baud when port.baud == 0
+		port.dataBits = dataBitsOf(u32(settings, C_CFLAG))
+		port.parity = parityOf(u32(settings, C_CFLAG))
+		port.stopBits = (u32(settings, C_CFLAG) & CSTOPB) != 0 ?? (2, 1)
+		port.flow = flowOf(u32(settings, C_IFLAG), u32(settings, C_CFLAG))
+		return none
+	}
+
+	// How much one read takes at most.
+	internal const READ_CHUNK = 4096
+	// The longest wait a read or write without a timeout makes at once.
+	internal const FOREVER = 3600s
+	// The characters a UART holds after the driver handed them over: a
+	// 16550's transmit buffer.
+	internal const UART_FIFO = 16
+}
+
+// The Linux serial port interface (asm-generic/termbits.h, asm/ioctls.h):
+// the settings travel in a `termios2`, whose own speed fields take any rate
+// (BOTHER).
+internal partial module std.devices.termios {
+	use (
+		std.devices::(FlowControl, Parity)
+		std.devices.structs::*
+	)
+
+	// struct termios2: four flag words, the line discipline, 19 control
+	// characters, the input and output speeds.
+	const TERMIOS2_SIZE = 44
+	const C_IFLAG = 0
+	const C_OFLAG = 4
+	const C_CFLAG = 8
+	const C_LFLAG = 12
+	const C_CC = 17
+	const C_ISPEED = 36
+	const C_OSPEED = 40
+
+	const TCGETS2 = 0x802C542A
+	const TCSETS2 = 0x402C542B
+	const TCSETSW2 = 0x402C542C
+	const TCFLSH = 0x540B
+	const TCIOFLUSH = 2
+	const TIOCEXCL = 0x540C
+	const TIOCNXCL = 0x540D
+	const TIOCOUTQ = 0x5411
+	const TIOCMGET = 0x5415
+	const TIOCMBIS = 0x5416
+	const TIOCMBIC = 0x5417
+	const TIOCSBRK = 0x5427
+	const TIOCCBRK = 0x5428
+	const FIONBIO = 0x5421
+
+	const TIOCM_DTR = 0x002
+	const TIOCM_RTS = 0x004
+	const TIOCM_CTS = 0x020
+	const TIOCM_CAR = 0x040
+	const TIOCM_RNG = 0x080
+	const TIOCM_DSR = 0x100
+
+	// c_cflag.
+	const CBAUD = 0x100F
+	const BOTHER = 0x1000
+	const CSIZE = 0x30
+	const CSTOPB = 0x40
+	const CREAD = 0x80
+	const PARENB = 0x100
+	const PARODD = 0x200
+	const HUPCL = 0x400
+	const CLOCAL = 0x800
+	const CMSPAR = 0x40000000
+	const CRTSCTS = 0x80000000
+	const CIBAUD = 0x100F0000
+	const IBSHIFT = 16
+
+	// c_iflag.
+	const IGNBRK = 0x001
+	const BRKINT = 0x002
+	const PARMRK = 0x008
+	const INPCK = 0x010
+	const ISTRIP = 0x020
+	const INLCR = 0x040
+	const IGNCR = 0x080
+	const ICRNL = 0x100
+	const IXON = 0x400
+	const IXANY = 0x800
+	const IXOFF = 0x1000
+
+	// c_oflag and c_lflag.
+	const OPOST = 0x01
+	const ISIG = 0x01
+	const ICANON = 0x02
+	const ECHO = 0x08
+	const ECHOE = 0x10
+	const ECHOK = 0x20
+	const ECHONL = 0x40
+	const IEXTEN = 0x8000
+
+	// c_cc: a read returns what is there (VMIN 0) without waiting (VTIME
+	// 0); the waiting is the poller's.
+	const VTIME = 5
+	const VMIN = 6
+
+	// Rewrites a termios2 the driver handed out to raw mode at the
+	// settings, as cfmakeraw does, with the receiver on, the modem's
+	// carrier ignored, the lines left up on close, and the speed in the
+	// speed fields.
+	def rawSettings(settings byte[], baud int, dataBits int, parity Parity, stopBits int, flow FlowControl) {
+		let iflag = u32(settings, C_IFLAG) & ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON | IXOFF | IXANY | INPCK)
+		let lflag = u32(settings, C_LFLAG) & ~(ECHO | ECHOE | ECHOK | ECHONL | ICANON | ISIG | IEXTEN)
+		let oflag = u32(settings, C_OFLAG) & ~OPOST
+		let cflag = u32(settings, C_CFLAG) & ~(CBAUD | CIBAUD | CSIZE | CSTOPB | PARENB | PARODD | CMSPAR | CRTSCTS | HUPCL)
+		cflag |= CREAD | CLOCAL | BOTHER | (BOTHER << IBSHIFT) | sizeBits(dataBits)
+		cflag |= CSTOPB when stopBits == 2
+		match parity {
+			case Parity.None:
+				cflag |= 0
+			case Parity.Odd:
+				cflag |= PARENB | PARODD
+			case Parity.Even:
+				cflag |= PARENB
+			case Parity.Mark:
+				cflag |= PARENB | CMSPAR | PARODD
+			case Parity.Space:
+				cflag |= PARENB | CMSPAR
+		}
+		iflag |= INPCK unless parity == Parity.None
+		cflag |= CRTSCTS when flow == FlowControl.Hardware
+		iflag |= IXON | IXOFF when flow == FlowControl.Software
+		putU32(settings, C_IFLAG, iflag)
+		putU32(settings, C_OFLAG, oflag)
+		putU32(settings, C_CFLAG, cflag)
+		putU32(settings, C_LFLAG, lflag)
+		settings[C_CC + VMIN] = byte(0)
+		settings[C_CC + VTIME] = byte(0)
+		putU32(settings, C_ISPEED, baud)
+		putU32(settings, C_OSPEED, baud)
+	}
+
+	// The CSIZE bits for 5 to 8 data bits (CS5 is 0, CS8 0x30).
+	def sizeBits(dataBits int) int {
+		return ((dataBits - 5) << 4) & CSIZE
+	}
+
+	// The data bits a c_cflag sets.
+	def dataBitsOf(cflag int) int {
+		return 5 + ((cflag & CSIZE) >> 4)
+	}
+
+	// The parity a c_cflag sets.
+	def parityOf(cflag int) Parity {
+		return Parity.None when (cflag & PARENB) == 0
+		return (cflag & PARODD) != 0 ?? (Parity.Mark, Parity.Space) when (cflag & CMSPAR) != 0
+		return (cflag & PARODD) != 0 ?? (Parity.Odd, Parity.Even)
+	}
+
+	// The flow control the flags set; hardware wins when both are.
+	def flowOf(iflag int, cflag int) FlowControl {
+		return FlowControl.Hardware when (cflag & CRTSCTS) != 0
+		return FlowControl.Software when (iflag & IXON) != 0
+		return FlowControl.None
+	}
+}

@@ -1,0 +1,423 @@
+// Reading keyboards, mice, game pads, touch pads and other input devices
+// directly, event by event, outside any window (Linux evdev).
+//
+// A window gets its keys and pointer through `std.ui`; this is for what no
+// window sees: a game pad's sticks and rumble, a device the program owns
+// alone (`grab`), a kiosk or a service without a window.
+//
+// Example: the next report of the first game pad
+// ```example
+// use std.devices
+//
+// let pads = try devices.inputDevices(DeviceKind.Gamepad)
+// let pad = try devices.openInput(pads[0].id)
+// defer pad.close()
+// for let (_, event) in try pad.read(1s) {
+//     println("{event.kind} {event.code} = {event.value}")
+// }
+// ```
+partial module std.devices {
+	use (
+		std.services.storage::(Storage)
+		std.services.devices::(Device, DeviceKind, Devices)
+		std.time
+		std.devices.evdev::*
+		std.devices.structs::*
+	)
+
+	// What an input event reports.
+	enum InputKind {
+		// A key or button went down (1), up (0), or repeats (2).
+		Key,
+		// Movement by an amount: a mouse's motion, a wheel's turn.
+		Relative,
+		// A position on an axis: a stick, a trigger, a touch pad finger.
+		Absolute,
+		// A switch's state: a laptop lid, a headphone jack.
+		Switch,
+		// A value no other kind carries: a key's scan code, a timestamp.
+		Misc,
+		// A LED's state: caps lock, num lock.
+		Led,
+		// A sound the device makes: a click, a bell.
+		Sound,
+		// The key-repeat delay or period.
+		Repeat,
+		// A force-feedback effect's state.
+		ForceFeedback,
+		// A power button or power-state event.
+		Power,
+	}
+
+	// One event of an input device. `code` is the Linux code of the key,
+	// button or axis (linux/input-event-codes.h: KEY_A is 30, BTN_SOUTH 304,
+	// ABS_X 0, REL_WHEEL 8).
+	struct InputEvent {
+		// When the kernel saw it, on the clock `time.monoNs` reads.
+		time  duration
+		kind  InputKind
+		code  int
+		value int
+	}
+
+	// An absolute axis: its range and where it is now.
+	struct Axis {
+		code       int
+		value      int
+		minimum    int
+		maximum    int
+		// Changes smaller than this are noise the driver filters out.
+		fuzz       int
+		// Values within this of the centre read as the centre (a stick's dead zone).
+		flat       int
+		// Units a millimetre, or a radian for a rotation; 0 when unknown.
+		resolution int
+	}
+
+	// An open input device. openInput returns one; close it when done, or let
+	// it go: dispose closes it.
+	type InputDevice {
+		// The device the events come from.
+		device Device
+
+		// The node's descriptor, -1 once closed.
+		internal fd        int            = -1
+		// Bytes read from the node and not yet taken apart.
+		internal pending   byte[]
+		// The events of the report being gathered.
+		internal gathered  InputEvent[]
+		// Events were lost: what follows up to the next report is discarded
+		// and the state is read from the driver again.
+		internal dropped   bool           = false
+		// The keys down and the axes' values as the reports handed out tell
+		// them, to report what changed while events were lost.
+		internal down      map<int, bool> = map<int, bool>{}
+		internal positions map<int, int>  = map<int, int>{}
+		// The rumble effect's slot in the driver, -1 before the first rumble.
+		internal effect    int            = -1
+
+		internal def new(device Device, fd int) {
+			self.device = device
+			self.fd = fd
+			// Event times on the monotonic clock; a driver without the
+			// request keeps the wall clock.
+			let clock = zeroed(4)
+			putU32(clock, 0, CLOCK_MONOTONIC)
+			Storage.control(fd, EVIOCSCLOCKID, clock) onerror recover 0
+		}
+
+		// The events of the next report: everything the device changed at
+		// one moment (a stick's two axes, a key and its scan code), waiting
+		// up to timeout for it; empty when none arrived in time. After the
+		// kernel dropped events because they were not read fast enough, the
+		// report holds what changed meanwhile, read from the driver.
+		//
+		// Fails when the device is closed or the read fails, as it does when
+		// the device is unplugged.
+		def read(timeout duration) !InputEvent[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			let started = time.monoNs()
+			for {
+				let report = try takeReport()
+				// A report with nothing in it (only types no event carries, or
+				// a loss that changed nothing) is no report.
+				if !(report is none) {
+					let events InputEvent[] = report
+					return events when events.len() > 0
+					continue
+				}
+				let left = timeout - duration(time.monoNs() - started)
+				return [] when left <= 0s && pending.len() == 0
+				let ready = try Storage.wait(fd, left > 0s ?? (left, 0s))
+				return [] unless ready
+				let buf byte[]
+				buf.len(READ_EVENTS * EVENT_SIZE)
+				let n = try Storage.read(fd, buf)
+				fail "devices: {device.id} is gone" when n == 0
+				pending.push(...buf.slice(0, n))
+			}
+		}
+
+		// The kinds of event the device reports.
+		//
+		// Fails when the device is closed.
+		def kinds() !InputKind[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			let out InputKind[]
+			for let (_, code) in try supported(fd, 0, EV_MAX) {
+				let kind = inputKindOf(code)
+				out.push(kind) unless kind is none
+			}
+			return out
+		}
+
+		// The codes of the keys and buttons the device has.
+		//
+		// Fails when the device is closed.
+		def keys() !int[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			return supported(fd, EV_KEY, KEY_MAX)
+		}
+
+		// The codes of the relative axes the device has (REL_X, REL_WHEEL).
+		//
+		// Fails when the device is closed.
+		def relativeAxes() !int[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			return supported(fd, EV_REL, REL_MAX)
+		}
+
+		// The absolute axes the device has, with their ranges and current
+		// values.
+		//
+		// Fails when the device is closed or will not describe an axis.
+		def axes() !Axis[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			let out Axis[]
+			for let (_, code) in try supported(fd, EV_ABS, ABS_MAX) {
+				out.push(try axis(code))
+			}
+			return out
+		}
+
+		// One absolute axis with its range and current value.
+		//
+		// Fails when the device is closed or has no such axis.
+		def axis(code int) !Axis {
+			fail "devices: {device.id} is closed" when fd < 0
+			fail "devices: {code} is not an axis code" when code < 0 || code > ABS_MAX
+			let buf = zeroed(ABSINFO_SIZE)
+			try Storage.control(fd, EVIOCGABS_BASE + code, buf)
+			return Axis{
+				code:       code,
+				value:      s32(buf, 0),
+				minimum:    s32(buf, 4),
+				maximum:    s32(buf, 8),
+				fuzz:       s32(buf, 12),
+				flat:       s32(buf, 16),
+				resolution: s32(buf, 20),
+			}
+		}
+
+		// The codes of the keys and buttons down now.
+		//
+		// Fails when the device is closed.
+		def pressed() !int[] {
+			fail "devices: {device.id} is closed" when fd < 0
+			let bitmap = zeroed(bitmapBytes(KEY_MAX))
+			try Storage.control(fd, keyStateRequest(bitmap.len()), bitmap)
+			return setBits(bitmap)
+		}
+
+		// Takes the device for this program alone: its events stop reaching
+		// the desktop and every other reader until `release` or close.
+		//
+		// Fails when the device is closed or another program has grabbed it.
+		def grab() !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			try Storage.control(fd, EVIOCGRAB, 1)
+			return none
+		}
+
+		// Gives a grabbed device back to the desktop.
+		//
+		// Fails when the device is closed or was not grabbed.
+		def release() !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			try Storage.control(fd, EVIOCGRAB, 0)
+			return none
+		}
+
+		// Shakes the device's two rumble motors at the strengths, 0 to 1, for
+		// length (at most 65 s): `heavy` the low-frequency motor with the
+		// large weight, `light` the high-frequency one. A new rumble replaces
+		// the one playing.
+		//
+		// Fails when the device is closed, has no rumble motors, or the
+		// strengths are outside 0 to 1.
+		def rumble(heavy float, light float, length duration) !none {
+			expects {
+				assert heavy >= 0.0 && heavy <= 1.0 && light >= 0.0 && light <= 1.0 onerror fail "devices: rumble strengths are 0 to 1, not {heavy} and {light}"
+			}
+			fail "devices: {device.id} is closed" when fd < 0
+			let ms = int(length / 1ms).max(0).min(0xFFFF)
+			let effectData = encodeRumble(effect, int(heavy * 65535.0 + 0.5), int(light * 65535.0 + 0.5), ms)
+			Storage.control(fd, EVIOCSFF, effectData) onerror (err error) {
+				fail "devices: {device.id} has no rumble motors" when effect < 0
+				fail err
+			}
+			effect = effectId(effectData)
+			try Storage.write(fd, encodeEvent(EV_FF, effect, 1))
+			return none
+		}
+
+		// Stops the rumble playing; nothing happens when none plays.
+		//
+		// Fails when the device is closed.
+		def stopRumble() !none {
+			fail "devices: {device.id} is closed" when fd < 0
+			return none when effect < 0
+			try Storage.write(fd, encodeEvent(EV_FF, effect, 0))
+			return none
+		}
+
+		// Releases the device, its rumble effect and a grab; a closed device
+		// stays closed.
+		def close() {
+			return when fd < 0
+			if effect >= 0 {
+				Storage.control(fd, EVIOCRMFF, effect) onerror recover 0
+			}
+			Devices.close(fd) onerror recover none
+			fd = -1
+		}
+
+		// Whether the device is open.
+		def isOpen() bool {
+			return fd >= 0
+		}
+
+		// Closing on dispose, so a device nobody holds any more is released.
+		def dispose() {
+			close()
+		}
+
+		// The next whole report among the bytes read so far, none when they
+		// hold none yet.
+		//
+		// Fails when the driver will not report its state after a drop.
+		internal def takeReport() !?InputEvent[] {
+			let at = 0
+			let report ?InputEvent[] = none
+			for at + EVENT_SIZE <= pending.len() {
+				let raw = decodeEvent(pending, at)
+				at += EVENT_SIZE
+				if raw.kind == EV_SYN {
+					if raw.code == SYN_DROPPED {
+						dropped = true
+						gathered = []
+					} else if raw.code == SYN_REPORT {
+						if dropped {
+							report = try resynchronise(raw)
+						} else {
+							report = gathered
+						}
+						dropped = false
+						gathered = []
+						break
+					}
+					continue
+				}
+				continue when dropped
+				let kind = inputKindOf(raw.kind)
+				continue when kind is none
+				let event = InputEvent{time: duration(raw.seconds * 1000000000 + raw.microseconds * 1000), kind: kind, code: raw.code, value: raw.value}
+				remember(event)
+				gathered.push(event)
+			}
+			pending = pending[at:].clone() when at > 0
+			return report
+		}
+
+		// Records a key's or an axis's new state, as the reports hand it out.
+		internal def remember(event InputEvent) {
+			if event.kind == InputKind.Key {
+				down[event.code] = event.value != 0
+			} else if event.kind == InputKind.Absolute {
+				positions[event.code] = event.value
+			}
+		}
+
+		// The events that tell what changed while events were lost: the
+		// keys that went down or up and the axes that moved, from the
+		// driver's state at the report that followed the loss.
+		//
+		// Fails when the driver will not report its state.
+		internal def resynchronise(at RawEvent) !InputEvent[] {
+			let stamp = duration(at.seconds * 1000000000 + at.microseconds * 1000)
+			let out InputEvent[]
+			let now = map<int, bool>{}
+			for let (_, code) in try pressed() {
+				now[code] = true
+			}
+			for let (code, wasDown) in down {
+				out.push(InputEvent{time: stamp, kind: InputKind.Key, code: code, value: 0}) when wasDown && !now.hasKey(code)
+			}
+			for let (code, _) in now {
+				let known = down.get(code)
+				let wasDown = !(known is none) && known == true
+				out.push(InputEvent{time: stamp, kind: InputKind.Key, code: code, value: 1}) unless wasDown
+			}
+			for let (_, code) in try supported(fd, EV_ABS, ABS_MAX) {
+				let value = (try axis(code)).value
+				let before = positions.get(code)
+				out.push(InputEvent{time: stamp, kind: InputKind.Absolute, code: code, value: value}) when before is none || before != value
+			}
+			for let (_, event) in out {
+				remember(event)
+			}
+			return out
+		}
+	}
+
+	// The input devices, one per event node: keyboards, mice, game pads and
+	// the rest (`DeviceKind.Hid` for media keys, power buttons, sensors).
+	//
+	// Fails when the policy denies listing the devices.
+	def inputDevices() !Device[] {
+		let out Device[]
+		for let (_, d) in try Devices.list() {
+			out.push(d) when d.id.startsWith("input:")
+		}
+		return out
+	}
+
+	// The input devices of one kind (`DeviceKind.Gamepad`, `Keyboard`, ...).
+	//
+	// Fails when the policy denies listing the devices.
+	def inputDevices(kind DeviceKind) !Device[] {
+		return (try inputDevices()).filter((d) => d.kind == kind)
+	}
+
+	// Opens the input device behind an id from inputDevices to read its
+	// events. On Linux the desktop user may open game pads (udev grants
+	// them); keyboards and mice take membership of the `input` group, since
+	// reading them directly reads every key typed anywhere.
+	//
+	// Fails when the policy denies reading input devices (the `input`
+	// permission, and its `device` rules for this id), there is no such
+	// device, or it cannot be opened.
+	@requires("adm.devices.input")
+	def openInput(id string) !InputDevice {
+		expects {
+			assert id.startsWith("input:") onerror fail "devices: {id} is not an input device"
+		}
+		try admitDevice("adm.devices.input", id)
+		let fd = try Devices.open(id)
+		let found = Devices.opened(fd)
+		if found is none {
+			Devices.close(fd) onerror recover none
+			fail "devices: no device with the id {id}"
+		}
+		let device Device = found
+		return new InputDevice(device, fd)
+	}
+
+	// The kind an EV_ type is, none for EV_SYN and the types no event carries.
+	internal def inputKindOf(code int) ?InputKind {
+		return InputKind.Key when code == EV_KEY
+		return InputKind.Relative when code == EV_REL
+		return InputKind.Absolute when code == EV_ABS
+		return InputKind.Switch when code == EV_SW
+		return InputKind.Misc when code == EV_MSC
+		return InputKind.Led when code == EV_LED
+		return InputKind.Sound when code == EV_SND
+		return InputKind.Repeat when code == EV_REP
+		return InputKind.ForceFeedback when code == EV_FF
+		return InputKind.Power when code == EV_PWR
+		return none
+	}
+
+	// How many events one read takes at most.
+	internal const READ_EVENTS = 64
+}
