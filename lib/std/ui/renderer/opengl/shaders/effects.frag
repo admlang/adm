@@ -3,23 +3,43 @@
 // rounded up to whole vectors. Each pass writes one plane (or, for colour
 // blurs, four channels) from others; the comments name the canvas function.
 
-uniform int uMode;
-uniform sampler2D uA;
-uniform sampler2D uB;
-uniform sampler2D uC;
-uniform sampler2D uImage;      // RGBA8 pixels (the group, or the target below)
-uniform ivec2 uOrigin;         // the region's corner on uImage
-uniform int uW;                // the region's width
-uniform int uH;                // its height
-uniform int uPW;               // the plane's width
-uniform vec4 uF;               // float parameters of the pass
-uniform ivec4 uI;              // int parameters of the pass
-uniform double uD;             // a double parameter
-uniform sampler2D uLinear;     // 256 x 1: srgbToLinearTable
-uniform sampler2D uSrgb;       // 4096 x 1: linearToSrgbTable / 255
-uniform sampler2D uOld;        // the region before a store (within blends)
+// Prepended: `#version`; for Vulkan `#define ADM_VULKAN`, which puts the
+// uniforms in one std140 block (set 0, binding 0, at the offsets noted) and
+// the samplers at the bindings named, as canvas.frag has it.
+#ifdef ADM_VULKAN
+#define UNIFORMS_BEGIN layout(std140, set = 0, binding = 0) uniform Uniforms {
+#define UNIFORM
+#define UNIFORMS_END };
+#define SAMPLER(binding_, type_, name_) layout(set = 0, binding = binding_) uniform type_ name_
+#define FRAG_OUT layout(location = 0) out vec4 fragColor
+#else
+#define UNIFORMS_BEGIN
+#define UNIFORM uniform
+#define UNIFORMS_END
+#define SAMPLER(binding_, type_, name_) uniform type_ name_
+#define FRAG_OUT out vec4 fragColor
+#endif
 
-out vec4 fragColor;
+UNIFORMS_BEGIN
+UNIFORM vec4 uF;               // float parameters of the pass   (0)
+UNIFORM ivec4 uI;              // int parameters of the pass     (16)
+UNIFORM ivec2 uOrigin;         // the region's corner on uImage  (32)
+UNIFORM int uMode;             //                                (40)
+UNIFORM int uW;                // the region's width             (44)
+UNIFORM int uH;                // its height                     (48)
+UNIFORM int uPW;               // the plane's width              (52)
+UNIFORM double uD;             // a double parameter             (56, to 64)
+UNIFORMS_END
+
+SAMPLER(1, sampler2D, uA);
+SAMPLER(2, sampler2D, uB);
+SAMPLER(3, sampler2D, uC);
+SAMPLER(4, sampler2D, uImage);  // RGBA8 pixels (the group, or the target below)
+SAMPLER(5, sampler2D, uLinear); // 256 x 1: srgbToLinearTable
+SAMPLER(6, sampler2D, uSrgb);   // 4096 x 1: linearToSrgbTable / 255
+SAMPLER(7, sampler2D, uOld);    // the region before a store (within blends)
+
+FRAG_OUT;
 
 const int Alpha = 0, Covered = 1, Copy = 2, Inverted = 3, Multiply = 4, MultiplyInverse = 5,
 	Shifted = 6, Box = 7, Grown = 8, Ring = 9, Signed = 10, DistanceInit = 11, DistanceColumns = 12,

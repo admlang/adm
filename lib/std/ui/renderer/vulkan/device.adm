@@ -1,0 +1,801 @@
+@os("linux", "darwin", "windows")
+partial module std.ui.renderer.vulkan {
+	use (
+		std.services.runtime::(Runtime)
+		std.ui.renderer.vulkan.vk
+	)
+
+	// An image with its view, in the general layout from its first use on;
+	// its memory is `span` bytes at `offset` of the device's block `block`
+	// (none when `span` is 0).
+	// The PCI vendor id of NVIDIA's devices.
+	internal const vendorNvidia uint32 = 0x10DE
+
+	internal struct Image {
+		image  uint
+		view   uint
+		w      int
+		h      int
+		format uint32
+		block  int    = 0
+		offset uint   = 0
+		span   uint   = 0
+		// A dedicated allocation of its own (an exported image), freed with it.
+		memory uint   = 0
+	}
+
+	// Bytes a block of device memory holds; an image needing more than a
+	// quarter of that gets a block of its own, freed with it.
+	internal const memoryBlock = 64 * 1024 * 1024
+
+	// A block of device memory the images share: the ranges in use, by offset.
+	internal type MemoryBlock {
+		memory     uint
+		size       uint
+		memoryType uint32
+		starts     uint[]
+		ends       uint[]
+
+		def new(memory uint, size uint, memoryType uint32) {
+			self.memory = memory
+			self.size = size
+			self.memoryType = memoryType
+		}
+
+		// The offset a range of `size` bytes aligned to `align` fits at: the
+		// first gap between the ranges in use; none when no gap is large enough.
+		def fit(size uint, align uint) ?uint {
+			let at = uint(0)
+			for let i = 0; i <= starts.len(); i++ {
+				let aligned = (at + align - 1) / align * align
+				let limit = i < starts.len() ?? (starts[i], self.size)
+				return aligned when aligned + size <= limit
+				at = ends[i] when i < starts.len()
+			}
+			return none
+		}
+
+		// Marks the range in use.
+		def take(offset uint, size uint) {
+			let i = 0
+			for i < starts.len() && starts[i] < offset {
+				i++
+			}
+			starts = starts[:i] + uint[offset] + starts[i:]
+			ends = ends[:i] + uint[offset + size] + ends[i:]
+		}
+
+		// Frees the range starting at the offset.
+		def release(offset uint) {
+			for let i = 0; i < starts.len(); i++ {
+				if starts[i] == offset {
+					starts = starts.remove(i)
+					ends = ends.remove(i)
+					return
+				}
+			}
+		}
+
+		def isEmpty() bool {
+			return starts.len() == 0
+		}
+	}
+
+	// A host-visible buffer of the staging arena, mapped for good.
+	internal struct Chunk {
+		buffer uint
+		memory uint
+		mapped uint
+		size   int
+		used   int
+	}
+
+	// Bytes an upload or a uniform block starts at: a multiple of the texel
+	// sizes, of VkBufferImageCopy's 4, and of the device's uniform offset
+	// alignment (the arena rounds up to the larger).
+	internal const arenaAlign = 16
+	// The least a new arena chunk holds.
+	internal const arenaChunk = 4 * 1024 * 1024
+	// Descriptor sets a pool holds, and the descriptors in all of them.
+	internal const poolSets = 1024
+	// Nanoseconds a wait for the GPU may take before the frame is given up.
+	internal const fenceTimeout = 10 * 1000 * 1000 * 1000
+
+	// The Vulkan device the renderer draws with: one instance, one physical
+	// device, one queue, one command buffer in flight. Everything the frame
+	// uploads goes through the arena (host-visible chunks reused once the
+	// GPU is done with the frame), descriptor sets come from pools reset per
+	// frame, and what a frame frees is kept in the graveyard until the fence
+	// says the GPU no longer reads it.
+	internal type Device {
+		internal instance    uint
+		internal physical    uint
+		internal device      uint
+		internal queue       uint
+		internal family      uint32
+		// The device's uniform offset alignment, at least arenaAlign.
+		internal uboAlign    int
+		internal maxImage    int
+		// The alignment images keep from each other (bufferImageGranularity).
+		internal granularity uint
+		// The blocks of device memory the images are carved from.
+		internal blocks      MemoryBlock[]
+		name                 string
+		// Whether it is a CPU device (Mesa's llvmpipe).
+		isCpu                bool
+		// Whether a render pass reads its colour attachment back draw by draw
+		// (VK_KHR_dynamic_rendering_local_read): the canvas then draws a run of
+		// operations in one pass instead of copying the target\'s box before each.
+		localRead            bool
+		// Whether the device computes the canvas in 64-bit floats (its shaders
+		// declare doubles); else the float variants run, within a level of the
+		// CPU canvas, as the GPU canvas does on the web.
+		float64              bool
+		// Whether an image's memory can be exported for another API to import
+		// (VK_KHR_external_memory_fd): a decoded picture is then copied into
+		// the renderer's images on the GPU.
+		exportable           bool
+		// The device's PCI vendor id (`vendorNvidia` for one whose pictures
+		// NVDEC decodes).
+		vendor               uint32
+		internal pool        uint
+		internal cmd         uint
+		internal fence       uint
+		// The command buffer is open for commands.
+		internal recording   bool
+		// A submission is on the GPU: its fence is awaited before the arena,
+		// the pools and the graveyard are reused.
+		internal pending     bool
+
+		internal chunks       Chunk[]
+		internal current      int
+		internal descriptors  uint[]
+		internal poolIndex    int
+		internal graveImages  Image[]
+		internal graveBuffers (uint, uint)[]
+		// The buffer frames are read back through, grown to the largest read.
+		internal readback     Chunk          = Chunk{}
+
+		// Samplers: texels as they are, and bilinear (video planes).
+		internal nearest   uint
+		internal linear    uint
+		// Set and pipeline layouts, shader modules and pipelines by name.
+		internal layouts   map<string, (uint, uint)>
+		internal shaders   map<string, uint>
+		internal pipelines map<string, uint>
+		// 1 x 1 images for the samplers a draw does not read, by format.
+		internal dummies   map<uint32, Image>
+
+		def new() {
+			layouts = map<string, (uint, uint)>{}
+			shaders = map<string, uint>{}
+			pipelines = map<string, uint>{}
+			dummies = map<uint32, Image>{}
+		}
+
+		// Creates the instance (with the extensions, and VK_KHR_surface's
+		// companions when presenting), picks the physical device, creates
+		// the device, its queue, command buffer and samplers. `presents` says
+		// whether a device's graphics queue family can present to the host's
+		// windows on the instance; none when nothing is presented.
+		//
+		// `float64` false makes the device compute in floats even when it has
+		// doubles (the suites check that path).
+		//
+		// Fails when the loader has no Vulkan 1.2 instance, when no device has
+		// what the GPU canvas needs (dynamic rendering and synchronization2,
+		// from Vulkan 1.3 or the KHR extensions on a 1.2 device, and a swapchain
+		// and presentation when presenting), or a creation call fails; the
+		// message names the devices seen and what each lacks. A device without
+		// 64-bit shader floats (MoltenVK) runs the float shaders.
+		def start(loader uint, extensions string[], presents ?(def(uint, uint, uint32) bool), float64 bool = true) !none {
+			let presenting = !(presents is none)
+			fail "the Vulkan loader gave no vkGetInstanceProcAddr" unless vk.load(loader)
+			let version = vk.instanceVersion()
+			fail "the Vulkan loader supports version {version >> 22}.{(version >> 12) & 1023}; the renderer needs 1.2" when version < vk.API_VERSION_1_2
+			let exts = extensions.clone()
+			// MoltenVK's devices are listed only under portability enumeration.
+			exts.push("VK_KHR_portability_enumeration") when vk.hasInstanceExtension("VK_KHR_portability_enumeration")
+			let layers string[]
+			let debug = false
+			let wantDebug = Runtime.getEnv("ADM_VULKAN_VALIDATION")
+			if !(wantDebug is none) && wantDebug == "1" {
+				if vk.hasLayer("VK_LAYER_KHRONOS_validation") && vk.hasInstanceExtension("VK_EXT_debug_utils") {
+					layers.push("VK_LAYER_KHRONOS_validation")
+					exts.push("VK_EXT_debug_utils")
+					debug = true
+				} else {
+					println("vulkan: ADM_VULKAN_VALIDATION is set but VK_LAYER_KHRONOS_validation is not installed")
+				}
+			}
+			let out uint[]
+			out.len(2)
+			let r = vk.createInstance(version >= vk.API_VERSION_1_3 ?? (vk.API_VERSION_1_3, vk.API_VERSION_1_2), exts, uint32(exts.len()), layers, uint32(layers.len()), debug, out)
+			fail "the Vulkan instance cannot be created: {vk.resultName(r)}" when r != vk.SUCCESS
+			instance = out[0]
+
+			let devices uint[]
+			devices.len(16)
+			let n = int(vk.physicalDevices(instance, devices, 16)).min(16)
+			if n == 0 {
+				vk.destroyInstance(instance)
+				instance = 0
+				fail "no Vulkan device is installed"
+			}
+			let pick = -1
+			let pickRank = -1
+			let seen string[]
+			let chosen = Runtime.getEnv("ADM_VULKAN_DEVICE")
+			let wanted = -1
+			wanted = chosen.trim().isNumeric() ?? (chosen.trim().toInt<int>(), -1) unless (chosen is none)
+			let info uint32[]
+			info.len(13)
+			let nameBytes byte[]
+			nameBytes.len(256)
+			for let i = 0; i < n; i++ {
+				vk.physicalDeviceInfo(devices[i], info, nameBytes)
+				let end = 0
+				for end < 255 && nameBytes[end] != 0 {
+					end++
+				}
+				let deviceName = string(nameBytes[0:end])
+				let lacks string[]
+				lacks.push("Vulkan 1.2") when info[0] < vk.API_VERSION_1_2
+				lacks.push("dynamic rendering") when info[3] == 0
+				lacks.push("synchronization2") when info[4] == 0
+				lacks.push("VK_KHR_swapchain") when presenting && info[7] == 0
+				let graphics = vk.queueFamily(devices[i], 0)
+				lacks.push("a graphics queue") when graphics < 0
+				lacks.push("presentation to the windows") when graphics >= 0 && !(presents is none) && !presents(instance, devices[i], uint32(graphics))
+				if lacks.len() > 0 {
+					seen.push("{deviceName} (lacks {lacks.join(", ")})")
+					continue
+				}
+				seen.push(deviceName)
+				if wanted >= 0 {
+					continue when i != wanted
+					pick = i
+					break
+				}
+				// Discrete first, then integrated, virtual, and a CPU device last;
+				// of a kind, one with doubles before one without.
+				let rank = 2 * (info[1] == vk.DEVICE_DISCRETE ?? (4, info[1] == vk.DEVICE_INTEGRATED ?? (3, info[1] == vk.DEVICE_VIRTUAL ?? (2, info[1] == vk.DEVICE_CPU ?? (1, 0))))) + (info[2] != 0 ?? (1, 0))
+				if rank > pickRank {
+					pick = i
+					pickRank = rank
+				}
+			}
+			if pick < 0 {
+				vk.destroyInstance(instance)
+				instance = 0
+				fail "no Vulkan device can run the GPU canvas{wanted >= 0 ?? (" (ADM_VULKAN_DEVICE={wanted})", "")}: {seen.join("; ")}"
+			}
+			physical = devices[pick]
+			vk.physicalDeviceInfo(physical, info, nameBytes)
+			let end = 0
+			for end < 255 && nameBytes[end] != 0 {
+				end++
+			}
+			name = string(nameBytes[0:end])
+			isCpu = info[1] == vk.DEVICE_CPU
+			uboAlign = int(info[5]).max(arenaAlign)
+			maxImage = int(info[6])
+			granularity = uint(info[8]).max(1)
+			localRead = info[9] != 0
+			let noLocal = Runtime.getEnv("ADM_VULKAN_LOCAL_READ")
+			localRead = false when !(noLocal is none) && noLocal == "0"
+			self.float64 = float64 && info[2] != 0
+			exportable = info[11] != 0
+			vendor = info[12]
+			family = uint32(vk.queueFamily(physical, 0))
+
+			let deviceExts string[]
+			deviceExts.push("VK_KHR_swapchain") when presenting
+			if info[0] < vk.API_VERSION_1_3 {
+				deviceExts.push("VK_KHR_dynamic_rendering")
+				deviceExts.push("VK_KHR_synchronization2")
+			}
+			deviceExts.push("VK_KHR_dynamic_rendering_local_read") when localRead
+			deviceExts.push("VK_KHR_portability_subset") when info[10] != 0
+			deviceExts.push("VK_KHR_external_memory_fd") when exportable
+			r = vk.createDevice(physical, family, deviceExts, uint32(deviceExts.len()), localRead, self.float64, out)
+			if r != vk.SUCCESS {
+				vk.destroyInstance(instance)
+				instance = 0
+				fail "the Vulkan device {name} cannot be created: {vk.resultName(r)}"
+			}
+			device = out[0]
+			queue = out[1]
+
+			let made uint[]
+			made.len(3)
+			r = vk.createCommands(device, family, made)
+			fail "the Vulkan command buffer cannot be created: {vk.resultName(r)}" when r != vk.SUCCESS
+			pool = made[0]
+			cmd = made[1]
+			fence = made[2]
+			r = vk.createSampler(device, linear = false, repeat = false, out = made)
+			fail "a Vulkan sampler cannot be created: {vk.resultName(r)}" when r != vk.SUCCESS
+			nearest = made[0]
+			r = vk.createSampler(device, linear = true, repeat = false, out = made)
+			fail "a Vulkan sampler cannot be created: {vk.resultName(r)}" when r != vk.SUCCESS
+			linear = made[0]
+			return none
+		}
+
+		// Waits for the GPU when a submission is pending, frees what the last
+		// frame retired, resets the arena and the descriptor pools, and opens
+		// the command buffer.
+		//
+		// Fails when the GPU does not finish (lost) or the buffer cannot begin.
+		def open() !none {
+			return none when recording
+			try wait()
+			for let (_, g) in graveImages {
+				freeImage(g)
+			}
+			graveImages.len(0)
+			for let (_, b) in graveBuffers {
+				let (buffer, memory) = b
+				vk.destroyBuffer(device, buffer, memory)
+			}
+			graveBuffers.len(0)
+			for let i = 0; i < chunks.len(); i++ {
+				chunks[i].used = 0
+			}
+			current = 0
+			for let (_, p) in descriptors {
+				let _ = vk.resetDescriptorPool(device, p)
+			}
+			poolIndex = 0
+			let r = vk.beginCommands(device, pool, cmd)
+			fail "the Vulkan command buffer cannot begin: {vk.resultName(r)}" when r != vk.SUCCESS
+			recording = true
+			return none
+		}
+
+		// Closes the command buffer and submits it, after `wait` (a semaphore
+		// or 0) and signalling `signal` (or 0).
+		//
+		// Fails when the buffer cannot end or the submission is refused (the
+		// device lost).
+		def submit(wait uint, signal uint) !none {
+			fail "no Vulkan commands are being recorded" unless recording
+			recording = false
+			let r = vk.endCommands(cmd)
+			fail "the Vulkan command buffer cannot end: {vk.resultName(r)}" when r != vk.SUCCESS
+			r = vk.submit(queue, cmd, wait, signal, fence)
+			fail "the Vulkan queue refused the frame: {vk.resultName(r)}" when r != vk.SUCCESS
+			pending = true
+			return none
+		}
+
+		// Waits for the pending submission, when there is one.
+		//
+		// Fails when the GPU does not finish within fenceTimeout.
+		def wait() !none {
+			return none unless pending
+			pending = false
+			let r = vk.waitFence(device, fence, uint(fenceTimeout))
+			fail "the GPU did not finish the frame: {vk.resultName(r)}" when r != vk.SUCCESS
+			return none
+		}
+
+		// Submits what is recorded, waits for it, and opens the buffer again:
+		// for a frame that reads its own pixels back halfway.
+		def flush() !none {
+			try submit(0, 0)
+			try wait()
+			return try open()
+		}
+
+		// Space for n bytes in the arena: the chunk and the offset, aligned
+		// to the device's uniform alignment.
+		//
+		// Fails when a chunk cannot be allocated.
+		internal def reserve(n int) !(int, uint) {
+			let size = n.max(1)
+			for current < chunks.len() {
+				let c = chunks[current]
+				let at = (c.used + uboAlign - 1) / uboAlign * uboAlign
+				if at + size <= c.size {
+					chunks[current].used = at + size
+					return (current, uint(at))
+				}
+				current++
+			}
+			let want = size.max(arenaChunk)
+			want = want.max(chunks[chunks.len() - 1].size * 2) when chunks.len() > 0
+			let out uint[]
+			out.len(3)
+			let r = vk.createBuffer(device, uint(want), vk.BUFFER_TRANSFER_SRC | vk.BUFFER_UNIFORM, true, out)
+			fail "the Vulkan staging buffer ({want} bytes) cannot be allocated: {vk.resultName(r)}" when r != vk.SUCCESS
+			chunks.push(Chunk{buffer: out[0], memory: out[1], mapped: out[2], size: want, used: size})
+			current = chunks.len() - 1
+			return (current, uint(0))
+		}
+
+		// Puts bytes in the arena: the buffer and the offset they start at.
+		def stage(data byte[], n int) !(uint, uint) {
+			let (i, at) = try reserve(n)
+			vk.writeMapped(chunks[i].mapped, at, data, uint(n))
+			return (chunks[i].buffer, at)
+		}
+
+		def stageFloats(data float32[]) !(uint, uint) {
+			let (i, at) = try reserve(data.len() * 4)
+			vk.writeMappedFloats(chunks[i].mapped, at, data, uint(data.len() * 4))
+			return (chunks[i].buffer, at)
+		}
+
+		def stageShorts(data uint16[]) !(uint, uint) {
+			let (i, at) = try reserve(data.len() * 2)
+			vk.writeMappedShorts(chunks[i].mapped, at, data, uint(data.len() * 2))
+			return (chunks[i].buffer, at)
+		}
+
+		def stageInts(data int32[]) !(uint, uint) {
+			let (i, at) = try reserve(data.len() * 4)
+			vk.writeMappedInts(chunks[i].mapped, at, data, uint(data.len() * 4))
+			return (chunks[i].buffer, at)
+		}
+
+		// Uploads w x h texels of `texel` bytes each, packed, into the image at
+		// (x, y) (general layout), through the arena.
+		def upload(img Image, x int, y int, w int, h int, texel int, data byte[]) !none {
+			let n = w * h * texel
+			fail "an upload of {n} bytes was given {data.len()}" when data.len() < n
+			let (buffer, at) = try stage(data, n)
+			vk.cmdCopyToImage(cmd, buffer, at, 0, img.image, int32(x), int32(y), uint32(w), uint32(h))
+			return none
+		}
+
+		// A 2D image of w x h for the usage, its memory carved from a block
+		// (one of its own when it needs more than a quarter of one), brought
+		// into the general layout in the command buffer (so `open` must have
+		// been called).
+		//
+		// Fails when the device cannot make it or has no memory for it.
+		def createImage(w int, h int, format uint32, usage uint32) !Image {
+			fail "a Vulkan image is made outside a frame" unless recording
+			let out uint[]
+			out.len(4)
+			let r = vk.createImage(device, uint32(w.max(1)), uint32(h.max(1)), format, usage, out)
+			fail "a {w}x{h} Vulkan image (format {format}) cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+			let img = Image{image: out[0], w: w.max(1), h: h.max(1), format: format}
+			let (size, align) = (out[1], out[2].max(granularity))
+			let memoryType = vk.chooseMemory(uint32(out[3]), true)
+			if memoryType < 0 {
+				vk.destroyImage(device, img.image, 0)
+				fail "no device memory holds a {w}x{h} Vulkan image (format {format})"
+			}
+			let (block, offset) = try reserveMemory(size, align, uint32(memoryType))
+			let views uint[]
+			views.len(1)
+			r = vk.bindImage(device, img.image, format, blocks[block].memory, offset, views)
+			if r != vk.SUCCESS {
+				blocks[block].release(offset)
+				vk.destroyImage(device, img.image, 0)
+				fail "a {w}x{h} Vulkan image cannot be bound to its memory: {vk.resultName(r)}"
+			}
+			img.view = views[0]
+			img.block = block
+			img.offset = offset
+			img.span = size
+			vk.cmdLayout(cmd, img.image, vk.LAYOUT_UNDEFINED, vk.LAYOUT_GENERAL)
+			return img
+		}
+
+		// An image another API can import (`exportable`): a dedicated
+		// allocation of its own, and the file descriptor over it (the importer
+		// owns it) with the allocation's size.
+		//
+		// Fails when the device cannot make or export it.
+		def createExportedImage(w int, h int, format uint32, usage uint32) !(Image, int, uint) {
+			fail "a Vulkan image is made outside a frame" unless recording
+			fail "the device {name} cannot export an image's memory" unless exportable
+			let out uint[]
+			out.len(4)
+			let r = vk.createExportedImage(device, uint32(w.max(1)), uint32(h.max(1)), format, usage, out)
+			fail "a {w}x{h} exportable Vulkan image (format {format}) cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+			let img = Image{image: out[0], view: out[2], w: w.max(1), h: h.max(1), format: format, block: -1, memory: out[1]}
+			let fd = int(vk.exportMemoryFd(device, img.memory))
+			if fd < 0 {
+				freeImage(img)
+				fail "the memory of a {w}x{h} Vulkan image cannot be exported"
+			}
+			vk.cmdLayout(cmd, img.image, vk.LAYOUT_UNDEFINED, vk.LAYOUT_GENERAL)
+			return (img, fd, out[3])
+		}
+
+		// A range of `size` bytes aligned to `align` in a block of the memory
+		// type: the block's index and the offset. A block is made when none has
+		// room, of memoryBlock bytes, or of the range's own when that is large.
+		//
+		// Fails when the device refuses the memory.
+		internal def reserveMemory(size uint, align uint, memoryType uint32) !(int, uint) {
+			let quarter = uint(memoryBlock / 4)
+			if size <= quarter {
+				for let (i, b) in blocks {
+					continue when b.memoryType != memoryType || b.size != uint(memoryBlock)
+					let at = b.fit(size, align)
+					continue when at is none
+					b.take(at, size)
+					return (i, at)
+				}
+			}
+			let want = size <= quarter ?? (uint(memoryBlock), size)
+			let out uint[]
+			out.len(1)
+			let r = vk.allocate(device, want, memoryType, out)
+			fail "the device refused {want} bytes of memory: {vk.resultName(r)}" when r != vk.SUCCESS
+			let b = new MemoryBlock(out[0], want, memoryType)
+			b.take(0, size)
+			blocks.push(b)
+			return (blocks.len() - 1, 0)
+		}
+
+		// Destroys an image and gives its memory back; a block of the image's
+		// own goes with it.
+		internal def freeImage(img Image) {
+			return when img.image == 0
+			vk.destroyImage(device, img.image, img.view)
+			if img.memory != 0 {
+				vk.free(device, img.memory)
+				return
+			}
+			return when img.span == 0 || img.block < 0 || img.block >= blocks.len()
+			let b = blocks[img.block]
+			b.release(img.offset)
+			if b.isEmpty() && b.size != uint(memoryBlock) {
+				vk.free(device, b.memory)
+				b.memory = 0
+				b.size = 0
+			}
+		}
+
+		// Frees the image once the GPU is done with the frame.
+		def retire(img Image) {
+			return when img.image == 0
+			graveImages.push(img)
+		}
+
+		// A 1 x 1 image of the format for a sampler a draw does not read.
+		def dummy(format uint32) !Image {
+			return dummies[format] when dummies.hasKey(format)
+			let img = try createImage(1, 1, format, vk.USAGE_SAMPLED | vk.USAGE_TRANSFER_DST)
+			vk.cmdClear(cmd, img.image, 0.0, 0.0, 0.0, 0.0)
+			dummies = dummies.set(format, img)
+			return img
+		}
+
+		// A set layout with `uniforms` uniform buffers read by the fragment
+		// stage (one more, read by the vertex stage, when `vertexUniform`),
+		// then `inputs` input attachments and `samplers` combined image
+		// samplers, with a pipeline layout over it: both handles, made once
+		// per name.
+		//
+		// Fails when the device cannot make them.
+		def layout(name string, uniforms int, vertexUniform bool, inputs int, samplers int) !(uint, uint) {
+			return layouts[name] when layouts.hasKey(name)
+			let types uint32[]
+			let stages uint32[]
+			for let i = 0; i < uniforms; i++ {
+				types.push(vk.DESCRIPTOR_UNIFORM_BUFFER)
+				stages.push(vk.STAGE_FRAGMENT)
+			}
+			if vertexUniform {
+				types.push(vk.DESCRIPTOR_UNIFORM_BUFFER)
+				stages.push(vk.STAGE_VERTEX)
+			}
+			for let i = 0; i < inputs; i++ {
+				types.push(vk.DESCRIPTOR_INPUT_ATTACHMENT)
+				stages.push(vk.STAGE_FRAGMENT)
+			}
+			for let i = 0; i < samplers; i++ {
+				types.push(vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER)
+				stages.push(vk.STAGE_FRAGMENT)
+			}
+			let out uint[]
+			out.len(2)
+			let r = vk.createLayouts(device, types, stages, uint32(types.len()), out)
+			fail "the Vulkan layout {name} cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+			let made = (out[0], out[1])
+			layouts = layouts.set(name, made)
+			return made
+		}
+
+		// A shader module from SPIR-V, made once per name.
+		def shader(name string, code byte[]) !uint {
+			return shaders[name] when shaders.hasKey(name)
+			fail "the shader {name} has no SPIR-V" when code.len() == 0 || code.len() % 4 != 0
+			let out uint[]
+			out.len(1)
+			let r = vk.createShader(device, code, uint(code.len()), out)
+			fail "the Vulkan shader {name} cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+			shaders = shaders.set(name, out[0])
+			return out[0]
+		}
+
+		// A pipeline of the vertex and fragment modules into one attachment of
+		// the format (read back by the fragment stage when `local`), made once
+		// per name and format.
+		def pipeline(name string, pipelineLayout uint, vertex uint, fragment uint, format uint32, local bool = false) !uint {
+			let key = "{name}:{format}"
+			return pipelines[key] when pipelines.hasKey(key)
+			let out uint[]
+			out.len(1)
+			let r = vk.createPipeline(device, pipelineLayout, vertex, fragment, format, local, out)
+			fail "the Vulkan pipeline {name} cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+			pipelines = pipelines.set(key, out[0])
+			return out[0]
+		}
+
+		// A descriptor set of the layout, written with the uniform buffers
+		// (from the arena: buffers, offsets, ranges) and then the images, the
+		// first `inputs` of them input attachments, the rest read through their
+		// samplers.
+		//
+		// Fails when no pool can give one.
+		def set(setLayout uint, buffers uint[], offsets uint[], ranges uint[], views uint[], samplers uint[], inputs int = 0) !uint {
+			let out uint[]
+			out.len(1)
+			for true {
+				if poolIndex >= descriptors.len() {
+					let r = vk.createDescriptorPool(device, uint32(poolSets), uint32(poolSets * 2), uint32(poolSets * 12), out)
+					fail "a Vulkan descriptor pool cannot be made: {vk.resultName(r)}" when r != vk.SUCCESS
+					descriptors.push(out[0])
+				}
+				let r = vk.allocateSet(device, descriptors[poolIndex], setLayout, out)
+				if r == vk.SUCCESS {
+					break
+				}
+				fail "a Vulkan descriptor set cannot be allocated: {vk.resultName(r)}" when r != vk.ERROR_OUT_OF_POOL_MEMORY && r != -1 && r != -2
+				poolIndex++
+			}
+			vk.writeSet(device, out[0], buffers, offsets, ranges, uint32(buffers.len()), views, samplers, uint32(views.len()), uint32(inputs))
+			return out[0]
+		}
+
+		// A barrier: every write so far done before anything after reads or
+		// writes. Not inside rendering.
+		def barrier() {
+			vk.cmdBarrier(cmd)
+		}
+
+		// The w x h box of the image at (x, y), as its texels are laid out
+		// (`texel` bytes each), after everything recorded so far has run.
+		// Leaves the buffer open for commands when it was.
+		//
+		// Fails when the GPU does not finish.
+		def readPixels(img Image, x int, y int, w int, h int, texel int) !byte[] {
+			let open = recording
+			if recording {
+				try submit(0, 0)
+			}
+			try wait()
+			let n = w * h * texel
+			if readback.size < n {
+				if readback.buffer != 0 {
+					vk.destroyBuffer(device, readback.buffer, readback.memory)
+					readback = Chunk{}
+				}
+				let out uint[]
+				out.len(3)
+				let r = vk.createBuffer(device, uint(n), vk.BUFFER_TRANSFER_DST, true, out)
+				fail "the Vulkan readback buffer ({n} bytes) cannot be allocated: {vk.resultName(r)}" when r != vk.SUCCESS
+				readback = Chunk{buffer: out[0], memory: out[1], mapped: out[2], size: n}
+			}
+			try open()
+			vk.cmdBarrier(cmd)
+			vk.cmdCopyToBuffer(cmd, img.image, int32(x), int32(y), uint32(w), uint32(h), readback.buffer, 0)
+			try submit(0, 0)
+			try wait()
+			let bytes byte[]
+			bytes.len(n)
+			vk.readMapped(readback.mapped, 0, bytes, uint(n))
+			if open {
+				try open()
+			}
+			return bytes
+		}
+
+		// Waits for the GPU and frees everything: the frame renderers' images
+		// must have been retired or destroyed before.
+		def dispose() {
+			return when device == 0
+			if recording {
+				let _ = vk.endCommands(cmd)
+				recording = false
+			}
+			let _ = vk.deviceWaitIdle(device)
+			pending = false
+			for let (_, g) in graveImages {
+				freeImage(g)
+			}
+			graveImages.len(0)
+			for let (_, b) in graveBuffers {
+				let (buffer, memory) = b
+				vk.destroyBuffer(device, buffer, memory)
+			}
+			graveBuffers.len(0)
+			for let (_, d) in dummies {
+				freeImage(d)
+			}
+			dummies = map<uint32, Image>{}
+			for let (_, b) in blocks {
+				vk.free(device, b.memory) when b.memory != 0
+			}
+			blocks.len(0)
+			for let (_, p) in pipelines {
+				vk.destroyPipeline(device, p)
+			}
+			pipelines = map<string, uint>{}
+			for let (_, s) in shaders {
+				vk.destroyShader(device, s)
+			}
+			shaders = map<string, uint>{}
+			for let (_, l) in layouts {
+				let (setLayout, pipelineLayout) = l
+				vk.destroyLayouts(device, setLayout, pipelineLayout)
+			}
+			layouts = map<string, (uint, uint)>{}
+			for let (_, p) in descriptors {
+				vk.destroyDescriptorPool(device, p)
+			}
+			descriptors.len(0)
+			for let (_, c) in chunks {
+				vk.destroyBuffer(device, c.buffer, c.memory)
+			}
+			chunks.len(0)
+			if readback.buffer != 0 {
+				vk.destroyBuffer(device, readback.buffer, readback.memory)
+				readback = Chunk{}
+			}
+			vk.destroySampler(device, nearest)
+			vk.destroySampler(device, linear)
+			vk.destroyCommands(device, pool, fence)
+			vk.destroyDevice(device)
+			device = 0
+			vk.destroyInstance(instance)
+			instance = 0
+		}
+	}
+
+	// A device on the loader, with the instance extensions (a host's, for
+	// its surfaces) and the swapchain extension when presenting (`presents`
+	// given: it says which devices can present to the host's windows).
+	//
+	// Fails as Device.start does.
+	internal def openDevice(loader uint, extensions string[], presents ?(def(uint, uint, uint32) bool), float64 bool = true) !Device {
+		let dev = new Device()
+		try dev.start(loader, extensions, presents, float64)
+		return dev
+	}
+
+	// Little-endian writers for a uniform block's bytes.
+	internal def putI32(b byte[], at int, v int) {
+		let u = uint32(int32(v))
+		b[at] = byte(u & 255)
+		b[at + 1] = byte((u >> 8) & 255)
+		b[at + 2] = byte((u >> 16) & 255)
+		b[at + 3] = byte(u >> 24)
+	}
+
+	internal def putU32(b byte[], at int, u uint32) {
+		b[at] = byte(u & 255)
+		b[at + 1] = byte((u >> 8) & 255)
+		b[at + 2] = byte((u >> 16) & 255)
+		b[at + 3] = byte(u >> 24)
+	}
+
+	internal def putF32(b byte[], at int, v float32) {
+		putU32(b, at, __bitcast_u32_from_f32(v))
+	}
+
+	internal def putF64(b byte[], at int, v float64) {
+		let u = __bitcast_u64_from_f64(v)
+		putU32(b, at, uint32(u & 0xFFFFFFFF))
+		putU32(b, at + 4, uint32(u >> 32))
+	}
+}

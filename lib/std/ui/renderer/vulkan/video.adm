@@ -1,0 +1,207 @@
+@os("linux", "darwin", "windows")
+partial module std.ui.renderer.vulkan {
+	use (
+		std.formats.video as video
+		std.services.logging::(Logging)
+		std.ui.renderer.vulkan.vk
+	)
+
+	// The video shaders as SPIR-V (tools/build-spirv.sh, shaders/video.*).
+	@embed("spirv/video.vert.spv")
+	internal const videoVertexSpirv byte[]
+
+	@embed("spirv/video.frag.spv")
+	internal const videoFragmentSpirv byte[]
+
+	// The video shader's uniform block (shaders/video.frag).
+	internal const videoBlock = 32
+	internal const vLumaScale = 0
+	internal const vChromaScale = 4
+	internal const vNv12 = 8
+	internal const vFull = 12
+	internal const vBt709 = 16
+	internal const videoSamplers = 4
+
+	// The images a video frame's planes are uploaded to: luma, the two chroma
+	// planes, and interleaved chroma (NV12), each remade when a frame brings
+	// another size or format. The GPU canvas converts them to RGB with the
+	// video pipeline into an image level.
+	internal type VideoPlanes {
+		internal planes       Image[]
+		// For a picture the GPU decoded: the luma (R8) and interleaved chroma
+		// (RG8, half size) images the decoder's API copies into on the GPU
+		// (exportable memory), and their imports on the decoder's side.
+		internal shared       Image[]
+		internal imports      video.GpuImage[]
+		// The import was refused once (another GPU decodes, or the driver
+		// cannot share memory): such pictures go through their planes.
+		internal importFailed bool
+
+		def new() {
+			planes.len(4)
+			for let k = 0; k < 4; k++ {
+				planes[k] = Image{}
+			}
+			shared.len(2)
+			shared[0] = Image{}
+			shared[1] = Image{}
+		}
+
+		// The shared images at the picture's size, imported, remade when the
+		// size changes. Fails when the device cannot export them or the
+		// decoder's API cannot import them.
+		internal def ensureShared(dev Device, w int, h int) !none {
+			let cw = w >> 1
+			let ch = h >> 1
+			return none when shared[0].image != 0 && shared[0].w == w && shared[0].h == h && shared[1].w == cw && shared[1].h == ch
+			freeShared(dev)
+			let (luma, lumaFd, lumaSize) = try dev.createExportedImage(w, h, vk.FORMAT_R8_UNORM, sampledUsage)
+			shared[0] = luma
+			let lumaImport = try video.importGpuImage(lumaFd, int(lumaSize), w, h, 1)
+			imports.push(lumaImport)
+			let (chroma, chromaFd, chromaSize) = try dev.createExportedImage(cw, ch, vk.FORMAT_R8G8_UNORM, sampledUsage)
+			shared[1] = chroma
+			let chromaImport = try video.importGpuImage(chromaFd, int(chromaSize), cw, ch, 2)
+			imports.push(chromaImport)
+			return none
+		}
+
+		internal def freeShared(dev Device) {
+			for let imp in imports {
+				imp.release()
+			}
+			imports = video.GpuImage[]
+			dev.retire(shared[0])
+			dev.retire(shared[1])
+			shared[0] = Image{}
+			shared[1] = Image{}
+		}
+
+		// Copies a picture the GPU decoded into the shared images on the GPU:
+		// true when it is there, false when it must go through its planes.
+		internal def copyShared(dev Device, gpu video.GpuPicture, w int, h int) bool {
+			return false when !dev.exportable || importFailed
+			ensureShared(dev, w, h) onerror (err error) {
+				Logging.warning("vulkan: decoded pictures cannot be shared with the GPU canvas, copying them through main memory", {"error": err.message})
+				importFailed = true
+				freeShared(dev)
+				return false
+			}
+			return gpu.fillImages(imports[0], imports[1])
+		}
+
+		// Plane k as an image of w x h texels of the format.
+		internal def ensure(dev Device, k int, w int, h int, format uint32) !Image {
+			let have = planes[k]
+			if have.image == 0 || have.w != w || have.h != h || have.format != format {
+				dev.retire(have)
+				planes[k] = try dev.createImage(w, h, format, sampledUsage)
+			}
+			return planes[k]
+		}
+
+		// Loads a plane of w x h samples, `stride` bytes apart, into image k:
+		// 8-bit samples, or 16-bit when `wide`.
+		internal def load(dev Device, k int, plane byte[], w int, h int, stride int, wide bool) !none {
+			let texel = wide ?? (2, 1)
+			let img = try ensure(dev, k, w, h, wide ?? (vk.FORMAT_R16_UNORM, vk.FORMAT_R8_UNORM))
+			return try dev.upload(img, 0, 0, w, h, texel, plane) when stride == w * texel
+			// Rows packed for the copy.
+			let packed byte[]
+			packed.len(w * h * texel)
+			for let j = 0; j < h; j++ {
+				let from = j * stride
+				let to = j * w * texel
+				for let i = 0; i < w * texel; i++ {
+					packed[to + i] = plane[from + i]
+				}
+			}
+			return try dev.upload(img, 0, 0, w, h, texel, packed)
+		}
+
+		// A plane of one neutral chroma sample (a monochrome frame).
+		internal def neutral(dev Device, k int) !none {
+			let img = try ensure(dev, k, 1, 1, vk.FORMAT_R8_UNORM)
+			return try dev.upload(img, 0, 0, 1, 1, 1, byte[128])
+		}
+
+		// Converts the frame's picture into `into` (RGBA8, the frame's size),
+		// the picture's first row in the image's first row. False when there is
+		// nothing to draw. A picture the GPU decoded is copied into the shared
+		// images on the GPU (NVDEC, through CUDA's import of their memory) and
+		// read as NV12; when that cannot be, through its planes.
+		def convert(dev Device, frame video.VideoFrame, into Image) !bool {
+			let w = int(frame.width)
+			let h = int(frame.height)
+			let block byte[]
+			block.len(videoBlock)
+			// The planes are written before the last conversion that read them is done.
+			dev.barrier()
+			let gpu = frame.gpu
+			let nv12 = false
+			if !(gpu is none) && copyShared(dev, gpu, w, h) {
+				nv12 = true
+				try neutral(dev, 1)
+				try neutral(dev, 2)
+				putF32(block, vLumaScale, float32(1.0))
+				putF32(block, vChromaScale, float32(1.0))
+			} else if !(gpu is none) {
+				let (y, u, v) = gpu.planes() onerror recover (byte[], byte[], byte[])
+				return false when y.len() < w * h
+				try load(dev, 0, y, w, h, w, false)
+				try load(dev, 1, u, w >> 1, h >> 1, w >> 1, false)
+				try load(dev, 2, v, w >> 1, h >> 1, w >> 1, false)
+				putF32(block, vLumaScale, float32(1.0))
+				putF32(block, vChromaScale, float32(1.0))
+			} else {
+				return false when frame.y.len() == 0
+				let wide = frame.bitDepth > 8
+				// 16-bit texels hold samples of `bitDepth` bits: scale to 0..1.
+				let scale = wide ?? (65535.0 / float((1 << frame.bitDepth) - 1), 1.0)
+				try load(dev, 0, frame.y, w, h, frame.yStride, wide)
+				if frame.chroma == video.ChromaLayout.Mono {
+					try neutral(dev, 1)
+					try neutral(dev, 2)
+					putF32(block, vChromaScale, float32(1.0))
+				} else {
+					let cw = frame.chroma == video.ChromaLayout.Yuv444 ?? (w, (w + 1) >> 1)
+					let ch = frame.chroma == video.ChromaLayout.Yuv420 ?? ((h + 1) >> 1, h)
+					try load(dev, 1, frame.u, cw, ch, frame.uvStride, wide)
+					try load(dev, 2, frame.v, cw, ch, frame.uvStride, wide)
+					putF32(block, vChromaScale, float32(scale))
+				}
+				putF32(block, vLumaScale, float32(scale))
+			}
+			// Without NV12 the interleaved plane is not read; it holds a texel for
+			// the sampler.
+			let luma = nv12 ?? (shared[0], planes[0])
+			let cbcr = nv12 ?? (shared[1], try ensure(dev, 3, 1, 1, vk.FORMAT_R8G8_UNORM))
+			putI32(block, vNv12, nv12 ?? (1, 0))
+			putI32(block, vFull, frame.fullRange ?? (1, 0))
+			putI32(block, vBt709, frame.matrix == 709 ?? (1, 0))
+			let (setLayout, pipelineLayout) = try dev.layout("video", 1, false, 0, videoSamplers)
+			let vs = try dev.shader("video.vert", videoVertexSpirv)
+			let fs = try dev.shader("video.frag", videoFragmentSpirv)
+			let pipeline = try dev.pipeline("video", pipelineLayout, vs, fs, into.format)
+			let (buffer, at) = try dev.stage(block, videoBlock)
+			let views = uint[luma.view, planes[1].view, planes[2].view, cbcr.view]
+			let samplers = uint[dev.linear, dev.linear, dev.linear, dev.linear]
+			let set = try dev.set(setLayout, uint[buffer], uint[at], uint[uint(videoBlock)], views, samplers)
+			dev.barrier()
+			vk.cmdBeginRendering(dev.cmd, into.view, vk.LAYOUT_GENERAL, 0, 0, uint32(into.w), uint32(into.h), false, 0.0, 0.0, 0.0, 0.0)
+			vk.cmdBind(dev.cmd, pipeline, pipelineLayout, set)
+			vk.cmdViewportScissor(dev.cmd, uint32(into.w), uint32(into.h), 0, 0, uint32(into.w), uint32(into.h))
+			vk.cmdDraw(dev.cmd, 3)
+			vk.cmdEndRendering(dev.cmd)
+			return true
+		}
+
+		def free(dev Device) {
+			for let k = 0; k < 4; k++ {
+				dev.retire(planes[k])
+				planes[k] = Image{}
+			}
+			freeShared(dev)
+		}
+	}
+}
