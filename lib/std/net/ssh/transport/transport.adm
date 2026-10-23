@@ -11,7 +11,19 @@ internal partial module std.net.ssh.transport {
 	// The SSH transport layer (RFC 4253): the version exchange, key
 	// exchange and re-exchange, and packets in both directions. One task
 	// reads (`readPacket`); any task may write (`writePacket`), and
-	// writes wait while a key exchange runs.
+	// writes wait while a key exchange runs. Packets are sealed in the
+	// order they are sent and written by a task of their own, so a reader
+	// that answers (key exchange messages, `queuePacket`) never waits on
+	// the socket: two peers whose readers did would stop reading while
+	// both sockets are full.
+
+	// Bytes of sealed packets an application write lets wait for the
+	// writer task before it waits itself.
+	internal const maxBuffered = 1048576
+
+	// Bytes waiting for the writer task past which a peer that keeps
+	// asking for answers and reads none loses the connection.
+	internal const maxQueued = 16777216
 
 	// The version this implementation announces.
 	const softwareVersion = "SSH-2.0-ADM_1.0"
@@ -81,6 +93,17 @@ internal partial module std.net.ssh.transport {
 		internal signal           channel<none>
 		internal atomic closed    bool                   = false
 		internal failure          ?error                 = none
+		// Sealed packets in wire order, for the writer task, and the bytes
+		// sent but not yet written.
+		internal outgoing         byte[][]               = []
+		internal atomic queued    int                    = 0
+		// What the reader answered with while a key exchange holds
+		// application packets, sealed with the new keys when it ends.
+		internal held             byte[][]               = []
+		internal outReady         channel<none>
+		internal room             channel<none>
+		internal drained          channel<none>
+		internal writerStarted    bool                   = false
 
 		def new(stream net.Stream, client bool, algorithms Algorithms, timeout duration) {
 			self.stream = stream
@@ -91,6 +114,9 @@ internal partial module std.net.ssh.transport {
 			outbound = new Protection()
 			inbound = new Protection()
 			signal = new channel<none>(1)
+			outReady = new channel<none>(1)
+			room = new channel<none>(1)
+			drained = new channel<none>(1)
 			lastKex = time.now()
 		}
 
@@ -99,6 +125,7 @@ internal partial module std.net.ssh.transport {
 		// refused.
 		def handshake() !none {
 			try writeRaw((localVersion + "\r\n").bytes())
+			startWriter()
 			try readVersion()
 			try sendKexInit()
 			let peer = try readRaw()
@@ -126,7 +153,7 @@ internal partial module std.net.ssh.transport {
 		// The payload of our KEXINIT, sent. Blocks application writes
 		// until the exchange ends.
 		def sendKexInit() !none {
-			return none when !markKexStarted()
+			return none when kexActive || localInit.len() > 0
 			let kex = filterKnown(algorithms.kex, kexMethods())
 			if kexCount == 0 {
 				kex.push(client ?? (extInfoClient, extInfoServer))
@@ -145,15 +172,22 @@ internal partial module std.net.ssh.transport {
 			w.putNames(compression).putNames(compression)
 			w.putNames([]).putNames([])
 			w.putBool(false).putUint32(0)
-			localInit = w.bytes()
-			try sendKex(localInit)
+			try startKex(w.bytes())
 			return none
 		}
 
-		// Whether this call started an exchange (false when one runs).
-		internal atomic def markKexStarted() bool {
-			return false when localInit.len() > 0
+		// Starts an exchange with our KEXINIT `init` unless one runs: marks
+		// it, keeps `init` and queues it, all under the lock, so whoever
+		// sees an exchange running also finds our KEXINIT (the reader that
+		// takes the peer's negotiates against it) and sends after it.
+		// Returns whether this call started it; fails when the connection
+		// is closed or the packet cannot be sealed.
+		internal atomic def startKex(init byte[]) !bool {
+			return false when kexActive || localInit.len() > 0
+			fail sshError("closed", "connection is closed") when closed
 			kexActive = true
+			localInit = init
+			enqueue(try outbound.seal(init))
 			return true
 		}
 
@@ -253,26 +287,37 @@ internal partial module std.net.ssh.transport {
 			return none
 		}
 
-		// Sends NEWKEYS and switches outgoing packets to the new keys.
+		// Sends NEWKEYS and switches outgoing packets to the new keys. It
+		// goes through the writer task like every packet sealed before it,
+		// which it must not overtake.
 		atomic def sendNewKeys(next Protection) !none {
-			try writeRaw(try outbound.seal(message(msgNewKeys)))
+			enqueue(try outbound.seal(message(msgNewKeys)))
 			next.startCompression(true, authenticated)
 			outbound = next
 			outbound.seq = 0 when strict
 			return none
 		}
 
-		// Ends an exchange: application writes resume.
-		def kexDone() {
-			finishKex()
+		// Ends an exchange: what the reader answered with meanwhile goes
+		// out under the new keys, and application writes resume. Fails when
+		// a held packet cannot be sealed.
+		def kexDone() !none {
+			let sealed = finishKex()
 			signal.offer(none)
+			return sealed
 		}
 
-		internal atomic def finishKex() {
+		internal atomic def finishKex() !none {
 			kexActive = false
 			localInit = []
 			kexCount++
 			lastKex = time.now()
+			let waiting = held
+			held = []
+			for let payload in waiting {
+				enqueue(try outbound.seal(payload))
+			}
+			return none
 		}
 
 		// Sends a packet. Waits while a key exchange runs; starts one when
@@ -280,9 +325,9 @@ internal partial module std.net.ssh.transport {
 		// connection is closed or the write fails.
 		def writePacket(payload byte[]) !none {
 			for {
-				fail sshError("closed", "connection is closed") when closed
-				let err = failure
+				let err = lastFailure()
 				fail err unless err is none
+				fail sshError("closed", "connection is closed") when closed
 				break when try send(payload, false)
 				select {
 					case signal:
@@ -294,16 +339,113 @@ internal partial module std.net.ssh.transport {
 			if kexCount > 0 && localInit.len() == 0 && (outbound.bytes > rekeyBytes || time.now() - lastKex > rekeyAfter) {
 				try sendKexInit()
 			}
+			for queued > maxBuffered && !closed {
+				select {
+					case room:
+						room.flush()
+				}
+			}
+			// Pass the wake-up on to the next waiting writer.
+			room.offer(none) when queued <= maxBuffered
+			let err = lastFailure()
+			fail err unless err is none
+			fail sshError("closed", "connection is closed") when closed
 			return none
 		}
 
-		// Seals and writes a packet unless a key exchange holds
-		// application writes; returns whether it went out.
+		// Sends a packet the reader answers with (a window adjustment, a
+		// reply, a channel's close) without waiting: while a key exchange
+		// holds application packets it is held too, and sealed with the new
+		// keys. Fails when the connection is closed, or when more than
+		// `maxQueued` bytes wait because the peer reads nothing.
+		atomic def queuePacket(payload byte[]) !none {
+			fail sshError("closed", "connection is closed") when closed
+			fail sshError("overflow", "{queued} bytes wait for the peer to read them", disconnectByApplication) when queued > maxQueued
+			if kexActive {
+				held.push(payload)
+				return none
+			}
+			enqueue(try outbound.seal(payload))
+			return none
+		}
+
+		// Seals a packet for the writer task unless a key exchange holds
+		// application packets; returns whether it was sent.
 		internal atomic def send(payload byte[], kex bool) !bool {
 			fail sshError("closed", "connection is closed") when closed
 			return false when kexActive && !kex
-			try writeRaw(try outbound.seal(payload))
+			enqueue(try outbound.seal(payload))
 			return true
+		}
+
+		// Caller holds the lock.
+		internal def enqueue(packet byte[]) {
+			outgoing.push(packet)
+			queued += packet.len()
+			outReady.offer(none)
+		}
+
+		internal def startWriter() {
+			return when writerStarted
+			writerStarted = true
+			let writer = async writeLoop()
+			writer.keepAlive()
+		}
+
+		// The writer task: writes the sealed packets in order until the
+		// connection closes. A failed write closes it; readers and writers
+		// then fail with that error.
+		internal def writeLoop() {
+			for {
+				for let packet in takeOutgoing() {
+					return when closed || !writeOne(packet)
+				} empty {
+					return when closed
+					drained.offer(none)
+					select {
+						case outReady:
+							outReady.flush()
+					}
+				}
+			}
+		}
+
+		// Writes one packet; false, with the connection closed, when the
+		// write fails.
+		internal def writeOne(packet byte[]) bool {
+			let ok = true
+			writeRaw(packet) onerror (err error) {
+				recordFailure(err)
+				ok = false
+				recover none
+			}
+			if !ok {
+				close()
+				return false
+			}
+			wrote(packet.len())
+			return true
+		}
+
+		internal atomic def takeOutgoing() byte[][] {
+			let batch = outgoing
+			outgoing = []
+			return batch
+		}
+
+		internal atomic def wrote(n int) {
+			queued -= n
+			room.offer(none)
+		}
+
+		// The first failure; a later one (the reader's, once the stream
+		// closed under it) keeps it.
+		internal atomic def recordFailure(err error) {
+			failure = err when failure is none
+		}
+
+		internal atomic def lastFailure() ?error {
+			return failure
 		}
 
 		internal def writeRaw(data byte[]) !none {
@@ -331,7 +473,7 @@ internal partial module std.net.ssh.transport {
 					let r = new Reader(payload[1:])
 					let reason = int(r.readUint32() onerror recover 0)
 					let text = r.readText() onerror recover ""
-					closed = true
+					close()
 					fail sshError("disconnect", "peer disconnected: {text}", reason)
 				}
 				return payload
@@ -349,13 +491,23 @@ internal partial module std.net.ssh.transport {
 		// the peer starts, and takes EXT_INFO. Fails when the connection
 		// breaks or the peer disconnects.
 		def readPacket() !byte[] {
+			// Whatever ends the reading ends the connection: writers waiting
+			// for an exchange or for room, and the writer task, wake and fail.
+			// The first failure is the one reported: a write that failed
+			// first closed the stream under the read.
+			return nextPacket() onerror (err error) {
+				recordFailure(err)
+				close()
+				let first = lastFailure()
+				fail first unless first is none
+				fail err
+			}
+		}
+
+		internal def nextPacket() !byte[] {
 			for {
-				let payload = readRaw() onerror (err error) {
-					failure = err
-					closed = true
-					recover byte[]
-				}
-				let err = failure
+				let payload = try readRaw()
+				let err = lastFailure()
 				fail err unless err is none
 				let code = int(payload[0])
 				if code == msgKexInit {
@@ -393,20 +545,36 @@ internal partial module std.net.ssh.transport {
 			inbound.startCompression(false, true)
 		}
 
-		// Sends DISCONNECT and closes. Never fails.
+		// Sends DISCONNECT, waits up to the timeout for what was sent
+		// before it to be written, and closes. Never fails.
 		def disconnect(reason int, text string) {
 			if !closed {
 				let w = new Writer(msgDisconnect).putUint32(int64(reason)).putText(text).putText("")
-				send(w.bytes(), true) onerror recover false
+				let sent = send(w.bytes(), true) onerror recover false
+				if sent && writerStarted {
+					let limit = time.now() + timeout
+					for queued > 0 && !closed && time.now().before(limit) {
+						let wait = time.sleepChan(limit - time.now())
+						select {
+							case drained:
+								drained.flush()
+							case wait:
+						}
+					}
+				}
 			}
 			close()
 		}
 
-		// Closes the stream; writers fail with `closed`. Never fails.
+		// Closes the stream; writers fail with `closed`, and what waits to
+		// be written is dropped. Never fails.
 		def close() {
 			closed = true
 			stream.close() onerror recover none
 			signal.offer(none)
+			room.offer(none)
+			outReady.offer(none)
+			drained.offer(none)
 		}
 
 		def isOpen() bool {
