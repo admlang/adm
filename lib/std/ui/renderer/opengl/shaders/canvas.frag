@@ -5,54 +5,103 @@
 // double for the blend formulas and blits).
 //
 // Prepended: `#version`, and for a shader paint `#define ADM_FRAGMENT`, the
-// fragment's GLSL and `#define ADM_ENTRY <entry>`.
+// fragment's GLSL and `#define ADM_ENTRY <entry>`; for Vulkan `#define
+// ADM_VULKAN`, which puts the uniforms below in one std140 block (set 0,
+// binding 0; std.ui.renderer.vulkan writes it at the offsets noted) and the
+// samplers at the bindings named, so the one text serves both APIs.
+#ifdef ADM_VULKAN
+#define UNIFORMS_BEGIN layout(std140, set = 0, binding = 0) uniform Uniforms {
+#define UNIFORM
+#define UNIFORMS_END };
+#define SAMPLER(binding_, type_, name_) layout(set = 0, binding = binding_) uniform type_ name_
+#define FRAG_OUT layout(location = 0) out vec4 fragColor
+#else
+#define UNIFORMS_BEGIN
+#define UNIFORM uniform
+#define UNIFORMS_END
+#define SAMPLER(binding_, type_, name_) uniform type_ name_
+#define FRAG_OUT out vec4 fragColor
+#endif
 
-uniform ivec4 uBox;            // x, y, w, h on the target
-uniform sampler2D uDst;        // the target's box before this operation
-uniform sampler2D uCoverage;
-uniform int uHasCoverage;
-uniform sampler2D uClip;
-uniform int uHasClip;
-uniform int uPaintKind;        // 0 solid, 1 pixels, 2 fragment, 3 gradient, 4 noise, 5 solid by plane, 6 image
-uniform uvec3 uSolid;
-uniform uint uSolidA;          // the solid's alpha where it is shaded (atop, plane layers)
-uniform sampler2D uPixels;
-uniform ivec2 uPixelsOrigin;   // target pixel of uPixels's texel (0, 0)
-uniform vec2 uInvX;            // device to paint space: x' = a x + c y + tx
-uniform vec2 uInvY;            //                        y' = b x + d y + ty
-uniform vec2 uInvT;
-uniform uint uAlpha;
-uniform int uComposite;
-uniform int uBlend;
-uniform int uPaired;           // shaded source-over through the pair table
-uniform int uOp;               // 0 fill, 1 layer, 2 blit copy, 3 blit, 4 atop, 5 colour matrix
-uniform sampler2D uPlane;      // an effect plane over the box (R32F)
-uniform int uCoverageFromPlane;
-uniform int uHasQuad;          // coverage from a convex quadrilateral
-uniform int uHardQuad;         // ... or the path's, without antialias
-uniform sampler2D uEdges;      // a path's edges (RGBA32F, EdgeRow texels a row): per band of
-                               // EdgeBandRows rows its first edge and count, then x0 y0 x1 y1
-uniform int uEdgeBands;        // coverage from the path's edges: their bands, 0 for none
-uniform int uEvenOdd;          // ... filled even-odd, else nonzero
-uniform double uQuad[8];
-uniform vec4 uMatrix[5];       // colour matrix columns
-uniform usampler2D uTable;     // gradient colours, 8.8 fixed point
-uniform sampler2D uBlueNoise;  // 64 x 64 dither bytes
-uniform isampler2D uPerm;      // noise hashes
-uniform int uGradKind;         // 0 linear, 1 radial, 2 conic
-uniform int uSpread;           // 0 pad, 1 repeat, 2 reflect
-uniform double uParams[8];
-uniform int uOctaves;
-uniform sampler2D uImage;      // an image level, straight sRGB RGBA8
-uniform ivec2 uImageSize;      // its texels
-uniform ivec2 uImageSpread;    // spread across and down
-uniform int uSampling;         // 0 nearest, 1 bilinear, 2 bicubic
-uniform int uTinted;
-uniform uvec4 uTint;
-uniform sampler2D uToLinear;   // 256 x 1: srgbToLinearTable
-uniform sampler2D uToSrgb;     // 4096 x 1: linearToSrgbTable / 255
+UNIFORMS_BEGIN
+UNIFORM ivec4 uBox;             // x, y, w, h on the target                                  (0)
+UNIFORM uvec4 uTint;            //                                                           (16)
+UNIFORM ivec2 uPixelsOrigin;    // target pixel of uPixels's texel (0, 0)                     (32)
+UNIFORM ivec2 uImageSize;       // uImage's texels                                            (40)
+UNIFORM ivec2 uImageSpread;     // spread across and down                                     (48)
+UNIFORM vec2 uInvX;             // device to paint space: x' = a x + c y + tx                 (56)
+UNIFORM vec2 uInvY;             //                        y' = b x + d y + ty                 (64)
+UNIFORM vec2 uInvT;             //                                                           (72)
+UNIFORM uvec3 uSolid;           //                                                           (80)
+UNIFORM uint uSolidA;           // the solid's alpha where it is shaded (atop, plane layers)  (92)
+UNIFORM uint uAlpha;            //                                                           (96)
+UNIFORM int uComposite;         //                                                           (100)
+UNIFORM int uBlend;             //                                                           (104)
+UNIFORM int uPaired;            // shaded source-over through the pair table                  (108)
+UNIFORM int uOp;                // 0 fill, 1 layer, 2 blit copy, 3 blit, 4 atop, 5 colour matrix (112)
+UNIFORM int uPaintKind;         // 0 solid, 1 pixels, 2 fragment, 3 gradient, 4 noise, 5 solid by plane, 6 image (116)
+UNIFORM int uHasCoverage;       //                                                           (120)
+UNIFORM int uHasClip;           //                                                           (124)
+UNIFORM int uCoverageFromPlane; //                                                           (128)
+UNIFORM int uHasQuad;           // coverage from a convex quadrilateral                       (132)
+UNIFORM int uHardQuad;          // ... or the path's, without antialias                       (136)
+UNIFORM int uEdgeBands;         // coverage from the path's edges: their bands, 0 for none    (140)
+UNIFORM int uEvenOdd;           // ... filled even-odd, else nonzero                          (144)
+UNIFORM int uGradKind;          // 0 linear, 1 radial, 2 conic                                (148)
+UNIFORM int uSpread;            // 0 pad, 1 repeat, 2 reflect                                 (152)
+UNIFORM int uOctaves;           //                                                           (156)
+UNIFORM int uSampling;          // 0 nearest, 1 bilinear, 2 bicubic                           (160)
+UNIFORM int uTinted;            //                                                           (164)
+UNIFORM double uQuad[8];        // std140: 16 bytes an element                                (176)
+UNIFORM double uParams[8];      //                                                           (304)
+UNIFORM vec4 uMatrix[5];        // colour matrix columns                                      (432, to 512)
+UNIFORMS_END
 
-out vec4 fragColor;
+// The target's pixel before this operation: a copy of its box, or under
+// Vulkan's ADM_LOCAL_READ the attachment itself read back within the render
+// pass (one pass for a run of draws, a barrier between them).
+#ifdef ADM_LOCAL_READ
+layout(input_attachment_index = 0, set = 0, binding = 1) uniform subpassInput uDst;
+#define DST_PIXEL subpassLoad(uDst)
+#else
+SAMPLER(1, sampler2D, uDst);
+#define DST_PIXEL texelFetch(uDst, local, 0)
+#endif
+SAMPLER(2, sampler2D, uCoverage);
+SAMPLER(3, sampler2D, uClip);
+SAMPLER(4, sampler2D, uPixels);
+SAMPLER(5, sampler2D, uBlueNoise);  // 64 x 64 dither bytes
+SAMPLER(6, sampler2D, uPlane);      // an effect plane over the box (R32F)
+SAMPLER(7, sampler2D, uImage);      // an image level, straight sRGB RGBA8
+SAMPLER(8, sampler2D, uToLinear);   // 256 x 1: srgbToLinearTable
+SAMPLER(9, sampler2D, uToSrgb);     // 4096 x 1: linearToSrgbTable / 255
+SAMPLER(10, usampler2D, uTable);    // gradient colours, 8.8 fixed point
+SAMPLER(11, isampler2D, uPerm);     // noise hashes
+SAMPLER(12, sampler2D, uEdges);     // a path's edges (RGBA32F, EdgeRow texels a row): per band of
+                                    // EdgeBandRows rows its first edge and count, then x0 y0 x1 y1
+
+FRAG_OUT;
+
+// Division of doubles as IEEE 754 rounds it. A driver's double division may
+// be off by an ulp (NVIDIA's Vulkan compiler's is, within what Vulkan asks of
+// 64-bit floats), which flips the canvas's roundings at ties (HardMix's
+// threshold, Average's halves); the quotient, its exact fused remainder and
+// one fused correction give the rounded quotient, which the suites check
+// against the CPU canvas. OpenGL's drivers divide exactly.
+#ifdef ADM_VULKAN
+double ddiv(double a, double b) {
+	double q = a / b;
+	if (b == 0.0lf) return q;
+	double r = fma(-q, b, a);
+	return fma(r, 1.0lf / b, q);
+}
+
+dvec3 ddiv(dvec3 a, double b) {
+	return dvec3(ddiv(a.x, b), ddiv(a.y, b), ddiv(a.z, b));
+}
+#else
+#define ddiv(a, b) ((a) / (b))
+#endif
 
 const int SourceOver = 0, SourceIn = 1, SourceOut = 2, SourceAtop = 3, DestinationOver = 4,
 	DestinationIn = 5, DestinationOut = 6, DestinationAtop = 7, XorOp = 8, Copy = 9, Clear = 10, Plus = 11;
@@ -122,13 +171,13 @@ double separable(int mode, double cs, double cd) {
 	}
 	if (mode == ColorDodge || (mode == VividLight && cs >= 0.5lf) || (mode == HardMix && cs >= 0.5lf)) {
 		double s = mode == ColorDodge ? cs : 2.0lf * cs - 1.0lf;
-		double v = (s >= 1.0lf || cd >= 1.0lf) ? 1.0lf : min(cd / (1.0lf - s), 1.0lf);
+		double v = (s >= 1.0lf || cd >= 1.0lf) ? 1.0lf : min(ddiv(cd, 1.0lf - s), 1.0lf);
 		if (mode == HardMix) return v < 0.5lf ? 0.0lf : 1.0lf;
 		return v;
 	}
 	if (mode == ColorBurn || mode == VividLight || mode == HardMix) {
 		double s = mode == ColorBurn ? cs : 2.0lf * cs;
-		double v = (s <= 0.0lf || cd <= 0.0lf) ? 0.0lf : max(1.0lf - (1.0lf - cd) / s, 0.0lf);
+		double v = (s <= 0.0lf || cd <= 0.0lf) ? 0.0lf : max(1.0lf - ddiv(1.0lf - cd, s), 0.0lf);
 		if (mode == HardMix) return v < 0.5lf ? 0.0lf : 1.0lf;
 		return v;
 	}
@@ -139,8 +188,8 @@ double separable(int mode, double cs, double cd) {
 	if (mode == Difference) return abs(cd - cs);
 	if (mode == Exclusion) return cd + cs - 2.0lf * cd * cs;
 	if (mode == Subtract) return max(cd - cs, 0.0lf);
-	if (mode == Divide) return cs <= 0.0lf ? 1.0lf : min(cd / cs, 1.0lf);
-	if (mode == Average) return (cs + cd) / 2.0lf;
+	if (mode == Divide) return cs <= 0.0lf ? 1.0lf : min(ddiv(cd, cs), 1.0lf);
+	if (mode == Average) return ddiv(cs + cd, 2.0lf);
 	if (mode == Negation) return 1.0lf - abs(1.0lf - cd - cs);
 	return cs;
 }
@@ -152,8 +201,8 @@ uvec3 blendRGB(int mode, uvec3 s, uvec3 d) {
 	if (mode == DarkerColor) return ss < ds ? s : d;
 	if (mode == LighterColor) return ss > ds ? s : d;
 	if (mode == XorMode) return s ^ d;
-	dvec3 sf = dvec3(s) / 255.0lf;
-	dvec3 df = dvec3(d) / 255.0lf;
+	dvec3 sf = ddiv(dvec3(s), 255.0lf);
+	dvec3 df = ddiv(dvec3(d), 255.0lf);
 	return uvec3(clampU8(separable(mode, sf.r, df.r) * 255.0lf), clampU8(separable(mode, sf.g, df.g) * 255.0lf), clampU8(separable(mode, sf.b, df.b) * 255.0lf));
 }
 
@@ -166,8 +215,8 @@ double satOf(dvec3 c) {
 }
 
 double clipToLum(double v, double lum, double n, double x) {
-	if (n < 0.0lf && lum - n > 0.0lf) v = lum + (v - lum) * lum / (lum - n);
-	if (x > 1.0lf && x - lum > 0.0lf) v = lum + (v - lum) * (1.0lf - lum) / (x - lum);
+	if (n < 0.0lf && lum - n > 0.0lf) v = lum + ddiv((v - lum) * lum, lum - n);
+	if (x > 1.0lf && x - lum > 0.0lf) v = lum + ddiv((v - lum) * (1.0lf - lum), x - lum);
 	return v;
 }
 
@@ -195,8 +244,8 @@ dvec3 setSat(dvec3 c, double s) {
 }
 
 uvec3 blendNonSeparable(int mode, uvec3 s, uvec3 d) {
-	dvec3 src = dvec3(s) / 255.0lf;
-	dvec3 dst = dvec3(d) / 255.0lf;
+	dvec3 src = ddiv(dvec3(s), 255.0lf);
+	dvec3 dst = ddiv(dvec3(d), 255.0lf);
 	dvec3 o;
 	if (mode == Hue) o = setLum(setSat(src, satOf(dst)), lumOf(dst));
 	else if (mode == Saturation) o = setLum(setSat(dst, satOf(src)), lumOf(dst));
@@ -262,24 +311,24 @@ uvec4 blitPixel(uvec4 d, uvec4 s, int mode) {
 	if (mode == Normal) {
 		if (s.a == 255u || (s.a > 0u && d.a == 0u)) return s;
 		if (s.a == 0u) return d;
-		double sa = double(s.a) / 255.0lf;
-		double da = double(d.a) / 255.0lf;
+		double sa = ddiv(double(s.a), 255.0lf);
+		double da = ddiv(double(d.a), 255.0lf);
 		double ao = sa + da - sa * da;
-		dvec3 cs = dvec3(s.rgb) / 255.0lf;
-		dvec3 cd = dvec3(d.rgb) / 255.0lf;
+		dvec3 cs = ddiv(dvec3(s.rgb), 255.0lf);
+		dvec3 cd = ddiv(dvec3(d.rgb), 255.0lf);
 		dvec3 p = cs * sa * (1.0lf - da) + cd * da * (1.0lf - sa) + cs * (sa * da);
-		return uvec4(uvec3(floor(clamp(p / ao, 0.0lf, 1.0lf) * 255.0lf + 0.5lf)), clampU8(ao * 255.0lf));
+		return uvec4(uvec3(floor(clamp(ddiv(p, ao), 0.0lf, 1.0lf) * 255.0lf + 0.5lf)), clampU8(ao * 255.0lf));
 	}
 	if (s.a == 0u) return d;
-	double sa = double(s.a) / 255.0lf;
-	double da = double(d.a) / 255.0lf;
+	double sa = ddiv(double(s.a), 255.0lf);
+	double da = ddiv(double(d.a), 255.0lf);
 	if (da <= 0.0lf && mode != Dissolve) return s;
 	if (mode == Dissolve) return sa < 0.5lf ? d : s;
 	uvec3 b = nonSeparable(mode) ? blendNonSeparable(mode, s.rgb, d.rgb) : blendRGB(mode, s.rgb, d.rgb);
 	double ao = sa + da - sa * da;
 	if (ao <= 0.0lf) return uvec4(0u);
-	dvec3 o = (dvec3(s.rgb) / 255.0lf * sa) * (1.0lf - da) + (dvec3(d.rgb) / 255.0lf * da) * (1.0lf - sa) + dvec3(b) / 255.0lf * (sa * da);
-	dvec3 c = clamp(o / ao, 0.0lf, 1.0lf) * 255.0lf;
+	dvec3 o = (ddiv(dvec3(s.rgb), 255.0lf) * sa) * (1.0lf - da) + (ddiv(dvec3(d.rgb), 255.0lf) * da) * (1.0lf - sa) + ddiv(dvec3(b), 255.0lf) * (sa * da);
+	dvec3 c = clamp(ddiv(o, ao), 0.0lf, 1.0lf) * 255.0lf;
 	return uvec4(clampU8(c.r), clampU8(c.g), clampU8(c.b), clampU8(ao * 255.0lf));
 }
 
@@ -316,12 +365,12 @@ uvec4 gradient(ivec2 at) {
 	dvec2 u = paintSpace(p);
 	if (uGradKind == 2) {
 		double a = double(atan(float(u.y - uParams[1]), float(u.x - uParams[0]))) - uParams[2];
-		return tableColor(tableIndex(float(a / 6.283185307179586lf), 1), at);
+		return tableColor(tableIndex(float(ddiv(a, 6.283185307179586lf)), 1), at);
 	}
 	double fx = uParams[0], fy = uParams[1], r0 = uParams[2], cdx = uParams[3], cdy = uParams[4], dr = uParams[5], qa = uParams[6];
 	double px = u.x - fx, py = u.y - fy;
 	if (uParams[7] != 0.0lf) {
-		float t = float(sqrt(float(px * px + py * py))) * float(1.0lf / (r0 + dr));
+		float t = float(sqrt(float(px * px + py * py))) * float(ddiv(1.0lf, r0 + dr));
 		return tableColor(tableIndex(t, uSpread), at);
 	}
 	double b = px * cdx + py * cdy + r0 * dr;
@@ -330,15 +379,15 @@ uvec4 gradient(ivec2 at) {
 	bool ok = false;
 	if (abs(qa) < 1e-12lf) {
 		if (abs(b) > 1e-12lf) {
-			t = c / (2.0lf * b);
+			t = ddiv(c, 2.0lf * b);
 			ok = r0 + t * dr >= 0.0lf;
 		}
 	} else {
 		double disc = b * b - qa * c;
 		if (disc >= 0.0lf) {
 			double root = sqrt(disc);
-			double t1 = (b + root) / qa;
-			double t2 = (b - root) / qa;
+			double t1 = ddiv(b + root, qa);
+			double t2 = ddiv(b - root, qa);
 			double hi = max(t1, t2);
 			double lo = min(t1, t2);
 			if (r0 + hi * dr >= 0.0lf) {
@@ -366,7 +415,7 @@ uvec4 noise(ivec2 at) {
 		peak += amp;
 		amp *= 0.5;
 	}
-	float norm = float(0.5lf / double(peak));
+	float norm = float(ddiv(0.5lf, double(peak)));
 	precise float sum = 0.0;
 	precise float a = 1.0;
 	for (int o = 0; o < uOctaves; o++) {
@@ -476,7 +525,7 @@ double quadArea(ivec2 at) {
 				m++;
 			}
 			if ((dp >= 0.0lf) != (dq >= 0.0lf)) {
-				double t = dp / (dp - dq);
+				double t = ddiv(dp, dp - dq);
 				bx[m] = ax[i] + (ax[j] - ax[i]) * t;
 				by[m] = ay[i] + (ay[j] - ay[i]) * t;
 				m++;
@@ -500,11 +549,11 @@ double quadArea(ivec2 at) {
 // spreadIndex: a texel index along an axis of n under the spread.
 int spreadIndex(int i, int n, int spread) {
 	if (spread == 1) {
-		return i - n * int(floor(double(i) / double(n)));
+		return i - n * int(floor(ddiv(double(i), double(n))));
 	}
 	if (spread == 2) {
 		int p = 2 * n;
-		int m = i - p * int(floor(double(i) / double(p)));
+		int m = i - p * int(floor(ddiv(double(i), double(p))));
 		return m < n ? m : p - 1 - m;
 	}
 	return clamp(i, 0, n - 1);
@@ -596,7 +645,7 @@ uvec4 shaded(vec2 device) {
 void main() {
 	ivec2 at = ivec2(gl_FragCoord.xy);
 	ivec2 local = at - uBox.xy;
-	uvec4 d = bytesOf(texelFetch(uDst, local, 0));
+	uvec4 d = bytesOf(DST_PIXEL);
 	uvec4 s = uvec4(uSolid, 255u);
 	if (uPaintKind == 1) {
 		s = bytesOf(texelFetch(uPixels, at - uPixelsOrigin, 0));
@@ -679,7 +728,7 @@ void main() {
 		} else {
 			uvec3 rgb = s.rgb;
 			if (uPaired != 0) {
-				uvec3 bl = uBlend == XorMode ? (s.rgb ^ d.rgb) : uvec3(clampU8(separable(uBlend, double(s.r) / 255.0lf, double(d.r) / 255.0lf) * 255.0lf), clampU8(separable(uBlend, double(s.g) / 255.0lf, double(d.g) / 255.0lf) * 255.0lf), clampU8(separable(uBlend, double(s.b) / 255.0lf, double(d.b) / 255.0lf) * 255.0lf));
+				uvec3 bl = uBlend == XorMode ? (s.rgb ^ d.rgb) : uvec3(clampU8(separable(uBlend, ddiv(double(s.r), 255.0lf), ddiv(double(d.r), 255.0lf)) * 255.0lf), clampU8(separable(uBlend, ddiv(double(s.g), 255.0lf), ddiv(double(d.g), 255.0lf)) * 255.0lf), clampU8(separable(uBlend, ddiv(double(s.b), 255.0lf), ddiv(double(d.b), 255.0lf)) * 255.0lf));
 				rgb = div255(s.rgb * (255u - d.a) + bl * d.a);
 			}
 			if ((uComposite == SourceOver && uBlend == Normal) || uPaired != 0) {
