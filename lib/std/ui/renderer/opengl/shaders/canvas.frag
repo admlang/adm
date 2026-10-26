@@ -677,11 +677,15 @@ void main() {
 			if (sa > 0u) o = composePixel(d, uSolid, sa, SourceAtop, uBlend, 255u);
 		}
 	} else if (uOp == 5) {
-		// applyMatrix on straight colours 0 to 1.
-		if (d.a != 0u) {
+		// applyMatrix on straight colours 0 to 1; with the plane (a backdrop's
+		// coverage), replacing the pixel only as far as it covers.
+		uint t = 255u;
+		if (uCoverageFromPlane != 0) t = uint(floor(clamp(double(texelFetch(uPlane, local, 0).r), 0.0lf, 1.0lf) * 255.0lf + 0.5lf));
+		if (d.a != 0u && t != 0u) {
 			vec4 v = vec4(d) / 255.0;
 			precise vec4 m = uMatrix[0] * v.r + uMatrix[1] * v.g + uMatrix[2] * v.b + uMatrix[3] * v.a + uMatrix[4];
 			o = uvec4(clamp(m, 0.0, 1.0) * 255.0 + 0.5);
+			if (t != 255u) o = uvec4(div255(o.rgb * t + d.rgb * (255u - t)), div255(o.a * t + d.a * (255u - t)));
 		}
 	} else if (uOp == 3) {
 		o = blitPixel(d, s, uBlend);

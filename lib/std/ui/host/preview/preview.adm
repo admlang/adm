@@ -1,0 +1,672 @@
+// The host of a program the IDE previews: its windows are drawn in the IDE's editor.
+// It draws nothing on the screen: the CPU
+// renderer's pictures go to the IDE through memory files, only the part of each that
+// changed, and the IDE sends the pointer, the keys and the size it gives each window.
+// Linux only, as the memory files and `adm run --hot` are.
+//
+//     let host = new PreviewHost()
+//     host.targets = ["app.ui.Button"]
+//     host.mount = def (target string, cfg renderer.WindowConfig) !renderer.Window {
+//         return try UI.openWindow(Button(), cfg)
+//     }
+//     try host.connect(socketPath)
+//     try UI.config(UIConfig{rendererName: "cpu", host: host})
+//     try await UI.start()
+//     try await host.serve()
+partial module std.ui.host.preview {
+	use (
+		std.data.encoding::MsgPackValue
+		std.formats.image
+		std.math.geom::(Point, Rect, Size)
+		std.mem
+		std.net
+		std.os
+		std.proto.msgpackrpc
+		std.services.storage::MapAccess
+		std.time
+		std.ui
+		std.ui.host.browser::(PageEvent, PageNames)
+		std.ui.renderer as r
+		std.ui.runtime
+		std.ui.styles::Cursor
+		std.units::Pixels
+	)
+
+	// How many frames a window's memory file holds: one the IDE copies, one written, one
+	// waiting for the IDE.
+	internal const frameSlots = 3
+
+	// The preview's host: windows the IDE asks for and draws, events the IDE sends.
+	type PreviewHost {
+		// Opens a window showing the component a target names (its qualified name), with
+		// `UI.openWindow`. Set by the program before `serve`.
+		mount   ?(def(string, r.WindowConfig) !r.Window) = none
+		// The components `mount` takes, by qualified name, and those it cannot take and
+		// why: told to the IDE in `hello`. Set before `connect`.
+		targets string[]
+		blocked BlockedTarget[]
+
+		internal conn      ?net.Connection          = none
+		internal reader    ?Patient                 = none
+		internal peer      ?msgpackrpc.Peer         = none
+		internal names     PageNames
+		internal pid       int
+		internal scale     float                    = 1.0
+		internal windows   map<uint, PreviewWindow>
+		internal next      uint                     = 1
+		// The `open` being served: what `openWindow` gives the window it opens.
+		internal opening   ?OpenArgs                = none
+		// What the IDE sent that the windows' loop has not taken yet.
+		internal inbox     Incoming[]
+		internal nudges    channel<none>
+		internal events    r.PlatformEvent[]
+		internal quitAsked bool
+
+		def new() {
+			names = new PageNames()
+			windows = map<uint, PreviewWindow>{}
+			nudges = new channel<none>(1)
+		}
+
+		// Connects to the IDE listening on the Unix socket at `path` and says hello.
+		//
+		// Fails when the socket does not answer or the process cannot name itself.
+		def connect(path string) !none {
+			pid = parseInt<int>(try os.readLink("/proc/self"), 10)
+			let c = try net.dialStream(path, 10s)
+			let patient = new Patient(c)
+			let p = new msgpackrpc.Peer(patient, c)
+			// Only the clipboard is asked of the IDE, and it answers at once.
+			p.timeout = 2s
+			p.handle("setup", def (req msgpackrpc.Request) !any {
+				let args = new SetupArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "setup", scale: args.scale})
+				return none
+			})
+			p.handle("open", def (req msgpackrpc.Request) !any {
+				let args = new OpenArgs()
+				try req.bind(0, args)
+				let reply = new channel<string>(1)
+				self.put(Incoming{kind: "open", open: args, reply: reply})
+				let late = time.sleepChan(30s)
+				select {
+					case reply:
+						let why = <-reply
+						fail msgpackrpc.errorOf(why) when why != ""
+						return true
+					case late:
+						fail msgpackrpc.errorOf("the preview did not open {args.target} within 30 s")
+				}
+			})
+			p.handle("close", def (req msgpackrpc.Request) !any {
+				let args = new PaneArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "close", pane: args.pane})
+				return none
+			})
+			p.handle("resize", def (req msgpackrpc.Request) !any {
+				let args = new ResizeArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "resize", pane: args.pane, width: args.width, height: args.height})
+				return none
+			})
+			p.handle("input", def (req msgpackrpc.Request) !any {
+				let args = new InputArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "input", pane: args.pane, events: args.events})
+				return none
+			})
+			p.handle("release", def (req msgpackrpc.Request) !any {
+				let args = new ReleaseArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "release", pane: args.pane, slot: args.slot})
+				return none
+			})
+			p.handle("pins", def (req msgpackrpc.Request) !any {
+				let args = new PinsArgs()
+				try req.bind(0, args)
+				self.put(Incoming{kind: "pins", pins: args.pins})
+				return none
+			})
+			p.handle("ping", def (req msgpackrpc.Request) !any {
+				return "pong"
+			})
+			p.handle("quit", def (req msgpackrpc.Request) !any {
+				self.put(Incoming{kind: "quit"})
+				return none
+			})
+			conn = c
+			reader = patient
+			peer = p
+			p.start()
+			try p.notify("hello", [Hello{protocol: protocol, pid: pid, targets: targets, blocked: blocked}])
+			return none
+		}
+
+		// Serves the IDE until it says `quit` or goes: opens the windows it asks for and
+		// runs the windows' loop while any is open.
+		//
+		// Fails when the UI service fails.
+		async def serve() !none {
+			for !ended() {
+				// No window, no loop to read the IDE's messages: they are taken here.
+				if windows.len() == 0 {
+					let _ = try poll()
+					try wait(1s) when windows.len() == 0
+					continue
+				}
+				try await ui.UI.runWindows()
+			}
+			return none
+		}
+
+		// Whether the IDE said `quit` or is gone.
+		def ended() bool {
+			let r = reader
+			return quitAsked || r is none || r.isGone()
+		}
+
+		internal atomic def put(item Incoming) {
+			inbox.push(item)
+			let _ = nudges.offer(none)
+		}
+
+		internal atomic def take() Incoming[] {
+			let taken = inbox
+			inbox = []
+			return taken
+		}
+
+		internal atomic def hasIncoming() bool {
+			return inbox.len() > 0
+		}
+
+		// Sends a notice to the IDE; one the IDE cannot take is dropped: it is gone, which
+		// `ended` tells.
+		internal def tell(method string, note any) {
+			let p = peer
+			return when p is none
+			p.notify(method, [note]) onerror recover none
+		}
+
+		// The window of the IDE's pane numbered `pane`; none while none is open.
+		def windowOfPane(pane int) ?PreviewWindow {
+			for let (_, w) in windows {
+				return w when w.pane == pane
+			}
+			return none
+		}
+
+		// Does what the IDE sent, on the windows' task.
+		internal def apply(item Incoming) {
+			match item.kind {
+				case "setup":
+					scale = item.scale <= 0.0 ?? (1.0, item.scale)
+					for let (_, w) in windows {
+						events.push(resized(w))
+					}
+				case "open":
+					let reply = item.reply
+					let why = openView(item.open)
+					reply <- why unless reply is none
+				case "close":
+					let w = windowOfPane(item.pane)
+					events.push(r.PlatformEvent{kind: r.PlatformEventKind.Close, window: w.handle}) unless w is none
+				case "resize":
+					let w = windowOfPane(item.pane)
+					if !(w is none) {
+						w.width = item.width.max(1.0)
+						w.height = item.height.max(1.0)
+						events.push(resized(w))
+					}
+				case "input":
+					let w = windowOfPane(item.pane)
+					return when w is none
+					for let e in item.events {
+						e.window = w.handle
+						let event = names.platformEvent(e)
+						events.push(event) unless event is none
+					}
+				case "release":
+					let w = windowOfPane(item.pane)
+					w.free[item.slot] = true when !(w is none) && item.slot >= 0 && item.slot < w.free.len()
+				case "pins":
+					let pinned map<string, string[]>
+					for let pin in item.pins {
+						pinned[pin.target] = pin.states unless pin.states.len() == 0
+					}
+					runtime.pinStates(pinned)
+					ui.UI.redraw() onerror recover none
+				case "quit":
+					quitAsked = true
+				default:
+			}
+		}
+
+		// Opens the IDE's pane: `mount` opens a window for its target, which
+		// `openWindow` gives the pane. "" when it opened, else why not.
+		internal def openView(args ?OpenArgs) string {
+			return "no pane asked for" when args is none
+			let m = mount
+			return "the program mounts nothing (PreviewHost.mount)" when m is none
+			return "pane {args.pane} is open already" unless windowOfPane(args.pane) is none
+			opening = args
+			let failed = ""
+			let _ = m(args.target, new r.WindowConfig(args.target, args.width.max(1.0), args.height.max(1.0))) onerror (err error) {
+				failed = err.message
+				recover new r.Window(0)
+			}
+			opening = none
+			return failed
+		}
+
+		// The Resize event of `w` at its size now.
+		internal def resized(w PreviewWindow) r.PlatformEvent {
+			let size = deviceSize(w)
+			return r.PlatformEvent{kind: r.PlatformEventKind.Resize, window: w.handle, size: new Size(float(size.0), float(size.1))}
+		}
+
+		internal def deviceSize(w PreviewWindow) (int, int) {
+			return (int((w.width * scale).round()).max(1), int((w.height * scale).round()).max(1))
+		}
+
+		// --- Host ------------------------------------------------------------
+
+		// Opens a window for the pane whose `open` is served. A window a component opens
+		// by itself (a dialog) is kept, never shown, and the IDE is told.
+		def openWindow(cfg r.WindowConfig) !r.Window {
+			let handle = next
+			next += 1
+			let w = new PreviewWindow(handle)
+			w.width = cfg.size.width.max(1.0)
+			w.height = cfg.size.height.max(1.0)
+			let asked = opening
+			if asked is none {
+				tell("problem", ProblemNote{pane: -1, message: "a window \"{cfg.title}\" was opened; a preview shows only the component the IDE asks for"})
+			} else {
+				w.pane = asked.pane
+			}
+			windows[handle] = w
+			return new r.Window(handle)
+		}
+
+		// Frees the window's memory file.
+		def closeWindow(win r.Window) !none {
+			let w = windows.get(win.id())
+			return none when w is none
+			w.drop()
+			windows.delete(win.id())
+			return none
+		}
+
+		def setWindowTitle(win r.Window, title string) !none {
+			return none
+		}
+
+		def setWindowIcon(win r.Window, icon image.Image) !none {
+			return none
+		}
+
+		def setWindowVisible(win r.Window, visible bool) !none {
+			return none
+		}
+
+		def setWindowState(win r.Window, state ui.WindowState) !none {
+			return none
+		}
+
+		// Tells the IDE the pointer's shape over the pane.
+		def setCursor(win r.Window, cursor Cursor) !none {
+			let w = windows.get(win.id())
+			return none when w is none || w.pane < 0 || w.cursor == cursor.name
+			w.cursor = cursor.name
+			tell("cursor", CursorNote{pane: w.pane, cursor: cursor.name})
+			return none
+		}
+
+		// The size the IDE gives the window, at (0, 0).
+		def windowBounds(win r.Window) !Rect<Pixels> {
+			let w = windows.get(win.id())
+			fail "unknown window" when w is none
+			return Rect<Pixels>{left: 0(px), top: 0(px), right: w.width * 1(px), bottom: w.height * 1(px)}
+		}
+
+		// The editor decides the window's size, not the program.
+		def setWindowBounds(win r.Window, bounds Rect<Pixels>) !none {
+			return none
+		}
+
+		def raiseWindow(win r.Window) !none {
+			return none
+		}
+
+		// What the IDE sent since the last call; and the frames waiting for a slot go out
+		// when the IDE has freed one.
+		def poll() !r.PlatformEvent[] {
+			for let item in take() {
+				apply(item)
+			}
+			if ended() {
+				for let (_, w) in windows {
+					events.push(r.PlatformEvent{kind: r.PlatformEventKind.Close, window: w.handle})
+				}
+			}
+			for let (_, w) in windows {
+				try flush(w)
+				tellContent(w)
+			}
+			let out = events
+			events = []
+			return out
+		}
+
+		// Returns when the IDE sent something, `wake` was called, or `limit` passed.
+		def wait(limit duration) !none {
+			return none when hasIncoming()
+			let sleep = time.sleepChan(limit)
+			select {
+				case nudges:
+					let _ = <-nudges
+				case sleep:
+			}
+			return none
+		}
+
+		def wake() {
+			let _ = nudges.offer(none)
+		}
+
+		// One display the size of the largest window, at the IDE's scale.
+		def displays() !ui.Display[] {
+			let (wide, high) = (1.0, 1.0)
+			for let (_, w) in windows {
+				wide = wide.max(w.width)
+				high = high.max(w.height)
+			}
+			let bounds = Rect<Pixels>{left: 0(px), top: 0(px), right: wide * 1(px), bottom: high * 1(px)}
+			return [ui.Display{name: "preview", bounds: bounds, workArea: bounds, scale: scale, primary: true}]
+		}
+
+		// The IDE's clipboard; "" when the IDE does not answer.
+		def clipboardText() !string {
+			let p = peer
+			return "" when p is none
+			let answer = p.call("clipboard", []) onerror recover new MsgPackValue()
+			return answer.asString() onerror recover ""
+		}
+
+		def setClipboardText(text string) !none {
+			tell("setClipboard", text)
+			return none
+		}
+
+		def startTextInput(win r.Window, kind ui.TextKind) !none {
+			let w = windows.get(win.id())
+			return none when w is none || w.pane < 0
+			w.typing = kind.name
+			tell("textInput", w.typingNote())
+			return none
+		}
+
+		def stopTextInput(win r.Window) !none {
+			let w = windows.get(win.id())
+			return none when w is none || w.pane < 0 || w.typing == ""
+			w.typing = ""
+			tell("textInput", w.typingNote())
+			return none
+		}
+
+		def setTextInputCaret(win r.Window, caret Rect<Pixels>) !none {
+			let w = windows.get(win.id())
+			return none when w is none || w.pane < 0
+			w.caret = Rect{left: float(caret.left), top: float(caret.top), right: float(caret.right), bottom: float(caret.bottom)}
+			tell("textInput", w.typingNote()) when w.typing != ""
+			return none
+		}
+
+		def setWindowDragTest(win r.Window, test ?(def(Point<Pixels>) bool)) !none {
+			return none
+		}
+
+		def setWindowShape(win r.Window, width int, height int, pixels byte[]) !none {
+			return none
+		}
+
+		// Fails: a preview has no tray.
+		def showTray(icon image.Image, tooltip string, menu ui.MenuEntry[]) !none {
+			fail "a preview has no tray"
+		}
+
+		def hideTray() !none {
+			return none
+		}
+
+		// --- PixelSurface, DamageSurface ----------------------------------------
+
+		def pixelWindows() !none {
+			return none
+		}
+
+		// Sends the whole picture.
+		//
+		// Fails when the window is unknown, the picture is short or its memory file cannot
+		// be made.
+		def presentPixels(window uint, width int, height int, pixels byte[]) !none {
+			return try presentDamage(window, width, height, pixels, Rect{left: 0.0, top: 0.0, right: float(width), bottom: float(height)})
+		}
+
+		// Sends the `damage` box of the picture: into a free slot of the window's memory
+		// file, or, while the IDE holds every slot, with the next picture's.
+		//
+		// Fails when the window is unknown, the picture is short or its memory file cannot
+		// be made.
+		def presentDamage(window uint, width int, height int, pixels byte[], damage Rect) !none {
+			let w = windows.get(window)
+			fail "unknown window" when w is none
+			fail "the picture is short of pixels" when width <= 0 || height <= 0 || pixels.len() < width * height * 4
+			return none when w.pane < 0
+			let box = damage
+			// A picture of another size is all new.
+			if width != w.pictureWidth || height != w.pictureHeight {
+				box = Rect{left: 0.0, top: 0.0, right: float(width), bottom: float(height)}
+				w.pictureWidth = width
+				w.pictureHeight = height
+			}
+			w.picture = pixels
+			w.change(int(box.left.floor()).max(0), int(box.top.floor()).max(0), int(box.right.ceil()).min(width), int(box.bottom.ceil()).min(height))
+			return try flush(w)
+		}
+
+		// Tells the IDE the size the window's component was laid out to, when it changed.
+		internal def tellContent(w PreviewWindow) {
+			return when w.pane < 0
+			let size = ui.UI.rootSize(new r.Window(w.handle))
+			return when size is none
+			let (wide, high) = (float(size.width), float(size.height))
+			return when wide == w.contentWide && high == w.contentHigh
+			w.contentWide = wide
+			w.contentHigh = high
+			tell("content", ContentNote{pane: w.pane, width: wide, height: high})
+		}
+
+		// The window's drawing surface: the size the IDE gives it, in device pixels.
+		def surfaceSize(window uint) Size {
+			let w = windows.get(window)
+			return new Size(0.0, 0.0) when w is none
+			let (wide, high) = deviceSize(w)
+			return new Size(float(wide), float(high))
+		}
+
+		// Sends what changed of the window's picture since its last frame sent, when a
+		// slot is free.
+		internal def flush(w PreviewWindow) !none {
+			return none unless w.pending && w.pane >= 0
+			let need = w.pictureWidth * w.pictureHeight * 4
+			if need > w.slotBytes {
+				try w.grow(need)
+				tell("buffers", BuffersNote{pane: w.pane, pid: pid, fd: w.descriptor(), slots: frameSlots, slotBytes: w.slotBytes})
+			}
+			let slot = w.freeSlot()
+			return none when slot < 0
+			let (left, top, right, bottom) = (w.left, w.top, w.right, w.bottom)
+			let rowBytes = (right - left) * 4
+			let base = slot * w.slotBytes
+			for let y = top; y < bottom; y++ {
+				let _ = mem.copyN(w.pages, base + (y - top) * rowBytes, w.picture, (y * w.pictureWidth + left) * 4, rowBytes)
+			}
+			w.free[slot] = false
+			w.pending = false
+			tell("frame", FrameNote{pane: w.pane, slot: slot, width: w.pictureWidth, height: w.pictureHeight, left: left, top: top, right: right, bottom: bottom})
+			return none
+		}
+	}
+
+	// A window of the preview: the IDE's pane it is drawn in, its size, its memory file
+	// and what of its picture the IDE has not been sent.
+	type PreviewWindow {
+		handle        uint
+		// The IDE's pane; -1 for a window a component opened by itself, never shown.
+		pane          int         = -1
+		// The size the IDE gives it, in logical pixels.
+		width         float       = 1.0
+		height        float       = 1.0
+		cursor        string      = ""
+		typing        string      = ""
+		// The size its component was last laid out to, as told to the IDE.
+		contentWide   float       = -1.0
+		contentHigh   float       = -1.0
+		caret         Rect        = Rect{}
+		// The memory file of its frames: `frameSlots` slots of `slotBytes` each, mapped
+		// as `pages`; which slots the IDE has given back.
+		file          ?os.File    = none
+		mapping       ?os.Mapping = none
+		pages         byte[]
+		slotBytes     int
+		free          bool[]
+		// The last picture, and the box of it not sent yet when `pending`.
+		picture       byte[]
+		pictureWidth  int
+		pictureHeight int
+		pending       bool
+		left, top     int
+		right, bottom int
+
+		def new(handle uint) {
+			self.handle = handle
+		}
+
+		// Adds the box to what is to be sent.
+		def change(left int, top int, right int, bottom int) {
+			return when right <= left || bottom <= top
+			if !pending {
+				(self.left, self.top, self.right, self.bottom) = (left, top, right, bottom)
+				pending = true
+				return
+			}
+			self.left = self.left.min(left)
+			self.top = self.top.min(top)
+			self.right = self.right.max(right)
+			self.bottom = self.bottom.max(bottom)
+		}
+
+		// A new memory file whose slots hold `need` bytes and a quarter more, every slot
+		// free. The IDE maps the old one itself, so dropping it here takes nothing from
+		// a frame the IDE is copying.
+		//
+		// Fails when the system gives no memory file or it cannot be mapped.
+		def grow(need int) !none {
+			drop()
+			let bytes = need + need / 4
+			let made = try os.memoryFile("adm-preview-{pane}")
+			try made.truncate(bytes * frameSlots)
+			let mapped = try os.mapFile("/proc/self/fd/{made.descriptor()}", MapAccess.ReadWrite)
+			pages = try mapped.pages(0, bytes * frameSlots)
+			file = made
+			mapping = mapped
+			slotBytes = bytes
+			free = [true, true, true]
+		}
+
+		// A slot the IDE has given back; -1 while it holds them all.
+		def freeSlot() int {
+			for let (i, on) in free {
+				return i when on
+			}
+			return -1
+		}
+
+		// The descriptor of the memory file; -1 for none.
+		def descriptor() int {
+			let made = file
+			return made is none ?? (-1, made.descriptor())
+		}
+
+		def typingNote() TextInputNote {
+			return TextInputNote{pane: pane, on: typing != "", kind: typing, left: caret.left, top: caret.top, right: caret.right, bottom: caret.bottom}
+		}
+
+		// Lets go of the memory file.
+		def drop() {
+			let mapped = mapping
+			mapped.close() unless mapped is none
+			let made = file
+			if !(made is none) {
+				made.close() onerror recover none
+			}
+			mapping = none
+			file = none
+			pages = []
+			slotBytes = 0
+		}
+	}
+
+	// One thing the IDE sent, waiting for the windows' task.
+	internal struct Incoming {
+		kind   string
+		pane   int
+		width  float
+		height float
+		scale  float
+		slot   int
+		open   ?OpenArgs        = none
+		events PageEvent[]      = []
+		pins   PinNote[]        = []
+		reply  ?channel<string> = none
+	}
+
+	// Reads the IDE's connection without a deadline: an IDE whose prepanes are idle sends
+	// nothing for long, which is no reason to give up on it. Says when the IDE went.
+	internal type Patient {
+		internal conn net.Connection
+		atomic gone   bool
+
+		def new(conn net.Connection) {
+			self.conn = conn
+		}
+
+		// Reads what the IDE sent; 0 once it closed the connection.
+		//
+		// Fails when the connection breaks.
+		def read(data byte[]) !int {
+			for {
+				let timedOut = false
+				let n = conn.read(data, 1h) onerror (err error) {
+					if err is net.NetError && err.kind == net.ErrorCode.TimedOut {
+						timedOut = true
+						recover 0
+					}
+					gone = true
+					fail err
+				}
+				continue when timedOut
+				gone = true when n == 0
+				return n
+			}
+		}
+
+		def isGone() bool {
+			return gone
+		}
+	}
+}
