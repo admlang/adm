@@ -85,9 +85,82 @@ ADM_GL_VOID(glUniform3ui, (GLint location, GLuint v0, GLuint v1, GLuint v2), (lo
 ADM_GL_VOID(glUniform4f, (GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3), (location, v0, v1, v2, v3))
 ADM_GL_VOID(glUniform4i, (GLint location, GLint v0, GLint v1, GLint v2, GLint v3), (location, v0, v1, v2, v3))
 ADM_GL_VOID(glUniform4ui, (GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3), (location, v0, v1, v2, v3))
+ADM_GL_VOID(glUniform4uiv, (GLint location, GLsizei count, const GLuint *value), (location, count, value))
 ADM_GL_VOID(glUseProgram, (GLuint program), (program))
 ADM_GL_VOID(glVertexAttribPointer, (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer), (index, size, type, normalized, stride, pointer))
 
 #else
 #include <GL/gl.h>
+#endif
+
+// adm_gl_texture_barrier_ready reports whether the current context has
+// glTextureBarrier (OpenGL 4.5, ARB_texture_barrier, or NV_texture_barrier's
+// glTextureBarrierNV), looking the entry point up for adm_gl_texture_barrier.
+// The renderer asks once a context is current; a context without it, or a
+// platform that never has it (macOS stops at OpenGL 4.1, the web at WebGL 2),
+// answers 0 and the renderer copies the destination instead.
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(__wasm__) || defined(__ANDROID__)
+int adm_gl_texture_barrier_ready(void) { return 0; }
+void adm_gl_texture_barrier(void) {}
+#else
+#include <string.h>
+#if defined(_WIN32)
+static void* adm_gl_lookup(const char* name) {
+    PROC p = wglGetProcAddress(name);
+    if (p == 0 || p == (PROC)1 || p == (PROC)2 || p == (PROC)3 || p == (PROC)-1) return 0;
+    return (void*)p;
+}
+#else
+#include <dlfcn.h>
+// The program's own handle: the GL library it links answers for it (RTLD_DEFAULT
+// needs _GNU_SOURCE, which this header does not set).
+static void* adm_gl_lookup(const char* name) {
+    static void* self;
+    if (!self) self = dlopen(0, RTLD_LAZY);
+    return self ? dlsym(self, name) : 0;
+}
+#endif
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+static void (APIENTRY* adm_gl_barrier)(void);
+
+static int adm_gl_has_extension(const char* want) {
+    typedef const GLubyte* (APIENTRY* stringi_fn)(GLenum, GLuint);
+    stringi_fn stringi = (stringi_fn)adm_gl_lookup("glGetStringi");
+    if (!stringi) return 0;
+    GLint n = 0;
+    glGetIntegerv(0x821D /* GL_NUM_EXTENSIONS */, &n);
+    for (GLint i = 0; i < n; i++) {
+        const GLubyte* e = stringi(0x1F03 /* GL_EXTENSIONS */, (GLuint)i);
+        if (e && strcmp((const char*)e, want) == 0) return 1;
+    }
+    return 0;
+}
+
+int adm_gl_texture_barrier_ready(void) {
+    const char* version = (const char*)glGetString(0x1F02 /* GL_VERSION */);
+    int major = 0, minor = 0;
+    if (version) {
+        const char* v = version;
+        while (*v && (*v < '0' || *v > '9')) v++;
+        while (*v >= '0' && *v <= '9') major = major * 10 + (*v++ - '0');
+        if (*v == '.') {
+            v++;
+            while (*v >= '0' && *v <= '9') minor = minor * 10 + (*v++ - '0');
+        }
+    }
+    const char* name = 0;
+    if (major > 4 || (major == 4 && minor >= 5) || adm_gl_has_extension("GL_ARB_texture_barrier")) {
+        name = "glTextureBarrier";
+    } else if (adm_gl_has_extension("GL_NV_texture_barrier")) {
+        name = "glTextureBarrierNV";
+    }
+    adm_gl_barrier = name ? (void (APIENTRY*)(void))adm_gl_lookup(name) : 0;
+    return adm_gl_barrier != 0;
+}
+
+void adm_gl_texture_barrier(void) {
+    if (adm_gl_barrier) adm_gl_barrier();
+}
 #endif

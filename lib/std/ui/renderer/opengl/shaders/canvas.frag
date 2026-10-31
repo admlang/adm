@@ -6,63 +6,117 @@
 //
 // Prepended: `#version`, and for a shader paint `#define ADM_FRAGMENT`, the
 // fragment's GLSL and `#define ADM_ENTRY <entry>`; for Vulkan `#define
-// ADM_VULKAN`, which puts the uniforms below in one std140 block (set 0,
-// binding 0; std.ui.renderer.vulkan writes it at the offsets noted) and the
-// samplers at the bindings named, so the one text serves both APIs.
+// ADM_VULKAN`, which puts the samplers at the bindings named, so the one text
+// serves both APIs. A draw's uniforms are one std140 block of 528 bytes, which
+// the renderers write at the offsets noted and send in one call: Vulkan as
+// this uniform block (set 0, binding 0); OpenGL as the 33 vectors of uWords,
+// read back below member by member at the same offsets (a draw's uniforms set
+// by value: a write into a buffer that queued draws read makes some drivers
+// finish those draws first). Where doubles are floats (WebGL 2) the offsets
+// stay the same: std140 gives a scalar array's elements 16 bytes each either
+// way.
 #ifdef ADM_VULKAN
-#define UNIFORMS_BEGIN layout(std140, set = 0, binding = 0) uniform Uniforms {
-#define UNIFORM
-#define UNIFORMS_END };
 #define SAMPLER(binding_, type_, name_) layout(set = 0, binding = binding_) uniform type_ name_
 #define FRAG_OUT layout(location = 0) out vec4 fragColor
+
+layout(std140, set = 0, binding = 0) uniform Uniforms {
+	ivec4 uBox;             // x, y, w, h on the target                                  (0)
+	uvec4 uTint;            //                                                           (16)
+	ivec2 uPixelsOrigin;    // target pixel of uPixels's texel (0, 0)                     (32)
+	ivec2 uImageSize;       // uImage's texels                                            (40)
+	ivec2 uImageSpread;     // spread across and down                                     (48)
+	vec2 uInvX;             // device to paint space: x' = a x + c y + tx                 (56)
+	vec2 uInvY;             //                        y' = b x + d y + ty                 (64)
+	vec2 uInvT;             //                                                           (72)
+	uvec3 uSolid;           //                                                           (80)
+	uint uSolidA;           // the solid's alpha where it is shaded (atop, plane layers)  (92)
+	uint uAlpha;            //                                                           (96)
+	int uComposite;         //                                                           (100)
+	int uBlend;             //                                                           (104)
+	int uPaired;            // shaded source-over through the pair table                  (108)
+	int uOp;                // 0 fill, 1 layer, 2 blit copy, 3 blit, 4 atop, 5 colour matrix (112)
+	int uPaintKind;         // 0 solid, 1 pixels, 2 fragment, 3 gradient, 4 noise, 5 solid by plane, 6 image (116)
+	int uHasCoverage;       //                                                           (120)
+	int uHasClip;           //                                                           (124)
+	int uCoverageFromPlane; //                                                           (128)
+	int uHasQuad;           // coverage from a convex quadrilateral                       (132)
+	int uHardQuad;          // ... or the path's, without antialias                       (136)
+	int uEdgeBands;         // coverage from the path's edges: their bands, 0 for none    (140)
+	int uEvenOdd;           // ... filled even-odd, else nonzero                          (144)
+	int uGradKind;          // 0 linear, 1 radial, 2 conic                                (148)
+	int uSpread;            // 0 pad, 1 repeat, 2 reflect                                 (152)
+	int uOctaves;           //                                                           (156)
+	int uSampling;          // 0 nearest, 1 bilinear, 2 bicubic                           (160)
+	int uTinted;            //                                                           (164)
+	int uEdgeBase;          // the texel of uEdges this draw's band table starts at       (168)
+	int uTableRow;          // the row of uTable holding this draw's table                (172)
+	double uQuad[8];        // std140: 16 bytes an element                                (176)
+	double uParams[8];      //                                                           (304)
+	vec4 uMatrix[5];        // colour matrix columns                                      (432)
+	int uCoverageBase;      // OpenGL: the byte of uCoverage this draw's coverage starts at (512)
+	int uClipBase;          // ... and its clip's                                         (516, to 528)
+};
+#define QUAD(i) uQuad[i]
+#define PARAM(i) uParams[i]
+#define MATRIX(i) uMatrix[i]
 #else
-#define UNIFORMS_BEGIN
-#define UNIFORM uniform
-#define UNIFORMS_END
 #define SAMPLER(binding_, type_, name_) uniform type_ name_
 #define FRAG_OUT out vec4 fragColor
+
+uniform uvec4 uWords[33];
+#ifdef GL_ES
+#define DOUBLE_IN(v) uintBitsToFloat((v).x)
+#else
+#define DOUBLE_IN(v) packDouble2x32((v).xy)
+#endif
+#define uBox ivec4(uWords[0])
+#define uTint uWords[1]
+#define uPixelsOrigin ivec2(uWords[2].xy)
+#define uImageSize ivec2(uWords[2].zw)
+#define uImageSpread ivec2(uWords[3].xy)
+#define uInvX uintBitsToFloat(uWords[3].zw)
+#define uInvY uintBitsToFloat(uWords[4].xy)
+#define uInvT uintBitsToFloat(uWords[4].zw)
+#define uSolid uWords[5].xyz
+#define uSolidA uWords[5].w
+#define uAlpha uWords[6].x
+#define uComposite int(uWords[6].y)
+#define uBlend int(uWords[6].z)
+#define uPaired int(uWords[6].w)
+#define uOp int(uWords[7].x)
+#define uPaintKind int(uWords[7].y)
+#define uHasCoverage int(uWords[7].z)
+#define uHasClip int(uWords[7].w)
+#define uCoverageFromPlane int(uWords[8].x)
+#define uHasQuad int(uWords[8].y)
+#define uHardQuad int(uWords[8].z)
+#define uEdgeBands int(uWords[8].w)
+#define uEvenOdd int(uWords[9].x)
+#define uGradKind int(uWords[9].y)
+#define uSpread int(uWords[9].z)
+#define uOctaves int(uWords[9].w)
+#define uSampling int(uWords[10].x)
+#define uTinted int(uWords[10].y)
+#define uEdgeBase int(uWords[10].z)
+#define uTableRow int(uWords[10].w)
+#define QUAD(i) DOUBLE_IN(uWords[11 + (i)])
+#define PARAM(i) DOUBLE_IN(uWords[19 + (i)])
+#define MATRIX(i) uintBitsToFloat(uWords[27 + (i)])
+#define uCoverageBase int(uWords[32].x)
+#define uClipBase int(uWords[32].y)
 #endif
 
-UNIFORMS_BEGIN
-UNIFORM ivec4 uBox;             // x, y, w, h on the target                                  (0)
-UNIFORM uvec4 uTint;            //                                                           (16)
-UNIFORM ivec2 uPixelsOrigin;    // target pixel of uPixels's texel (0, 0)                     (32)
-UNIFORM ivec2 uImageSize;       // uImage's texels                                            (40)
-UNIFORM ivec2 uImageSpread;     // spread across and down                                     (48)
-UNIFORM vec2 uInvX;             // device to paint space: x' = a x + c y + tx                 (56)
-UNIFORM vec2 uInvY;             //                        y' = b x + d y + ty                 (64)
-UNIFORM vec2 uInvT;             //                                                           (72)
-UNIFORM uvec3 uSolid;           //                                                           (80)
-UNIFORM uint uSolidA;           // the solid's alpha where it is shaded (atop, plane layers)  (92)
-UNIFORM uint uAlpha;            //                                                           (96)
-UNIFORM int uComposite;         //                                                           (100)
-UNIFORM int uBlend;             //                                                           (104)
-UNIFORM int uPaired;            // shaded source-over through the pair table                  (108)
-UNIFORM int uOp;                // 0 fill, 1 layer, 2 blit copy, 3 blit, 4 atop, 5 colour matrix (112)
-UNIFORM int uPaintKind;         // 0 solid, 1 pixels, 2 fragment, 3 gradient, 4 noise, 5 solid by plane, 6 image (116)
-UNIFORM int uHasCoverage;       //                                                           (120)
-UNIFORM int uHasClip;           //                                                           (124)
-UNIFORM int uCoverageFromPlane; //                                                           (128)
-UNIFORM int uHasQuad;           // coverage from a convex quadrilateral                       (132)
-UNIFORM int uHardQuad;          // ... or the path's, without antialias                       (136)
-UNIFORM int uEdgeBands;         // coverage from the path's edges: their bands, 0 for none    (140)
-UNIFORM int uEvenOdd;           // ... filled even-odd, else nonzero                          (144)
-UNIFORM int uGradKind;          // 0 linear, 1 radial, 2 conic                                (148)
-UNIFORM int uSpread;            // 0 pad, 1 repeat, 2 reflect                                 (152)
-UNIFORM int uOctaves;           //                                                           (156)
-UNIFORM int uSampling;          // 0 nearest, 1 bilinear, 2 bicubic                           (160)
-UNIFORM int uTinted;            //                                                           (164)
-UNIFORM double uQuad[8];        // std140: 16 bytes an element                                (176)
-UNIFORM double uParams[8];      //                                                           (304)
-UNIFORM vec4 uMatrix[5];        // colour matrix columns                                      (432, to 512)
-UNIFORMS_END
-
-// The target's pixel before this operation: a copy of its box, or under
-// Vulkan's ADM_LOCAL_READ the attachment itself read back within the render
-// pass (one pass for a run of draws, a barrier between them).
+// The target's pixel before this operation: a copy of its box, or the target
+// itself: under Vulkan's ADM_LOCAL_READ the attachment read back within the
+// render pass (one pass for a run of draws, a barrier between them), under
+// OpenGL's ADM_TARGET_READ the texture being drawn into, after a texture
+// barrier (each fragment reads only the pixel it writes).
 #ifdef ADM_LOCAL_READ
 layout(input_attachment_index = 0, set = 0, binding = 1) uniform subpassInput uDst;
 #define DST_PIXEL subpassLoad(uDst)
+#elif defined(ADM_TARGET_READ)
+SAMPLER(1, sampler2D, uDst);
+#define DST_PIXEL texelFetch(uDst, at, 0)
 #else
 SAMPLER(1, sampler2D, uDst);
 #define DST_PIXEL texelFetch(uDst, local, 0)
@@ -81,6 +135,24 @@ SAMPLER(12, sampler2D, uEdges);     // a path's edges (RGBA32F, EdgeRow texels a
                                     // EdgeBandRows rows its first edge and count, then x0 y0 x1 y1
 
 FRAG_OUT;
+
+// A draw's coverage and clip bytes over its box, row by row. Under Vulkan
+// each is an image of the box's size. OpenGL keeps those of a run of draws in
+// one R8 texture (both samplers on it), each draw's from its base, row after
+// row of the texture, so that a run is one upload: an upload between draws
+// makes the GPU wait for the draws before it.
+#ifdef ADM_VULKAN
+#define COVERAGE_BYTE(p) texelFetch(uCoverage, p, 0).r
+#define CLIP_BYTE(p) texelFetch(uClip, p, 0).r
+#else
+float storedByte(int base, ivec2 p) {
+	int w = textureSize(uCoverage, 0).x;
+	int i = base + p.y * uBox.z + p.x;
+	return texelFetch(uCoverage, ivec2(i % w, i / w), 0).r;
+}
+#define COVERAGE_BYTE(p) storedByte(uCoverageBase, p)
+#define CLIP_BYTE(p) storedByte(uClipBase, p)
+#endif
 
 // Division of doubles as IEEE 754 rounds it. A driver's double division may
 // be off by an ulp (NVIDIA's Vulkan compiler's is, within what Vulkan asks of
@@ -349,7 +421,7 @@ int tableIndex(float t, int spread) {
 uvec4 tableColor(int index, ivec2 at) {
 	if (index < 0) return uvec4(0u);
 	uint d = byteOf(texelFetch(uBlueNoise, ivec2(at.x & 63, at.y & 63), 0).r);
-	return (texelFetch(uTable, ivec2(index, 0), 0) + d) >> 8;
+	return (texelFetch(uTable, ivec2(index, uTableRow), 0) + d) >> 8;
 }
 
 dvec2 paintSpace(dvec2 p) {
@@ -359,17 +431,17 @@ dvec2 paintSpace(dvec2 p) {
 uvec4 gradient(ivec2 at) {
 	dvec2 p = dvec2(at) + 0.5lf;
 	if (uGradKind == 0) {
-		float t = float(uParams[0] + uParams[1] * p.x + uParams[2] * p.y);
+		float t = float(PARAM(0) + PARAM(1) * p.x + PARAM(2) * p.y);
 		return tableColor(tableIndex(t, uSpread), at);
 	}
 	dvec2 u = paintSpace(p);
 	if (uGradKind == 2) {
-		double a = double(atan(float(u.y - uParams[1]), float(u.x - uParams[0]))) - uParams[2];
+		double a = double(atan(float(u.y - PARAM(1)), float(u.x - PARAM(0)))) - PARAM(2);
 		return tableColor(tableIndex(float(ddiv(a, 6.283185307179586lf)), 1), at);
 	}
-	double fx = uParams[0], fy = uParams[1], r0 = uParams[2], cdx = uParams[3], cdy = uParams[4], dr = uParams[5], qa = uParams[6];
+	double fx = PARAM(0), fy = PARAM(1), r0 = PARAM(2), cdx = PARAM(3), cdy = PARAM(4), dr = PARAM(5), qa = PARAM(6);
 	double px = u.x - fx, py = u.y - fy;
-	if (uParams[7] != 0.0lf) {
+	if (PARAM(7) != 0.0lf) {
 		float t = float(sqrt(float(px * px + py * py))) * float(ddiv(1.0lf, r0 + dr));
 		return tableColor(tableIndex(t, uSpread), at);
 	}
@@ -447,11 +519,13 @@ uvec4 noise(ivec2 at) {
 	return tableColor(tableIndex(t, 0), at);
 }
 
-// The layout of uEdges (FrameRenderer.bindEdges).
+// The layout of uEdges (FrameRenderer.bindEdges): a draw's texels from
+// uEdgeBase, its band table's edge indices counted from there.
 const int EdgeRow = 1024;
 const int EdgeBandRows = 16;
 
 vec4 edgeTexel(int i) {
+	i += uEdgeBase;
 	return texelFetch(uEdges, ivec2(i % EdgeRow, i / EdgeRow), 0);
 }
 
@@ -506,8 +580,8 @@ uint pathCoverage(ivec2 at) {
 double quadArea(ivec2 at) {
 	double ax[12], ay[12], bx[12], by[12];
 	for (int i = 0; i < 4; i++) {
-		ax[i] = uQuad[i * 2];
-		ay[i] = uQuad[i * 2 + 1];
+		ax[i] = QUAD(i * 2);
+		ay[i] = QUAD(i * 2 + 1);
 	}
 	int n = 4;
 	for (int side = 0; side < 4; side++) {
@@ -583,8 +657,8 @@ vec4 catmullRom(float t) {
 // PatternShader: the image level sampled at the pixel centre.
 uvec4 image(ivec2 at) {
 	dvec2 p = dvec2(at) + 0.5lf;
-	double u = uParams[0] * p.x + uParams[2] * p.y + uParams[4];
-	double v = uParams[1] * p.x + uParams[3] * p.y + uParams[5];
+	double u = PARAM(0) * p.x + PARAM(2) * p.y + PARAM(4);
+	double v = PARAM(1) * p.x + PARAM(3) * p.y + PARAM(5);
 	int w = uImageSize.x, h = uImageSize.y;
 	uvec4 o;
 	if (uSampling == 0) {
@@ -683,14 +757,14 @@ void main() {
 		if (uCoverageFromPlane != 0) t = uint(floor(clamp(double(texelFetch(uPlane, local, 0).r), 0.0lf, 1.0lf) * 255.0lf + 0.5lf));
 		if (d.a != 0u && t != 0u) {
 			vec4 v = vec4(d) / 255.0;
-			precise vec4 m = uMatrix[0] * v.r + uMatrix[1] * v.g + uMatrix[2] * v.b + uMatrix[3] * v.a + uMatrix[4];
+			precise vec4 m = MATRIX(0) * v.r + MATRIX(1) * v.g + MATRIX(2) * v.b + MATRIX(3) * v.a + MATRIX(4);
 			o = uvec4(clamp(m, 0.0, 1.0) * 255.0 + 0.5);
 			if (t != 255u) o = uvec4(div255(o.rgb * t + d.rgb * (255u - t)), div255(o.a * t + d.a * (255u - t)));
 		}
 	} else if (uOp == 3) {
 		o = blitPixel(d, s, uBlend);
 	} else {
-		uint k = uHasCoverage != 0 ? byteOf(texelFetch(uCoverage, local, 0).r) : 255u;
+		uint k = uHasCoverage != 0 ? byteOf(COVERAGE_BYTE(local)) : 255u;
 		if (uHasQuad != 0) {
 			k = uint(float(min(quadArea(at), 1.0lf)) * 255.0 + 0.5);
 			if (uHardQuad != 0) k = k >= 128u ? 255u : 0u;
@@ -705,9 +779,9 @@ void main() {
 			k = pathCoverage(at);
 			if (uHardQuad != 0) k = k >= 128u ? 255u : 0u;
 			// lowerFill's clipCoverage, for an operator that keeps what lies outside.
-			if (uHasClip != 0 && !unbounded) k = div255(k * byteOf(texelFetch(uClip, local, 0).r));
+			if (uHasClip != 0 && !unbounded) k = div255(k * byteOf(CLIP_BYTE(local)));
 		}
-		uint m = (unbounded && uHasClip != 0) ? byteOf(texelFetch(uClip, local, 0).r) : 255u;
+		uint m = (unbounded && uHasClip != 0) ? byteOf(CLIP_BYTE(local)) : 255u;
 		bool shadedPaint = uPaintKind != 0;
 		if (uOp == 1) {
 			// compositeRowWith.
@@ -742,5 +816,8 @@ void main() {
 			}
 		}
 	}
+	// A pixel the draw leaves as it was is not written: the renderer then
+	// tracks only what a draw can change (FrameRenderer.settle).
+	if (o == d) discard;
 	fragColor = vec4(o) / 255.0;
 }
