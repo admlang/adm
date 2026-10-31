@@ -1,7 +1,8 @@
 // The common item dialog (IFileOpenDialog, IFileSaveDialog) for std.ui's pickFolder,
 // pickFiles and saveFile on Windows: shown over the window given, modal to it, from
 // whatever thread calls (COM is entered for the call). Included by the native-support
-// unit that std/ui/pickers_windows.adm binds; empty elsewhere.
+// unit that std/ui/pickers_windows.adm binds, whose compiled code calls the three
+// functions it names: those have external linkage. Empty elsewhere.
 #ifndef ADM_PICKERS_WIN32_H
 #define ADM_PICKERS_WIN32_H
 
@@ -84,7 +85,7 @@ static int adm_pick_filters(const char* text, COMDLG_FILTERSPEC* specs, int max)
 // Shows the dialog: kind 0 a folder, 1 files (several when multiple), 2 a save. Returns
 // the chosen paths joined by '\n' ("" when cancelled or failed; adm_pick_status tells
 // which).
-static const char* adm_pick_paths(uint64_t hwnd, int kind, const char* title, const char* start, const char* name, const char* filters, int multiple) {
+const char* adm_pick_paths(uint64_t hwnd, int kind, const char* title, const char* start, const char* name, const char* filters, int multiple) {
     adm_pick_last_status = 0;
     adm_pick_last_error[0] = 0;
     if (adm_pick_last_paths) adm_pick_last_paths[0] = 0;
@@ -186,12 +187,12 @@ static const char* adm_pick_paths(uint64_t hwnd, int kind, const char* title, co
 }
 
 // The last call's result: 0 chosen, 1 cancelled, 2 failed.
-static int adm_pick_status(void) {
+int adm_pick_status(void) {
     return adm_pick_last_status;
 }
 
 // Why the last call failed.
-static const char* adm_pick_error(void) {
+const char* adm_pick_error(void) {
     return adm_pick_last_error;
 }
 
