@@ -1,0 +1,728 @@
+// What runs behind `std.text.grammar`: the source read into states and rules, the table of
+// state stacks, and a scan. Its grammars, tables and scans are what the public types hold.
+internal partial module std.text.grammar.engine {
+	use (
+		std.data.encoding::(TOML, TOMLArray, TOMLTable)
+	)
+
+	// The most frames on a stack: a push past it does nothing.
+	const maxDepth = 64
+
+	// The most bytes of a group a frame keeps.
+	const maxKept = 256
+
+	// The longest token, and the furthest one search reads: a longer match is not seen, and
+	// the text it would have covered goes on as it can. A line of any length then costs in
+	// proportion to its length.
+	const maxToken = 1 << 16
+
+	// How many rules may apply at one position without consuming anything before the
+	// scanner moves on by a character: the end of a push and pop cycle.
+	const maxSteps = 32
+
+	// What a grammar compiles to by default: instructions per state's rules.
+	const defaultMaxProgram = 1 << 16
+
+	// A rule of a state as the scanner reads it. Kinds, states and labels are indexes,
+	// -1 for none.
+	type Rule {
+		name        string
+		kind        int         = -1
+		groupKinds  int[]       = []
+		pop         int         = 0
+		push        int         = -1
+		next        int         = -1
+		keepNames   int[]       = []
+		keepGroups  int[]       = []
+		guard       Guard       = new Guard()
+		embedName   string      = ""
+		embedGroup  int         = -1
+		closing     int         = -1
+		opens       int         = -1
+		closes      int         = -1
+		// The rules after this one, tried when its guard refuses the match.
+		after       ?RegexRules = none
+		// Whether the groups of the match are read.
+		readsGroups bool        = false
+		// Whether a match changes the state.
+		acts        bool        = false
+	}
+
+	// What must hold of a match's groups for its rule to apply: each `equal` group is
+	// the kept value of that name, each `atLeast` group as long as it or longer.
+	type Guard {
+		equalNames    int[] = []
+		equalGroups   int[] = []
+		atLeastNames  int[] = []
+		atLeastGroups int[] = []
+
+		def any() bool {
+			return equalNames.len() + atLeastNames.len() > 0
+		}
+	}
+
+	// What ends an embedded language.
+	type Closing {
+		rules  RegexRules
+		kind   int        = -1
+		guard  Guard      = new Guard()
+		// How many groups its pattern has, for reading those the guard names.
+		groups int        = 0
+		// The byte that escapes what follows it: a match after an odd run of it does not
+		// close. -1 when there is none.
+		escape int        = -1
+
+		def new(rules RegexRules) {
+			self.rules = rules
+		}
+	}
+
+	type State {
+		name     string
+		fallback int        = -1
+		rules    RegexRules
+		table    Rule[]     = []
+
+		def new(name string, rules RegexRules) {
+			self.name = name
+			self.rules = rules
+		}
+	}
+
+	// What a compiled grammar holds.
+	type GrammarCore {
+		grammarName string
+		kindNames   string[]           = []
+		kindIndex   map<string, int>   = map<string, int>{}
+		labelNames  string[]           = []
+		labelIndex  map<string, int>   = map<string, int>{}
+		roles       map<string, int[]> = map<string, int[]>{}
+		states      State[]            = []
+		stateIndex  map<string, int>   = map<string, int>{}
+		keepNames   string[]           = []
+		keepIndex   map<string, int>   = map<string, int>{}
+		closings    Closing[]          = []
+		first       int                = 0
+		foldBy      string             = ""
+	}
+
+	def mapOfTable(table TOMLTable) map<string, any> {
+		let out = map<string, any>{}
+		for let key in table.keys() {
+			let value = table.get(key)
+			continue when value is none
+			out[key] = plainValue(value)
+		}
+		return out
+	}
+
+	def plainValue(value any) any {
+		return mapOfTable(value) when value is TOMLTable
+		return plainValue(value.items) when value is TOMLArray
+		if value is any[] {
+			let items any[]
+			for let (_, item) in value {
+				items.push(plainValue(item))
+			}
+			return items
+		}
+		return value
+	}
+
+	// The line of each `[[states.name]]` header of the text, by state.
+	def ruleLines(source string) map<string, int[]> {
+		let out = map<string, int[]>{}
+		for let (i, raw) in source.split("\n") {
+			let line = raw.trim()
+			continue unless line.startsWith("[[states.") && line.endsWith("]]")
+			let name = line["[[states.".len():line.len() - 2]
+			out[name] = [] unless out.hasKey(name)
+			out[name].push(i + 1)
+		}
+		return out
+	}
+
+	// Compiles a grammar's TOML text.
+	def compileText(source string, maxProgram int) !GrammarCore {
+		let doc = new TOMLTable()
+		try new TOML().decode(source, doc)
+		return try new Reader(mapOfTable(doc), ruleLines(source), maxProgram).read()
+	}
+
+	// Compiles the tree a grammar's text reads as.
+	def compileTree(source map<string, any>, maxProgram int) !GrammarCore {
+		return try new Reader(source, map<string, int[]>{}, maxProgram).read()
+	}
+
+	// A place in a stack of states, the same object for the same stack.
+	type Frame {
+		id         int
+		parent     ?Frame
+		grammar    int
+		core       GrammarCore
+		state      int
+		depth      int
+		// What the frame keeps, by the grammar's keep names.
+		keptNames  int[]       = []
+		keptValues string[]    = []
+		// What closes the language embedded here (an index into the grammar below it), -1
+		// when none does; `embedId` is the nearest frame up to this one that has one, by number:
+		// a frame holding itself would never be freed.
+		closing    int         = -1
+		embedId    int         = -1
+		// What the rule that embedded the language kept, by the keep names of the grammar
+		// below: its closing's, and no business of the language's.
+		hostNames  int[]       = []
+		hostValues string[]    = []
+
+		def new(id int, parent ?Frame, grammar int, core GrammarCore, state int) {
+			self.id = id
+			self.parent = parent
+			self.grammar = grammar
+			self.core = core
+			self.state = state
+			depth = parent is none ?? (0, parent.depth + 1)
+			embedId = parent is none ?? (-1, parent.embedId)
+		}
+
+		// The value kept under `name` here or in a frame below, of this grammar's frames.
+		def kept(name int) ?string {
+			let at = keptNames.indexOf(name)
+			return keptValues[at] when at >= 0
+			let below = parent
+			return none when below is none || below.grammar != grammar
+			return below.kept(name)
+		}
+
+		// The value kept under `name` for this frame's closing, whose guards are in the
+		// grammar below the frame.
+		def closingKept(name int) ?string {
+			let at = hostNames.indexOf(name)
+			return hostValues[at] when at >= 0
+			let below = parent
+			return none when below is none
+			return below.kept(name)
+		}
+	}
+
+	// The stacks of states of one document, by small numbers.
+	type FrameTable {
+		maxStates int
+		frames    Frame[]          = []
+		grammars  GrammarCore[]    = []
+		plain     map<int, int>    = map<int, int>{}
+		keyed     map<string, int> = map<string, int>{}
+
+		def new(maxStates int) {
+			self.maxStates = maxStates
+		}
+
+		atomic def len() int {
+			return frames.len()
+		}
+
+		// The small number of a grammar in this table: a token's `grammar`.
+		atomic def grammarIndex(g GrammarCore) int {
+			for let (i, held) in grammars {
+				return i when held == g
+			}
+			grammars.push(g)
+			return grammars.len() - 1
+		}
+
+		atomic def grammarAt(index int) GrammarCore {
+			return grammars[index]
+		}
+
+		def startOf(g GrammarCore) int {
+			return find(none, grammarIndex(g), g.first, [], [], -1, [], []).id
+		}
+
+		atomic def frame(id int) Frame {
+			return frames[id]
+		}
+		// The frame for this place on a stack, made when new; when the table is full, the
+		// frame without kept values, then `parent` itself.
+		atomic def find(parent ?Frame, grammar int, state int, names int[], values string[], closing int, hostNames int[], hostValues string[]) Frame {
+			let below = parent is none ?? (-1, parent.id)
+			let bare = (below + 1) << 40 | (closing + 1) << 26 | grammar << 13 | (state + 1)
+			if names.len() == 0 && hostNames.len() == 0 {
+				let held = plain.get(bare)
+				return frames[held] unless held is none
+			} else {
+				let key = "{bare}/{names.join(",")}/{values.join("\n")}/{hostNames.join(",")}/{hostValues.join("\n")}"
+				let held = keyed.get(key)
+				return frames[held] unless held is none
+				if frames.len() < maxStates {
+					let made = addFrame(parent, grammar, state, closing)
+					made.keptNames = names
+					made.keptValues = values
+					made.hostNames = hostNames
+					made.hostValues = hostValues
+					keyed[key] = made.id
+					return made
+				}
+				let without = plain.get(bare)
+				return frames[without] unless without is none
+			}
+			return parent when frames.len() >= maxStates && !(parent is none)
+			let made = addFrame(parent, grammar, state, closing)
+			plain[bare] = made.id
+			return made
+		}
+
+		def addFrame(parent ?Frame, grammar int, state int, closing int) Frame {
+			let made = new Frame(frames.len(), parent, grammar, grammars[grammar], state)
+			if closing >= 0 {
+				made.closing = closing
+				made.embedId = made.id
+			}
+			frames.push(made)
+			return made
+		}
+	}
+
+	// A scan's tokens, in flat arrays so a line of any size allocates nothing per token.
+	type TokenStore {
+		starts   int[] = []
+		stops    int[] = []
+		kinds    int[] = []
+		owners   int[] = []
+		openings int[] = []
+		closings int[] = []
+
+		def clear() {
+			starts.len(0)
+			stops.len(0)
+			kinds.len(0)
+			owners.len(0)
+			openings.len(0)
+			closings.len(0)
+		}
+
+		def add(start int, stop int, kind int, owner int, opens int, closes int) {
+			starts.push(start)
+			stops.push(stop)
+			kinds.push(kind)
+			owners.push(owner)
+			openings.push(opens)
+			closings.push(closes)
+		}
+	}
+
+	// Where a scan stopped, by what it hands back.
+	struct RunStop {
+		at    int
+		state int
+		done  bool
+	}
+
+	// A scanner's searches and the languages it can reach.
+	type ScanCore {
+		grammar   GrammarCore
+		table     FrameTable
+		resolve   ?def (string) ?GrammarCore
+		searchers map<int, RegexSearcher>    = map<int, RegexSearcher>{}
+		tails     map<string, RegexSearcher> = map<string, RegexSearcher>{}
+		slots     int[]                      = []
+
+		def new(grammar GrammarCore, table FrameTable, resolve ?def (string) ?GrammarCore) {
+			self.grammar = grammar
+			self.table = table
+			self.resolve = resolve
+			slots.len(2)
+		}
+
+		def scan(raw byte[], from int, end int, state int, out TokenStore, budget int, pause int) RunStop {
+			let run = new ScanRun(self, raw, end, out)
+			return run.go(from, table.frame(state), budget, pause)
+		}
+
+		def searcherOf(g GrammarCore, owner int, state int) RegexSearcher {
+			let key = owner << 13 | state
+			let held = searchers.get(key)
+			return held unless held is none
+			let made = g.states[state].rules.searcher()
+			searchers[key] = made
+			return made
+		}
+
+		def closingSearcher(g GrammarCore, owner int, index int) RegexSearcher {
+			let key = "c{owner}/{index}"
+			let held = tails.get(key)
+			return held unless held is none
+			let made = g.closings[index].rules.searcher()
+			tails[key] = made
+			return made
+		}
+
+		def tailSearcher(rule Rule, rules RegexRules) RegexSearcher {
+			let held = tails.get(rule.name)
+			return held unless held is none
+			let made = rules.searcher()
+			tails[rule.name] = made
+			return made
+		}
+
+		def slotsFor(pairs int) int[] {
+			slots.len(2 * pairs) when slots.len() < 2 * pairs
+			return slots
+		}
+	}
+
+	// One call of `scan`: the place it has reached, in locals of an object so the steps
+	// below can share them without an allocation per token.
+	type ScanRun {
+		s          ScanCore
+		raw        byte[]
+		end        int
+		out        TokenStore
+		frame      Frame
+		g          GrammarCore
+		owner      int            = 0
+		searcher   ?RegexSearcher = none
+		stateOf    ?State         = none
+		scanned    int            = 0
+		// Where the region of the embedded language ends, its closing's match, and the
+		// frame it closes; `end` and none when no closing lies ahead on this line.
+		region     int            = 0
+		closeStop  int            = -1
+		closeFrame ?Frame         = none
+		regionFor  int            = -2
+		// What a rule that keeps nothing passes on, made once per scan.
+		noValues   string[]       = []
+		noNames    int[]          = []
+		// The token of the last run of text no rule took, which goes on when more follows.
+		lastGap    int            = -1
+		// The pending mark of a rule's first token.
+		opening    int            = -1
+		closing    int            = -1
+
+		def new(s ScanCore, raw byte[], end int, out TokenStore) {
+			self.s = s
+			self.raw = raw
+			self.end = end
+			self.out = out
+			g = s.grammar
+			frame = new Frame(-1, none, 0, s.grammar, -1)
+		}
+
+		// Brings what is cached of the frame in step with `frame`.
+		def enter(next Frame) {
+			frame = next
+			owner = next.grammar
+			g = next.core
+			if next.state < 0 {
+				searcher = none
+				stateOf = none
+			} else {
+				searcher = s.searcherOf(g, owner, next.state)
+				stateOf = g.states[next.state]
+			}
+		}
+
+		// Finds where the embedded languages on the stack close on this line, the earliest
+		// wins. Done once per embedding reached, not per token.
+		def findRegion(from int) {
+			let mark = frame.embedId
+			if mark == regionFor {
+				return when closeStop < 0 || region >= from
+			}
+			regionFor = mark
+			(region, closeStop, closeFrame) = (end, -1, none)
+			closingsFrom(mark, from)
+		}
+
+		// The closing of the embedded language at `at`, and of those it is embedded in.
+		def closingsFrom(id int, from int) {
+			return when id < 0
+			let at = s.table.frame(id)
+			let below = at.parent
+			return when below is none
+			let host = below.core
+			let ends = host.closings[at.closing]
+			let found = s.closingSearcher(host, below.grammar, at.closing)
+			let pos = from
+			let refused = -1
+			for pos <= region && found.search(raw, from = pos, end = end) {
+				scanned += found.scanned()
+				let (start, stop) = (found.start(), found.end())
+				// A match of nothing where a refused match ended is that place again.
+				if !(start == stop && start == refused) && !escaped(ends.escape, start, from) && guardHolds(ends.guard, ends.groups, found, at, true) {
+					(region, closeStop, closeFrame) = (start, stop, at) when start < region || closeStop < 0
+					break
+				}
+				refused = stop
+				pos = stop > start ?? (stop, stop + 1)
+			}
+			closingsFrom(below.embedId, from)
+		}
+
+		// Whether an odd run of the byte `escape` ends at `at`, the run counted back to `from`.
+		def escaped(escape int, at int, from int) bool {
+			return false when escape < 0
+			let k = at
+			for k > from && int(raw[k - 1]) == escape {
+				k--
+			}
+			scanned += at - k
+			return (at - k) % 2 == 1
+		}
+
+		// Whether a guard holds of the last match of `found`, against what `at` keeps.
+		def guardHolds(guard Guard, groups int, found RegexSearcher, at Frame, closes bool = false) bool {
+			return true unless guard.any()
+			let slots = s.slotsFor(groups + 1)
+			found.groups(raw, slots)
+			for let (i, name) in guard.equalNames {
+				let held = closes ?? (at.closingKept(name), at.kept(name))
+				let group = guard.equalGroups[i]
+				return false when held is none || slots[2 * group] < 0
+				return false unless bytesAre(slots[2 * group], slots[2 * group + 1], held)
+			}
+			for let (i, name) in guard.atLeastNames {
+				let held = closes ?? (at.closingKept(name), at.kept(name))
+				let group = guard.atLeastGroups[i]
+				return false when held is none || slots[2 * group] < 0
+				return false when slots[2 * group + 1] - slots[2 * group] < held.bytes().len()
+			}
+			return true
+		}
+
+		def bytesAre(from int, to int, text string) bool {
+			let want = text.bytes()
+			return false unless to - from == want.len()
+			for let i = 0; i < want.len(); i++ {
+				return false unless raw[from + i] == want[i]
+			}
+			return true
+		}
+
+		def go(from int, start Frame, budget int, pause int) RunStop {
+			enter(start)
+			let pos = from
+			let steps = 0
+			for {
+				findRegion(pos)
+				if closeStop >= 0 && pos >= region {
+					// The language ends here, whatever it was doing.
+					let closes = closeFrame
+					if !(closes is none) {
+						let below = closes.parent
+						if !(below is none) {
+							let kind = below.core.closings[closes.closing].kind
+							out.add(region, closeStop, kind, below.grammar, -1, -1) when kind >= 0 && closeStop > region
+							pos = closeStop
+							enter(below)
+							regionFor = -2
+							continue
+						}
+					}
+				}
+				return RunStop{at: pos, state: frame.id, done: false} when pos < end && ((budget >= 0 && scanned >= budget) || (pause >= 0 && pos >= pause))
+				let held = searcher
+				if held is none {
+					// A language nobody could name: its text stays plain.
+					return RunStop{at: end, state: frame.id, done: true} when closeStop < 0
+					pos = region
+					continue
+				}
+				let limit = pos + maxToken
+				let found = held.search(raw, from = pos, end = region, limit = limit, anchored = true)
+				scanned += held.scanned()
+				if !found && pos < region {
+					found = held.search(raw, from = pos + charLength(pos), end = region, limit = limit)
+					scanned += held.scanned()
+				}
+				if !found {
+					return RunStop{at: end, state: frame.id, done: true} when pos >= end
+					if pos >= region {
+						continue
+					}
+					let stop = limit < region ?? (limit, region)
+					gap(pos, stop)
+					pos = stop
+					steps = 0
+					continue
+				}
+				let at = held.start()
+				if at > pos {
+					gap(pos, at)
+					pos = at
+					steps = 0
+				}
+				let moved = apply(held, pos)
+				if moved > pos {
+					pos = moved
+					steps = 0
+					continue
+				}
+				// Nothing consumed: a change of state, as long as that goes anywhere.
+				steps++
+				if moved < 0 || steps >= maxSteps {
+					return RunStop{at: end, state: frame.id, done: true} when pos >= end
+					if pos >= region {
+						// Stuck at the edge of a region: the closing above takes it.
+						return RunStop{at: end, state: frame.id, done: true} when closeStop < 0
+						continue
+					}
+					let next = pos + charLength(pos)
+					gap(pos, next)
+					pos = next
+					steps = 0
+				}
+			}
+		}
+
+		// The rule that matched applies at `at`, unless its guard refuses it and no later
+		// rule takes its place. Where the text goes on, or -1 when nothing changed.
+		def apply(found RegexSearcher, at int) int {
+			let state = stateOf
+			return -1 when state is none
+			let rule = state.table[found.rule()]
+			let stop = found.end()
+			if rule.guard.any() {
+				let current = found
+				let base = 0
+				for !guardHolds(rule.guard, ruleGroups(state, base + current.rule()), current, frame) {
+					let rest = rule.after
+					return -1 when rest is none
+					base = base + current.rule() + 1
+					current = s.tailSearcher(rule, rest)
+					let again = current.search(raw, from = at, end = region, limit = at + maxToken, anchored = true)
+					scanned += current.scanned()
+					return -1 unless again
+					rule = state.table[base + current.rule()]
+					stop = current.end()
+				}
+				return emitAndAct(rule, current, at, stop, state, base + current.rule())
+			}
+			return emitAndAct(rule, found, at, stop, state, found.rule())
+		}
+
+		def ruleGroups(state State, rule int) int {
+			return state.rules.groups(rule)
+		}
+
+		def emitAndAct(rule Rule, found RegexSearcher, at int, stop int, state State, index int) int {
+			let before = frame
+			let groups = rule.readsGroups ?? (state.rules.groups(index), 0)
+			let slots = s.slotsFor(groups + 1)
+			found.groups(raw, slots) when rule.readsGroups
+			emitTokens(rule, at, stop, slots)
+			let next = frame
+			for let i = 0; i < rule.pop; i++ {
+				let below = next.parent
+				// A language cannot pop what it is embedded in, nor a text its first state.
+				break when below is none || next.closing >= 0
+				next = below
+			}
+			let names = rule.keepNames
+			let values = noValues
+			if names.len() > 0 {
+				let made string[]
+				made.len(names.len())
+				for let (i, group) in rule.keepGroups {
+					let (a, b) = (slots[2 * group], slots[2 * group + 1])
+					made[i] = a < 0 ?? ("", string(raw[a:(b - a < maxKept ?? (b, a + maxKept))]))
+				}
+				values = made
+			}
+			if rule.next >= 0 {
+				let (keptNames, keptValues) = keptAcrossGoto(next, names, values)
+				next = s.table.find(next.parent, owner, rule.next, keptNames, keptValues, next.closing, next.hostNames, next.hostValues)
+			}
+			next = s.table.find(next, owner, rule.push, names, values, -1, noNames, noValues) when rule.push >= 0 && next.depth < maxDepth
+			next = embedFrame(rule, next, names, values, slots) when rule.closing >= 0 && next.depth < maxDepth
+			if next != before {
+				enter(next)
+			} else if stop == at {
+				return -1
+			}
+			return stop
+		}
+
+		// The frame of a language a rule embeds, plain when nobody can name it.
+		def embedFrame(rule Rule, below Frame, names int[], values string[], slots int[]) Frame {
+			let name = rule.embedName
+			if rule.embedGroup >= 0 {
+				let (a, b) = (slots[2 * rule.embedGroup], slots[2 * rule.embedGroup + 1])
+				name = a < 0 ?? ("", string(raw[a:b]))
+			}
+			let resolve = s.resolve
+			let guest = resolve is none || name == "" ?? (none, resolve(name))
+			return s.table.find(below, owner, -1, noNames, noValues, rule.closing, names, values) when guest is none
+			return s.table.find(below, s.table.grammarIndex(guest), guest.first, noNames, noValues, rule.closing, names, values)
+		}
+
+		// What the frame a goto makes keeps: what the frame it replaces kept, with what the
+		// rule kept taking over from a value of the same name.
+		def keptAcrossGoto(from Frame, names int[], values string[]) (int[], string[]) {
+			return (from.keptNames, from.keptValues) when names.len() == 0
+			return (names, values) when from.keptNames.len() == 0
+			let merged = from.keptNames.clone()
+			let held = from.keptValues.clone()
+			for let (i, name) in names {
+				let at = merged.indexOf(name)
+				if at >= 0 {
+					held[at] = values[i]
+				} else {
+					merged.push(name)
+					held.push(values[i])
+				}
+			}
+			return (merged, held)
+		}
+
+		def emitTokens(rule Rule, at int, stop int, slots int[]) {
+			opening = rule.opens
+			closing = rule.closes
+			let kinds = rule.groupKinds
+			if kinds.len() > 0 {
+				let cursor = at
+				for let (i, kind) in kinds {
+					let group = i + 1
+					let (a, b) = (slots[2 * group], slots[2 * group + 1])
+					continue when a < cursor || kind < 0 || b <= a
+					token(cursor, a, rule.kind) when a > cursor && rule.kind >= 0
+					token(a, b, kind)
+					cursor = b
+				}
+				token(cursor, stop, rule.kind) when stop > cursor && rule.kind >= 0
+			} else if rule.kind >= 0 && stop > at {
+				token(at, stop, rule.kind)
+			}
+			if opening >= 0 || closing >= 0 {
+				out.add(at, stop, -1, owner, opening, closing)
+				(opening, closing) = (-1, -1)
+			}
+		}
+
+		// A token, carrying the rule's marks when it is the first.
+		def token(from int, to int, kind int) {
+			out.add(from, to, kind, owner, opening, closing)
+			(opening, closing) = (-1, -1)
+		}
+
+		// Text no rule took, in the state's fallback kind if it has one.
+		def gap(from int, to int) {
+			let state = stateOf
+			return when state is none || state.fallback < 0 || to <= from
+			let last = out.stops.len() - 1
+			if last == lastGap && last >= 0 && out.stops[last] == from && out.kinds[last] == state.fallback {
+				out.stops[last] = to
+				return
+			}
+			out.add(from, to, state.fallback, owner, -1, -1)
+			lastGap = last + 1
+		}
+
+		// The bytes of the UTF-8 character at `at`.
+		def charLength(at int) int {
+			return 1 when at >= end
+			let lead = int(raw[at])
+			let n = lead < 0x80 ?? (1, lead < 0xE0 ?? (2, lead < 0xF0 ?? (3, 4)))
+			return at + n > end ?? (end - at, n)
+		}
+	}
+}
