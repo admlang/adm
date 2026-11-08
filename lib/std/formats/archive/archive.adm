@@ -56,6 +56,15 @@ partial module std.formats.archive {
 		// Recreate symlink entries as symlinks rather than following them.
 		restoreLinks  bool
 		overwrite     OverwriteMode
+		// The most bytes one entry may decode to, and all of them together; 0
+		// for no bound of its own. Every extraction keeps to the disk's free
+		// room besides: what the entries declare is checked against it before
+		// anything is written, and what they decode to as it is written, so an
+		// archive that lies about its sizes or holds more than fits (a zip
+		// bomb) stops at the bound with the entry it was writing removed, and
+		// never fills the disk.
+		maxEntrySize  uint64        = 0
+		maxTotalSize  uint64        = 0
 	}
 
 	// AddOptions is how a file is added: the path recorded inside the archive,
@@ -64,7 +73,10 @@ partial module std.formats.archive {
 		// Path recorded inside the archive; defaults to `path` made relative.
 		path        string
 		recursive   bool
-		// Store symlinks as links instead of following them.
+		// Follow symbolic links: what a link points at is added under the
+		// link's name, a folder it points at descended into; a link that leads
+		// back into a folder being added fails rather than loops. Off: a link
+		// is stored as a link, with its target as written.
 		followLinks bool
 	}
 
@@ -147,20 +159,63 @@ partial module std.formats.archive {
 	// eventually one of them would not.
 	// Fails when an entry cannot be read or written.
 	def extractAll(arc Archive, dir string, opts ExtractOptions = ExtractOptions{}) !int {
+		let entries = arc.entries()
+		let declared = uint64(0)
+		for let entry in entries {
+			declared = declared > declared + entry.size ?? (uint64(0xFFFFFFFFFFFFFFFF), declared + entry.size)
+		}
+		let budget = try extractBudget(dir, declared, opts)
 		let written = 0
-		for let entry in arc.entries() {
-			written += 1 when try writeEntry(arc, entry, dir, opts)
+		for let entry in entries {
+			written += 1 when try writeEntry(arc, entry, dir, opts, budget)
 		}
 		return written
 	}
 
 	// Extracts a single entry of `arc` into `dir`.
 	//
-	// Applies the same name and symlink-target checks as `extractAll`, so it is
-	// safe to call directly on an entry chosen by a caller.
+	// Applies the same name, symlink-target and size checks as `extractAll`, so
+	// it is safe to call directly on an entry chosen by a caller.
 	// Fails when the entry cannot be read or written.
 	def extractEntry(arc Archive, entry Entry, dir string, opts ExtractOptions = ExtractOptions{}) !none {
-		let written = try writeEntry(arc, entry, dir, opts)
+		let budget = try extractBudget(dir, entry.size, opts)
+		let _ = try writeEntry(arc, entry, dir, opts, budget)
+	}
+
+	// What an extraction may still write: the least of `opts.maxTotalSize` and
+	// the disk's free room when it started, less what was written; -1 for no
+	// bound (no limit asked and the room unknown).
+	internal type ExtractBudget {
+		left int64
+
+		def new(left int64) {
+			self.left = left
+		}
+
+		// Takes `n` bytes out of the budget. Fails when they do not fit.
+		def take(n int, entry string) !none {
+			return none when left < 0
+			fail "archive entry " + entry + " decodes past the bytes allowed for the whole archive, or the disk's free room" when int64(n) > left
+			left -= int64(n)
+			return none
+		}
+	}
+
+	// The budget of an extraction into `dir` whose entries declare `declared`
+	// bytes in all. Fails when they declare more than fits the disk's free
+	// room, or than `opts.maxTotalSize` allows.
+	internal def extractBudget(dir string, declared uint64, opts ExtractOptions) !ExtractBudget {
+		let left = int64(-1)
+		if opts.maxTotalSize > 0 {
+			fail "archive declares {declared} bytes, more than the {opts.maxTotalSize} allowed" when declared > opts.maxTotalSize
+			left = int64(opts.maxTotalSize)
+		}
+		let free = os.freeSpace(dir) onerror recover int64(-1)
+		if free >= 0 {
+			fail "archive declares {declared} bytes, more than the {free} free at {dir}" when declared > uint64(free)
+			left = free when left < 0 || free < left
+		}
+		return new ExtractBudget(left)
 	}
 
 	// Writes one entry below `dir` and reports whether bytes were written:
@@ -172,7 +227,7 @@ partial module std.formats.archive {
 	// time. Nothing is written through a symbolic link: an entry whose path
 	// passes through one fails, and a link in the entry's own place is
 	// replaced, not followed.
-	internal def writeEntry(arc Archive, entry Entry, dir string, opts ExtractOptions) !bool {
+	internal def writeEntry(arc Archive, entry Entry, dir string, opts ExtractOptions, budget ExtractBudget) !bool {
 		let kind = int(entry.mode) & fileTypeMask()
 		// A directory entry naming the archive's root (`./`) is `dir` itself.
 		return false when kind & int(os.FileMode.Dir) != 0 && isRootName(entry.name)
@@ -210,28 +265,61 @@ partial module std.formats.archive {
 			return false
 		}
 
+		fail "archive entry " + entry.name + " declares {entry.size} bytes, more than the {opts.maxEntrySize} allowed per entry" when opts.maxEntrySize > 0 && entry.size > opts.maxEntrySize
 		let src = try arc.open(entry)
 		let out = try os.open(dest, "w")
 		// Stop at the entry's recorded size, or at a zero read for formats that
 		// do not record one. Readers such as `bytes.Reader` fail when read past
-		// their end, so the size bound is what keeps the copy from asking.
+		// their end, so the size bound is what keeps the copy from asking. The
+		// bytes are counted against the entry's and the extraction's bounds as
+		// they come, whatever the entry declared; a copy that fails leaves no
+		// part of the file behind.
 		let buf byte[] = []
 		buf.len(64 * 1024)
 		let remaining = int(entry.size)
 		let sized = entry.size > 0
+		let total = uint64(0)
 		for !sized || remaining > 0 {
 			let want = buf.len()
 			want = remaining when sized && remaining < want
-			let n = try src.read(buf[0:want])
+			let n = src.read(buf[0:want]) onerror (err error) {
+				dropPartial(out, dest)
+				fail err
+			}
 			break when n <= 0
-			let wrote = try out.write(buf[0:n])
-			fail "short write to " + dest when wrote != n
+			total += uint64(n)
+			if opts.maxEntrySize > 0 && total > opts.maxEntrySize {
+				dropPartial(out, dest)
+				fail "archive entry " + entry.name + " decodes past the {opts.maxEntrySize} bytes allowed per entry"
+			}
+			budget.take(n, entry.name) onerror (err error) {
+				dropPartial(out, dest)
+				fail err
+			}
+			let wrote = out.write(buf[0:n]) onerror (err error) {
+				dropPartial(out, dest)
+				fail err
+			}
+			if wrote != n {
+				dropPartial(out, dest)
+				fail "short write to " + dest
+			}
 			remaining -= n
 		}
-		try out.close()
+		out.close() onerror (err error) {
+			os.remove(dest) onerror recover none
+			fail err
+		}
 		try os.chmod(dest, int64(int(entry.mode) & int(os.FileMode.Perm))) when opts.preserveMode
 		try os.touch(dest, entry.modTime) when opts.preserveTimes && entry.modTime.unixNs() > int64(0)
 		return true
+	}
+
+	// Closes and removes a file whose extraction failed, so that no part of
+	// it is left behind.
+	internal def dropPartial(out os.File, dest string) {
+		out.close() onerror recover none
+		os.remove(dest) onerror recover none
 	}
 
 	// `os.FileMode.Type` spelled out from the literal members.

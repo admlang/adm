@@ -11,19 +11,33 @@ partial module std.data.compress.zstd {
 	internal const writeWindow = 8388608
 
 	// Compresses the bytes into one Zstandard frame with the content's size
-	// and checksum.
-	def compress(src byte[]) byte[] {
+	// and checksum. `dict` is the dictionary a reader will be given: plain
+	// content, which the frame's matches reach into as the data before its
+	// first byte (an earlier version of the data makes the frame a patch), or
+	// a formatted dictionary, whose content section is used and whose id the
+	// frame names.
+	def compress(src byte[], dict byte[] = []) byte[] {
 		let out byte[] = []
 		out.cap(src.len() / 3 + 64)
 		let size = src.len()
-		writeFrameHeader(out, size)
-		let state = new BlockEncoder()
-		let at = 0
+		let (prefix, dictId) = dictionaryContent(dict)
+		writeFrameHeader(out, size, dictId)
+		let base = prefix.len()
+		let data = src
+		if base > 0 {
+			data = []
+			data.len(base + size)
+			mem.copyN(data, prefix, base)
+			mem.copyN(data[base:], src, size) when size > 0
+		}
+		let state = new BlockEncoder(slotsFor(base + size), base)
+		state.remember(data, 0, base) when base > 0
+		let at = base
 		for {
-			let end = (at + 131072).min(size)
-			state.block(src, at, end, end == size, out)
+			let end = (at + 131072).min(base + size)
+			state.block(data, at, end, end == base + size, out)
 			at = end
-			break when at >= size
+			break when at >= base + size
 		}
 		let sum = uint32(xxh64(src) & uint64(0xFFFFFFFF))
 		out.push(byte(sum & 0xFF), byte((sum >> 8) & 0xFF), byte((sum >> 16) & 0xFF), byte((sum >> 24) & 0xFF))
@@ -100,9 +114,33 @@ partial module std.data.compress.zstd {
 		}
 	}
 
+	// The content of a dictionary and the id a frame names it by: a plain
+	// one is all content and has no id; a formatted one's content follows
+	// its tables (a damaged one counts as plain).
+	internal def dictionaryContent(dict byte[]) (byte[], int) {
+		return (dict, 0) when dict.len() < 8
+		let magic = uint32(dict[0]) | (uint32(dict[1]) << 8) | (uint32(dict[2]) << 16) | (uint32(dict[3]) << 24)
+		return (dict, 0) when magic != 0xEC30A437
+		let (id, at) = readDictionary(dict, new BlockDecoder()) onerror recover (0, 0)
+		return (dict, 0) when at == 0
+		return (dict[at:], id)
+	}
+
+	// How many slots the match table gets for this much data: a power of
+	// two from 128 Ki to 16 Mi.
+	internal def slotsFor(size int) int {
+		let slots = 131072
+		for slots < size && slots < 16777216 {
+			slots *= 2
+		}
+		return slots
+	}
+
 	// Appends a frame header: for a known size (0 or more) the content size,
 	// in one segment when it fits the window; for -1 the window alone.
-	internal def writeFrameHeader(out byte[], size int) {
+	// `dictId` names the dictionary the frame needs; 0 for none or plain
+	// content.
+	internal def writeFrameHeader(out byte[], size int, dictId int = 0) {
 		out.push(byte(0x28), byte(0xB5), byte(0x2F), byte(0xFD))
 		if size < 0 {
 			out.push(byte(0x04), byte(0x68))
@@ -121,8 +159,11 @@ partial module std.data.compress.zstd {
 			flag = 2
 			width = 4
 		}
-		out.push(byte((flag << 6) | (single ?? (0x20, 0)) | 0x04))
+		out.push(byte((flag << 6) | (single ?? (0x20, 0)) | 0x04 | (dictId != 0 ?? (3, 0))))
 		out.push(byte(0x68)) unless single
+		if dictId != 0 {
+			out.push(byte(dictId & 0xFF), byte((dictId >> 8) & 0xFF), byte((dictId >> 16) & 0xFF), byte((dictId >> 24) & 0xFF))
+		}
 		let value = flag == 1 ?? (size - 256, size)
 		for let i = 0; i < width; i++ {
 			out.push(byte((value >> (8 * i)) & 0xFF))
@@ -133,6 +174,12 @@ partial module std.data.compress.zstd {
 	// sequences were last seen and the last three offsets.
 	internal type BlockEncoder {
 		table    int[]
+		// How far right a hash of a 4-byte word moves to index the table:
+		// the table holds a power of two slots.
+		shift    uint32
+		// The positions below this are the dictionary's content: a match
+		// there is reachable whatever its distance.
+		reach    int
 		recent   int[]
 		// The sequences of the block being built.
 		runs     int[]
@@ -140,10 +187,17 @@ partial module std.data.compress.zstd {
 		offsets  int[]
 		literals byte[]
 
-		def new() {
+		// `slots` is the match table's size, a power of two; `reach` the
+		// length of the dictionary content the data starts with.
+		def new(slots int = 131072, reach int = 0) {
 			table = []
-			table.len(131072)
+			table.len(slots)
 			table.fill(-1)
+			shift = uint32(32)
+			for let n = 1; n < slots; n *= 2 {
+				shift -= uint32(1)
+			}
+			self.reach = reach
 			recent = [1, 4, 8]
 			runs = []
 			lengths = []
@@ -154,6 +208,24 @@ partial module std.data.compress.zstd {
 		// Forgets the positions seen: they are about to change.
 		def forget() {
 			table.fill(-1)
+		}
+
+		// The table slot of the 4-byte word at `pos`.
+		internal def slotOf(data byte[], pos int) int {
+			return int((le32(data, pos) * uint32(2654435761)) >> shift)
+		}
+
+		// Indexes `data[from:to]`, the dictionary content, so that matches
+		// reach into it: every position when the table has room, else one
+		// in every `step`, which finds a match of `step` + 3 bytes or more.
+		def remember(data byte[], from int, to int) {
+			let span = to - from
+			let room = table.len() / 2
+			let step = (span + room - 1) / room
+			step = 1 when step < 1
+			for let pos = from; pos + 4 <= to; pos += step {
+				table[slotOf(data, pos)] = pos
+			}
 		}
 
 		// Appends `data[from:to]` to `out` as one block: compressed, or as
@@ -200,14 +272,14 @@ partial module std.data.compress.zstd {
 			let misses = 0
 			for pos < limit {
 				let word = le32(data, pos)
-				let slot = int(((word * 2654435761) >> 15) & 0x1FFFF)
+				let slot = slotOf(data, pos)
 				let found = table[slot]
 				table[slot] = pos
 				// The last offset again is the cheapest match there is.
 				let again = pos - recent[0]
 				if again >= 0 && pos > anchor && le32(data, again) == word {
 					found = again
-				} else if found < 0 || pos - found > writeWindow || le32(data, found) != word {
+				} else if found < 0 || (found >= reach && pos - found > writeWindow) || le32(data, found) != word {
 					misses++
 					pos += 1 + (misses >> 6)
 					continue
@@ -241,7 +313,7 @@ partial module std.data.compress.zstd {
 				// Remember a place inside the match too.
 				if length > 8 && pos + length < limit {
 					let inside = pos + length - 3
-					table[int(((le32(data, inside) * 2654435761) >> 15) & 0x1FFFF)] = inside
+					table[slotOf(data, inside)] = inside
 				}
 				pos += length
 				anchor = pos

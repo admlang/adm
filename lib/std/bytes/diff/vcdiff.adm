@@ -1,0 +1,647 @@
+// VCDIFF (RFC 3284), the format of xdelta3 and open-vcdiff: the new data
+// in windows, each a run of ADD (new bytes), COPY (bytes from an address
+// in the old data's segment or in the window so far) and RUN (one byte
+// repeated) instructions, coded through a table of 256 entries that packs
+// common pairs into one byte, with COPY addresses shortened through a
+// cache of recent ones.
+//
+// Written as xdelta3 does by default except for secondary compression
+// (`xdelta3 -S none -A`): one window per 8 MiB of new data with the old
+// data as its source segment and xdelta3's Adler-32 of the window. Read
+// with xdelta3's LZMA secondary compression (its default) and a custom
+// code table too; its DJW and FGK compressors are refused as unsupported.
+internal partial module std.bytes.diff.vcdiff {
+	use (
+		std.bytes
+		std.bytes.diff::*
+		std.bytes.diff.faults::*
+		std.bytes.diff.matcher::(Matcher)
+		std.crypto.hash::(adler32)
+		std.data.compress.xz
+		std.io
+	)
+
+	internal const (
+		noop          = 0
+		add           = 1
+		run           = 2
+		copy          = 3
+		// Flags of the file header.
+		hasSecondary  = 1
+		hasCodeTable  = 2
+		hasAppHeader  = 4
+		// Flags of a window header.
+		fromSource    = 1
+		fromTarget    = 2
+		hasAdler32    = 4
+		// Secondary compressors xdelta3 names.
+		secondaryDjw  = 1
+		secondaryLzma = 2
+		secondaryFgk  = 16
+		// The new data per window written.
+		windowSize    = 8388608
+		// A match shorter than this costs more as a COPY than as new bytes.
+		leastMatch    = 5
+	)
+
+	// Whether the bytes start as a VCDIFF file does.
+	def matches(patch byte[]) bool {
+		return patch.len() >= 4 && patch[0] == byte(0xD6) && patch[1] == byte(0xC3) && patch[2] == byte(0xC4) && patch[3] == byte(0)
+	}
+
+	// An instruction code table: for each of the 256 codes, one or two
+	// instructions with their sizes (0: the size follows in the stream) and
+	// COPY modes.
+	internal type CodeTable {
+		inst1 int[]
+		inst2 int[]
+		size1 int[]
+		size2 int[]
+		mode1 int[]
+		mode2 int[]
+
+		def new() {
+			inst1 = []
+			inst2 = []
+			size1 = []
+			size2 = []
+			mode1 = []
+			mode2 = []
+			for let (_, column) in [inst1, inst2, size1, size2, mode1, mode2] {
+				column.len(256)
+				column.fill(0)
+			}
+		}
+
+		// The table's 1536 bytes as RFC 3284 lays them out: the six columns
+		// in turn.
+		def bytes() byte[] {
+			let out byte[] = []
+			for let (_, column) in [inst1, inst2, size1, size2, mode1, mode2] {
+				for let (_, v) in column {
+					out.push(byte(v))
+				}
+			}
+			return out
+		}
+
+		// A table from its 1536 bytes.
+		def load(data byte[]) {
+			let columns = [inst1, inst2, size1, size2, mode1, mode2]
+			for let c = 0; c < 6; c++ {
+				for let i = 0; i < 256; i++ {
+					columns[c][i] = int(data[c * 256 + i])
+				}
+			}
+		}
+	}
+
+	// The default table of RFC 3284 section 5.6: RUN, ADD of sizes 0 and
+	// 1 to 17, COPY of sizes 0 and 4 to 18 in each of 9 modes, then the
+	// pairs ADD 1-4 + COPY 4-6 (modes 0-5), ADD 1-4 + COPY 4 (modes 6-8)
+	// and COPY 4 + ADD 1 (every mode).
+	internal def defaultTable() CodeTable {
+		let t = new CodeTable()
+		t.inst1[0] = run
+		t.inst1[1] = add
+		for let s = 1; s <= 17; s++ {
+			t.inst1[1 + s] = add
+			t.size1[1 + s] = s
+		}
+		let i = 19
+		for let mode = 0; mode < 9; mode++ {
+			t.inst1[i] = copy
+			t.mode1[i] = mode
+			i++
+			for let s = 4; s <= 18; s++ {
+				t.inst1[i] = copy
+				t.size1[i] = s
+				t.mode1[i] = mode
+				i++
+			}
+		}
+		for let mode = 0; mode < 6; mode++ {
+			for let a = 1; a <= 4; a++ {
+				for let c = 4; c <= 6; c++ {
+					t.inst1[i] = add
+					t.size1[i] = a
+					t.inst2[i] = copy
+					t.size2[i] = c
+					t.mode2[i] = mode
+					i++
+				}
+			}
+		}
+		for let mode = 6; mode < 9; mode++ {
+			for let a = 1; a <= 4; a++ {
+				t.inst1[i] = add
+				t.size1[i] = a
+				t.inst2[i] = copy
+				t.size2[i] = 4
+				t.mode2[i] = mode
+				i++
+			}
+		}
+		for let mode = 0; mode < 9; mode++ {
+			t.inst1[i] = copy
+			t.size1[i] = 4
+			t.mode1[i] = mode
+			t.inst2[i] = add
+			t.size2[i] = 1
+			i++
+		}
+		return t
+	}
+
+	// The cache COPY addresses are coded against: the last `nearSize`
+	// addresses in turn, and `sameSize` * 256 slots keyed by the address.
+	internal type AddressCache {
+		near     int[]
+		same     int[]
+		nearNext int
+
+		def new(nearSize int, sameSize int) {
+			near = []
+			near.len(nearSize)
+			near.fill(0)
+			same = []
+			same.len(sameSize * 256)
+			same.fill(0)
+			nearNext = 0
+		}
+
+		def update(address int) {
+			if near.len() > 0 {
+				near[nearNext] = address
+				nearNext = (nearNext + 1) % near.len()
+			}
+			same[address % same.len()] = address when same.len() > 0
+		}
+
+		// Decodes an address read in `mode` at `here`, the position the
+		// copy goes to, from the address stream at `r`.
+		def decode(here int, mode int, r Cursor) !int {
+			let address = 0
+			if mode == 0 {
+				address = try r.varint()
+			} else if mode == 1 {
+				address = here - (try r.varint())
+			} else if mode - 2 < near.len() {
+				address = near[mode - 2] + (try r.varint())
+			} else {
+				let m = mode - 2 - near.len()
+				fail damaged("a COPY address mode of {mode} is beyond the cache") when m >= same.len() / 256
+				address = same[m * 256 + (try r.byte())]
+			}
+			update(address)
+			return address
+		}
+
+		// Encodes `address` for a copy at `here` the shortest way, appending
+		// the mode's bytes to `out`; returns the mode.
+		def encode(here int, address int, out byte[]) int {
+			let mode = 0
+			let value = address
+			let width = varintWidth(address)
+			let viaHere = here - address
+			if varintWidth(viaHere) < width {
+				mode = 1
+				value = viaHere
+				width = varintWidth(viaHere)
+			}
+			for let i = 0; i < near.len(); i++ {
+				let d = address - near[i]
+				if d >= 0 && varintWidth(d) < width {
+					mode = 2 + i
+					value = d
+					width = varintWidth(d)
+				}
+			}
+			if same.len() > 0 && same[address % same.len()] == address {
+				mode = 2 + near.len() + (address % same.len()) / 256
+				out.push(byte(address % 256))
+			} else {
+				putVarint(out, value)
+			}
+			update(address)
+			return mode
+		}
+	}
+
+	// A position in a patch's bytes, with the readers of its numbers that
+	// fail `Damaged` at the end.
+	internal type Cursor {
+		data byte[]
+		pos  int
+		end  int
+
+		def new(data byte[], pos int, end int) {
+			self.data = data
+			self.pos = pos
+			self.end = end
+		}
+
+		def done() bool {
+			return pos >= end
+		}
+
+		def byte() !int {
+			fail damaged("the VCDIFF data ends early") when pos >= end
+			let v = int(data[pos])
+			pos++
+			return v
+		}
+
+		// A base-128 number, high bits first, continuation bit on every
+		// byte but the last.
+		def varint() !int {
+			let value = 0
+			for let i = 0; i < 10; i++ {
+				let b = try byte()
+				value = (value << 7) | (b & 0x7F)
+				return value when b & 0x80 == 0
+			}
+			fail damaged("a VCDIFF number is too long")
+		}
+
+		def take(n int) !byte[] {
+			fail damaged("the VCDIFF data ends early") when n < 0 || pos + n > end
+			let out = data[pos:pos + n]
+			pos += n
+			return out
+		}
+	}
+
+	internal def varintWidth(value int) int {
+		let width = 1
+		for let v = value >> 7; v > 0; v >>= 7 {
+			width++
+		}
+		return width
+	}
+
+	internal def putVarint(out byte[], value int) {
+		let width = varintWidth(value)
+		for let i = width - 1; i >= 0; i-- {
+			let group = (value >> (7 * i)) & 0x7F
+			out.push(byte(i > 0 ?? (group | 0x80, group)))
+		}
+	}
+
+	// Applies the patch to `before`.
+	def decode(before byte[], patch byte[]) !byte[] {
+		fail damaged("a VCDIFF file starts with its 4-byte magic number") when patch.len() < 5
+		let r = new Cursor(patch, 4, patch.len())
+		let header = try r.byte()
+		let secondary = 0
+		if header & hasSecondary != 0 {
+			secondary = try r.byte()
+			fail unsupported("xdelta3's {secondary == secondaryDjw ?? ("DJW", "FGK")} secondary compression is not read") when secondary == secondaryDjw || secondary == secondaryFgk
+			fail unsupported("VCDIFF secondary compressor {secondary} is unknown") when secondary != secondaryLzma
+		}
+		let table = defaultTable()
+		let nearSize = 4
+		let sameSize = 3
+		if header & hasCodeTable != 0 {
+			let length = try r.varint()
+			nearSize = try r.byte()
+			sameSize = try r.byte()
+			let packed = try r.take(length - 2)
+			table = try customTable(packed, secondary)
+		}
+		if header & hasAppHeader != 0 {
+			let length = try r.varint()
+			let _ = try r.take(length)
+		}
+		let out byte[] = []
+		for !r.done() {
+			try decodeWindow(r, before, out, table, nearSize, sameSize, secondary)
+		}
+		return out
+	}
+
+	// Reads a custom code table: its 1536 bytes are coded as VCDIFF windows
+	// against the default table with the default caches.
+	internal def customTable(packed byte[], secondary int) !CodeTable {
+		let source = defaultTable().bytes()
+		let out byte[] = []
+		let r = new Cursor(packed, 0, packed.len())
+		for !r.done() {
+			try decodeWindow(r, source, out, defaultTable(), 4, 3, secondary)
+		}
+		fail damaged("a custom code table holds 1536 bytes, this one {out.len()}") when out.len() != 1536
+		let table = new CodeTable()
+		table.load(out)
+		return table
+	}
+
+	// Reads one window at `r` and appends its new data to `out`.
+	internal def decodeWindow(r Cursor, before byte[], out byte[], table CodeTable, nearSize int, sameSize int, secondary int) !none {
+		let indicator = try r.byte()
+		let source = before
+		let segmentLength = 0
+		let segmentStart = 0
+		if indicator & (fromSource | fromTarget) != 0 {
+			fail damaged("a window names the old data and the new as its source") when indicator & fromSource != 0 && indicator & fromTarget != 0
+			source = out when indicator & fromTarget != 0
+			segmentLength = try r.varint()
+			segmentStart = try r.varint()
+			fail damaged("a window's source segment is outside the data") when segmentStart < 0 || segmentLength < 0 || segmentStart + segmentLength > source.len()
+		}
+		let deltaLength = try r.varint()
+		let deltaStart = r.pos
+		let targetLength = try r.varint()
+		let deltaIndicator = try r.byte()
+		let dataLength = try r.varint()
+		let instLength = try r.varint()
+		let addrLength = try r.varint()
+		let expected = uint32(0)
+		if indicator & hasAdler32 != 0 {
+			let sum = try r.take(4)
+			expected = (uint32(sum[0]) << 24) | (uint32(sum[1]) << 16) | (uint32(sum[2]) << 8) | uint32(sum[3])
+		}
+		let data = try r.take(dataLength)
+		let inst = try r.take(instLength)
+		let addr = try r.take(addrLength)
+		fail damaged("a window's delta encoding length does not match its parts") when r.pos - deltaStart != deltaLength
+		data = try expand(data, deltaIndicator & 1 != 0, secondary)
+		inst = try expand(inst, deltaIndicator & 2 != 0, secondary)
+		addr = try expand(addr, deltaIndicator & 4 != 0, secondary)
+
+		let start = out.len()
+		out.len(start + targetLength)
+		let produced = 0
+		let cache = new AddressCache(nearSize, sameSize)
+		let dataAt = new Cursor(data, 0, data.len())
+		let instAt = new Cursor(inst, 0, inst.len())
+		let addrAt = new Cursor(addr, 0, addr.len())
+		for produced < targetLength {
+			let code = try instAt.byte()
+			for let half = 0; half < 2; half++ {
+				let kind = half == 0 ?? (table.inst1[code], table.inst2[code])
+				continue when kind == noop
+				let size = half == 0 ?? (table.size1[code], table.size2[code])
+				let mode = half == 0 ?? (table.mode1[code], table.mode2[code])
+				size = try instAt.varint() when size == 0
+				fail damaged("a window's instructions produce more than its length") when produced + size > targetLength
+				if kind == add {
+					let bytes = try dataAt.take(size)
+					for let i = 0; i < size; i++ {
+						out[start + produced + i] = bytes[i]
+					}
+				} else if kind == run {
+					let b = byte(try dataAt.byte())
+					out.fill(b, start + produced, start + produced + size)
+				} else if kind == copy {
+					let here = segmentLength + produced
+					let address = try cache.decode(here, mode, addrAt)
+					fail damaged("a COPY reaches outside the window's address space") when address < 0 || address >= here
+					for let i = 0; i < size; i++ {
+						let a = address + i
+						out[start + produced + i] = a < segmentLength ?? (source[segmentStart + a], out[start + a - segmentLength])
+					}
+				} else {
+					fail damaged("a code table entry names instruction {kind}")
+				}
+				produced += size
+			}
+		}
+		fail damaged("a window's instructions do not use all of its data") unless dataAt.done() && instAt.done() && addrAt.done()
+		if indicator & hasAdler32 != 0 {
+			fail mismatch("a window's Adler-32 does not match: the old data is not the one the patch was made against, or the patch is damaged") when adler32(out[start:start + targetLength]) != expected
+		}
+		return none
+	}
+
+	// A section as it is, or decompressed by the secondary compressor when
+	// the delta indicator says it is. xdelta3 writes the section's length
+	// as a number, then an xz stream it cuts as soon as that many bytes are
+	// in it: the stream's end is never there, so only that many are read.
+	internal def expand(section byte[], compressed bool, secondary int) !byte[] {
+		return section unless compressed
+		fail damaged("a section is compressed but the header names no compressor") when secondary == 0
+		let r = new Cursor(section, 0, section.len())
+		let size = try r.varint()
+		let out byte[] = []
+		out.len(size)
+		return out when size == 0
+		let reader = new xz.Reader(new bytes.Reader(section[r.pos:]))
+		io.readFull(reader, out) onerror (err error) {
+			fail PatchError{message: "diff: a VCDIFF section's LZMA data is damaged: {err.message}", code: PatchErrorKind.Damaged.value, cause: err, kind: PatchErrorKind.Damaged}
+		}
+		return out
+	}
+
+	// The patch from `before` to `after`.
+	def encode(before byte[], after byte[]) byte[] {
+		let out byte[] = [byte(0xD6), byte(0xC3), byte(0xC4), byte(0), byte(0)]
+		let table = defaultTable()
+		let codes = pairCodes(table)
+		let matcher = new Matcher(before, windowSize.min(after.len()))
+		let at = 0
+		for {
+			let end = (at + windowSize).min(after.len())
+			encodeWindow(out, after, at, end, matcher, codes)
+			at = end
+			break when at >= after.len()
+		}
+		return out
+	}
+
+	// An instruction to write: its kind, size, and for a COPY the address
+	// (in the window's address space) and later the mode.
+	internal struct Op {
+		kind    int
+		size    int
+		address int
+		mode    int
+		// Where its ADD or RUN bytes are in the new data.
+		at      int
+	}
+
+	// The code of each single instruction and pair the table has, keyed by
+	// kind, size and mode of both; -1 where the table has none.
+	internal type PairCodes {
+		single int[]
+		pair   int[]
+
+		def new() {
+			single = []
+			single.len(4 * 32 * 9)
+			single.fill(-1)
+			pair = []
+			pair.len(4 * 32 * 9 * 4 * 32 * 9)
+			pair.fill(-1)
+		}
+
+		def singleKey(kind int, size int, mode int) int {
+			return (kind * 32 + size) * 9 + mode
+		}
+
+		def pairKey(kind1 int, size1 int, mode1 int, kind2 int, size2 int, mode2 int) int {
+			return singleKey(kind1, size1, mode1) * (4 * 32 * 9) + singleKey(kind2, size2, mode2)
+		}
+	}
+
+	internal def pairCodes(table CodeTable) PairCodes {
+		let codes = new PairCodes()
+		for let code = 0; code < 256; code++ {
+			if table.inst2[code] == noop {
+				let key = codes.singleKey(table.inst1[code], table.size1[code], table.mode1[code])
+				codes.single[key] = code when codes.single[key] < 0
+			} else {
+				let key = codes.pairKey(table.inst1[code], table.size1[code], table.mode1[code], table.inst2[code], table.size2[code], table.mode2[code])
+				codes.pair[key] = code when codes.pair[key] < 0
+			}
+		}
+		return codes
+	}
+
+	// Appends one window: the new data `after[from:to]` against the part
+	// of `before` its copies reach.
+	internal def encodeWindow(out byte[], after byte[], from int, to int, matcher Matcher, codes PairCodes) {
+		let oldLength = matcher.oldLength()
+		let found = matcher.matches(after, from, to, leastMatch, true)
+		// The source segment is the span of the old data the copies use.
+		let segmentStart = oldLength
+		let segmentEnd = 0
+		for let (_, m) in found {
+			continue when m.address >= oldLength
+			segmentStart = m.address when m.address < segmentStart
+			segmentEnd = m.address + m.length when m.address + m.length > segmentEnd
+		}
+		let segmentLength = segmentEnd > segmentStart ?? (segmentEnd - segmentStart, 0)
+		segmentStart = 0 when segmentLength == 0
+
+		// The instructions: new bytes between the matches (a run of one byte
+		// of 8 or more as a RUN), each match a COPY.
+		let ops Op[] = []
+		let pos = from
+		for let (_, m) in found {
+			addOps(ops, after, pos, m.at)
+			let address = m.address < oldLength ?? (m.address - segmentStart, segmentLength + (m.address - oldLength))
+			ops.push(Op{kind: copy, size: m.length, address: address, mode: 0, at: m.at})
+			pos = m.at + m.length
+		}
+		addOps(ops, after, pos, to)
+
+		let data byte[] = []
+		let inst byte[] = []
+		let addr byte[] = []
+		let cache = new AddressCache(4, 3)
+		let here = segmentLength
+		let i = 0
+		for i < ops.len() {
+			let op = ops[i]
+			if op.kind == copy {
+				ops[i].mode = cache.encode(here, op.address, addr)
+				op = ops[i]
+			}
+			here += op.size
+			// A pair with the next instruction, when the table has one.
+			if i + 1 < ops.len() {
+				let next = ops[i + 1]
+				if next.kind == copy {
+					next.mode = cache.encode(here, next.address, addr)
+					ops[i + 1].mode = next.mode
+				}
+				let code = -1
+				code = codes.pair[codes.pairKey(op.kind, op.size, op.mode, next.kind, next.size, next.mode)] when op.size <= 18 && next.size <= 18
+				if code >= 0 {
+					inst.push(byte(code))
+					putData(data, after, op)
+					putData(data, after, next)
+					here += next.size
+					i += 2
+					continue
+				}
+				// Not paired: the next is written on its own below, its
+				// address already coded.
+				putSingle(inst, codes, op)
+				putData(data, after, op)
+				putSingle(inst, codes, next)
+				putData(data, after, next)
+				here += next.size
+				i += 2
+				continue
+			}
+			putSingle(inst, codes, op)
+			putData(data, after, op)
+			i++
+		}
+
+		let indicator = hasAdler32 | (segmentLength > 0 ?? (fromSource, 0))
+		out.push(byte(indicator))
+		if segmentLength > 0 {
+			putVarint(out, segmentLength)
+			putVarint(out, segmentStart)
+		}
+		let delta byte[] = []
+		putVarint(delta, to - from)
+		delta.push(byte(0))
+		putVarint(delta, data.len())
+		putVarint(delta, inst.len())
+		putVarint(delta, addr.len())
+		let sum = adler32(after[from:to])
+		delta.push(byte(sum >> 24), byte((sum >> 16) & 0xFF), byte((sum >> 8) & 0xFF), byte(sum & 0xFF))
+		putVarint(out, delta.len() + data.len() + inst.len() + addr.len())
+		out.push(...delta)
+		out.push(...data)
+		out.push(...inst)
+		out.push(...addr)
+	}
+
+	// The ADD and RUN instructions for `after[from:to]`.
+	internal def addOps(ops Op[], after byte[], from int, to int) {
+		let pos = from
+		for pos < to {
+			let end = pos
+			for end < to && after[end] == after[pos] {
+				end++
+			}
+			if end - pos >= 8 {
+				ops.push(Op{kind: run, size: end - pos, address: 0, mode: 0, at: pos})
+				pos = end
+				continue
+			}
+			// New bytes up to the next run of 8.
+			let stop = pos + 1
+			for stop < to {
+				let runEnd = stop
+				for runEnd < to && after[runEnd] == after[stop] {
+					runEnd++
+				}
+				break when runEnd - stop >= 8
+				stop = runEnd
+			}
+			ops.push(Op{kind: add, size: stop - pos, address: 0, mode: 0, at: pos})
+			pos = stop
+		}
+	}
+
+	// Writes one instruction's code, with its size in the stream when the
+	// table has no code for the size.
+	internal def putSingle(inst byte[], codes PairCodes, op Op) {
+		let code = -1
+		code = codes.single[codes.singleKey(op.kind, op.size, op.mode)] when op.size <= 18
+		if code >= 0 {
+			inst.push(byte(code))
+			return
+		}
+		inst.push(byte(codes.single[codes.singleKey(op.kind, 0, op.mode)]))
+		putVarint(inst, op.size)
+	}
+
+	// An ADD's bytes, or a RUN's byte, into the data section.
+	internal def putData(data byte[], after byte[], op Op) {
+		if op.kind == add {
+			let start = data.len()
+			data.len(start + op.size)
+			for let i = 0; i < op.size; i++ {
+				data[start + i] = after[op.at + i]
+			}
+		} else if op.kind == run {
+			data.push(after[op.at])
+		}
+	}
+}
