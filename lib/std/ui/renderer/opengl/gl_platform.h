@@ -87,11 +87,41 @@ ADM_GL_VOID(glUniform4i, (GLint location, GLint v0, GLint v1, GLint v2, GLint v3
 ADM_GL_VOID(glUniform4ui, (GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3), (location, v0, v1, v2, v3))
 ADM_GL_VOID(glUniform4uiv, (GLint location, GLsizei count, const GLuint *value), (location, count, value))
 ADM_GL_VOID(glUseProgram, (GLuint program), (program))
+ADM_GL_VOID(glGenBuffers, (GLsizei n, GLuint *buffers), (n, buffers))
+ADM_GL_VOID(glDeleteBuffers, (GLsizei n, const GLuint *buffers), (n, buffers))
+ADM_GL_VOID(glBindBuffer, (GLenum target, GLuint buffer), (target, buffer))
+ADM_GL_VOID(glBufferData, (GLenum target, GLsizeiptr size, const void *data, GLenum usage), (target, size, data, usage))
+ADM_GL_VOID(glUniformMatrix4fv, (GLint location, GLsizei count, GLboolean transpose, const GLfloat *value), (location, count, transpose, value))
+ADM_GL_VOID(glUniform3fv, (GLint location, GLsizei count, const GLfloat *value), (location, count, value))
+ADM_GL_VOID(glUniform4fv, (GLint location, GLsizei count, const GLfloat *value), (location, count, value))
+ADM_GL_VOID(glGenRenderbuffers, (GLsizei n, GLuint *renderbuffers), (n, renderbuffers))
+ADM_GL_VOID(glDeleteRenderbuffers, (GLsizei n, const GLuint *renderbuffers), (n, renderbuffers))
+ADM_GL_VOID(glBindRenderbuffer, (GLenum target, GLuint renderbuffer), (target, renderbuffer))
+ADM_GL_VOID(glRenderbufferStorage, (GLenum target, GLenum internalformat, GLsizei width, GLsizei height), (target, internalformat, width, height))
+ADM_GL_VOID(glFramebufferRenderbuffer, (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer), (target, attachment, renderbuffertarget, renderbuffer))
+ADM_GL_VOID(glGenerateMipmap, (GLenum target), (target))
 ADM_GL_VOID(glVertexAttribPointer, (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer), (index, size, type, normalized, stride, pointer))
 
 #else
 #include <GL/gl.h>
 #endif
+
+// A vertex attribute read from the start of the bound array buffer, and a
+// draw of indices from the start of the bound index buffer: the calls take
+// the buffer offset where a pointer goes.
+#if !defined(__APPLE__) && !defined(_WIN32)
+// <GL/gl.h> declares OpenGL 1.1 at most (the web's declares the types
+// alone); the binding declares the entry points it uses, and these two are
+// called here too.
+void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer);
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices);
+#endif
+void adm_gl_attrib_buffer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride) {
+    glVertexAttribPointer(index, size, type, normalized, stride, (const void*)0);
+}
+void adm_gl_draw_indices(GLenum mode, GLsizei count, GLenum type) {
+    glDrawElements(mode, count, type, (const void*)0);
+}
 
 // adm_gl_texture_barrier_ready reports whether the current context has
 // glTextureBarrier (OpenGL 4.5, ARB_texture_barrier, or NV_texture_barrier's

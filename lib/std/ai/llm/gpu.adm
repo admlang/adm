@@ -5,6 +5,7 @@ internal partial module std.ai.llm.model {
 		std.ai.tensor::(Weights, RopeStyle)
 		std.ai.tensor.gpu::*
 		std.ai.llm::*
+		std.services.runtime::(Runtime)
 	)
 
 	// One layer's weights on the GPU, and where its vectors (norm weights,
@@ -331,32 +332,18 @@ internal partial module std.ai.llm.model {
 	// grew; with 16 GiB Qwen 3.5 122B keeps all its experts and the
 	// desktop 28 GiB).
 	def hostCacheBudget(asked int) int {
-		let available = memoryInfo("MemAvailable:")
+		let memory = Runtime.systemMemory()
+		let available = int(memory.availableBytes)
 		return asked > 0 ?? (asked, -1) when available <= 0
-		let total = memoryInfo("MemTotal:").max(available)
+		let total = int(memory.totalBytes).max(available)
 		let room = (available - (total / 8).max(16 << 30)).max(0)
 		return asked > 0 && asked < room ?? (asked, room)
 	}
 
-	// Bytes of host memory the system can give without swapping (Linux's
-	// MemAvailable, which counts the file pages it can drop), or 0 when
-	// it does not say.
+	// Bytes of host memory the system can give without swapping
+	// (`Runtime.systemMemory`), or 0 when it does not say.
 	def availableMemory() int {
-		return memoryInfo("MemAvailable:")
-	}
-
-	// The bytes /proc/meminfo gives for `field` (with its colon), or 0
-	// when it does not.
-	internal def memoryInfo(field string) int {
-		let text = os.readFile("/proc/meminfo") onerror (err error) {
-			return 0
-		}
-		for let (_, line) in string(text).split("\n") {
-			continue unless line.startsWith(field)
-			let kib = line.slice(field.len()).trim().trimEnd(" kB").trim()
-			return kib.toInt<int>() * 1024
-		}
-		return 0
+		return int(Runtime.systemMemory().availableBytes)
 	}
 
 	// Whether a model that holds the experts of `parts` in slots gets
@@ -594,6 +581,8 @@ internal partial module std.ai.llm.model {
 		// Layers whose experts have adapters run through this (see
 		// DeviceMixer); none until one runs.
 		mixer       ?DeviceMixer
+		// While `attention` runs: what it records.
+		probe       ?AttentionProbe
 
 		def new(parts ModelParts, model DeviceModel, context int) {
 			self.parts = parts
@@ -776,14 +765,7 @@ internal partial module std.ai.llm.model {
 		// Negative tokens stand for the `rows` they key.
 		def forward(tokens int[], start int, out float32[], rows map<int, float32[]>, turns float32[] = float32[]) !none {
 			try open() when capacity == 0
-			hasAxes = turns.len() > 0
-			if hasAxes {
-				if axes.len() < turns.len() {
-					axes.dispose()
-					axes = try zeros(turns.len())
-				}
-				try axes.write(turns, 0)
-			}
+			try placeAxes(turns)
 			if tokens.len() > 1 && widestHead() <= 512 {
 				try run(tokens, start, rows)
 			} else {
@@ -793,6 +775,72 @@ internal partial module std.ai.llm.model {
 			}
 			try logits.download(out)
 			return none
+		}
+
+		// The multi-axis RoPE positions of the tokens about to run, three
+		// per token; none without multi-axis RoPE.
+		// Fails when the copy fails or the device memory runs out.
+		internal def placeAxes(turns float32[]) !none {
+			hasAxes = turns.len() > 0
+			return none unless hasAxes
+			if axes.len() < turns.len() {
+				axes.dispose()
+				axes = try zeros(turns.len())
+			}
+			return axes.write(turns, 0)
+		}
+
+		// Runs `tokens` at positions from `start` on as `forward` does, for
+		// `watch` (see ForwardState.attention): the caches stay as they
+		// are, no layer after `watch.last` runs, no logits are made, and
+		// the weights of the token at `watch.position`, the last of
+		// `tokens`, go to `watch.weights`.
+		// Fails when a launch or copy fails or the device memory runs out.
+		def recordAttention(tokens int[], start int, rows map<int, float32[]>, turns float32[], watch AttentionProbe) !none {
+			try open() when capacity == 0
+			try placeAxes(turns)
+			let heads = parts.info.heads
+			let stride = watch.position + 1
+			let total = 0
+			watch.at.len(0)
+			for let (_, asked) in watch.wanted {
+				watch.at.push(asked ?? (total, -1))
+				total += heads * stride when asked
+			}
+			let out = try zeros(total)
+			defer out.dispose()
+			watch.out = out
+			probe = watch
+			let ran = probeTokens(tokens, start, rows)
+			probe = none
+			watch.out = none
+			fail ran when ran is error
+			let all float32[]
+			all.len(total)
+			try out.download(all)
+			for let (l, layer) in watch.weights {
+				let from = watch.at[l]
+				continue when from < 0
+				for let (h, weights) in layer {
+					all[from + h * stride:from + (h + 1) * stride].copy(weights)
+				}
+			}
+			return none
+		}
+
+		// The tokens under the probe: all but the last as `forward` runs
+		// them, the last one by `step`, which records its weights.
+		// Fails when a launch fails.
+		internal def probeTokens(tokens int[], start int, rows map<int, float32[]>) !none {
+			let n = tokens.len()
+			if n > 2 && widestHead() <= 512 {
+				try run(tokens[:n - 1], start, rows)
+			} else {
+				for let i = 0; i < n - 1; i++ {
+					try step(tokens[i], start + i, false, rows, i)
+				}
+			}
+			return step(tokens[n - 1], start + n - 1, false, rows, n - 1)
 		}
 
 		// One token through every layer; the logits only when `last`.
@@ -825,8 +873,10 @@ internal partial module std.ai.llm.model {
 			}
 			let halves = parts.pairing == RopeStyle.Halves ?? (1, 0)
 			let count = parts.layers.len()
+			let watch = probe
 			try rmsNorm(x, 0, normed, 0, e, v, model.layers[0].attentionNorm, float32(1), eps, 256) when count > 0
 			for let (index, layer) in parts.layers {
+				break when watch is AttentionProbe && index > watch.last
 				let d = model.layers[index]
 				let hs = layer.headSize
 				let kvSize = info.kvHeads * hs
@@ -839,7 +889,7 @@ internal partial module std.ai.llm.model {
 				let (both, gates, buffers) = (qg, qgate, delta)
 				if recurrent is DeviceRecurrent && buffers is DeltaBuffers {
 					try deltaLayer(index, d, recurrent, normed, projected, buffers, 1, none)
-				} else if key is DeviceWeights && value is DeviceWeights {
+				} else if key is DeviceWeights && value is DeviceWeights && watch is none {
 					let at = position * kvSize
 					let kc = keys[index]
 					let vc = values[index]
@@ -873,6 +923,10 @@ internal partial module std.ai.llm.model {
 				if recurrent is none {
 					let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
 					let first = layer.window > 0 ?? ((position - layer.window + 1).max(0), 0)
+					if watch is AttentionProbe && position == watch.position && watch.at[index] >= 0 {
+						let out = watch.out
+						try attentionWeights(q, keys[cache], out, info.heads, info.kvHeads, hs, first, position + 1 - first, parts.attentionScale, parts.attentionCap, model.vectors, d.sinks, watch.at[index] + first, position + 1, info.heads * 256) when out is gpu.DeviceBuffer<float32>
+					}
 					try attention(q, keys[cache], values[cache], attended, work, info.heads, info.kvHeads, hs, first, position + 1 - first, parts.attentionScale, parts.attentionCap, model.vectors, d.sinks)
 					try gateValues(attended, gates, info.heads * hs) when layer.gatedQuery && gates is gpu.DeviceBuffer<float32>
 					try d.output.multiply(attended, 0, projected, 0)
@@ -979,8 +1033,10 @@ internal partial module std.ai.llm.model {
 			}
 			let halves = parts.pairing == RopeStyle.Halves ?? (1, 0)
 			let count = parts.layers.len()
+			let watch = probe
 			try rmsNorm(b.x, 0, b.normed, 0, e, v, model.layers[0].attentionNorm, float32(1), eps, n * 256) when count > 0
 			for let (index, layer) in parts.layers {
+				break when watch is AttentionProbe && index > watch.last
 				let d = model.layers[index]
 				let hs = layer.headSize
 				let qSize = info.heads * hs
@@ -1011,7 +1067,7 @@ internal partial module std.ai.llm.model {
 					try adapted(slotAdapted(layer, slotQuery), b.normed, 0, e, target, 0, queryWidth, n, queryWidth)
 					try splitGated(both, b.q, gates, hs, n * qSize) when layer.gatedQuery && both is gpu.DeviceBuffer<float32> && gates is gpu.DeviceBuffer<float32>
 					try biasRows(b.q, 0, d.queryBias, qSize, n)
-					if key is DeviceWeights && value is DeviceWeights {
+					if key is DeviceWeights && value is DeviceWeights && watch is none {
 						let at = start * kvSize
 						let kc = keys[index]
 						let vc = values[index]
@@ -1089,6 +1145,7 @@ internal partial module std.ai.llm.model {
 					try addNormed(b.x, b.projected, e, v, d.feedForwardPost, eps, layer.outputScale, b.normed, next, n * 256)
 				}
 			}
+			return none when watch is AttentionProbe
 			try model.output.multiply(b.normed, (n - 1) * e, logits, 0)
 			try adapted(parts.outputAdapters, b.normed, (n - 1) * e, 0, logits, 0, 0, 1, logits.len())
 			try capValues(logits, logits.len(), parts.softCap) when parts.softCap > float32(0)

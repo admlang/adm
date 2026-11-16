@@ -7,8 +7,9 @@
 # Removes only what install.sh recorded in <install dir>/install-manifest:
 # the bin/, lib/ and tools/ directories, this script, and the "# ADM" PATH
 # block it appended to shell startup files (only when that block is still
-# exactly as written). System packages are never touched: install.sh never
-# installs any.
+# exactly as written), and locks/, where running adms coordinate (the memory
+# their compile workers take). System packages are never touched: install.sh
+# never installs any.
 #
 # cache/, pkg/ and catalog/ hold the user's build cache and downloaded
 # libraries; they stay unless --purge is given. Anything else in the install
@@ -61,7 +62,7 @@ elif [ -x "$INSTALL_DIR/bin/adm" ] && [ -d "$INSTALL_DIR/lib/std" ]; then
     RC_ENTRIES="$(printf 'rc\t%s\t%s\nrc\t%s\t%s\nrc\t%s\t%s\nrc\t%s\t%s' \
         "$HOME/.bashrc" "$LINE" "$HOME/.zshrc" "$LINE" "$HOME/.profile" "$LINE" \
         "$HOME/.config/fish/config.fish" "fish_add_path $INSTALL_DIR/bin")"
-elif [ "$PURGE" = "1" ] && { [ -e "$INSTALL_DIR/cache" ] || [ -e "$INSTALL_DIR/pkg" ] || [ -e "$INSTALL_DIR/catalog" ]; }; then
+elif [ "$PURGE" = "1" ] && { [ -e "$INSTALL_DIR/cache" ] || [ -e "$INSTALL_DIR/pkg" ] || [ -e "$INSTALL_DIR/catalog" ] || [ -e "$INSTALL_DIR/locks" ]; }; then
     # Already uninstalled; --purge still clears what the first run kept.
     DIRS=""
     FILES=""
@@ -75,6 +76,9 @@ fi
 for part in $DIRS; do
     rm -rf "${INSTALL_DIR:?}/$part"
 done
+if [ -n "$DIRS" ] || [ "$PURGE" = "1" ]; then
+    rm -rf "${INSTALL_DIR:?}/locks"
+fi
 for f in $FILES; do
     rm -f "${INSTALL_DIR:?}/$f"
 done

@@ -1,0 +1,709 @@
+@os("linux", "darwin", "windows")
+partial module std.ui.renderer.vulkan {
+	use (
+		std.formats.models::(AlphaMode, Filter, LightKind, Texture, TextureRef, Wrap)
+		std.gfx.canvas::(ModelPicture)
+		std.gfx.scene::(GpuMesh, GpuScene, GpuTexture, Viewpoint, modelAlive)
+		std.ui.renderer.vulkan.vk
+	)
+
+	// The model shaders as SPIR-V (tools/build-spirv.sh, from the OpenGL
+	// renderer's shaders/model.*).
+	@embed("spirv/model.vert.spv")
+	internal const modelVertexSpirv byte[]
+
+	@embed("spirv/model.frag.spv")
+	internal const modelFragmentSpirv byte[]
+
+	@embed("spirv/modelresolve.frag.spv")
+	internal const modelResolveSpirv byte[]
+
+	// The model shader's uniform blocks (shaders/model.frag, model.vert):
+	// their sizes and where their members start.
+	internal const modelSceneBlock = 576
+	internal const msEdge = 0
+	internal const msEye = 16
+	internal const msAmbient = 28
+	internal const msForward = 32
+	internal const msOrtho = 44
+	internal const msLightCount = 48
+	internal const msLightPlace = 64
+	internal const msLightAim = 192
+	internal const msLightColor = 320
+	internal const msLightCone = 448
+	internal const modelSurfaceBlock = 240
+	internal const mfBase = 0
+	internal const mfEmissive = 16
+	internal const mfMetallic = 28
+	internal const mfRoughness = 32
+	internal const mfCutoff = 36
+	internal const mfNormalScale = 40
+	internal const mfOcclusion = 44
+	internal const mfMode = 48
+	internal const mfAlphaMode = 52
+	internal const mfUnlit = 56
+	internal const mfHasNormal = 60
+	internal const mfHasTangent = 64
+	internal const mfHasColor = 68
+	internal const mfTexMove = 80
+	internal const mfTexScale = 160
+	internal const modelViewBlock = 80
+	internal const mvLift = 64
+	internal const modelResolveBlock = 16
+
+	// The most lights the model shader takes.
+	internal const modelLights = 8
+	// The textures a surface reads: base colour, metallic-roughness, normal,
+	// occlusion, emissive.
+	internal const modelTextures = 5
+
+	// How far towards the eye a wireframe edge is drawn, in depth units, as
+	// std.gfx.scene's CPU renderer lifts it.
+	internal const modelEdgeLift = 2.0e-5
+
+	// How many frames a model's buffers, textures and pictures are kept
+	// after they were last drawn.
+	internal const modelKeptFrames = 600
+
+	// What the model pipelines draw.
+	internal const modelTriangles = 0
+	internal const modelSegments = 1
+	internal const modelPoints = 2
+
+	// One mesh's vertices and indices in one buffer, and the stamp of the
+	// vertices it holds. The attributes follow each other (positions,
+	// normals, tangents, two coordinate sets, colours), then the index
+	// lists; an attribute the mesh lacks is bound where the positions start,
+	// and the buffer is long enough for the widest attribute read from
+	// there.
+	internal type ModelBuffers {
+		stamp      uint64
+		held       Buffer = Buffer{}
+		// Where each of the six attributes starts.
+		attributes uint[]
+		// Where the triangles, segments and points start, and how many
+		// indices each has.
+		lists      uint[]
+		counts     int[]
+		// The wireframe's edges, listed only while a wireframe is drawn.
+		edges      Buffer = Buffer{}
+		edgeCount  int    = 0
+	}
+
+	// What is kept of one prepared model: its meshes' buffers by mesh id and
+	// its textures in the scene's order with their samplers, for one
+	// generation of it.
+	internal type ModelStore {
+		generation uint64
+		meshes     map<uint64, ModelBuffers>
+		textures   Image[]
+		samplers   uint[]
+		sources    Texture[]
+		used       int
+
+		def new(generation uint64) {
+			self.generation = generation
+			meshes = map<uint64, ModelBuffers>{}
+		}
+	}
+
+	// A model's picture as last drawn: the image the canvas samples and what
+	// it shows (the model by its id, so that the picture does not keep the
+	// model).
+	internal type ModelDrawn {
+		level   Image
+		model   uint64
+		changes uint64
+		samples int
+		from    Viewpoint
+		used    int
+
+		def new(level Image, picture ModelPicture) {
+			self.level = level
+			keep(picture)
+		}
+
+		// Notes what the level now shows.
+		def keep(picture ModelPicture) {
+			model = picture.model.id()
+			changes = picture.changes
+			samples = picture.samples
+			from = picture.from
+		}
+
+		// Whether the level shows the picture as it is asked for.
+		def shows(picture ModelPicture) bool {
+			return changes == picture.changes && samples == picture.samples && from.equals(picture.from)
+		}
+	}
+
+	// One draw of a picture, with everything it binds made before rendering
+	// begins: `indices` 0 buffer draws `count` vertices as they come.
+	internal struct ModelDraw {
+		pipeline uint
+		set      uint
+		buffers  uint[]
+		offsets  uint[]
+		indices  uint
+		first    uint
+		count    int
+	}
+
+	// ModelLayer draws 3D models (std.gfx.scene GpuScene) into images the
+	// GPU canvas samples: depth-tested triangles shaded as the CPU renderer
+	// shades them (the OpenGL renderer's model shader), in a target `samples`
+	// times the picture's size along each axis, resolved to the picture. A
+	// model's vertices and textures are uploaded once and kept while it is
+	// drawn; a picture whose model and viewpoint have not changed is not
+	// drawn again.
+	internal type ModelLayer {
+		internal dev    Device
+		internal stores map<uint64, ModelStore>
+		internal drawn  map<string, ModelDrawn>
+		// The drawing target: colour, depth and their size.
+		internal color  Image                   = Image{}
+		internal depth  Image                   = Image{}
+		internal width  int                     = 0
+		internal height int                     = 0
+		// A white texel for the samplers a material leaves unused.
+		internal white  Image                   = Image{}
+
+		def new(dev Device) {
+			self.dev = dev
+			stores = map<uint64, ModelStore>{}
+			drawn = map<string, ModelDrawn>{}
+		}
+
+		// The picture's image: the one kept when the model, the viewpoint,
+		// the size and the samples are those it was drawn with, else drawn
+		// now. `frame` counts the frames drawn. Not inside rendering.
+		//
+		// Fails when an image, a buffer, a pipeline or a descriptor set
+		// cannot be made.
+		def level(picture ModelPicture, frame int) !Image {
+			let key = "{picture.model.id()} {picture.width}x{picture.height}"
+			let kept = drawn.get(key)
+			if !(kept is none) {
+				kept.used = frame
+				return kept.level when kept.shows(picture)
+				try draw(picture, kept.level, frame)
+				kept.keep(picture)
+				return kept.level
+			}
+			let made = new ModelDrawn(try dev.createImage(picture.width, picture.height, vk.FORMAT_R8G8B8A8_UNORM, targetUsage), picture)
+			made.used = frame
+			drawn = drawn.set(key, made)
+			try draw(picture, made.level, frame)
+			return made.level
+		}
+
+		// Makes the drawing target at least `w` by `h`.
+		def reserve(w int, h int) !none {
+			return none when color.image != 0 && width >= w && height >= h
+			dev.retire(color)
+			dev.retire(depth)
+			color = Image{}
+			depth = Image{}
+			width = w.max(width)
+			height = h.max(height)
+			color = try dev.createImage(width, height, vk.FORMAT_R8G8B8A8_UNORM, vk.USAGE_COLOR_ATTACHMENT | vk.USAGE_SAMPLED)
+			depth = try dev.createImage(width, height, dev.depthFormat, vk.USAGE_DEPTH_ATTACHMENT)
+			return none
+		}
+
+		// Draws the picture into `into`: the scene into the drawing target,
+		// then resolved.
+		def draw(picture ModelPicture, into Image, frame int) !none {
+			let samples = picture.samples.clamp(1, 4)
+			let w = picture.width * samples
+			let h = picture.height * samples
+			let scene = picture.model.gpuScene(picture.from, w, h)
+			// What the last picture drew into the target is read before it is
+			// drawn into again.
+			dev.barrier()
+			let store = try storeOf(scene, frame)
+			try reserve(w, h)
+			if white.image == 0 {
+				white = try dev.createImage(1, 1, vk.FORMAT_R8G8B8A8_UNORM, sampledUsage)
+				try dev.upload(white, 0, 0, 1, 1, 4, byte[255, 255, 255, 255])
+			}
+			let (setLayout, pipelineLayout) = try dev.layout("model", 2, true, 0, modelTextures)
+			let vs = try dev.shader("model.vert", modelVertexSpirv)
+			let fs = try dev.shader("model.frag", modelFragmentSpirv)
+			let shared = try dev.stage(sceneBlock(scene), modelSceneBlock)
+			let flat = try dev.stage(viewBlock(scene, 0.0), modelViewBlock)
+			let lifted = try dev.stage(viewBlock(scene, modelEdgeLift), modelViewBlock)
+			// Every draw is made ready first: buffers are filled and sets
+			// written outside rendering, and nothing can fail inside it.
+			// Solid meshes write depth; the blended ones are drawn after, from
+			// the farthest, over what is there.
+			let draws ModelDraw[]
+			for let (_, mesh) in scene.meshes {
+				continue when mesh.blend
+				try meshDraws(draws, scene, store, mesh, setLayout, pipelineLayout, vs, fs, shared, flat, lifted)
+			}
+			try lineDraws(draws, scene, setLayout, pipelineLayout, vs, fs, shared, flat)
+			let blended GpuMesh[]
+			for let (_, mesh) in scene.meshes {
+				blended.push(mesh) when mesh.blend
+			}
+			blended.sort((a GpuMesh, b GpuMesh) => a.depth > b.depth)
+			for let (_, mesh) in blended {
+				try meshDraws(draws, scene, store, mesh, setLayout, pipelineLayout, vs, fs, shared, flat, lifted)
+			}
+			// The resolve: one triangle over the picture.
+			let (resolveSet, resolveLayout) = try dev.layout("modelresolve", 1, false, 0, 1)
+			let resolveVs = try dev.shader("video.vert", videoVertexSpirv)
+			let resolveFs = try dev.shader("modelresolve.frag", modelResolveSpirv)
+			let resolve = try dev.pipeline("modelresolve", resolveLayout, resolveVs, resolveFs, into.format)
+			let block byte[]
+			block.len(modelResolveBlock)
+			putI32(block, 0, samples)
+			let (resolveBuffer, resolveAt) = try dev.stage(block, modelResolveBlock)
+			let averaged = try dev.set(resolveSet, uint[resolveBuffer], uint[resolveAt], uint[uint(modelResolveBlock)], uint[color.view], uint[dev.nearest])
+
+			dev.barrier()
+			vk.cmdBeginModelRendering(dev.cmd, color.view, depth.view, uint32(w), uint32(h))
+			vk.cmdViewportScissor(dev.cmd, uint32(w), uint32(h), 0, 0, uint32(w), uint32(h))
+			for let (_, d) in draws {
+				vk.cmdBind(dev.cmd, d.pipeline, pipelineLayout, d.set)
+				vk.cmdBindVertexBuffers(dev.cmd, 6, d.buffers, d.offsets)
+				if d.indices == 0 {
+					vk.cmdDraw(dev.cmd, uint32(d.count))
+				} else {
+					vk.cmdBindIndexBuffer(dev.cmd, d.indices, d.first)
+					vk.cmdDrawIndexed(dev.cmd, uint32(d.count))
+				}
+			}
+			vk.cmdEndRendering(dev.cmd)
+			dev.barrier()
+			vk.cmdBeginRendering(dev.cmd, into.view, vk.LAYOUT_GENERAL, 0, 0, uint32(into.w), uint32(into.h), false, 0.0, 0.0, 0.0, 0.0)
+			vk.cmdBind(dev.cmd, resolve, resolveLayout, averaged)
+			vk.cmdViewportScissor(dev.cmd, uint32(into.w), uint32(into.h), 0, 0, uint32(into.w), uint32(into.h))
+			vk.cmdDraw(dev.cmd, 3)
+			vk.cmdEndRendering(dev.cmd)
+			return none
+		}
+
+		// The store of the scene's model, emptied when the model was prepared
+		// again, with its textures uploaded.
+		def storeOf(scene GpuScene, frame int) !ModelStore {
+			let kept = stores.get(scene.model)
+			if !(kept is none) {
+				if kept.generation == scene.generation {
+					kept.used = frame
+					return kept
+				}
+				free(kept)
+			}
+			let made = new ModelStore(scene.generation)
+			made.used = frame
+			stores = stores.set(scene.model, made)
+			for let (_, t) in scene.textures {
+				let (image, sampler) = try upload(t)
+				made.sources.push(t.texture)
+				made.textures.push(image)
+				made.samplers.push(sampler)
+			}
+			return made
+		}
+
+		// A texture with its smaller levels and the sampler that reads it as
+		// the model's texture says: a colour texture is stored as sRGB, so the
+		// GPU reads and averages it in linear light.
+		def upload(t GpuTexture) !(Image, uint) {
+			let source = t.texture
+			let mip = 2
+			let minLinear = true
+			switch source.minFilter {
+				case Filter.Nearest:
+					mip = 0
+					minLinear = false
+				case Filter.Linear:
+					mip = 0
+				case Filter.NearestMipmapNearest:
+					mip = 1
+					minLinear = false
+				case Filter.LinearMipmapNearest:
+					mip = 1
+				case Filter.NearestMipmapLinear:
+					minLinear = false
+				default:
+					mip = 2
+			}
+			let levels = 1
+			if mip != 0 {
+				for (t.width.max(t.height) >> levels) > 0 {
+					levels++
+				}
+			}
+			let image = try dev.createImage(t.width, t.height, t.colour ?? (vk.FORMAT_R8G8B8A8_SRGB, vk.FORMAT_R8G8B8A8_UNORM), sampledUsage, levels)
+			try dev.upload(image, 0, 0, t.width, t.height, 4, t.pixels)
+			vk.cmdMakeLevels(dev.cmd, image.image, uint32(t.width), uint32(t.height), uint32(levels)) when levels > 1
+			let sampler = try dev.textureSampler(minLinear, source.magFilter != Filter.Nearest, mip, wrapOf(source.wrapS), wrapOf(source.wrapT))
+			return (image, sampler)
+		}
+
+		// A wrapping as vk.createTextureSampler numbers it.
+		def wrapOf(w Wrap) int {
+			return 1 when w == Wrap.Clamp
+			return 2 when w == Wrap.Mirror
+			return 0
+		}
+
+		// What every draw of the picture shares: the eye, the edge colour and
+		// the lights.
+		def sceneBlock(scene GpuScene) byte[] {
+			let b byte[]
+			b.len(modelSceneBlock)
+			let edge = scene.edgeColor
+			putF32(b, msEdge, float32(float(edge.red) / 255.0))
+			putF32(b, msEdge + 4, float32(float(edge.green) / 255.0))
+			putF32(b, msEdge + 8, float32(float(edge.blue) / 255.0))
+			putF32(b, msEdge + 12, float32(float(edge.alpha) / 255.0))
+			putF32(b, msEye, float32(scene.eye.x))
+			putF32(b, msEye + 4, float32(scene.eye.y))
+			putF32(b, msEye + 8, float32(scene.eye.z))
+			putF32(b, msAmbient, float32(scene.ambient))
+			putF32(b, msForward, float32(scene.forward.x))
+			putF32(b, msForward + 4, float32(scene.forward.y))
+			putF32(b, msForward + 8, float32(scene.forward.z))
+			putI32(b, msOrtho, scene.orthographic ?? (1, 0))
+			let count = scene.lights.len().min(modelLights)
+			putI32(b, msLightCount, count)
+			for let i = 0; i < count; i++ {
+				let l = scene.lights[i]
+				let kind = l.kind == LightKind.Directional ?? (0.0, l.kind == LightKind.Spot ?? (2.0, 1.0))
+				let at = i * 16
+				putF32(b, msLightPlace + at, float32(l.position.x))
+				putF32(b, msLightPlace + at + 4, float32(l.position.y))
+				putF32(b, msLightPlace + at + 8, float32(l.position.z))
+				putF32(b, msLightPlace + at + 12, float32(kind))
+				putF32(b, msLightAim + at, float32(l.direction.x))
+				putF32(b, msLightAim + at + 4, float32(l.direction.y))
+				putF32(b, msLightAim + at + 8, float32(l.direction.z))
+				putF32(b, msLightAim + at + 12, float32(l.range))
+				putF32(b, msLightColor + at, float32(l.r))
+				putF32(b, msLightColor + at + 4, float32(l.g))
+				putF32(b, msLightColor + at + 8, float32(l.b))
+				putF32(b, msLightColor + at + 12, float32(l.cosInner))
+				putF32(b, msLightCone + at, float32(l.cosOuter))
+			}
+			return b
+		}
+
+		// The vertex stage's block: the scene's matrix (its rows, written as
+		// the block's columns) and how far the draw is lifted towards the eye.
+		def viewBlock(scene GpuScene, lift float) byte[] {
+			let b byte[]
+			b.len(modelViewBlock)
+			for let r = 0; r < 4; r++ {
+				for let c = 0; c < 4; c++ {
+					putF32(b, (c * 4 + r) * 4, scene.viewProjection[r * 4 + c])
+				}
+			}
+			putF32(b, mvLift, float32(lift))
+			return b
+		}
+
+		// The mesh's buffer, filled when the mesh is new or its vertices moved.
+		def buffersOf(store ModelStore, mesh GpuMesh) !ModelBuffers {
+			let kept = store.meshes.get(mesh.id)
+			if !(kept is none) {
+				if kept.stamp == mesh.stamp {
+					// Edges are listed only for a wireframe, which may start
+					// after the mesh was first drawn.
+					try fillEdges(kept, mesh) when kept.edgeCount == 0 && mesh.edges.len() > 0
+					return kept
+				}
+				dev.retireBuffer(kept.held)
+				dev.retireBuffer(kept.edges)
+			}
+			let made = new ModelBuffers()
+			made.stamp = mesh.stamp
+			let vertices = mesh.positions.len() / 3
+			let arrays = float32[][mesh.positions, mesh.normals, mesh.tangents, mesh.uvs.len() > 0 ?? (mesh.uvs[0], float32[]), mesh.uvs.len() > 1 ?? (mesh.uvs[1], float32[]), mesh.colors]
+			let lists = uint32[][mesh.triangles, mesh.segments, mesh.points]
+			let size = 0
+			for let (_, a) in arrays {
+				made.attributes.push(a.len() > 0 ?? (uint(size), uint(0)))
+				size += a.len() * 4
+			}
+			for let (_, l) in lists {
+				made.lists.push(uint(size))
+				made.counts.push(l.len())
+				size += l.len() * 4
+			}
+			// The widest attribute (four floats a vertex) is read from the
+			// buffer's start for an attribute the mesh lacks.
+			made.held = try dev.createBuffer(size.max(vertices * 16), vk.BUFFER_VERTEX | vk.BUFFER_INDEX)
+			for let (k, a) in arrays {
+				continue when a.len() == 0
+				let (source, from) = try dev.stageFloats(a)
+				dev.fill(made.held, int(made.attributes[k]), source, from, a.len() * 4)
+			}
+			for let (k, l) in lists {
+				continue when l.len() == 0
+				let (source, from) = try dev.stageUints(l)
+				dev.fill(made.held, int(made.lists[k]), source, from, l.len() * 4)
+			}
+			store.meshes = store.meshes.set(mesh.id, made)
+			try fillEdges(made, mesh) when mesh.edges.len() > 0
+			return made
+		}
+
+		// The wireframe's edges in a buffer of their own.
+		def fillEdges(b ModelBuffers, mesh GpuMesh) !none {
+			b.edges = try dev.createBuffer(mesh.edges.len() * 4, vk.BUFFER_INDEX)
+			let (source, from) = try dev.stageUints(mesh.edges)
+			dev.fill(b.edges, 0, source, from, mesh.edges.len() * 4)
+			b.edgeCount = mesh.edges.len()
+			return none
+		}
+
+		// The model's texture for a material's reference and the sampler it
+		// is read through, with its place in the surface block: offset,
+		// rotation and coordinate set (-1 when the reference draws nothing),
+		// and the scale.
+		def bind(store ModelStore, mesh GpuMesh, ref ?TextureRef, unit int, block byte[], views uint[], samplers uint[]) {
+			let seen = white.view
+			let sampler = dev.nearest
+			let set = -1.0
+			let offsetU = 0.0
+			let offsetV = 0.0
+			let rotation = 0.0
+			let scaleU = 1.0
+			let scaleV = 1.0
+			if !(ref is none) {
+				// The shader reads two coordinate sets.
+				if ref.uv >= 0 && ref.uv < 2 && ref.uv < mesh.uvs.len() && mesh.uvs[ref.uv].len() > 0 {
+					for let (i, source) in store.sources {
+						continue when source != ref.texture
+						seen = store.textures[i].view
+						sampler = store.samplers[i]
+						set = float(ref.uv)
+						break
+					}
+				}
+				let t = ref.transform
+				if !(t is none) {
+					offsetU = t.offsetU
+					offsetV = t.offsetV
+					rotation = t.rotation
+					scaleU = t.scaleU
+					scaleV = t.scaleV
+				}
+			}
+			views.push(seen)
+			samplers.push(sampler)
+			putF32(block, mfTexMove + unit * 16, float32(offsetU))
+			putF32(block, mfTexMove + unit * 16 + 4, float32(offsetV))
+			putF32(block, mfTexMove + unit * 16 + 8, float32(rotation))
+			putF32(block, mfTexMove + unit * 16 + 12, float32(set))
+			putF32(block, mfTexScale + unit * 16, float32(scaleU))
+			putF32(block, mfTexScale + unit * 16 + 4, float32(scaleV))
+		}
+
+		// An 8-bit sRGB channel as linear light.
+		def linear(c uint8) float32 {
+			let v = float(c) / 255.0
+			return float32(v / 12.92) when v <= 0.04045
+			return float32(((v + 0.055) / 1.055) ** 2.4)
+		}
+
+		// A lit surface's block and what its samplers read.
+		def surfaceBlock(store ModelStore, mesh GpuMesh, views uint[], samplers uint[]) byte[] {
+			let b byte[]
+			b.len(modelSurfaceBlock)
+			let m = mesh.material
+			putI32(b, mfMode, 0)
+			putI32(b, mfHasNormal, mesh.normals.len() > 0 ?? (1, 0))
+			putI32(b, mfHasTangent, mesh.tangents.len() > 0 ?? (1, 0))
+			putI32(b, mfHasColor, mesh.colors.len() > 0 ?? (1, 0))
+			if m is none {
+				for let unit = 0; unit < modelTextures; unit++ {
+					bind(store, mesh, none, unit, b, views, samplers)
+				}
+				for let k = 0; k < 4; k++ {
+					putF32(b, mfBase + k * 4, float32(1))
+				}
+				putF32(b, mfMetallic, float32(1))
+				putF32(b, mfRoughness, float32(1))
+				putI32(b, mfAlphaMode, 3)
+				return b
+			}
+			bind(store, mesh, m.baseColorTexture, 0, b, views, samplers)
+			bind(store, mesh, m.metallicRoughnessTexture, 1, b, views, samplers)
+			bind(store, mesh, m.normalTexture, 2, b, views, samplers)
+			bind(store, mesh, m.occlusionTexture, 3, b, views, samplers)
+			bind(store, mesh, m.emissiveTexture, 4, b, views, samplers)
+			let base = m.baseColor
+			putF32(b, mfBase, linear(base.red))
+			putF32(b, mfBase + 4, linear(base.green))
+			putF32(b, mfBase + 8, linear(base.blue))
+			putF32(b, mfBase + 12, float32(float(base.alpha) / 255.0))
+			let glow = m.emissive
+			let strength = float32(m.emissiveStrength)
+			putF32(b, mfEmissive, linear(glow.red) * strength)
+			putF32(b, mfEmissive + 4, linear(glow.green) * strength)
+			putF32(b, mfEmissive + 8, linear(glow.blue) * strength)
+			putF32(b, mfMetallic, float32(m.metallic))
+			putF32(b, mfRoughness, float32(m.roughness))
+			putF32(b, mfCutoff, float32(m.alphaCutoff))
+			putI32(b, mfAlphaMode, m.alphaMode == AlphaMode.Opaque ?? (0, m.alphaMode == AlphaMode.Mask ?? (1, 2)))
+			putI32(b, mfUnlit, m.unlit ?? (1, 0))
+			let normal = m.normalTexture
+			putF32(b, mfNormalScale, normal is none ?? (float32(1), float32(normal.strength)))
+			let occlusion = m.occlusionTexture
+			putF32(b, mfOcclusion, occlusion is none ?? (float32(1), float32(occlusion.strength)))
+			return b
+		}
+
+		// The block of a draw in one colour: mode 1 the base colour times the
+		// vertex colour (with the material's alpha when it blends), mode 2
+		// the scene's edge colour.
+		def plainBlock(mesh ?GpuMesh, mode int) byte[] {
+			let b byte[]
+			b.len(modelSurfaceBlock)
+			putI32(b, mfMode, mode)
+			putI32(b, mfAlphaMode, 3)
+			for let k = 0; k < 4; k++ {
+				putF32(b, mfBase + k * 4, float32(1))
+			}
+			for let unit = 0; unit < modelTextures; unit++ {
+				putF32(b, mfTexMove + unit * 16 + 12, float32(-1))
+			}
+			if mesh is none {
+				putI32(b, mfHasColor, 1)
+				return b
+			}
+			putI32(b, mfHasColor, mesh.colors.len() > 0 ?? (1, 0))
+			let m = mesh.material
+			if !(m is none) {
+				let base = m.baseColor
+				putF32(b, mfBase, linear(base.red))
+				putF32(b, mfBase + 4, linear(base.green))
+				putF32(b, mfBase + 8, linear(base.blue))
+				putF32(b, mfBase + 12, m.alphaMode == AlphaMode.Blend ?? (float32(float(base.alpha) / 255.0), float32(1)))
+			}
+			return b
+		}
+
+		// A descriptor set over the scene's block, a surface block and a view
+		// block, with the five samplers.
+		def setOf(setLayout uint, shared (uint, uint), surface byte[], seen (uint, uint), views uint[], samplers uint[]) !uint {
+			let (sceneBuffer, sceneAt) = shared
+			let (viewBuffer, viewAt) = seen
+			let (buffer, at) = try dev.stage(surface, modelSurfaceBlock)
+			return try dev.set(setLayout, uint[sceneBuffer, buffer, viewBuffer], uint[sceneAt, at, viewAt], uint[uint(modelSceneBlock), uint(modelSurfaceBlock), uint(modelViewBlock)], views, samplers)
+		}
+
+		// The white texel on every sampler.
+		def unread() (uint[], uint[]) {
+			let views uint[]
+			let samplers uint[]
+			for let unit = 0; unit < modelTextures; unit++ {
+				views.push(white.view)
+				samplers.push(dev.nearest)
+			}
+			return (views, samplers)
+		}
+
+		// Adds one mesh's draws: its triangles lit, its segments and points
+		// in the base colour, its edges in the edge colour.
+		def meshDraws(draws ModelDraw[], scene GpuScene, store ModelStore, mesh GpuMesh, setLayout uint, pipelineLayout uint, vs uint, fs uint, shared (uint, uint), flat (uint, uint), lifted (uint, uint)) !none {
+			let b = try buffersOf(store, mesh)
+			let buffers uint[]
+			for let k = 0; k < 6; k++ {
+				buffers.push(b.held.buffer)
+			}
+			if scene.fill && b.counts[0] > 0 {
+				let views uint[]
+				let samplers uint[]
+				let set = try setOf(setLayout, shared, surfaceBlock(store, mesh, views, samplers), flat, views, samplers)
+				// Front faces are clockwise in the target, which the pipeline,
+				// like OpenGL, calls back faces.
+				let pipeline = try dev.modelPipeline("model", pipelineLayout, vs, fs, vk.FORMAT_R8G8B8A8_UNORM, modelTriangles, mesh.doubleSided ?? (0, 1), mesh.blend)
+				draws.push(ModelDraw{pipeline: pipeline, set: set, buffers: buffers, offsets: b.attributes, indices: b.held.buffer, first: b.lists[0], count: b.counts[0]})
+			}
+			if b.counts[1] > 0 || b.counts[2] > 0 {
+				let (views, samplers) = unread()
+				let set = try setOf(setLayout, shared, plainBlock(mesh, 1), flat, views, samplers)
+				for let kind = modelSegments; kind <= modelPoints; kind++ {
+					continue when b.counts[kind] == 0
+					let pipeline = try dev.modelPipeline("model", pipelineLayout, vs, fs, vk.FORMAT_R8G8B8A8_UNORM, kind, 0, mesh.blend)
+					draws.push(ModelDraw{pipeline: pipeline, set: set, buffers: buffers, offsets: b.attributes, indices: b.held.buffer, first: b.lists[kind], count: b.counts[kind]})
+				}
+			}
+			if scene.wire && b.edgeCount > 0 {
+				let (views, samplers) = unread()
+				let set = try setOf(setLayout, shared, plainBlock(mesh, 2), lifted, views, samplers)
+				let pipeline = try dev.modelPipeline("model", pipelineLayout, vs, fs, vk.FORMAT_R8G8B8A8_UNORM, modelSegments, 0, mesh.blend)
+				draws.push(ModelDraw{pipeline: pipeline, set: set, buffers: buffers, offsets: b.attributes, indices: b.edges.buffer, first: 0, count: b.edgeCount})
+			}
+			return none
+		}
+
+		// Adds the scene's own lines, coloured per end, read from the frame's
+		// arena.
+		def lineDraws(draws ModelDraw[], scene GpuScene, setLayout uint, pipelineLayout uint, vs uint, fs uint, shared (uint, uint), flat (uint, uint)) !none {
+			let ends = scene.linePositions.len() / 3
+			return none when ends < 2
+			// The attributes the lines lack are read where the positions are.
+			let (positions, positionsAt) = try dev.stageVertices(scene.linePositions, ends * 16)
+			let (colors, colorsAt) = try dev.stageVertices(scene.lineColors, ends * 16)
+			let (views, samplers) = unread()
+			let set = try setOf(setLayout, shared, plainBlock(none, 1), flat, views, samplers)
+			let pipeline = try dev.modelPipeline("model", pipelineLayout, vs, fs, vk.FORMAT_R8G8B8A8_UNORM, modelSegments, 0, false)
+			draws.push(ModelDraw{pipeline: pipeline, set: set, buffers: uint[positions, positions, positions, positions, positions, colors], offsets: uint[positionsAt, positionsAt, positionsAt, positionsAt, positionsAt, colorsAt], indices: 0, first: 0, count: ends})
+			return none
+		}
+
+		// Gives a model's buffers and textures back once the GPU is done with
+		// the frame.
+		def free(store ModelStore) {
+			for let (_, b) in store.meshes {
+				dev.retireBuffer(b.held)
+				dev.retireBuffer(b.edges)
+			}
+			for let (_, t) in store.textures {
+				dev.retire(t)
+			}
+		}
+
+		// Frees what has not been drawn for `modelKeptFrames` frames and what
+		// belongs to a prepared model nobody holds any more: a model that is
+		// no longer shown, or gone, gives its memory back. The frame renderer
+		// calls it once a frame.
+		def sweep(frame int) {
+			for let (key, kept) in drawn {
+				continue when frame - kept.used < modelKeptFrames && modelAlive(kept.model)
+				dev.retire(kept.level)
+				drawn = drawn.delete(key)
+			}
+			for let (id, store) in stores {
+				continue when frame - store.used < modelKeptFrames && modelAlive(id)
+				free(store)
+				stores = stores.delete(id)
+			}
+		}
+
+		// Retires everything the layer holds.
+		def dispose() {
+			for let (_, kept) in drawn {
+				dev.retire(kept.level)
+			}
+			drawn = map<string, ModelDrawn>{}
+			for let (_, store) in stores {
+				free(store)
+			}
+			stores = map<uint64, ModelStore>{}
+			dev.retire(color)
+			dev.retire(depth)
+			dev.retire(white)
+			color = Image{}
+			depth = Image{}
+			white = Image{}
+		}
+	}
+}

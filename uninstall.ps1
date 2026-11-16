@@ -5,7 +5,8 @@
 #
 # Removes only what install.ps1 recorded in <install dir>\install-manifest:
 # the bin\, lib\ and tools\ folders, this script, and the user PATH entry it
-# added. cache\, pkg\ and catalog\ hold the user's build cache and downloaded
+# added, and locks\, where running adms coordinate. cache\, pkg\ and
+# catalog\ hold the user's build cache and downloaded
 # libraries; they stay unless -Purge is given (or $env:ADM_PURGE = "1", for a
 # piped run, which takes no arguments). Anything else in the install folder is
 # left alone, and the folder itself is removed only when empty.
@@ -43,7 +44,7 @@ function Uninstall-Adm([bool]$purge) {
         $files = $lines | Where-Object { $_ -eq "file uninstall.ps1" } | ForEach-Object { $_.Substring(5) }
         $pathAdded = $lines -contains "path-added 1"
         $createdRoot = $lines -contains "created-root 1"
-    } elseif ($purge -and ((Test-Path (Join-Path $installDir "cache")) -or (Test-Path (Join-Path $installDir "pkg")) -or (Test-Path (Join-Path $installDir "catalog")))) {
+    } elseif ($purge -and ((Test-Path (Join-Path $installDir "cache")) -or (Test-Path (Join-Path $installDir "pkg")) -or (Test-Path (Join-Path $installDir "catalog")) -or (Test-Path (Join-Path $installDir "locks")))) {
         # Already uninstalled; -Purge still clears what the first run kept.
         $createdRoot = $true
     } else {
@@ -52,6 +53,9 @@ function Uninstall-Adm([bool]$purge) {
 
     if ($dirs.Count -gt 0) { Status "Removing ADM from $installDir..." }
     foreach ($part in $dirs) { Remove-Item -LiteralPath (Join-Path $installDir $part) -Recurse -Force -ErrorAction SilentlyContinue }
+    # locks\ is where running adms coordinate (the memory their compile
+    # workers take): adm's own, gone with it.
+    if ($dirs.Count -gt 0 -or $purge) { Remove-Item -LiteralPath (Join-Path $installDir "locks") -Recurse -Force -ErrorAction SilentlyContinue }
     if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force }
 
     if ($pathAdded) {

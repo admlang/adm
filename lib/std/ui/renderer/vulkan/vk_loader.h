@@ -47,6 +47,7 @@ static struct {
     PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties getPhysicalDeviceQueueFamilyProperties;
     PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties;
+    PFN_vkGetPhysicalDeviceFormatProperties getPhysicalDeviceFormatProperties;
     PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensionProperties;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR getPhysicalDeviceSurfaceSupportKHR;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR getPhysicalDeviceSurfaceCapabilitiesKHR;
@@ -116,6 +117,11 @@ static struct {
     PFN_vkCmdSetViewport cmdSetViewport;
     PFN_vkCmdSetScissor cmdSetScissor;
     PFN_vkCmdDraw cmdDraw;
+    PFN_vkCmdDrawIndexed cmdDrawIndexed;
+    PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers;
+    PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer;
+    PFN_vkCmdCopyBuffer cmdCopyBuffer;
+    PFN_vkCmdBlitImage cmdBlitImage;
     PFN_vkCreateSwapchainKHR createSwapchainKHR;
     PFN_vkDestroySwapchainKHR destroySwapchainKHR;
     PFN_vkGetSwapchainImagesKHR getSwapchainImagesKHR;
@@ -251,6 +257,7 @@ int32_t adm_vk_create_instance(uint32_t apiVersion, const char* const* extension
     ADM_VK_INSTANCE_PROC(getPhysicalDeviceFeatures2, vkGetPhysicalDeviceFeatures2);
     ADM_VK_INSTANCE_PROC(getPhysicalDeviceQueueFamilyProperties, vkGetPhysicalDeviceQueueFamilyProperties);
     ADM_VK_INSTANCE_PROC(getPhysicalDeviceMemoryProperties, vkGetPhysicalDeviceMemoryProperties);
+    ADM_VK_INSTANCE_PROC(getPhysicalDeviceFormatProperties, vkGetPhysicalDeviceFormatProperties);
     ADM_VK_INSTANCE_PROC(enumerateDeviceExtensionProperties, vkEnumerateDeviceExtensionProperties);
     ADM_VK_INSTANCE_PROC(getPhysicalDeviceSurfaceSupportKHR, vkGetPhysicalDeviceSurfaceSupportKHR);
     ADM_VK_INSTANCE_PROC(getPhysicalDeviceSurfaceCapabilitiesKHR, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
@@ -409,6 +416,9 @@ int32_t adm_vk_create_device(adm_vk_handle physical, uint32_t family, const char
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
+    // The canvas shaders' `discard` is a demotion to a helper invocation in
+    // the SPIR-V 1.6 they are compiled to; every Vulkan 1.3 device has it.
+    f13.shaderDemoteToHelperInvocation = VK_TRUE;
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dyn = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
     dyn.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceSynchronization2FeaturesKHR sync2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR};
@@ -492,6 +502,11 @@ int32_t adm_vk_create_device(adm_vk_handle physical, uint32_t family, const char
     ADM_VK_DEVICE_PROC(cmdSetViewport, vkCmdSetViewport);
     ADM_VK_DEVICE_PROC(cmdSetScissor, vkCmdSetScissor);
     ADM_VK_DEVICE_PROC(cmdDraw, vkCmdDraw);
+    ADM_VK_DEVICE_PROC(cmdDrawIndexed, vkCmdDrawIndexed);
+    ADM_VK_DEVICE_PROC(cmdBindVertexBuffers, vkCmdBindVertexBuffers);
+    ADM_VK_DEVICE_PROC(cmdBindIndexBuffer, vkCmdBindIndexBuffer);
+    ADM_VK_DEVICE_PROC(cmdCopyBuffer, vkCmdCopyBuffer);
+    ADM_VK_DEVICE_PROC(cmdBlitImage, vkCmdBlitImage);
     ADM_VK_DEVICE_PROC(createSwapchainKHR, vkCreateSwapchainKHR);
     ADM_VK_DEVICE_PROC(destroySwapchainKHR, vkDestroySwapchainKHR);
     ADM_VK_DEVICE_PROC(getSwapchainImagesKHR, vkGetSwapchainImagesKHR);
@@ -1127,6 +1142,27 @@ void adm_vk_cmd_layout(adm_vk_handle cmd, adm_vk_handle image, uint32_t oldLayou
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = (VkImage)(uintptr_t)image;
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    b.subresourceRange.layerCount = 1;
+    VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &b;
+    adm_vk.cmdPipelineBarrier2((VkCommandBuffer)(uintptr_t)cmd, &dep);
+}
+
+// adm_vk_cmd_layout for a depth image.
+void adm_vk_cmd_layout_depth(adm_vk_handle cmd, adm_vk_handle image, uint32_t oldLayout, uint32_t newLayout) {
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    b.oldLayout = (VkImageLayout)oldLayout;
+    b.newLayout = (VkImageLayout)newLayout;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = (VkImage)(uintptr_t)image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
     VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -1362,6 +1398,301 @@ int32_t adm_vk_present(adm_vk_handle queue, adm_vk_handle swapchain, uint32_t in
 
 int32_t adm_vk_queue_wait_idle(adm_vk_handle queue) {
     return adm_vk.queueWaitIdle((VkQueue)(uintptr_t)queue);
+}
+
+// What the model layer (3D models drawn into images the canvas samples)
+// adds to the calls above: depth, vertex and index buffers carved from the
+// device's memory blocks, textures with their smaller levels, and pipelines
+// with a vertex layout.
+
+// Whether `format` is a depth format (D16, X8_D24, D32).
+static int adm_vk_is_depth(uint32_t format) {
+    return format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_X8_D24_UNORM_PACK32 || format == VK_FORMAT_D32_SFLOAT;
+}
+
+// The depth format the device draws into: 32-bit floats, else 24 bits, else
+// the 16 every device has.
+uint32_t adm_vk_depth_format(adm_vk_handle physical) {
+    VkFormat wanted[2] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32};
+    for (int i = 0; i < 2; i++) {
+        VkFormatProperties props;
+        adm_vk.getPhysicalDeviceFormatProperties((VkPhysicalDevice)(uintptr_t)physical, wanted[i], &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) return (uint32_t)wanted[i];
+    }
+    return (uint32_t)VK_FORMAT_D16_UNORM;
+}
+
+// A buffer of `size` bytes for `usage` with no memory yet: out[0] the
+// buffer, out[1] the bytes it needs, out[2] their alignment, out[3] the
+// memory types that may hold it (a bit each). A VkResult.
+int32_t adm_vk_create_unbound_buffer(adm_vk_handle device, uint64_t size, uint32_t usage, adm_vk_handle* out) {
+    VkDevice dev = (VkDevice)(uintptr_t)device;
+    VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = 0;
+    VkResult r = adm_vk.createBuffer(dev, &info, 0, &buffer);
+    if (r != VK_SUCCESS) return r;
+    VkMemoryRequirements req;
+    adm_vk.getBufferMemoryRequirements(dev, buffer, &req);
+    out[0] = (adm_vk_handle)(uintptr_t)buffer;
+    out[1] = req.size;
+    out[2] = req.alignment;
+    out[3] = req.memoryTypeBits;
+    return VK_SUCCESS;
+}
+
+// Binds the buffer to the memory at the offset. A VkResult.
+int32_t adm_vk_bind_buffer(adm_vk_handle device, adm_vk_handle buffer, adm_vk_handle memory, uint64_t offset) {
+    return adm_vk.bindBufferMemory((VkDevice)(uintptr_t)device, (VkBuffer)(uintptr_t)buffer, (VkDeviceMemory)(uintptr_t)memory, offset);
+}
+
+// Copies `size` bytes of `src` at `srcOffset` into `dst` at `dstOffset`.
+void adm_vk_cmd_copy_buffer(adm_vk_handle cmd, adm_vk_handle src, uint64_t srcOffset, adm_vk_handle dst, uint64_t dstOffset, uint64_t size) {
+    VkBufferCopy region = {srcOffset, dstOffset, size};
+    adm_vk.cmdCopyBuffer((VkCommandBuffer)(uintptr_t)cmd, (VkBuffer)(uintptr_t)src, (VkBuffer)(uintptr_t)dst, 1, &region);
+}
+
+// adm_vk_create_image with `levels` mip levels.
+int32_t adm_vk_create_image_levels(adm_vk_handle device, uint32_t w, uint32_t h, uint32_t format, uint32_t usage, uint32_t levels, adm_vk_handle* out) {
+    VkDevice dev = (VkDevice)(uintptr_t)device;
+    VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = (VkFormat)format;
+    info.extent.width = w;
+    info.extent.height = h;
+    info.extent.depth = 1;
+    info.mipLevels = levels;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = 0;
+    VkResult r = adm_vk.createImage(dev, &info, 0, &image);
+    if (r != VK_SUCCESS) return r;
+    VkMemoryRequirements req;
+    adm_vk.getImageMemoryRequirements(dev, image, &req);
+    out[0] = (adm_vk_handle)(uintptr_t)image;
+    out[1] = req.size;
+    out[2] = req.alignment;
+    out[3] = req.memoryTypeBits;
+    return VK_SUCCESS;
+}
+
+// adm_vk_bind_image for an image of `levels` levels or a depth image: the
+// view covers every level, and a depth format's view is of its depth.
+int32_t adm_vk_bind_image_levels(adm_vk_handle device, adm_vk_handle image, uint32_t format, uint32_t levels, adm_vk_handle memory, uint64_t offset, adm_vk_handle* out) {
+    VkDevice dev = (VkDevice)(uintptr_t)device;
+    VkResult r = adm_vk.bindImageMemory(dev, (VkImage)(uintptr_t)image, (VkDeviceMemory)(uintptr_t)memory, offset);
+    if (r != VK_SUCCESS) return r;
+    VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = (VkImage)(uintptr_t)image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = (VkFormat)format;
+    view.subresourceRange.aspectMask = adm_vk_is_depth(format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.levelCount = levels;
+    view.subresourceRange.layerCount = 1;
+    VkImageView v = 0;
+    r = adm_vk.createImageView(dev, &view, 0, &v);
+    if (r == VK_SUCCESS) out[0] = (adm_vk_handle)(uintptr_t)v;
+    return r;
+}
+
+// Fills levels 1.. of the w x h image (general layout, level 0 written)
+// each from the one above it, averaged: what a mipmapping sampler reads.
+void adm_vk_cmd_make_levels(adm_vk_handle cmd, adm_vk_handle image, uint32_t w, uint32_t h, uint32_t levels) {
+    VkCommandBuffer c = (VkCommandBuffer)(uintptr_t)cmd;
+    int32_t lw = (int32_t)w, lh = (int32_t)h;
+    for (uint32_t level = 1; level < levels; level++) {
+        // The level above is written before it is read.
+        adm_vk_cmd_barrier(cmd);
+        int32_t nw = lw > 1 ? lw / 2 : 1, nh = lh > 1 ? lh / 2 : 1;
+        VkImageBlit blit = {0};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = level - 1;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[1].x = lw;
+        blit.srcOffsets[1].y = lh;
+        blit.srcOffsets[1].z = 1;
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = level;
+        blit.dstSubresource.layerCount = 1;
+        blit.dstOffsets[1].x = nw;
+        blit.dstOffsets[1].y = nh;
+        blit.dstOffsets[1].z = 1;
+        adm_vk.cmdBlitImage(c, (VkImage)(uintptr_t)image, VK_IMAGE_LAYOUT_GENERAL, (VkImage)(uintptr_t)image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+        lw = nw;
+        lh = nh;
+    }
+}
+
+// A sampler for a model's texture: `minLinear` and `magLinear` choose
+// between the nearest texel and four averaged, `mip` how the smaller levels
+// are read (0 not at all, 1 the nearest level, 2 two levels blended), and
+// `wrapU`, `wrapV` what is read outside 0..1 (0 the texture again, 1 its
+// edge, 2 the texture mirrored): out[0]. A VkResult.
+int32_t adm_vk_create_texture_sampler(adm_vk_handle device, uint32_t minLinear, uint32_t magLinear, uint32_t mip, uint32_t wrapU, uint32_t wrapV, adm_vk_handle* out) {
+    static const VkSamplerAddressMode modes[3] = {VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
+    VkSamplerCreateInfo info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    info.magFilter = magLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.minFilter = minLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    info.addressModeU = modes[wrapU < 3 ? wrapU : 0];
+    info.addressModeV = modes[wrapV < 3 ? wrapV : 0];
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    // Without smaller levels the first is read whatever the scale: a limit
+    // of a quarter level keeps the choice between the two filters.
+    info.maxLod = mip ? VK_LOD_CLAMP_NONE : 0.25f;
+    VkSampler s = 0;
+    VkResult r = adm_vk.createSampler((VkDevice)(uintptr_t)device, &info, 0, &s);
+    if (r == VK_SUCCESS) out[0] = (adm_vk_handle)(uintptr_t)s;
+    return r;
+}
+
+// A pipeline drawing a model's meshes from the two modules into a colour
+// attachment of `format` and a depth attachment of `depthFormat`, depth
+// tested (less). Six vertex buffers feed locations 0..5: position (3
+// floats), normal (3), tangent (4), two texture coordinate sets (2 each),
+// colour (4). `topology`: 0 triangles, 1 lines, 2 points. `cull`: 0 no
+// face, 1 front faces, 2 back faces (front faces are those OpenGL calls
+// so: gl_FrontFacing is the same on both).
+// `blend` composites premultiplied colour over what is there and leaves the
+// depth as it is; else the colour replaces it and the depth is written.
+// A VkResult.
+int32_t adm_vk_create_model_pipeline(adm_vk_handle device, adm_vk_handle layout, adm_vk_handle vertex, adm_vk_handle fragment, uint32_t format, uint32_t depthFormat, uint32_t topology, uint32_t cull, uint32_t blend, adm_vk_handle* out) {
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = (VkShaderModule)(uintptr_t)vertex;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = (VkShaderModule)(uintptr_t)fragment;
+    stages[1].pName = "main";
+    static const uint32_t floats[6] = {3, 3, 4, 2, 2, 4};
+    VkVertexInputBindingDescription bindings[6];
+    VkVertexInputAttributeDescription attributes[6];
+    for (uint32_t i = 0; i < 6; i++) {
+        bindings[i].binding = i;
+        bindings[i].stride = floats[i] * 4;
+        bindings[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        attributes[i].location = i;
+        attributes[i].binding = i;
+        attributes[i].format = floats[i] == 2 ? VK_FORMAT_R32G32_SFLOAT : floats[i] == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        attributes[i].offset = 0;
+    }
+    VkPipelineVertexInputStateCreateInfo vin = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 6;
+    vin.pVertexBindingDescriptions = bindings;
+    vin.vertexAttributeDescriptionCount = 6;
+    vin.pVertexAttributeDescriptions = attributes;
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = topology == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : topology == 2 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = cull == 1 ? VK_CULL_MODE_FRONT_BIT : cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    // Vulkan reckons a triangle's turn with the sign OpenGL gives the same
+    // pixel positions turned over, so OpenGL's counter-clockwise front
+    // faces are clockwise here.
+    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = blend ? VK_FALSE : VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState att = {0};
+    att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (blend) {
+        att.blendEnable = VK_TRUE;
+        att.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        att.colorBlendOp = VK_BLEND_OP_ADD;
+        att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        att.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &att;
+    VkDynamicState dynamics[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynamics;
+    VkFormat colorFormat = (VkFormat)format;
+    VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &colorFormat;
+    rendering.depthAttachmentFormat = (VkFormat)depthFormat;
+    VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vin;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &ds;
+    info.pColorBlendState = &cb;
+    info.pDynamicState = &dyn;
+    info.layout = (VkPipelineLayout)(uintptr_t)layout;
+    VkPipeline p = 0;
+    VkResult r = adm_vk.createGraphicsPipelines((VkDevice)(uintptr_t)device, 0, 1, &info, 0, &p);
+    if (r == VK_SUCCESS) out[0] = (adm_vk_handle)(uintptr_t)p;
+    return r;
+}
+
+// Begins rendering into the colour view and the depth view (both images in
+// the general layout) over w x h from the origin, the colour cleared to
+// transparent and the depth to the farthest.
+void adm_vk_cmd_begin_model_rendering(adm_vk_handle cmd, adm_vk_handle view, adm_vk_handle depthView, uint32_t w, uint32_t h) {
+    VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    att.imageView = (VkImageView)(uintptr_t)view;
+    att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depth.imageView = (VkImageView)(uintptr_t)depthView;
+    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.clearValue.depthStencil.depth = 1.0f;
+    VkRenderingInfo info = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea.extent.width = w;
+    info.renderArea.extent.height = h;
+    info.layerCount = 1;
+    info.colorAttachmentCount = 1;
+    info.pColorAttachments = &att;
+    info.pDepthAttachment = &depth;
+    adm_vk.cmdBeginRendering((VkCommandBuffer)(uintptr_t)cmd, &info);
+}
+
+// Binds `count` vertex buffers at bindings 0.., each from its offset.
+void adm_vk_cmd_bind_vertex_buffers(adm_vk_handle cmd, uint32_t count, const adm_vk_handle* buffers, const uint64_t* offsets) {
+    VkBuffer handles[8];
+    VkDeviceSize at[8];
+    if (count > 8) count = 8;
+    for (uint32_t i = 0; i < count; i++) {
+        handles[i] = (VkBuffer)(uintptr_t)buffers[i];
+        at[i] = offsets[i];
+    }
+    adm_vk.cmdBindVertexBuffers((VkCommandBuffer)(uintptr_t)cmd, 0, count, handles, at);
+}
+
+// Binds the buffer's 32-bit indices from the offset.
+void adm_vk_cmd_bind_index_buffer(adm_vk_handle cmd, adm_vk_handle buffer, uint64_t offset) {
+    adm_vk.cmdBindIndexBuffer((VkCommandBuffer)(uintptr_t)cmd, (VkBuffer)(uintptr_t)buffer, offset, VK_INDEX_TYPE_UINT32);
+}
+
+// Draws `indices` indices of the bound index buffer once.
+void adm_vk_cmd_draw_indexed(adm_vk_handle cmd, uint32_t indices) {
+    adm_vk.cmdDrawIndexed((VkCommandBuffer)(uintptr_t)cmd, indices, 1, 0, 0, 0);
 }
 
 #endif

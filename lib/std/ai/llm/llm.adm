@@ -4,6 +4,7 @@ partial module std.ai.llm {
 		std.time
 		std.math
 		std.gpu
+		std.simd
 		std.formats.ai
 		std.formats.image
 		std.formats.image::(Image)
@@ -99,22 +100,39 @@ partial module std.ai.llm {
 	// Architecture numbers read from the file.
 	struct LanguageModelInfo {
 		// "llama", "qwen2", ...
-		architecture  string
-		name          string
-		layers        int
+		architecture    string
+		name            string
+		layers          int
 		// Hidden size.
-		embedding     int
-		heads         int
-		kvHeads       int
-		contextLength int
-		vocabulary    int
-		parameters    int
+		embedding       int
+		heads           int
+		kvHeads         int
+		contextLength   int
+		vocabulary      int
+		parameters      int
 		// The type most weights are stored in, e.g. "Q4_0".
-		weightType    string
+		weightType      string
 		// Whether messages may carry images and audio: the model was
 		// loaded with a projector that has that encoder.
-		vision        bool
-		audio         bool
+		vision          bool
+		audio           bool
+		// What the model's chat template lets a session do, read from the
+		// template when the model is loaded.
+		// The template writes tool calls: `Session.tools` may be set.
+		tools           bool
+		// The template has a switch for reasoning: `Session.thinking = false`
+		// makes the model answer directly.
+		thinkingSwitch  bool
+		// The model reasons before every answer, whatever `Session.thinking`
+		// says: its template opens the reply inside the reasoning, or the
+		// format has no answer without it (gpt-oss).
+		alwaysReasons   bool
+		// `Session.reasoning` (Low, Medium, High) sets how long it reasons.
+		reasoningLevels bool
+		// The template has a turn for `Session.system`; without one the
+		// instructions go before the first user message, or the template
+		// refuses them.
+		systemTurn      bool
 	}
 
 	// A loaded model: weights resident in memory.
@@ -143,6 +161,11 @@ partial module std.ai.llm {
 			let found = detectChatFormat(parts.chatTemplate)
 			chatFormat = found is none ?? (ChatFormat.None, found)
 			setup = chatSetup(parts.chatTemplate, parts.tokenizer, chatFormat)
+			info.tools = setup.callFormat.shape != CallShape.None
+			info.thinkingSwitch = parts.chatTemplate.contains("enable_thinking")
+			info.reasoningLevels = chatFormat == ChatFormat.GptOss || parts.chatTemplate.contains("reasoning_effort")
+			info.alwaysReasons = chatFormat == ChatFormat.GptOss || (!info.thinkingSwitch && opensReasoning(setup, chatFormat))
+			info.systemTurn = takesSystem(setup, chatFormat)
 		}
 
 		// A new conversation with its own KV cache. `context` of 0 uses the model's full length.
@@ -205,6 +228,43 @@ partial module std.ai.llm {
 		generatedSeconds float
 		// Generated tokens per second.
 		generateSpeed    float
+		// The bytes the context's keys and values take, with the state of
+		// the recurrent layers; saved recurrent states not counted.
+		cacheBytes       int
+		// The bytes the keys and values of one more token take.
+		tokenBytes       int
+	}
+
+	// Where a generated token's text went.
+	enum TokenRoute {
+		// The reply's text.
+		Answer,
+		// The thinking before it.
+		Thinking,
+		// Neither: markup such as a think tag, a channel header or the
+		// token that ends the reply.
+		Hidden,
+	}
+
+	// One token of a reply as the model chose it, with what it thought of
+	// that token and of the likeliest others at that place
+	// (`Session.alternatives`, `Session.choices`).
+	struct TokenChoice {
+		token              int
+		// The token's bytes (`Tokenizer.piece`, markup spelled out): part of
+		// a UTF-8 character when the token ends inside one.
+		piece              byte[]
+		route              TokenRoute
+		// The model's own probability for the token: the softmax of its
+		// logits at temperature 1, before the repeat penalty, the top-k,
+		// top-p and min-p cuts and the schema.
+		probability        float
+		// The likeliest other tokens there, likeliest first, at most
+		// `Session.alternatives` of them, with their bytes and
+		// probabilities on the same terms.
+		others             int[]
+		otherPieces        byte[][]
+		otherProbabilities float[]
 	}
 
 	// One conversation: the KV cache, the tokens so far, and how the next
@@ -272,6 +332,11 @@ partial module std.ai.llm {
 		// Thinking before it stays free; tool calls are not made while it
 		// is set. none for free text. Takes effect at the next `ask`.
 		schema         ?map<string, any> = none
+		// Above 0: `next` records every token of a reply it generates, with
+		// the model's probability for it and for this many likeliest other
+		// tokens (`choices`), at the cost of one more pass over the
+		// vocabulary per token. Read when a reply opens.
+		alternatives   int               = 0
 
 		internal parts        ModelParts
 		internal context      int
@@ -317,6 +382,29 @@ partial module std.ai.llm {
 		// negative, so they never meet a token's).
 		internal media        map<int, MediaRun[]>
 		internal nextRow      int
+		// The last reply: whether there is one, its place in the
+		// conversation, the context before it, its tokens, and what it
+		// started from (its schema recognizer, whether it opened inside the
+		// thinking, the rounds of calls before it), which `continueWith`
+		// starts it again from.
+		internal hasReply     bool
+		internal replyIndex   int
+		internal replyPrompt  int[]
+		internal replyTokens  int[]
+		internal shapeStart   ?ShapeMatcher
+		internal openThinking bool
+		internal openRounds   int
+		// Whether the reply records its tokens (`alternatives` above 0 when
+		// it opened), and what it recorded.
+		internal recording    bool
+		internal record       TokenChoice[]
+		// What `continueWith` left for `next`: the text of the token it put
+		// in, and the end token it put in, -1 for none.
+		internal heldText     string
+		internal heldEnd      int
+		// The tokens `sample` penalized and their logits before it did.
+		internal penalized    int[]
+		internal penalizedRaw float32[]
 
 		// A conversation over the model's parts; use `LanguageModel.session`.
 		def new(parts ModelParts, context int, setup ChatSetup) {
@@ -329,6 +417,7 @@ partial module std.ai.llm {
 			media = new map<int, MediaRun[]>()
 			nextRow = -1
 			callFrom = -1
+			heldEnd = -1
 		}
 
 		// Adds text to the context and runs it through the model.
@@ -344,6 +433,18 @@ partial module std.ai.llm {
 				assert history.len() + tokens.len() <= context onerror fail "llm: {tokens.len()} more tokens overflow the context of {context} ({history.len()} used)"
 			}
 			endReply()
+			try run(tokens)
+			generated = 0
+			finished = false
+			produced = ""
+			heldText = ""
+			heldEnd = -1
+			return none
+		}
+
+		// Runs `tokens` through the model after the context, in batches,
+		// timed as prompt.
+		internal def run(tokens int[]) !none {
 			let began = time.now()
 			let step = batch.max(1)
 			for let from = 0; from < tokens.len(); from += step {
@@ -356,9 +457,6 @@ partial module std.ai.llm {
 			timing.promptTokens += tokens.len()
 			timing.promptSeconds += time.since(began).seconds()
 			timing.promptSpeed = speed(timing.promptTokens, timing.promptSeconds)
-			generated = 0
-			finished = false
-			produced = ""
 			return none
 		}
 
@@ -367,6 +465,11 @@ partial module std.ai.llm {
 		// Fails when the forward pass fails (device error).
 		def next() !?string {
 			for {
+				if heldText.len() > 0 {
+					let text = heldText
+					heldText = ""
+					return text
+				}
 				return none when finished
 				if history.len() == 0 {
 					let first = parts.tokenizer.startToken()
@@ -374,8 +477,12 @@ partial module std.ai.llm {
 					try append(int[first])
 				}
 				let began = time.now()
-				let over = generated >= limit || history.len() >= context
-				let token = over ?? (-1, sample())
+				let token = heldEnd
+				heldEnd = -1
+				if token < 0 {
+					let over = generated >= limit || history.len() >= context
+					token = over ?? (-1, pick())
+				}
 				if token < 0 || parts.tokenizer.isEnd(token) {
 					let rest = conclude()
 					if try runCalls() {
@@ -384,45 +491,187 @@ partial module std.ai.llm {
 					}
 					return rest
 				}
-				try state.forward(token, history.len())
-				history.push(token)
-				raw.push(...parts.tokenizer.piece(token, true)) when replying
-				generated++
-				timing.generatedTokens++
-				timing.generatedSeconds += time.since(began).seconds()
-				timing.generateSpeed = speed(timing.generatedTokens, timing.generatedSeconds)
-				let bytes = parts.tokenizer.piece(token)
-				let way = route(token, bytes)
-				continue when way == Route.Hidden
-				let shaping = shape
-				shaping.feed(bytes) unless shaping is none || way != Route.Answer
-				if way != pendingRoute && pending.len() > 0 {
-					keep(string(pending), pendingRoute)
-					pending.len(0)
-				}
-				pendingRoute = way
-				pending.push(...bytes)
-				let whole = completeUtf8(pending)
-				continue when whole == 0
-				let text = string(pending[:whole])
-				pending = pending[whole:].clone()
-				if way == Route.Answer || showThinking {
-					let before = produced.len()
-					produced = produced + text
-					for let (_, stop) in stopAt {
-						continue when stop.len() == 0
-						let at = produced.indexOf(stop)
-						if at >= 0 {
-							let shown = keep(at > before ?? (produced.slice(before, at), ""), way)
-							pending.len(0)
-							conclude()
-							return shown
-						}
+				try step(token, began)
+				let shown = absorb(token, true, recording ?? (record.len() - 1, -1))
+				continue when shown is none
+				return shown
+			}
+		}
+
+		// The next token, by `sample`; recorded with what the model thought
+		// of it and of the likeliest others when the reply records them.
+		internal def pick() int {
+			return sample() unless recording
+			let summary = summarize(state.logits, alternatives.max(0) + 1)
+			let token = sample()
+			record.push(choiceOf(token, rawLogit(token, summary), summary)) when token >= 0
+			return token
+		}
+
+		// The logit `token` had before `sample` penalized it.
+		internal def rawLogit(token int, summary LogitSummary) float {
+			for let (k, t) in summary.best {
+				return summary.values[k] when t == token
+			}
+			let at = penalized.indexOf(token)
+			return at >= 0 ?? (float(penalizedRaw[at]), float(state.logits[token]))
+		}
+
+		// `token` as a choice among the logits `summary` holds, its logit
+		// `raw`; its route is Hidden until `absorb` routes it.
+		internal def choiceOf(token int, raw float, summary LogitSummary) TokenChoice {
+			let total = summary.total > 0.0 ?? (summary.total, 1.0)
+			let choice = TokenChoice{token: token, piece: parts.tokenizer.piece(token, true), route: TokenRoute.Hidden, probability: (math.E ** (raw - summary.top)) / total, others: int[], otherPieces: byte[][], otherProbabilities: float[]}
+			let wanted = alternatives.max(0)
+			for let (k, t) in summary.best {
+				break when choice.others.len() >= wanted
+				continue when t == token
+				choice.others.push(t)
+				choice.otherPieces.push(parts.tokenizer.piece(t, true))
+				choice.otherProbabilities.push((math.E ** (summary.values[k] - summary.top)) / total)
+			}
+			return choice
+		}
+
+		// Runs a generated token through the model and adds it to the
+		// context and the reply.
+		internal def step(token int, began time.Time) !none {
+			try state.forward(token, history.len())
+			history.push(token)
+			if replying {
+				raw.push(...parts.tokenizer.piece(token, true))
+				replyTokens.push(token)
+			}
+			generated++
+			timing.generatedTokens++
+			timing.generatedSeconds += time.since(began).seconds()
+			timing.generateSpeed = speed(timing.generatedTokens, timing.generatedSeconds)
+			return none
+		}
+
+		// Routes a token that was added to the reply: the text `next` shows
+		// of it, none when it shows nothing yet (markup, part of a
+		// character, held for a call). A `stopAt` match ends the reply when
+		// `stops`; the choice recorded at `chosen` (-1 for none) takes the
+		// token's route.
+		internal def absorb(token int, stops bool, chosen int) ?string {
+			let bytes = parts.tokenizer.piece(token)
+			let way = route(token, bytes)
+			record[chosen].route = way == Route.Answer ?? (TokenRoute.Answer, way == Route.Thinking ?? (TokenRoute.Thinking, TokenRoute.Hidden)) when chosen >= 0
+			return none when way == Route.Hidden
+			let shaping = shape
+			shaping.feed(bytes) unless shaping is none || way != Route.Answer
+			if way != pendingRoute && pending.len() > 0 {
+				keep(string(pending), pendingRoute)
+				pending.len(0)
+			}
+			pendingRoute = way
+			pending.push(...bytes)
+			let whole = completeUtf8(pending)
+			return none when whole == 0
+			let text = string(pending[:whole])
+			pending = pending[whole:].clone()
+			if way == Route.Answer || showThinking {
+				let before = produced.len()
+				produced = produced + text
+				for let (_, stop) in stopAt {
+					continue when stop.len() == 0 || !stops
+					let at = produced.indexOf(stop)
+					if at >= 0 {
+						let shown = keep(at > before ?? (produced.slice(before, at), ""), way)
+						pending.len(0)
+						conclude()
+						return shown
 					}
 				}
-				let shown = keep(text, way)
-				continue when shown.len() == 0
-				return shown
+			}
+			let shown = keep(text, way)
+			return none when shown.len() == 0
+			return shown
+		}
+
+		// The tokens of the reply being generated, or of the last one, in the
+		// order they were generated, with what the model thought of each and
+		// of the likeliest others: recorded when `alternatives` was above 0
+		// as the reply opened, else empty. Markup tokens are among them, and
+		// the token that ended the reply is the last, so `choices()[k]` is
+		// the reply's token k.
+		def choices() TokenChoice[] {
+			return record.clone()
+		}
+
+		// Cuts the reply being generated, or the last one, back to its first
+		// `at` tokens (a place in `choices`), puts `token` after them and
+		// leaves the reply open: the next `next` returns the text `token`
+		// adds, and generation goes on from it. The reply's text, thinking
+		// and calls and `choices` are then what they would be had the model
+		// generated those tokens; `choices()[at]` is `token` with the
+		// probability the model gave it there. An end token ends the reply
+		// at the next `next`. A model with recurrent layers runs the kept
+		// tokens again from its last saved state.
+		// Fails when there is no reply, or messages were added after it;
+		// when `at` is not from 0 to the reply's number of tokens (the
+		// token that ended it not counted); when `token` is not in the
+		// vocabulary; or like `append`.
+		def continueWith(at int, token int) !none {
+			fail "llm: there is no reply to continue; `ask` first" unless hasReply
+			fail "llm: the conversation has messages after the last reply" when conversation.len() != replyIndex + 1
+			fail "llm: the reply has {replyTokens.len()} tokens; continue it from 0 to {replyTokens.len()}, not {at}" when at < 0 || at > replyTokens.len()
+			fail "llm: token {token} is not in the vocabulary of {parts.tokenizer.size()} tokens" when token < 0 || token >= parts.tokenizer.size()
+			let kept = replyTokens[:at].clone()
+			let target = replyPrompt.clone()
+			target.push(...kept)
+			// The last kept token runs again for logits that no sampling has
+			// penalized; recurrent layers resume from the newest saved state.
+			let shared = sharedPrefix(history, target).min(target.len() - 1).max(0)
+			shared = try state.restore(shared) when state.recurrent() && shared < history.len()
+			history.len(shared)
+			try run(target[shared:])
+			replay(kept)
+			if recording {
+				record = record[:at.min(record.len())].clone()
+				record.push(choiceOf(token, float(state.logits[token]), summarize(state.logits, alternatives.max(0) + 1)))
+			}
+			if parts.tokenizer.isEnd(token) {
+				heldEnd = token
+				return none
+			}
+			try step(token, time.now())
+			let shown = absorb(token, true, recording ?? (record.len() - 1, -1))
+			heldText = shown is none ?? ("", shown)
+			return none
+		}
+
+		// Starts the reply again as it opened and routes `kept`, its tokens
+		// already in the context, without showing them.
+		internal def replay(kept int[]) {
+			reply.text = ""
+			reply.thinking = ""
+			reply.calls = ToolCall[]
+			calls = ToolCall[]
+			waiting.len(0)
+			results = new map<string, ToolOutput>()
+			rounds = openRounds
+			replying = true
+			finished = false
+			stage = Stage.Header
+			channelName = ""
+			pendingRoute = Route.Answer
+			pending.len(0)
+			raw.len(0)
+			callFrom = -1
+			released = 0
+			produced = ""
+			heldText = ""
+			heldEnd = -1
+			inThinking = openThinking
+			let start = shapeStart
+			shape = start is none ?? (none, start.copy())
+			replyTokens = kept
+			generated = kept.len()
+			for let (_, t) in kept {
+				raw.push(...parts.tokenizer.piece(t, true))
+				absorb(t, false, -1)
 			}
 		}
 
@@ -442,6 +691,36 @@ partial module std.ai.llm {
 		// Tokens in the context now.
 		def length() int {
 			return history.len()
+		}
+
+		// The context's tokens in order: the prompt as the chat template
+		// wrote it and the replies as generated. A negative id stands for
+		// one row of a picture or sound as its encoder made it.
+		def tokens() int[] {
+			return history.clone()
+		}
+
+		// The attention the token at context `position` (`tokens()[position]`)
+		// gave every position up to its own, as the model weighed them:
+		// `[layer][query head][0 ... position]`, each head's softmax. A
+		// recurrent layer, and a layer `layers` leaves out (all are asked
+		// for when it is empty), has no heads. Positions before a sliding
+		// window's start weigh 0; with attention sinks a head's weights sum
+		// to 1 less the sink's weight. The token runs through the layers
+		// again over the cache, which stays as it is, as the generation's
+		// state does; with recurrent layers it runs again from the newest
+		// state saved at or before it (the end of a prompt), so that costs
+		// the tokens since. The weights equal the ones the step computed up
+		// to float rounding; a prompt read with `fastPrompt` or Tf32
+		// `precision` was weighed from rounded values, so its tokens' weights
+		// differ more.
+		// Fails when `position` is outside the context, `layers` names a
+		// layer the model has not, or a GPU launch or copy fails.
+		def attention(position int, layers int[] = int[]) !float32[][][] {
+			expects {
+				assert position >= 0 && position < history.len() onerror fail "llm: position {position} is outside the context of {history.len()} tokens"
+			}
+			return state.attention(history[:position + 1], position, layers)
 		}
 
 		// Tokens `message` would add to the conversation: its text and
@@ -662,11 +941,19 @@ partial module std.ai.llm {
 			generated = 0
 			finished = false
 			timing = Stats{}
+			hasReply = false
+			replyPrompt = int[]
+			replyTokens = int[]
+			record = TokenChoice[]
+			heldText = ""
+			heldEnd = -1
 		}
 
 		// Timing since the last reset.
 		def stats() Stats {
-			return timing
+			let s = timing
+			let token = state.tokenBytes()
+			return Stats{promptTokens: s.promptTokens, promptSeconds: s.promptSeconds, promptSpeed: s.promptSpeed, generatedTokens: s.generatedTokens, generatedSeconds: s.generatedSeconds, generateSpeed: s.generateSpeed, cacheBytes: token * history.len() + state.recurrentBytes(), tokenBytes: token}
 		}
 
 		// Ends generation: what is left in `pending` (`none` when nothing
@@ -730,8 +1017,18 @@ partial module std.ai.llm {
 		// `shaping`.
 		internal def openReply(shaping ?ShapeMatcher) {
 			shape = shaping
+			shapeStart = shaping is none ?? (none, shaping.copy())
 			reply = Message{role: Role.Assistant}
 			conversation.push(reply)
+			hasReply = true
+			replyIndex = conversation.len() - 1
+			replyPrompt = history.clone()
+			replyTokens = int[]
+			openRounds = rounds
+			recording = alternatives > 0
+			record = TokenChoice[]
+			heldText = ""
+			heldEnd = -1
 			replying = true
 			stage = Stage.Header
 			channelName = ""
@@ -742,6 +1039,7 @@ partial module std.ai.llm {
 			// Templates of thinking-only models (Bailing, Qwen3 Thinking-2507)
 			// open the reply inside <think>, whatever `thinking` says.
 			inThinking = opensThinking(history, marks.thinkOpen, parts.tokenizer)
+			openThinking = inThinking
 		}
 
 		// After a reply that made calls: runs the calls whose tools have a
@@ -948,12 +1246,18 @@ partial module std.ai.llm {
 		internal def sample() int {
 			let logits = state.logits
 			let n = logits.len()
+			penalized.len(0)
+			penalizedRaw.len(0)
 			if repeatPenalty != 1.0 && repeatWindow > 0 {
 				let from = (history.len() - repeatWindow).max(0)
 				let penalty = float32(repeatPenalty)
 				for let k = from; k < history.len(); k++ {
 					let t = history[k]
 					continue when t < 0
+					if recording && !penalized.includes(t) {
+						penalized.push(t)
+						penalizedRaw.push(logits[t])
+					}
 					logits[t] = logits[t] > float32(0) ?? (logits[t] / penalty, logits[t] * penalty)
 				}
 			}
@@ -1072,6 +1376,96 @@ partial module std.ai.llm {
 			random = fresh
 			return fresh.of<float>()
 		}
+	}
+
+	// What a pass over a token's logits found: the largest logit, the sum of
+	// e to each logit less it (the softmax's divisor), and the `count`
+	// largest logits' tokens, largest first, with their logits.
+	internal struct LogitSummary {
+		top    float
+		total  float
+		best   int[]
+		values float[]
+	}
+
+	// The logits `summarize` takes in a block: 8 KiB, which stays in the
+	// first-level cache between the block's two looks.
+	internal const summaryBlock = 2048
+
+	// One pass over `logits` in blocks: the softmax's largest logit and
+	// divisor, and the `count` largest. A block is read for its largest
+	// logit, and for the tokens that beat the smallest kept; the divisor so
+	// far is scaled when the largest grows; then the block's exponentials
+	// are summed, one per logit, while the block is still in the cache.
+	internal def summarize(logits float32[], count int) LogitSummary {
+		let n = logits.len()
+		let best int[]
+		let values float[]
+		let lowest = float32(-3.0e38)
+		let floor = lowest
+		let top = lowest
+		let total = 0.0
+		for let from = 0; from < n; from += summaryBlock {
+			let to = (from + summaryBlock).min(n)
+			let vm = simd.splat8<float32>(lowest)
+			let vf = simd.splat8<float32>(floor)
+			let i = from
+			for; i + 8 <= to; i += 8 {
+				let v = simd.load8<float32>(logits, i)
+				vm = simd.max(vm, v)
+				if count > 0 && v.gt(vf).any() {
+					for let k = i; k < i + 8; k++ {
+						floor = float32(keepBest(best, values, count, k, float(logits[k]))) when logits[k] > floor
+					}
+					vf = simd.splat8<float32>(floor)
+				}
+			}
+			let high = vm.maxLane()
+			for let k = i; k < to; k++ {
+				high = high.max(logits[k])
+				floor = float32(keepBest(best, values, count, k, float(logits[k]))) when count > 0 && logits[k] > floor
+			}
+			if high > top {
+				total = total * math.E ** (float(top) - float(high))
+				top = high
+			}
+			let vt = simd.splat8<float32>(top)
+			let vs = simd.splat8<float32>(float32(0))
+			i = from
+			for; i + 8 <= to; i += 8 {
+				vs = vs + simd.exp(simd.load8<float32>(logits, i) - vt)
+			}
+			let sum = float(simd.sum(vs))
+			for; i < to; i++ {
+				sum += math.E ** (float(logits[i]) - float(top))
+			}
+			total += sum
+		}
+		return LogitSummary{top: float(top), total: total, best: best, values: values}
+	}
+
+	// Puts token `t` of logit `l` among the `count` largest kept in `best`
+	// and `values`, largest first (the earlier of equal ones first), and
+	// returns the smallest kept once there are `count`, else the lowest
+	// float32.
+	internal def keepBest(best int[], values float[], count int, t int, l float) float {
+		let lowest = -3.0e38
+		return values[count - 1] when best.len() == count && l <= values[count - 1]
+		let at = best.len()
+		for at > 0 && values[at - 1] < l {
+			at--
+		}
+		if best.len() < count {
+			best.push(0)
+			values.push(0.0)
+		}
+		for let m = best.len() - 1; m > at; m-- {
+			best[m] = best[m - 1]
+			values[m] = values[m - 1]
+		}
+		best[at] = t
+		values[at] = l
+		return best.len() == count ?? (values[count - 1], lowest)
 	}
 
 	// `all` rendered as the model's prompt: by its own template when it
@@ -1975,6 +2369,20 @@ internal partial module std.ai.llm.model {
 		return s
 	}
 
+	// What ForwardState.attention records: the probed position; per layer
+	// whether its weights are asked for, and its heads' weights (no rows
+	// for the others); the last layer asked for, after which no layer
+	// runs. On the GPU, the device buffer the weights are written to and
+	// where each asked-for layer's rows start in it.
+	struct AttentionProbe {
+		position int
+		wanted   bool[]
+		weights  float32[][][]
+		last     int
+		out      ?gpu.DeviceBuffer<float32>
+		at       int[]
+	}
+
 	// The KV cache and scratch vectors of one session.
 	type ForwardState {
 		parts         ModelParts
@@ -2044,6 +2452,8 @@ internal partial module std.ai.llm.model {
 		axes          float32[]
 		after         int[]
 		places        map<int, int[]>
+		// While `attention` runs: what it records.
+		probe         ?AttentionProbe
 
 		def new(parts ModelParts, context int) {
 			self.parts = parts
@@ -2094,7 +2504,8 @@ internal partial module std.ai.llm.model {
 			let n = tokens.len()
 			return none when n == 0
 			let gpuState = device
-			placeTokens(tokens, start) unless parts.ropeSections == 0
+			let watch = probe
+			placeTokens(tokens, start) unless parts.ropeSections == 0 || watch is AttentionProbe
 			if gpuState is DeviceState {
 				gpuState.rounded = rounded
 				gpuState.precision = precision
@@ -2103,6 +2514,7 @@ internal partial module std.ai.llm.model {
 					try gpuState.loadRecurrent(convStates, deltaStates)
 				}
 				let turns = parts.ropeSections == 0 ?? (float32[], axes[3 * start:3 * (start + n)])
+				return gpuState.recordAttention(tokens, start, rows, turns, watch) when watch is AttentionProbe
 				return gpuState.forward(tokens, start, logits, rows, turns)
 			}
 			let eps = parts.epsilon
@@ -2122,6 +2534,7 @@ internal partial module std.ai.llm.model {
 			}
 			layerInputs(tokens) when parts.layerWidth > 0
 			for let (index, layer) in parts.layers {
+				break when watch is AttentionProbe && index > watch.last
 				for let i = 0; i < n; i++ {
 					let normed = bn.row(i)
 					copyInto(bx.row(i), normed)
@@ -2151,7 +2564,8 @@ internal partial module std.ai.llm.model {
 					times(layer.query, bn, bq)
 					adapt(layer, slotQuery, bn, bq, n, layer.query.rows)
 				}
-				let own = layer.sharedCache < 0
+				// A probe reads the cached keys and values and writes none.
+				let own = layer.sharedCache < 0 && watch is none
 				if own {
 					times(layer.key, bn, bk)
 					times(layer.value, bn, bv)
@@ -2161,16 +2575,20 @@ internal partial module std.ai.llm.model {
 				for let i = 0; i < n; i++ {
 					store(index, layer, i, start + i, own)
 				}
-				let cache = own ?? (index, layer.sharedCache)
+				let cache = layer.sharedCache < 0 ?? (index, layer.sharedCache)
+				// The weights the probed token's heads give, when this layer's
+				// are asked for.
+				let recorded = watch is AttentionProbe && watch.wanted[index] ?? (watch.weights[index], float32[][])
+				let probed = watch is AttentionProbe ?? (watch.position, -1)
 				// Every row's keys are stored, so the rows attend in parallel,
 				// each with scores of its own.
 				if n == 1 {
-					attend(cache, layer, 0, start, scores)
+					attend(cache, layer, 0, start, scores, start == probed ?? (recorded, float32[][]))
 				} else {
 					forall let i in 0..n {
 						let row float32[]
 						row.len(start + i + 2)
-						attend(cache, layer, i, start + i, row)
+						attend(cache, layer, i, start + i, row, start + i == probed ?? (recorded, float32[][]))
 					}
 				}
 				if layer.gatedQuery {
@@ -2182,6 +2600,7 @@ internal partial module std.ai.llm.model {
 				adapt(layer, slotOutput, batt, bproj, n, layer.output.rows)
 				finishLayer(index, layer, n)
 			}
+			return none when watch is AttentionProbe
 			let last = bx.row(n - 1)
 			rmsNorm(last, parts.outputNorm, eps)
 			parts.output.multiply(last, logits)
@@ -2346,6 +2765,26 @@ internal partial module std.ai.llm.model {
 			return (2 * parts.deltaKeyHeads + parts.deltaValueHeads) * parts.deltaHeadSize
 		}
 
+		// The bytes the cached keys and values of one token take, over the
+		// layers with a cache of their own.
+		def tokenBytes() int {
+			let bytes = 0
+			for let (_, layer) in parts.layers {
+				bytes += 2 * parts.info.kvHeads * layer.headSize * 4 when layer.recurrent is none && layer.sharedCache < 0
+			}
+			return bytes
+		}
+
+		// The bytes the recurrent layers' state takes: each one's last
+		// convolution inputs and its heads' states.
+		def recurrentBytes() int {
+			let bytes = 0
+			for let (_, layer) in parts.layers {
+				bytes += ((parts.convWidth - 1) * convDim() + parts.deltaValueHeads * parts.deltaHeadSize * parts.deltaHeadSize) * 4 unless layer.recurrent is none
+			}
+			return bytes
+		}
+
 		// Whether the model has recurrent layers, whose state cannot be
 		// rewound like a KV cache.
 		def recurrent() bool {
@@ -2411,6 +2850,74 @@ internal partial module std.ai.llm.model {
 			let gpuState = device
 			try gpuState.loadRecurrent(convStates, deltaStates) when gpuState is DeviceState
 			return best < 0 ?? (0, snapPositions[best])
+		}
+
+		// The attention weights the token at `position` gave the positions
+		// up to its own (see Session.attention), `tokens` being the
+		// context's tokens up to and including it. The token runs through
+		// the layers again, reading the cached keys and values and writing
+		// none; with recurrent layers, from the newest saved state at or
+		// before it, the state being put back afterwards.
+		// Fails when `layers` names a layer the model has not, or a GPU
+		// launch or copy fails.
+		def attention(tokens int[], position int, layers int[]) !float32[][][] {
+			let count = parts.layers.len()
+			let heads = parts.info.heads
+			let watch = AttentionProbe{position: position, last: -1}
+			watch.wanted.len(count)
+			for let (_, l) in layers {
+				fail "llm: the model has no layer {l}; it has {count}" unless l >= 0 && l < count
+				watch.wanted[l] = true
+			}
+			for let (l, layer) in parts.layers {
+				let weighed float32[][]
+				if (layers.len() == 0 || watch.wanted[l]) && layer.recurrent is none {
+					watch.wanted[l] = true
+					watch.last = l
+					for let h = 0; h < heads; h++ {
+						let row float32[]
+						row.len(position + 1)
+						weighed.push(row)
+					}
+				} else {
+					watch.wanted[l] = false
+				}
+				watch.weights.push(weighed)
+			}
+			return watch.weights when watch.last < 0
+			let held = recurrent()
+			let conv float32[][]
+			let delta float32[][]
+			if held {
+				let gpuState = device
+				try gpuState.saveRecurrent(convStates, deltaStates) when gpuState is DeviceState
+				for let k = 0; k < convStates.len(); k++ {
+					conv.push(convStates[k].clone())
+					delta.push(deltaStates[k].clone())
+				}
+			}
+			probe = watch
+			let ran = replay(tokens, position)
+			probe = none
+			if held {
+				for let k = 0; k < convStates.len(); k++ {
+					conv[k].copy(convStates[k])
+					delta[k].copy(deltaStates[k])
+				}
+				let gpuState = device
+				try gpuState.loadRecurrent(convStates, deltaStates) when gpuState is DeviceState
+			}
+			fail ran when ran is error
+			return watch.weights
+		}
+
+		// Runs the token at `position` of `tokens` under the probe, from the
+		// newest saved recurrent state at or before it when there are
+		// recurrent layers.
+		// Fails when a GPU launch or copy fails.
+		internal def replay(tokens int[], position int) !none {
+			let from = recurrent() ?? (try restore(position), position)
+			return forward(tokens[from:position + 1], from)
 		}
 
 		// RoPE of `heads` heads of `hs` values in `x` for the token at cache
@@ -2627,8 +3134,9 @@ internal partial module std.ai.llm.model {
 
 		// Attention of batch row `i`, the token at `position`, in layer
 		// `index`, over the cached keys up to it, into `batt`. `scratch` holds
-		// at least position + 2 values.
-		internal def attend(index int, layer Layer, i int, position int, scratch float32[]) {
+		// at least position + 2 values. Each head's softmax weights also go
+		// to its row of `recorded` at their positions, when there are rows.
+		internal def attend(index int, layer Layer, i int, position int, scratch float32[], recorded float32[][]) {
 			let info = parts.info
 			let hs = layer.headSize
 			let kvSize = info.kvHeads * hs
@@ -2653,6 +3161,7 @@ internal partial module std.ai.llm.model {
 				} else {
 					softmax(scratch[:count])
 				}
+				copyAt(scratch[:count], recorded[h], first) when recorded.len() > 0
 				clearRange(attended, q, hs)
 				for let t = 0; t < count; t++ {
 					addScaled(attended, q, vc, (first + t) * kvSize + kv, scratch[t], hs)

@@ -467,9 +467,57 @@ internal partial module std.text.templates.jinja.runtime {
 	}
 
 	// Runs a parsed template.
+	// How deep values and macro calls may nest in a render.
+	internal const maxNesting = 200
+
+	// What stands for no limit, with room to add to it.
+	internal const unbounded = 1 << 60
+
+	// How many steps pass between two looks at whether the task was
+	// canceled.
+	internal const cancelEvery = 4096
+
+	// What `v` holds, taken off `room`: a string's bytes, a list's or
+	// dict's items and what they hold; 1 for anything else. Stops once
+	// `room` is used up, and gives -1 for a value nested deeper than
+	// `depth` allows (one that holds itself, in practice).
+	internal def weigh(v Value, room int, depth int) int {
+		match v.kind {
+			case Kind.String:
+				return room - v.text.len() - 1
+			case Kind.List:
+				return -1 when depth <= 0
+				room -= v.items.len() + 1
+				for let (_, item) in v.items {
+					return room when room < 0
+					room = weigh(item, room, depth - 1)
+				}
+				return room
+			case Kind.Dict:
+				return -1 when depth <= 0
+				room -= v.keys.len() + 1
+				for let (k, key) in v.keys {
+					return room when room < 0
+					room = weigh(key, room, depth - 1)
+					return room when room < 0
+					room = weigh(v.values[k], room, depth - 1)
+				}
+				return room
+			default:
+				return room - 1
+		}
+	}
+
 	type Renderer {
 		globals             map<string, Value>
 		internal autoescape bool
+		internal limits     Options
+		// The steps taken, the bytes written and the macro calls open.
+		internal steps      int
+		internal written    int
+		internal calls      int
+		// The captures open: a macro's body, a `set` or `call` block.
+		internal capturing  int
 		internal functions  map<string, def (args any[]) !any>
 		internal output     string[]
 		internal frames     Frame[]
@@ -477,8 +525,9 @@ internal partial module std.text.templates.jinja.runtime {
 		// its own frames and the template's, not its caller's.
 		internal base       int
 
-		def new(autoescape bool, functions map<string, def (args any[]) !any>) {
-			self.autoescape = autoescape
+		def new(options Options, functions map<string, def (args any[]) !any>) {
+			autoescape = options.autoescape
+			limits = options
 			self.functions = functions
 			globals = new map<string, Value>()
 			frames.push(new Frame())
@@ -493,18 +542,84 @@ internal partial module std.text.templates.jinja.runtime {
 			fail "jinja: {at.line}:{at.col}: {message}"
 		}
 
-		internal def write(v Value) {
+		// One more step of the render. Fails past `maxSteps`, and when the
+		// task rendering was canceled.
+		internal def step(at Node) !none {
+			steps++
+			try error(at, "the template ran more than {limits.maxSteps} steps") when limits.maxSteps > 0 && steps > limits.maxSteps
+			try error(at, "the render was canceled") when steps % cancelEvery == 0 && canceled()
+			return none
+		}
+
+		// Fails when a value holds more than `maxValue` allows or nests
+		// deeper than maxNesting: checked on every value an expression
+		// gives and on what an operation is about to turn into text, so
+		// no text is built from more than that.
+		internal def sized(v Value, at Node) !none {
+			return none when v.kind != Kind.String && v.kind != Kind.List && v.kind != Kind.Dict
+			let room = limits.maxValue > 0 ?? (limits.maxValue, unbounded)
+			return none when weigh(v, room, maxNesting) >= 0
+			try error(at, "a value holds more than {limits.maxValue} bytes and items, or nests more than {maxNesting} deep")
+			return none
+		}
+
+		internal def sized(all Value[], at Node) !none {
+			for let (_, v) in all {
+				try sized(v, at)
+			}
+			return none
+		}
+
+		// Fails when an operation is about to make a string of `count`
+		// bytes or a list of `count` items that `maxValue` does not allow.
+		internal def room(count int, at Node) !none {
+			try error(at, "an operation would make a value of {count} bytes or items, more than the {limits.maxValue} allowed") when count < 0 || (limits.maxValue > 0 && count > limits.maxValue)
+			return none
+		}
+
+		// A macro call ended.
+		internal def returned() {
+			calls--
+		}
+
+		// Counts text written. Fails past `maxOutput`.
+		internal def wrote(count int, at Node) !none {
+			written += count
+			if capturing > 0 {
+				try error(at, "a value holds more than {limits.maxValue} bytes and items, or nests more than {maxNesting} deep") when limits.maxValue > 0 && written > limits.maxValue
+				return none
+			}
+			try error(at, "the template wrote more than {limits.maxOutput} bytes") when limits.maxOutput > 0 && written > limits.maxOutput
+			return none
+		}
+
+		internal def write(v Value, at Node) !none {
+			try sized(v, at)
 			let s = text(v)
-			output.push((autoescape && !(v.kind == Kind.String && v.flag)) ?? (escapeHtml(s), s))
+			let out = (autoescape && !(v.kind == Kind.String && v.flag)) ?? (escapeHtml(s), s)
+			output.push(out)
+			return wrote(out.len(), at)
 		}
 
 		// Runs `body` and returns what it wrote instead of writing it.
 		internal def capture(body Node[]) !string {
 			let mark = output.len()
-			try exec(body)
-			let written = output[mark:].join("")
+			// What is captured becomes a value, not output: it is counted on
+			// its own, against what a value may hold.
+			let before = written
+			written = 0
+			capturing++
+			let failure ?error
+			exec(body) onerror (err error) {
+				failure = err
+				recover Flow.Normal
+			}
+			capturing--
+			written = before
+			fail failure unless failure is none
+			let captured = output[mark:].join("")
 			output.len(mark)
-			return written
+			return captured
 		}
 
 		internal def top() Frame {
@@ -566,11 +681,13 @@ internal partial module std.text.templates.jinja.runtime {
 
 		internal def exec(body Node[]) !Flow {
 			for let (_, n) in body {
+				try step(n)
 				match n.kind {
 					case NodeKind.Text:
 						output.push(n.text)
+						try wrote(n.text.len(), n)
 					case NodeKind.Output:
-						write(try eval(n.children[0]))
+						try write(try eval(n.children[0]), n)
 					case NodeKind.If:
 						let flow = try exec(truthy(try eval(n.children[0])) ?? (n.body, n.orelse))
 						return flow unless flow == Flow.Normal
@@ -596,7 +713,7 @@ internal partial module std.text.templates.jinja.runtime {
 						let caller = callable(CallableKind.Macro, "caller")
 						caller.node = n
 						caller.frame = frames.len()
-						write(try call(n.children[0], caller))
+						try write(try call(n.children[0], caller), n)
 					case NodeKind.FilterBlock:
 						let written = try capture(n.body)
 						let frame = new Frame()
@@ -607,7 +724,7 @@ internal partial module std.text.templates.jinja.runtime {
 							return err
 						}
 						frames.pop()
-						write(result)
+						try write(result, n)
 					case NodeKind.Break:
 						return Flow.Break
 					case NodeKind.Continue:
@@ -686,7 +803,16 @@ internal partial module std.text.templates.jinja.runtime {
 
 		// Expressions ------------------------------------------------------
 
+		// The value of an expression, counted as a step and held to
+		// `maxValue`.
 		internal def eval(n Node) !Value {
+			try step(n)
+			let v = try evaluate(n)
+			try sized(v, n)
+			return v
+		}
+
+		internal def evaluate(n Node) !Value {
 			match n.kind {
 				case NodeKind.Constant:
 					match n.constant {
@@ -934,6 +1060,9 @@ internal partial module std.text.templates.jinja.runtime {
 			}
 			frame.vars.set("varargs", list(extra))
 			frame.vars.set("kwargs", named)
+			try error(def_, "macro calls nest more than {maxNesting} deep") when calls >= maxNesting
+			calls++
+			defer returned()
 			let savedBase = base
 			// The caller of a call block sees the frames where the block is.
 			let callerFrames = m.name == "caller" && def_.kind == NodeKind.CallBlock
@@ -959,9 +1088,23 @@ internal partial module std.text.templates.jinja.runtime {
 			return autoescape ?? (markup(written), textValue(written))
 		}
 
+		// `s` with `old` replaced by `new`, as `replace` gives it. Fails when
+		// the result would be larger than `maxValue` allows.
+		internal def replaced(s string, old string, new_ string, count int, at Node) !string {
+			if new_.len() > old.len() {
+				let places = old.len() == 0 ?? (s.len() + 1, s.len() / old.len())
+				places = places.min(count) when count >= 0
+				let grown = new_.len() - old.len()
+				try room(places > 0 && grown > (unbounded - s.len()) / places ?? (-1, s.len() + places * grown), at)
+			}
+			return s.replace(old, new_, count)
+		}
+
 		// Operators and comparisons ---------------------------------------
 
 		internal def binary(op string, a Value, b Value, at Node) !Value {
+			try sized(a, at)
+			try sized(b, at)
 			if op == "+" {
 				if a.kind == Kind.String && b.kind == Kind.String {
 					// Markup + text escapes the text, as markupsafe does.
@@ -976,8 +1119,14 @@ internal partial module std.text.templates.jinja.runtime {
 				}
 			}
 			if op == "*" {
-				return textValue(a.text.repeat(asInt(b).max(0))) when a.kind == Kind.String && isInteger(b)
+				if a.kind == Kind.String && isInteger(b) {
+					let times = asInt(b).max(0)
+					try room(times > 0 && a.text.len() > unbounded / times ?? (-1, a.text.len() * times), at)
+					return textValue(a.text.repeat(times))
+				}
 				if a.kind == Kind.List && isInteger(b) {
+					let times = asInt(b).max(0)
+					try room(times > 0 && a.items.len() > unbounded / times ?? (-1, a.items.len() * times), at)
 					let items Value[]
 					for let k = 0; k < asInt(b); k++ {
 						items.push(...a.items)
@@ -1097,6 +1246,11 @@ internal partial module std.text.templates.jinja.runtime {
 		// Filters -----------------------------------------------------------
 
 		internal def filter(name string, v Value, args Value[], names string[], kwargs Value[], at Node) !Value {
+			// The value was held to the limit when it was evaluated; an
+			// argument evaluated after it may have added to it since.
+			try sized(v, at)
+			try sized(args, at)
+			try sized(kwargs, at)
 			let a = new Args(args, names, kwargs)
 			match name {
 				case "abs":
@@ -1107,6 +1261,7 @@ internal partial module std.text.templates.jinja.runtime {
 					return textValue(capitalize(text(v)))
 				case "center":
 					let width = asInt(a.at(0, "width", integer(80)))
+					try room(width.max(0), at)
 					let s = text(v)
 					let pad = (width - s.len()).max(0)
 					return textValue(" ".repeat(pad / 2) + s + " ".repeat(pad - pad / 2))
@@ -1158,10 +1313,12 @@ internal partial module std.text.templates.jinja.runtime {
 					return list(groups)
 				case "indent":
 					let widthValue = a.at(0, "width", integer(4))
+					try room(widthValue.kind == Kind.String ?? (0, asInt(widthValue).max(0)), at)
 					let prefix = widthValue.kind == Kind.String ?? (widthValue.text, " ".repeat(asInt(widthValue)))
 					let first = truthy(a.at(1, "first", boolean(false)))
 					let blank = truthy(a.at(2, "blank", boolean(false)))
 					let lines = text(v).split("\n")
+					try room(lines.len() > 0 && prefix.len() > unbounded / lines.len() ?? (-1, lines.len() * prefix.len()), at)
 					for let (k, line) in lines {
 						continue when k == 0 && !first
 						continue when line.len() == 0 && !blank
@@ -1182,6 +1339,7 @@ internal partial module std.text.templates.jinja.runtime {
 						safe = safe && y.kind == Kind.String && y.flag
 						parts.push(text(y))
 					}
+					try room(parts.len() > 0 && separator.len() > unbounded / parts.len() ?? (-1, separator.len() * parts.len()), at)
 					return textValue(parts.join(separator))
 				case "list":
 					return list(try iterate(v, at))
@@ -1240,7 +1398,7 @@ internal partial module std.text.templates.jinja.runtime {
 					return list(out)
 				case "replace":
 					let count = asInt(a.at(2, "count", integer(-1)))
-					return textValue(text(v).replace(text(a.at(0, "old", textValue(""))), text(a.at(1, "new", textValue(""))), count))
+					return textValue(try replaced(text(v), text(a.at(0, "old", textValue(""))), text(a.at(1, "new", textValue(""))), count, at))
 				case "reverse":
 					return textValue(reverseString(v.text)) when v.kind == Kind.String
 					return list((try iterate(v, at)).clone().reverse())
@@ -1283,6 +1441,11 @@ internal partial module std.text.templates.jinja.runtime {
 						keySep = text(separators.items[1])
 					}
 					let ascii = truthy(a.at(99, "ensure_ascii", boolean(false)))
+					// Every item is written with the separators and, when
+					// indented, up to `indent` spaces per level of nesting.
+					let items = (limits.maxValue > 0 ?? (limits.maxValue, unbounded)) - weigh(v, limits.maxValue > 0 ?? (limits.maxValue, unbounded), maxNesting)
+					let each = itemSep.len() + keySep.len() + indent.max(0) * maxNesting
+					try room(each > unbounded / items.max(1) ?? (-1, each * items), at)
 					return textValue(json(v, indent, 0, itemSep, keySep, sortKeys, ascii))
 				case "trim":
 					let chars = a.at(0, "chars", nothing())
@@ -1382,6 +1545,9 @@ internal partial module std.text.templates.jinja.runtime {
 		// Methods -----------------------------------------------------------
 
 		internal def callMethod(v Value, name string, args Value[], names string[], kwargs Value[], at Node) !Value {
+			try sized(v, at)
+			try sized(args, at)
+			try sized(kwargs, at)
 			let a = new Args(args, names, kwargs)
 			if v.kind == Kind.String {
 				let s = v.text
@@ -1407,7 +1573,7 @@ internal partial module std.text.templates.jinja.runtime {
 						let set = chars.kind == Kind.None ?? (whitespace, text(chars))
 						return textValue(pyStrip(s, set, name != "rstrip", name != "lstrip"))
 					case "replace":
-						return textValue(s.replace(text(a.at(0, "old", textValue(""))), text(a.at(1, "new", textValue(""))), asInt(a.at(2, "count", integer(-1)))))
+						return textValue(try replaced(s, text(a.at(0, "old", textValue(""))), text(a.at(1, "new", textValue(""))), asInt(a.at(2, "count", integer(-1))), at))
 					case "lower":
 						return textValue(s.lower())
 					case "upper":
@@ -1427,6 +1593,7 @@ internal partial module std.text.templates.jinja.runtime {
 						for let (_, x) in try iterate(a.at(0, "iterable", list(Value[])), at) {
 							parts.push(text(x))
 						}
+						try room(parts.len() > 0 && s.len() > unbounded / parts.len() ?? (-1, s.len() * parts.len()), at)
 						return textValue(parts.join(s))
 					case "format":
 						return textValue(try braceFormat(s, args, names, kwargs, at))
@@ -1514,12 +1681,16 @@ internal partial module std.text.templates.jinja.runtime {
 		// Globals -----------------------------------------------------------
 
 		internal def global(name string, args Value[], names string[], kwargs Value[], at Node) !Value {
+			try sized(args, at)
+			try sized(kwargs, at)
 			match name {
 				case "range":
 					let start = args.len() > 1 ?? (asInt(args[0]), 0)
 					let stop = args.len() > 1 ?? (asInt(args[1]), args.len() > 0 ?? (asInt(args[0]), 0))
 					let step = args.len() > 2 ?? (asInt(args[2]), 1)
 					try error(at, "range step cannot be zero") when step == 0
+					let span = step > 0 ?? (stop - start, start - stop)
+					try room(span <= 0 ?? (0, (span - 1) / step.abs() + 1), at)
 					let items Value[]
 					for let k = start; (step > 0 ?? (k < stop, k > stop)); k += step {
 						items.push(integer(k))
@@ -1634,6 +1805,13 @@ internal partial module std.text.templates.jinja.runtime {
 					spec = spec + chars[j]
 					j++
 				}
+				// A width or a precision is a number of characters to make.
+				let asked = 0
+				for let (_, digit) in spec.bytes() {
+					asked = digit >= 0x30 && digit <= 0x39 ?? ((asked * 10 + int(digit - 0x30)).min(unbounded / 20), 0)
+					try room(asked, at)
+				}
+				try error(at, "incomplete format") when j >= chars.len()
 				let verb = chars[j]
 				k = j
 				if verb == "%" {
